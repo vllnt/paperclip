@@ -2897,4 +2897,5 @@ export * from "./routine-noop-skip.js";
 export * from "./routine-gate.js";
 export * from "./event-sources.js";
 export * from "./run-context.js";
+export * from "./transient-retry-policy.js";
 export * from "./issue-git.js";

@@ -3,6 +3,7 @@ import type { EventGrouping, EventMatch } from "../event-sources.js";
 import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
 import type { RoutineGate, RoutineGateResult } from "../routine-gate.js";
 import type { RunContextPolicy } from "../run-context.js";
+import type { TransientRetryPolicy } from "../transient-retry-policy.js";
 import type {
   IssueOriginKind,
   IssuePriority,
@@ -90,6 +91,7 @@ export interface Routine {
   catchUpPolicy: string;
   activityGatePolicy: string;
   activityGateScope: string;
+  transientRetryPolicy?: TransientRetryPolicy;
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];

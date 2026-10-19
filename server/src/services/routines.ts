@@ -2996,6 +2996,7 @@ export function routineService(
             catchUpPolicy: input.catchUpPolicy,
             activityGatePolicy: input.activityGatePolicy ?? "always",
             activityGateScope: input.activityGateScope ?? "company",
+            transientRetryPolicy: input.transientRetryPolicy ?? {},
             variables,
             env,
             gate,
@@ -3170,6 +3171,7 @@ export function routineService(
           catchUpPolicy: patch.catchUpPolicy ?? locked.catchUpPolicy,
           activityGatePolicy: patch.activityGatePolicy ?? locked.activityGatePolicy,
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
+          transientRetryPolicy: patch.transientRetryPolicy ?? locked.transientRetryPolicy,
           variables: nextVariables,
           env: nextEnv,
           gate: nextGate ?? null,
@@ -3180,12 +3182,17 @@ export function routineService(
         };
 
         const folderChanged = patch.folderId !== undefined && locked.folderId !== candidate.folderId;
+        // The retry policy is not part of the revision snapshot, so a policy-only change
+        // still needs a direct write even when the snapshot comparison says nothing changed.
+        const policyChanged =
+          JSON.stringify(locked.transientRetryPolicy) !== JSON.stringify(candidate.transientRetryPolicy);
         if (locked.latestRevisionId && routineCurrentFieldsMatch(locked, candidate)) {
-          if (!folderChanged) return locked;
+          if (!folderChanged && !policyChanged) return locked;
           const [updated] = await txDb
             .update(routines)
             .set({
               folderId: candidate.folderId,
+              transientRetryPolicy: candidate.transientRetryPolicy,
               updatedByAgentId: actor.agentId ?? null,
               updatedByUserId: actor.userId ?? null,
               updatedAt: new Date(),
@@ -3217,7 +3224,13 @@ export function routineService(
                 { db: tx },
               );
             }
-            return locked;
+            if (!policyChanged) return locked;
+            const [policyUpdated] = await txDb
+              .update(routines)
+              .set({ transientRetryPolicy: candidate.transientRetryPolicy, updatedAt: new Date() })
+              .where(eq(routines.id, id))
+              .returning();
+            return policyUpdated ?? locked;
           }
         }
 
@@ -3237,6 +3250,7 @@ export function routineService(
             catchUpPolicy: candidate.catchUpPolicy,
             activityGatePolicy: candidate.activityGatePolicy,
             activityGateScope: candidate.activityGateScope,
+            transientRetryPolicy: candidate.transientRetryPolicy,
             variables: candidate.variables,
             env: candidate.env,
             gate: candidate.gate,

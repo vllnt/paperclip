@@ -20,6 +20,7 @@ import {
 } from "./issue.js";
 import { envConfigSchema } from "./secret.js";
 import { isValidRoutineDateString } from "../routine-variables.js";
+import { transientRetryPolicySchema } from "../transient-retry-policy.js";
 import { eventGroupingSchema, eventMatchSchema } from "../event-sources.js";
 import { objectWithoutDefaults } from "./partial.js";
 
@@ -129,6 +130,7 @@ export const createRoutineSchema = z.object({
   /** Board only: the route rejects it from any other actor. */
   gate: routineGateSchema.optional().nullable(),
   runContextPolicy: runContextPolicySchema.optional().nullable(),
+  transientRetryPolicy: transientRetryPolicySchema.optional(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
