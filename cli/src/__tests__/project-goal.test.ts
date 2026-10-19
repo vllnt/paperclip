@@ -158,4 +158,80 @@ describe("project and goal commands", () => {
     expect(fetchMock.mock.calls[3]?.[0]).toBe(`http://localhost:3100/api/goals/${GOAL_ID}`);
     expect(fetchMock.mock.calls[3]?.[1]?.method).toBe("DELETE");
   });
+  it("sets horizon, kind, target date and success criteria on goals and milestones", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ id: GOAL_ID }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await createProgram().parseAsync([
+      "goal", "create",
+      "--api-base", "http://localhost:3100", "--api-key", "board-token",
+      "--company-id", COMPANY_ID,
+      "--title", "Land open PRs",
+      "--kind", "milestone",
+      "--horizon", "short",
+      "--target-date", "2026-10-16",
+      "--success-criteria", "Open PRs = 0",
+      "--parent-id", GOAL_ID,
+    ], { from: "user" });
+    await createProgram().parseAsync([
+      "goal", "update", GOAL_ID,
+      "--api-base", "http://localhost:3100", "--api-key", "board-token",
+      "--horizon", "null",
+      "--target-date", "null",
+    ], { from: "user" });
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({
+      title: "Land open PRs", kind: "milestone", horizon: "short", targetDate: "2026-10-16", successCriteria: "Open PRs = 0", parentId: GOAL_ID,
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({ horizon: null, targetDate: null });
+  });
+
+  it("rejects a bad target date before calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit"); }) as never);
+
+    await expect(createProgram().parseAsync([
+      "goal", "create",
+      "--api-base", "http://localhost:3100", "--api-key", "board-token",
+      "--company-id", COMPANY_ID, "--title", "x", "--target-date", "16/10/2026",
+    ], { from: "user" })).rejects.toThrow();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    exit.mockRestore();
+  });
+
+  it("prints the company focus", async () => {
+    const focus = {
+      guidance: "Pick work that serves the focus first.",
+      goals: [{
+        id: GOAL_ID, title: "Land open PRs", kind: "goal", level: "company", targetDate: "2026-10-16", daysLeft: 7,
+        successCriteria: "Open PRs = 0", ownerAgentId: null, progress: { total: 4, done: 1, open: 3 },
+        milestones: [{ id: PROJECT_ID, title: "First half", status: "active", targetDate: "2026-10-10", daysLeft: 1, progress: { total: 2, done: 1, open: 1 } }],
+      }],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(focus), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const lines: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+
+    await createProgram().parseAsync([
+      "goal", "focus",
+      "--api-base", "http://localhost:3100", "--api-key", "board-token",
+      "--company-id", COMPANY_ID,
+    ], { from: "user" });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`http://localhost:3100/api/companies/${COMPANY_ID}/goals/focus`);
+    const text = lines.join("\n");
+    expect(text).toContain("Land open PRs");
+    expect(text).toContain("1/4 done");
+    expect(text).toContain("7 days left");
+    expect(text).toContain("Open PRs = 0");
+    expect(text).toContain("First half");
+    expect(text).toContain("1 day left");
+    expect(text).not.toContain("1 days");
+    expect(text).toContain("Pick work that serves the focus first.");
+  });
 });

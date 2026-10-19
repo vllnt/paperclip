@@ -370,6 +370,7 @@ export * from "./connection-setup-state.js";
 export * from "./google-workspace-connectors.js";
 export * from "./asana-connectors.js";
 export * from "./github-connectors.js";
+export * from "./goal-text.js";
 export {
   BLOCKED_MCP_PROVIDERS,
   SELF_SERVE_MCP_CANDIDATES,
@@ -495,6 +496,9 @@ export {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   GOAL_LEVELS,
   GOAL_STATUSES,
+  GOAL_KINDS,
+  GOAL_HORIZONS,
+  COMPANY_FOCUS_GUIDANCE,
   PROJECT_STATUSES,
   ENVIRONMENT_DRIVERS,
   ENVIRONMENT_STATUSES,
@@ -681,6 +685,8 @@ export {
   type IssueExecutionDecisionOutcome,
   type GoalLevel,
   type GoalStatus,
+  type GoalKind,
+  type GoalHorizon,
   type ProjectStatus,
   type EnvironmentDriver,
   type EnvironmentStatus,
@@ -1272,6 +1278,11 @@ export type {
   IssueTreePreviewTotals,
   IssueTreePreviewWarning,
   Goal,
+  GoalProgress,
+  CompanyFocus,
+  CompanyFocusGoal,
+  CompanyFocusMilestone,
+  IssueCompanyFocus,
   Approval,
   ApprovalComment,
   BudgetPolicy,
