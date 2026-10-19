@@ -355,6 +355,36 @@ describe("decideQueuedRunStaleness", () => {
     expect(decision).toMatchObject({ errorCode });
   });
 
+  describe("another open copy of the same routine execution holds the slot", () => {
+    const copyFacts = (
+      copy: { runLive: boolean },
+      overrides: Partial<QueuedRunFacts> = {},
+    ): QueuedRunFacts => ({
+      ...baseStalenessFacts(),
+      issueExecutionRunId: null,
+      routineCopyHoldingExecution: { issueId: "issue-live", runId: "run-live", runLive: copy.runLive },
+      ...overrides,
+    });
+
+    it("cancels the assignee's run when the holder's run is live", () => {
+      expect(decideQueuedRunStaleness(copyFacts({ runLive: true }), NOW)).toMatchObject({
+        stale: true,
+        errorCode: "routine_execution_superseded",
+        details: { issueId: "issue-1", liveIssueId: "issue-live", liveRunId: "run-live" },
+      });
+    });
+
+    it.each([
+      ["the holder's run already ended (a stale lock the sweep clears)", copyFacts({ runLive: false })],
+      ["no other copy holds the slot", { ...baseStalenessFacts(), issueExecutionRunId: null, routineCopyHoldingExecution: null }],
+      ["this issue already holds its own slot", copyFacts({ runLive: true }, { issueExecutionRunId: "run-other" })],
+      ["an interaction wake runs for a non-assignee, which never takes the slot", copyFacts({ runLive: true }, { runAgentId: "reviewer", isInteractionWake: true })],
+      ["the wake is a source-scoped recovery, which never takes the slot", copyFacts({ runLive: true }, { wakeReason: "source_scoped_recovery_action" })],
+    ])("does not cancel when %s", (_name, facts) => {
+      expect(decideQueuedRunStaleness(facts as QueuedRunFacts, NOW)).toEqual({ stale: false });
+    });
+  });
+
   describe.each([
     { name: "resolved connection", isResolvedInteractionContinuation: true, wakeReason: "issue_interaction_resolved" },
     { name: "tool snapshot refresh", isResolvedInteractionContinuation: false, wakeReason: "connection_tools_updated" },
