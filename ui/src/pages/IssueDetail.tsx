@@ -1,5 +1,10 @@
 import { TextAttachmentContext } from "../context/TextAttachmentContext";
 import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
+import {
+  ISSUE_PAGE_RUN_POLL_MS,
+  isRunExpectedOnIssue,
+  liveRunsRefetchInterval,
+} from "@/lib/live-run-polling";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
 import { readTaskRecordSelection } from "@/plugins/task-record-panels";
@@ -1196,6 +1201,8 @@ type IssueDetailChatTabProps = {
   issueAssigneeAgentId: Issue["assigneeAgentId"];
   issueWorkMode: IssueWorkMode;
   executionRunId: string | null;
+  /** True while a run is live or about to start on the issue (`isRunExpectedOnIssue`). */
+  runExpected: boolean;
   blockedBy: Issue["blockedBy"];
   liveIssueIds: ReadonlySet<string>;
   blockerAttention: Issue["blockerAttention"] | null;
@@ -1350,6 +1357,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   issueStatus,
   issueAssigneeAgentId,
   executionRunId,
+  runExpected,
   blockedBy,
   liveIssueIds,
   blockerAttention,
@@ -1471,14 +1479,16 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     queryKey: queryKeys.issues.liveRuns(issueQueryRef),
     queryFn: () => heartbeatsApi.liveRunsForIssue(issueQueryRef),
     enabled: !!issueId,
-    refetchInterval: 1000,
+    refetchInterval: liveRunsRefetchInterval(runExpected),
     placeholderData:
       keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(issueQueryRef),
   });
   const resolvedLiveRuns = liveRuns ?? [];
   const liveRunCount = resolvedLiveRuns.length;
-  const activeRunQueryEnabled =
-    !!executionRunId || issueStatus === "in_progress";
+  const activeRunQueryEnabled = shouldTrackIssueActiveRun({
+    status: issueStatus,
+    executionRunId,
+  });
   const {
     data: activeRun = null,
     isFetched: activeRunFetched,
@@ -3309,12 +3319,42 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     void refetchWorkProducts();
   }, [issueId, workProducts, refetchWorkProducts]);
 
+  const companyLiveRunsQueryKey = resolvedCompanyId
+    ? queryKeys.liveRuns(resolvedCompanyId)
+    : (["live-runs", "pending"] as const);
+  const sharedCompanyLiveRuns = useSharedPollingQuery<LiveRunForIssue[]>({
+    companyId: resolvedCompanyId,
+    resourceKey: "live-runs",
+    queryKey: companyLiveRunsQueryKey,
+    enabled: !!resolvedCompanyId,
+    // Event-sourced via LiveUpdatesProvider (GitHub issue 9627); no interval poll needed.
+    refetchInterval: false,
+    leaderOnly: true,
+  });
+  const { data: companyLiveRuns, dataUpdatedAt: companyLiveRunsUpdatedAt } =
+    useQuery({
+      queryKey: companyLiveRunsQueryKey,
+      queryFn: () => heartbeatsApi.liveRunsForCompany(resolvedCompanyId!),
+      enabled: sharedCompanyLiveRuns.enabled,
+      refetchInterval: sharedCompanyLiveRuns.refetchInterval,
+      placeholderData: keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(
+        resolvedCompanyId ?? "pending",
+      ),
+    });
+  usePublishSharedQueryData(
+    sharedCompanyLiveRuns,
+    companyLiveRuns,
+    companyLiveRunsUpdatedAt,
+  );
+  // One flag for every polled query of this page, so they cannot drift apart.
+  const runExpected = isRunExpectedOnIssue(issue, companyLiveRuns);
+
   const { data: liveRunCount = 0 } = useQuery<LiveRunForIssue[], Error, number>(
     {
       queryKey: queryKeys.issues.liveRuns(issueId!),
       queryFn: () => heartbeatsApi.liveRunsForIssue(issueId!),
       enabled: !!issueId,
-      refetchInterval: 3000,
+      refetchInterval: liveRunsRefetchInterval(runExpected, ISSUE_PAGE_RUN_POLL_MS),
       select: (runs) => runs.length,
       placeholderData: keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(
         issueId ?? "pending",
@@ -3329,9 +3369,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   >({
     queryKey: queryKeys.issues.activeRun(issueId!),
     queryFn: () => heartbeatsApi.activeRunForIssue(issueId!),
-    enabled:
-      !!issueId && (!!issue?.executionRunId || issue?.status === "in_progress"),
-    refetchInterval: liveRunCount > 0 ? false : 3000,
+    enabled: !!issueId && shouldTrackIssueActiveRun(issue),
+    refetchInterval: liveRunCount > 0 ? false : ISSUE_PAGE_RUN_POLL_MS,
     select: (run) => !!run,
     placeholderData: keepPreviousDataForSameQueryTail<ActiveRunForIssue | null>(
       issueId ?? "pending",
@@ -3405,33 +3444,6 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     enabled: !!resolvedCompanyId && !!issue?.parentId,
   });
   const rawSiblingIssues: Issue[] = rawSiblingIssuesData ?? EMPTY_ISSUES;
-  const companyLiveRunsQueryKey = resolvedCompanyId
-    ? queryKeys.liveRuns(resolvedCompanyId)
-    : (["live-runs", "pending"] as const);
-  const sharedCompanyLiveRuns = useSharedPollingQuery<LiveRunForIssue[]>({
-    companyId: resolvedCompanyId,
-    resourceKey: "live-runs",
-    queryKey: companyLiveRunsQueryKey,
-    enabled: !!resolvedCompanyId,
-    // Event-sourced via LiveUpdatesProvider (GitHub issue 9627); no interval poll needed.
-    refetchInterval: false,
-    leaderOnly: true,
-  });
-  const { data: companyLiveRuns, dataUpdatedAt: companyLiveRunsUpdatedAt } =
-    useQuery({
-      queryKey: companyLiveRunsQueryKey,
-      queryFn: () => heartbeatsApi.liveRunsForCompany(resolvedCompanyId!),
-      enabled: sharedCompanyLiveRuns.enabled,
-      refetchInterval: sharedCompanyLiveRuns.refetchInterval,
-      placeholderData: keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(
-        resolvedCompanyId ?? "pending",
-      ),
-    });
-  usePublishSharedQueryData(
-    sharedCompanyLiveRuns,
-    companyLiveRuns,
-    companyLiveRunsUpdatedAt,
-  );
 
   const { data: agents } = useQuery({
     queryKey: queryKeys.agents.list(selectedCompanyId!),
@@ -3732,7 +3744,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     openTaskSidePanel();
     if (isMobile) setMobilePropsOpen(true);
   }, [issue?.id, openTaskSidePanel, isMobile]);
-  const browserQuery = useTaskBrowsers(issue?.id);
+  const browsersRunExpected = hasLiveRuns || runExpected;
+  const browserQuery = useTaskBrowsers(issue?.id, browsersRunExpected);
   const { openBrowserId, openBrowser: setOpenBrowserId, acknowledgeBrowserOpened: handleBrowserOpened } =
     useBrowserArrivals(currentUserId ?? "anonymous", issue?.id, browserQuery.data);
   useEffect(() => {
@@ -5789,6 +5802,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       onAddSubIssue: openNewSubIssue,
       onUpdate: handleIssuePropertiesUpdate,
       hasActiveRun: resolvedHasActiveRun,
+      runExpected: browsersRunExpected,
       externalObjects: externalObjectsState.isEnabled
         ? externalObjectsState.groups
         : undefined,
@@ -7946,6 +7960,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   assigneeAdapterOverrides={issue.assigneeAdapterOverrides}
                   issueWorkMode={issue.workMode ?? "standard"}
                   executionRunId={issue.executionRunId ?? null}
+                  runExpected={runExpected}
                   blockedBy={issue.blockedBy ?? []}
                   liveIssueIds={liveIssueIds}
                   blockerAttention={issue.blockerAttention ?? null}
@@ -8309,6 +8324,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     onUpdate={(data) => updateIssue.mutate(data)}
                     inline
                     hasActiveRun={resolvedHasActiveRun}
+                    runExpected={browsersRunExpected}
                     externalObjects={
                       externalObjectsState.isEnabled
                         ? externalObjectsState.groups

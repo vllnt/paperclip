@@ -10,7 +10,7 @@ vi.mock("../api/issues", () => ({
   },
 }));
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import { __liveUpdatesTestUtils } from "./LiveUpdatesProvider";
 import { queryKeys } from "../lib/queryKeys";
@@ -1171,6 +1171,174 @@ describe("LiveUpdatesProvider issue invalidation", () => {
 
     expect(invalidated).toBe(false);
     expect(invalidations).toEqual([]);
+  });
+
+  function visibleIssueClient(invalidations: unknown[]) {
+    return {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: (key: unknown) => {
+        if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
+          return {
+            id: "issue-1",
+            identifier: "PAP-759",
+            assigneeAgentId: "agent-1",
+          };
+        }
+        return undefined;
+      },
+      setQueryData: vi.fn(),
+    };
+  }
+
+  // Payloads as `server/src/services/heartbeat.ts` publishes them. A queued run
+  // and its queued->running claim carry no `issueId`; the progress event does.
+  const serverQueuedPayload = (agentId: string) => ({
+    runId: "run-new",
+    agentId,
+    invocationSource: "automation",
+    triggerDetail: "system",
+    wakeupRequestId: "wake-1",
+  });
+  const serverClaimStatusPayload = (agentId: string) => ({
+    runId: "run-new",
+    agentId,
+    status: "running",
+    invocationSource: "automation",
+    triggerDetail: "system",
+  });
+  const serverProgressPayload = (agentId: string, issueId: string) => ({
+    runId: "run-new",
+    agentId,
+    issueId,
+    phase: "tool_call",
+    message: "Running a tool",
+    currentToolName: "Bash",
+    lastAssistantSnippet: null,
+    lastEventAt: "2026-07-24T10:00:00.000Z",
+    updatedAt: "2026-07-24T10:00:00.000Z",
+  });
+
+  it("refreshes the visible issue on a progress event from a different agent that names the issue", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      serverProgressPayload("agent-2", "issue-1"),
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(true);
+    expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.liveRuns("PAP-759") });
+    expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.liveRuns("issue-1") });
+    expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.activeRun("PAP-759") });
+  });
+
+  it("matches the visible issue by its identifier as well", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      serverProgressPayload("agent-2", "PAP-759"),
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(true);
+  });
+
+  it("still ignores a run that names a different issue", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      serverProgressPayload("agent-2", "issue-2"),
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(false);
+    expect(invalidations).toEqual([]);
+  });
+
+  it("does not match a non-assignee run by its queued or claim event, which carry no issue", () => {
+    // The page covers this start through the company live-runs list instead
+    // (see the next test and `isRunExpectedOnIssue`).
+    for (const payload of [serverQueuedPayload("agent-2"), serverClaimStatusPayload("agent-2")]) {
+      const invalidations: unknown[] = [];
+      const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+        visibleIssueClient(invalidations) as never,
+        "/PAP/issues/PAP-759",
+        payload,
+        { isForegrounded: true },
+      );
+      expect(invalidated).toBe(false);
+      expect(invalidations).toEqual([]);
+    }
+  });
+
+  it("still matches the assignee's own queued run by agent", () => {
+    const invalidations: unknown[] = [];
+
+    const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+      visibleIssueClient(invalidations) as never,
+      "/PAP/issues/PAP-759",
+      serverQueuedPayload("agent-1"),
+      { isForegrounded: true },
+    );
+
+    expect(invalidated).toBe(true);
+  });
+
+  it("refetches the company live-runs list for a queued run it cannot patch", () => {
+    // `applyRunLifecycleToCompanyLiveRuns` returns false without a status, and
+    // the event handler then invalidates `liveRuns(companyId)`. The issue page
+    // reads that list to learn a non-assignee run started on its issue.
+    const client = { getQueryData: () => undefined, setQueryData: vi.fn() };
+
+    const patched = __liveUpdatesTestUtils.applyRunLifecycleToCompanyLiveRuns(
+      client as never,
+      "company-1",
+      serverQueuedPayload("agent-2"),
+    );
+
+    expect(patched).toBe(false);
+  });
+
+  describe("when the window is visible but not focused", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("still refreshes the open issue's run queries", () => {
+      vi.stubGlobal("document", { visibilityState: "visible", hasFocus: () => false });
+      const invalidations: unknown[] = [];
+
+      const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+        visibleIssueClient(invalidations) as never,
+        "/PAP/issues/PAP-759",
+        serverProgressPayload("agent-1", "issue-1"),
+      );
+
+      expect(invalidated).toBe(true);
+      expect(invalidations).toContainEqual({ queryKey: queryKeys.issues.liveRuns("PAP-759") });
+    });
+
+    it("does not refresh while the page is hidden", () => {
+      vi.stubGlobal("document", { visibilityState: "hidden", hasFocus: () => false });
+      const invalidations: unknown[] = [];
+
+      const invalidated = __liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+        visibleIssueClient(invalidations) as never,
+        "/PAP/issues/PAP-759",
+        serverProgressPayload("agent-1", "issue-1"),
+      );
+
+      expect(invalidated).toBe(false);
+      expect(invalidations).toEqual([]);
+    });
   });
 });
 
