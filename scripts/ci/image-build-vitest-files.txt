@@ -50,3 +50,4 @@ ui/src/lib/safe-match-media.test.ts
 ui/src/lib/saved-provider-credentials.test.ts
 ui/src/lib/test-agent-setup.test.ts
 ui/src/pages/IssueDetail.test.tsx
+server/src/shutdown-budget.test.ts
