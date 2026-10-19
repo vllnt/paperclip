@@ -69,6 +69,7 @@ import { agentsApi } from "../api/agents";
 import { authApi } from "../api/auth";
 import { projectsApi } from "../api/projects";
 import { executionWorkspacesApi } from "../api/execution-workspaces";
+import { useRegisterCommandActions } from "../context/CommandActionsContext";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
 import { usePanel } from "../context/PanelContext";
@@ -6174,22 +6175,25 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     commentComposerRef.current?.focus();
   }, [detailTab, pendingCommentComposerFocusKey]);
 
-  useEffect(() => {
-    if (!fileViewerEnabled) return;
-    const handleOpenFileViewer = () => {
-      setFileViewerPromptOpen(true);
-    };
-    window.addEventListener(
-      "paperclip:open-file-viewer",
-      handleOpenFileViewer as EventListener,
-    );
-    return () => {
-      window.removeEventListener(
-        "paperclip:open-file-viewer",
-        handleOpenFileViewer as EventListener,
-      );
-    };
-  }, [fileViewerEnabled]);
+  useRegisterCommandActions({
+    // Only the classic interface's composer takes `commentComposerRef`; the
+    // chat shell's composer has no focus handle yet, so offering the action
+    // there would do nothing (the `g c` chord has the same gap).
+    "issue.focus-comment": taskChatShellEnabled ? null : {
+      run: () => {
+        setDetailTab("chat");
+        setPendingCommentComposerFocusKey((current) => current + 1);
+      },
+    },
+    // In the chat shell the file browser opens in the side panel, which is
+    // hidden on phones, so the action would do nothing there (`g f` too).
+    "issue.open-file": fileViewerEnabled && !(taskChatShellEnabled && isMobile)
+      ? { run: () => setFileViewerPromptOpen(true) }
+      : null,
+    "issue.archive-from-inbox": issue?.id && canQuickArchiveFromInbox
+      ? { run: () => { if (!archiveFromInbox.isPending) archiveFromInbox.mutate(issue.id); } }
+      : null,
+  });
 
   const promotedOutputAttachmentIds = useMemo(
     () => getPromotedOutputAttachmentIds(workProducts),

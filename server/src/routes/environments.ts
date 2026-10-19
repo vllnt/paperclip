@@ -2,11 +2,13 @@ import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_ADAPTER_TYPES,
+  COMPANY_ENVIRONMENT_LEASES_DEFAULT_STATUSES,
   cancelEnvironmentCustomImageSetupSessionSchema,
   createEnvironmentCustomImageTerminalSessionTokenSchema,
   createEnvironmentSchema,
   finishEnvironmentCustomImageSetupSessionSchema,
   getEnvironmentCapabilities,
+  listEnvironmentLeasesQuerySchema,
   probeEnvironmentConfigSchema,
   resolveDeclaredSandboxCapabilities,
   redactEnvironmentCustomImageSetupSession,
@@ -54,7 +56,8 @@ import {
   type ReadyPluginWorkerRecovery,
 } from "../services/plugin-environment-driver.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
+import { redactEventPayload } from "../redaction.js";
+import { assertBoardOrgAccess, assertCompanyAccess, getActorInfo } from "./authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -360,6 +363,23 @@ export function environmentRoutes(
 
   function assertCanReadInstanceEnvironments(req: Request) {
     assertBoardOrgAccess(req);
+  }
+
+  /**
+   * The companies whose lease rows the caller may read: `null` for the local
+   * board and instance admins (every company), otherwise the caller's own
+   * companies. `assertBoardOrgAccess` only proves the caller belongs to some
+   * company, so lease reads must also scope the rows.
+   */
+  function leaseReadCompanyScope(req: Request): readonly string[] | null {
+    if (req.actor.type !== "board") return [];
+    if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return null;
+    return req.actor.companyIds ?? [];
+  }
+
+  /** Lease metadata can echo provider config, so every lease read passes it through the shared redactor. */
+  function redactLease<T extends { metadata: Record<string, unknown> | null }>(lease: T): T {
+    return { ...lease, metadata: redactEventPayload(lease.metadata) };
   }
 
   function assertCustomImageCompanyAccess(req: Request, companyId: string) {
@@ -1106,20 +1126,41 @@ export function environmentRoutes(
       res.status(404).json({ error: "Environment not found" });
       return;
     }
+    const query = listEnvironmentLeasesQuerySchema.parse(req.query);
+    const companyScope = leaseReadCompanyScope(req);
     const leases = await svc.listLeases(environment.id, {
-      status: req.query.status as string | undefined,
+      status: query.status,
+      ...(companyScope ? { companyIds: companyScope } : {}),
     });
-    res.json(leases);
+    res.json(leases.map(redactLease));
+  });
+
+  // Company-wide lease list. Same gate as the per-environment lease list (board
+  // with org access; agents are denied), plus company access because the rows
+  // are filtered to this company's leases. Lease metadata can echo provider
+  // config, so it is passed through the shared redactor.
+  router.get("/companies/:companyId/environment-leases", async (req, res) => {
+    assertCanReadInstanceEnvironments(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const query = listEnvironmentLeasesQuerySchema.parse(req.query);
+    const leases = await svc.listCompanyLeases(companyId, {
+      statuses: query.status ?? COMPANY_ENVIRONMENT_LEASES_DEFAULT_STATUSES,
+    });
+    res.json(leases.map(redactLease));
   });
 
   router.get("/environment-leases/:leaseId", async (req, res) => {
     assertCanReadInstanceEnvironments(req);
     const lease = await svc.getLeaseById(req.params.leaseId as string);
-    if (!lease) {
+    const companyScope = leaseReadCompanyScope(req);
+    // Another company's lease answers exactly like a missing one, so the route
+    // is not an oracle for which lease IDs exist.
+    if (!lease || (companyScope && !companyScope.includes(lease.companyId))) {
       res.status(404).json({ error: "Environment lease not found" });
       return;
     }
-    res.json(lease);
+    res.json(redactLease(lease));
   });
 
   router.patch("/environments/:id", validate(updateEnvironmentSchema), async (req, res) => {

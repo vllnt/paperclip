@@ -1,0 +1,74 @@
+[
+  {
+    "id": "sample-dup-identical",
+    "a": { "title": "[Chore] Remove legacy client compatibility barrels", "description": "" },
+    "b": { "title": "[Chore] Remove legacy client compatibility barrels", "description": "" },
+    "label": "duplicate"
+  },
+  {
+    "id": "sample-dup-reworded",
+    "a": { "title": "Enforce PR assignee and GitHub issue linkage", "description": "Every pull request must name an assignee and link the GitHub issue it closes." },
+    "b": { "title": "Require assignee and linked issue on every pull request", "description": "Pull requests without an assignee or a linked GitHub issue should fail the check." },
+    "label": "duplicate"
+  },
+  {
+    "id": "sample-dup-typo",
+    "a": { "title": "Fix flaky checkout timeout test in billing service", "description": "" },
+    "b": { "title": "Fix flaky checkout timeouts test in the billing service", "description": "" },
+    "label": "duplicate"
+  },
+  {
+    "id": "sample-dup-description-only",
+    "a": { "title": "Rotate the staging database credentials", "description": "Rotate staging database credentials and update the secret store entry before Friday." },
+    "b": { "title": "Staging DB credential rotation", "description": "Rotate the staging database credentials and update the secret store entry before Friday." },
+    "label": "duplicate"
+  },
+  {
+    "id": "sample-keep-sibling-scope",
+    "a": { "title": "Add retry to the invoice export job", "description": "Retry failed invoice exports three times with backoff." },
+    "b": { "title": "Add retry to the receipt export job", "description": "Retry failed receipt exports three times with backoff." },
+    "label": "keep_both"
+  },
+  {
+    "id": "sample-keep-same-topic",
+    "a": { "title": "Document the deploy checklist", "description": "Write the deploy checklist page for the platform handbook." },
+    "b": { "title": "Automate the deploy checklist", "description": "Turn the deploy checklist into a CI job that blocks releases." },
+    "label": "keep_both"
+  },
+  {
+    "id": "sample-keep-subset",
+    "a": { "title": "Migrate all services to the new logger", "description": "Move every service off the legacy logger." },
+    "b": { "title": "Migrate the billing service to the new logger", "description": "Only the billing service." },
+    "label": "keep_both"
+  },
+  {
+    "id": "sample-keep-unrelated-a",
+    "a": { "title": "Add dark mode to the billing settings page", "description": "" },
+    "b": { "title": "Remove legacy client compatibility barrels", "description": "" },
+    "label": "keep_both"
+  },
+  {
+    "id": "sample-keep-unrelated-b",
+    "a": { "title": "Investigate slow dashboard queries on large companies", "description": "p95 above 4s for companies with over 10k issues." },
+    "b": { "title": "Write onboarding email copy for new workspaces", "description": "Three emails over the first week." },
+    "label": "keep_both"
+  },
+  {
+    "id": "sample-keep-recurring",
+    "a": { "title": "Weekly dependency review 2026-10-02", "description": "Review outdated dependencies and open upgrade PRs." },
+    "b": { "title": "Weekly dependency review 2026-10-09", "description": "Review outdated dependencies and open upgrade PRs." },
+    "label": "keep_both"
+  },
+  {
+    "id": "sample-keep-short-titles",
+    "a": { "title": "Fix bug", "description": "" },
+    "b": { "title": "Fix bug", "description": "" },
+    "label": "keep_both"
+  },
+  {
+    "id": "sample-keep-different-component",
+    "a": { "title": "Timeout when uploading large attachments", "description": "Uploads over 50 MB fail in the web app." },
+    "b": { "title": "Timeout when downloading large attachments", "description": "Downloads over 50 MB fail in the CLI." },
+    "label": "keep_both"
+  }
+]

@@ -3,6 +3,7 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { selectInCommentBatches } from "../../../services/comment-id-batches.js";
 import { ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON } from "../../../services/issue-dependency-wakeups.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -41,6 +42,11 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import { extractWakeCommentIds } from "../../run-dispatch/index.js";
+import {
+  AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
+  buildAutomationWakeCoalescedState,
+  readAutomationWakeCoalescedUntil,
+} from "../domain/automation-wake-coalesce.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
@@ -61,6 +67,8 @@ import {
 } from "../domain/values.js";
 import { requireTransactionScopeTx, TransactionScope } from "../application/ports.js";
 import type {
+  AutomationWakeAdmission,
+  AutomationWakeAdmissionInput,
   DeferredWakeCandidate,
   InvokableAgentSnapshot,
   IssueLockWriter,
@@ -177,6 +185,7 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
     wakeReason,
     selfReblockWake: readSelfReblockWakeMarker(payload, row.agentId),
     selfReblockParkedUntil: readSelfReblockWakeParkedUntil(payload),
+    automationCoalescedUntil: readAutomationWakeCoalescedUntil(payload),
   };
 }
 
@@ -184,6 +193,7 @@ export type WakeQueuePostgresAdapterDeps = {
   resolveResponsibleUserId: WakeQueueHost["resolveResponsibleUserId"];
   getRoutineEnv: WakeQueueHost["getRoutineEnv"];
   resolveSessionBeforeForWakeup: WakeQueueHost["resolveSessionBeforeForWakeup"];
+  admitAutomationWake: (input: AutomationWakeAdmissionInput & { tx: Db }) => Promise<AutomationWakeAdmission>;
 };
 
 function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
@@ -282,13 +292,14 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async getQueuedCommentLiveness({ companyId, issueId, wakeAgentId, finishingRunId, finishingRunAgentId, queuedCommentIds }) {
-      const rows = await tx
+      const rows = await selectInCommentBatches(queuedCommentIds, (batch) => tx
         .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId })
         .from(issueComments)
-        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queuedCommentIds), currentConversationCommentCondition()));
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, batch), currentConversationCommentCondition())));
+      const rowsById = new Map(rows.map((row) => [row.id, row]));
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
       const liveNonSelfCommentIds = queuedCommentIds.filter((commentId) => {
-        const row = rows.find((candidate) => candidate.id === commentId);
+        const row = rowsById.get(commentId);
         return Boolean(row && !row.deletedAt && (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
       });
       const containedSelfAuthoredComment = rows.some(
@@ -438,10 +449,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async getCommentSelfAuthorship({ companyId, issueId, finishingRunId, commentIds }) {
-      const rows = await tx
+      const rows = await selectInCommentBatches(commentIds, (batch) => tx
         .select({ createdByRunId: issueComments.createdByRunId })
         .from(issueComments)
-        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)));
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, batch))));
       return { allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId) };
     },
 
@@ -457,12 +468,12 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .then((rows) => rows[0]);
       if (parent?.status !== "done" || parent.assigneeAgentId !== run.agentId) return false;
 
-      const comments = await tx.select({ body: issueComments.body, createdByRunId: issueComments.createdByRunId,
+      const comments = await selectInCommentBatches(uniqueCommentIds, (batch) => tx.select({ body: issueComments.body, createdByRunId: issueComments.createdByRunId,
         authorAgentId: issueComments.authorAgentId })
         .from(issueComments).where(and(
           eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-          inArray(issueComments.id, uniqueCommentIds), isNull(issueComments.deletedAt), currentConversationCommentCondition(),
-        ));
+          inArray(issueComments.id, batch), isNull(issueComments.deletedAt), currentConversationCommentCondition(),
+        )));
       if (comments.length !== uniqueCommentIds.length || comments.some((comment) =>
         comment.createdByRunId !== run.id || (comment.authorAgentId !== null && comment.authorAgentId !== run.agentId)
       )) return false;
@@ -490,6 +501,59 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     async reopenIssue({ companyId, issueId }) {
       const updated = await issuesSvc.updateForCompany(issueId, companyId, { status: "todo", executionState: null }, tx);
       return updated ? toIssueSnapshot(updated as unknown as IssueRow) : null;
+    },
+
+    admitAutomationWake(input) {
+      return deps.admitAutomationWake({ ...input, tx });
+    },
+
+    async parkHeldAutomationWake({ companyId, agentId, issueId, reason, contextSnapshot, notBefore, now }) {
+      const [existing] = await tx
+        .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            sql`${agentWakeupRequests.payload} -> ${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY} is not null`,
+          ),
+        )
+        .orderBy(asc(agentWakeupRequests.requestedAt))
+        .limit(1);
+      const state = buildAutomationWakeCoalescedState({
+        notBefore,
+        existing: existing ? parseObject(existing.payload) : null,
+        reason,
+      });
+      if (existing) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY}]::text[], ${JSON.stringify(state)}::jsonb)`,
+            coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, existing.id));
+        return;
+      }
+      await tx.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "automation_wake_coalesced",
+        payload: {
+          issueId,
+          [DEFERRED_WAKE_CONTEXT_KEY]: contextSnapshot,
+          [AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY]: state,
+        },
+        status: DEFERRED_WAKE_STATUS,
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        updatedAt: now,
+      });
     },
 
     async claimDeferredWakeForPromotion({ companyId, wakeId, now }) {
@@ -524,6 +588,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: input.triggerDetail,
           status: "queued",
           wakeupRequestId: input.wakeId,
+          ...(input.admittedAt ? { createdAt: input.admittedAt } : {}),
           retryOfRunId: input.authorizedFailedChatRetry
             ? readNonEmptyString(input.contextSnapshot.retryOfRunId)
             : null,
@@ -729,6 +794,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       contextSnapshot,
       responsibleUserId,
       sessionBefore,
+      admittedAt,
       now,
     }) {
       const wakeupRequest = await tx
@@ -761,6 +827,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
+          ...(admittedAt ? { createdAt: admittedAt } : {}),
           updatedAt: now,
         })
         .returning()
@@ -1030,6 +1097,8 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             // A wake parked by the self-reblock limit keeps its own provenance;
             // other wakes queue beside it instead of inheriting its actor.
             sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} is null`,
+            // Likewise an automation-coalesced receipt waits out its window alone.
+            sql`${agentWakeupRequests.payload} -> ${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY} is null`,
             ...(durableActor
               ? [
                   durableActor.type === null

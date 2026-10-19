@@ -8,6 +8,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { selectInCommentBatches } from "../services/comment-id-batches.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -3094,7 +3095,10 @@ const ISSUE_LIST_SERVER_CACHE_STALE_MS = 5_000;
 export const ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES = 256;
 const ISSUE_LIST_STORM_WINDOW_MS = 500;
 const ISSUE_LIST_STORM_THRESHOLD = 4;
-const ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT = 8;
+// One Tasks board load legitimately fans out ~9 distinct list requests (seven
+// status columns, the task list, the inbox badge), which arrive together over
+// HTTP/2. The cap must clear one page with headroom; it only stops runaways.
+export const ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT = 16;
 
 type IssueListPreparedResponse =
   | {
@@ -6985,12 +6989,14 @@ export function issueRoutes(
     }
     const ids = queuedCommentIdsFromWakePayload(wake?.payload);
     if (ids.length === 0) return [];
-    const rows = await executor
-      .select()
-      .from(issueComments)
-      .where(
-        and(eq(issueComments.issueId, issueId), inArray(issueComments.id, ids)),
-      );
+    const rows = await selectInCommentBatches(ids, (batch) =>
+      executor
+        .select()
+        .from(issueComments)
+        .where(
+          and(eq(issueComments.issueId, issueId), inArray(issueComments.id, batch)),
+        ),
+    );
     const byId = new Map(rows.map((row) => [row.id, row]));
     return ids.flatMap((id) => {
       const row = byId.get(id);
