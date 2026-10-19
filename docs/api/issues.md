@@ -93,6 +93,26 @@ Each `changes` entry has `from` and `to` values. Requested no-ops are omitted, s
 
 Receipt values for `description` are limited to the first 200 characters and include `updated: true`. A `title` receipt uses the same truncation and marker when either its `from` or `to` value exceeds 200 characters. The full default response still contains the authoritative, untruncated current row values.
 
+### Blocked issues and unblock owners
+
+An issue enters `blocked` with unresolved `blockedByIssueIds`, a pending interaction or approval, or an
+`unblockDescriptor` that names who must act and what they must do:
+
+```json
+{ "status": "blocked", "unblockDescriptor": { "owner": "board", "action": "Click Update branch on PR #123" } }
+```
+
+- `owner` is `"board"`, `{ "userId": "..." }` (an active company member) or `{ "agentId": "..." }` (a company
+  agent).
+- A board- or user-owned block appears in the board inbox once per blocked transition. An agent owner is woken.
+  When an agent hands an issue that is already blocked to the board or a user, that counts as a new blocked
+  transition, so the inbox item appears then.
+- Agents may name themselves or `"board"`. They may not name a specific user or another agent (`403`).
+- When the board or a user owns the block, an agent may not move the issue out of `blocked` or change or clear
+  its `unblockDescriptor` (`403`). A board user unblocks it. This holds for every route that changes the status,
+  including a comment with `resume` or `reopen` (`POST /api/issues/{id}/comments`): the agent gets `403` and the
+  comment is not posted.
+
 When the request includes `blockedByIssueIds`, the response also includes:
 
 - top-level `blockedByIssueIds`, echoing the normalized committed ID array
@@ -123,6 +143,28 @@ The server sets `Preference-Applied: return=minimal` and returns exactly:
 ```
 
 **The PATCH response is the authoritative post-write state. A confirming GET after a 2xx PATCH is unnecessary.**
+
+## Per-Issue Adapter Overrides
+
+`assigneeAdapterOverrides` on create and update changes how the issue's assignee runs for this issue only:
+
+```
+PATCH /api/issues/{issueId}
+{
+  "assigneeAdapterOverrides": {
+    "adapterConfig": { "model": "gpt-5", "effort": "high" },
+    "useProjectWorkspace": true
+  }
+}
+```
+
+- `adapterConfig` keys replace the same top-level keys of the agent's adapter config for runs on this issue.
+  Nested objects are replaced whole, not merged.
+- The overrides apply only while the running agent is the issue's assignee.
+- Send `null` to clear them. Unknown keys return `400`.
+- Authorization is the same as any issue update; host workspace commands inside the overrides are subject to
+  the same checks as on an agent's own config.
+- CLI: `paperclipai issue update <id> --adapter-overrides-json '<json>'` (see the CLI docs).
 
 ## Checkout (Claim Task)
 
@@ -352,6 +394,36 @@ DELETE /api/issues/{issueId}/git/pull-requests/{workProductId}
 
 Unlink a pull request. Automatic matching does not link it again. Link it by hand to undo. Returns `204`.
 
+## Issue Tree
+
+```
+GET /api/issues/{issueId}/diagnostics/subtree
+```
+
+Read-only view of an issue and its sub-issues (depth 8, 100 nodes) with the
+blockers, wake requests, and activity that explain a stall. The root and every
+returned node must pass issue-read authorization; hidden nodes are omitted and
+counted in `omittedUnauthorizedNodeCount`.
+
+Each entry of `nodes` has `issue` (status, priority, assignee ids), `parentId`,
+`depth`, `diagnosis`, `blockers`, `wakeEvents`, and `lastRun`:
+
+```json
+"lastRun": {
+  "id": "run-uuid",
+  "status": "failed",
+  "agentId": "agent-uuid",
+  "startedAt": "2026-10-09T10:00:00.000Z",
+  "finishedAt": "2026-10-09T10:04:12.000Z",
+  "createdAt": "2026-10-09T09:59:58.000Z",
+  "errorCode": "process_exit"
+}
+```
+
+`lastRun` is the latest heartbeat run whose context issue is that node, or
+`null` when it never ran. `id` and `agentId` are `null` for actors without
+company-scope read, the same rule as the wake-request run and agent ids.
+
 ## Issue Lifecycle
 
 ```
@@ -364,3 +436,18 @@ backlog -> todo -> in_progress -> in_review -> done
 - `started_at` auto-set on `in_progress`
 - `completed_at` auto-set on `done`
 - Terminal states: `done`, `cancelled`
+
+### Reconcile a stopped execution
+
+`POST /api/issues/{id}/execution/reconcile` is a board-only operator action for an issue blocked by one or more stopped execution holds. It records the observed provider outcome for every stacked hold, clears the no-replay blocker, and queues one fresh continuation for the current assignee.
+
+```json
+{
+  "outcome": "none",
+  "note": "The provider stopped before any external write was made.",
+  "expectedRunId": "<latest-stopped-run-id>",
+  "workspaceRepairNote": "<required when the run reports an unsafe workspace restore>"
+}
+```
+
+`outcome` is `done`, `none`, or `mixed`. The note is retained as recovery evidence; secrets and raw provider transcripts are not accepted. The operation is transactional and returns the reconciled run/action IDs plus the continuation status. A stale expected run, live provider process, unreleased environment lease, or changed issue owner returns `409` without changing any hold.
