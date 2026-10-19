@@ -29,18 +29,45 @@ describe("plugin action/data CLI commands", () => {
     vi.restoreAllMocks();
   });
 
-  it("requires an explicit company for action and data commands", async () => {
+  it("requires a company for action and data commands when none is set anywhere", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    await expect(program().parseAsync([
-      "plugin", "action", "vllnt.paperclip-github", "company-app.status",
-      "--api-base", "http://localhost:3100", "--api-key", "board-token",
-    ], { from: "user" })).rejects.toThrow(/company-id/);
-    await expect(program().parseAsync([
-      "plugin", "data", "vllnt.paperclip-github", "allowed-owners.get",
-      "--api-base", "http://localhost:3100", "--api-key", "board-token",
-    ], { from: "user" })).rejects.toThrow(/company-id/);
-    expect(fetchMock).not.toHaveBeenCalled();
+    const previous = { context: process.env.PAPERCLIP_CONTEXT, company: process.env.PAPERCLIP_COMPANY_ID };
+    process.env.PAPERCLIP_CONTEXT = path.join(dir, "missing-context.json");
+    delete process.env.PAPERCLIP_COMPANY_ID;
+    const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    try {
+      for (const args of [
+        ["plugin", "action", "vllnt.paperclip-github", "company-app.status"],
+        ["plugin", "data", "vllnt.paperclip-github", "allowed-owners.get"],
+      ]) {
+        await program().parseAsync([...args, "--api-base", "http://localhost:3100", "--api-key", "board-token"], { from: "user" });
+      }
+      expect(exit).toHaveBeenCalledTimes(2);
+      expect(String(vi.mocked(console.error).mock.calls.flat().join(" "))).toMatch(/Company ID is required/);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      if (previous.context === undefined) delete process.env.PAPERCLIP_CONTEXT;
+      else process.env.PAPERCLIP_CONTEXT = previous.context;
+      if (previous.company !== undefined) process.env.PAPERCLIP_COMPANY_ID = previous.company;
+    }
+  });
+
+  it("takes the company from PAPERCLIP_COMPANY_ID when -C is omitted", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: { ok: true } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const previous = process.env.PAPERCLIP_COMPANY_ID;
+    process.env.PAPERCLIP_COMPANY_ID = COMPANY_ID;
+    try {
+      await program().parseAsync([
+        "plugin", "action", "vllnt.paperclip-github", "write-identity.get", "--params-json", "{}",
+        "--api-base", "http://localhost:3100", "--api-key", "board-token",
+      ], { from: "user" });
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({ companyId: COMPANY_ID, params: {} });
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_COMPANY_ID;
+      else process.env.PAPERCLIP_COMPANY_ID = previous;
+    }
   });
 
   it("rejects a legacy payload whose company differs from -C", async () => {

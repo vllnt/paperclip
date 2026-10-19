@@ -464,3 +464,31 @@ describe("plugin-owned secret writes", () => {
     expect(storeOwn).not.toHaveBeenCalled();
   });
 });
+
+describe("createHostClientHandlers activity.log", () => {
+  it("hands the host call context, including who started the action, to the activity service", async () => {
+    const activityLog = vi.fn(async () => undefined);
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["activity.log.write"],
+      services: { activity: { log: activityLog } } as unknown as HostServices,
+    });
+    const context = {
+      invocationScope: { companyId: "company-a" },
+      initiator: {
+        type: "user" as const,
+        userId: "user-1",
+        agentId: null,
+        runId: null,
+        companyId: "company-a",
+        keyId: "key-1",
+        source: "board_key" as const,
+      },
+    };
+    const params = { companyId: "company-a", message: "Policy updated" };
+
+    await handlers["activity.log"](params, context);
+
+    expect(activityLog).toHaveBeenCalledWith(params, context);
+  });
+});

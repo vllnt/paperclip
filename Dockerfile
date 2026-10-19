@@ -150,6 +150,8 @@ ARG PAPERCLIP_BUILD_COMMIT=""
 RUN node --test scripts/ci/run-image-build-vitest.test.mjs
 RUN sh scripts/ci/run-image-build-vitest.sh
 RUN pnpm check:token-gates
+# The GitHub launcher's retry of a busy or slow Paperclip server (bounded backoff, a clear final error); no database.
+RUN pnpm exec vitest run packages/adapter-utils/src/github-launcher-backoff.test.ts
 RUN pnpm exec vitest run ui/src/theme-tokens.test.ts ui/src/boot-theme-script.test.ts ui/src/context/ThemeContext.test.tsx ui/src/components/ThemeModeSwitch.test.tsx
 # The GitHub credentials route: the short per-run cache of ordinary reads (what it keeps, for how long, for whom) and what the
 # route does when its caller has gone. No database: the embedded Postgres tests of the same change are skipped in this build
