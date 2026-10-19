@@ -189,6 +189,13 @@ Reports keep every entry on the Convex page; the `convex_reap_previews` tool ret
 - A redeploy shortly before an expiry the reaper set can be missed: the last hourly pass before that moment has already listed the preview, and a skipped pass
   (the worker was down) widens the window. Convex then deletes the preview at the expiry although it was redeployed; the next deploy of the branch creates it again.
 - An agent can shorten a preview's expiry within the rules above; a shortened expiry is a deletion by Convex when it passes, and the plugin cannot take it back.
+- The deletion limit (`guards.maxDeletesPerRun`, 20 by default) is per agent run. A new run starts with a new allowance, so an agent that holds `lifecycle` on
+  `preview` can delete that many previews in every run it starts. Each delete still passes the hard guard, the open-pull-request and branch checks and the
+  evidence requirement, and each one is audited. `guards.dryRunOnly` stops all of it.
+- A lookup by a name that is not one of the company's deployments tries the mapped projects' credentials in turn and is refused when none finds it. The plugin
+  remembers which credential answered, and `guards.callsPerMinute` (per agent, in memory) limits how often an agent can ask.
+- The last reaper report is stored whole and replaced on each pass (about 50 KB for 300 previews), and `status` reads it back. The agent tool returns at most 25
+  entries per list.
 - The quota counts up to 10,000 team deployments. Above that, or with project-scoped tokens only, the answer is `lowerBound: true` or `partial: true`: a minimum.
 - `convex_list_projects` reads the company config only; it does not call Convex.
 - The health fields Convex shows in its dashboard (failure rate, cache hit rate, scheduler lag, function metrics, insights) have no documented API. The
