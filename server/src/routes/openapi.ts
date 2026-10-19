@@ -99,6 +99,13 @@ import {
   updateRoutineTriggerSchema,
   rotateRoutineTriggerSecretSchema,
   runRoutineSchema,
+  // Event sources
+  createEventSourceSchema,
+  updateEventSourceSchema,
+  testEventSourceSchema,
+  rotateEventSourceSecretSchema,
+  listEventDeliveriesQuerySchema,
+  genericV1EventSchema,
   // Folders
   createFolderSchema,
   ensureMySkillFolderSchema,
@@ -228,8 +235,10 @@ import {
   // Issue recovery and decomposition
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
   cancelIssueThreadInteractionSchema,
+  issueWaitRequestSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
   updateSecretProviderConfigSchema,
@@ -311,7 +320,11 @@ import {
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
+  observabilityFailuresQuerySchema,
+  observabilityFailuresResponseSchema,
   observabilityHealthSchema,
+  observabilityUsageQuerySchema,
+  observabilityUsageResponseSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -1308,6 +1321,7 @@ const RUNTIME_TOOLS_OPERATIONS = new Set([
 ]);
 
 const PUBLIC_OPERATIONS = new Set([
+  "POST /api/event-sources/public/{publicId}/events",
   "GET /api/agent-avatars/{version}/{palette}/{file}",
   "GET /api/health",
   "GET /api/openapi.json",
@@ -1351,6 +1365,10 @@ const browserUseOperations = [
 ] as const;
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/event-sources",
+  "PATCH /api/event-sources/{id}",
+  "DELETE /api/event-sources/{id}",
+  "POST /api/event-sources/{id}/rotate-secret",
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
@@ -1364,6 +1382,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections/{connectionId}/usage",
   "GET /api/companies/{companyId}/ai-connections/login/{sessionId}",
 
+  "GET /api/companies/{companyId}/chats",
+  "GET /api/companies/{companyId}/chats/{agentRef}",
+  "POST /api/companies/{companyId}/chats/{agentRef}",
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
   "DELETE /api/issues/{id}/documents/{key}",
@@ -1588,6 +1609,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
 ]);
 
 const CREATED_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/event-sources",
   "POST /api/adapters/install",
   "POST /api/chat-endpoints/{endpointId}/setup-secret",
   "POST /api/companies/{companyId}/agent-hires",
@@ -3941,6 +3963,26 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Get the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. `agentRef` is an agent ID or URL key. Returns the conversation issue, or null when none exists yet. Read-only.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Open the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. Returns the existing conversation issue, or creates it. `agentRef` is an agent ID or URL key.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "List issues in a company",
@@ -4000,7 +4042,9 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads.",
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. " +
+    "Agents may name themselves or `\"board\"` as `unblockDescriptor.owner`, never a specific user or another agent (403). " +
+    "While the board or a user owns a block, an agent may not move the issue out of `blocked` or change or clear its descriptor (403). The same rule applies to a comment that asks to `resume` or `reopen` the issue (POST /api/issues/{id}/comments).",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateIssueSchema.partial()),
@@ -4009,6 +4053,7 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
     422: r.unprocessable,
   },
@@ -4319,11 +4364,13 @@ registry.registerPath({
   path: "/api/issues/{id}/comments",
   tags: ["issues"],
   summary: "Add a comment to an issue",
+  description:
+    "An agent may not use `resume` or `reopen` to move an issue out of a block that the board or a user owns, or change that block's descriptor (403). Nothing is posted when this refuses. A board user may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(addIssueCommentSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -4370,11 +4417,13 @@ registry.registerPath({
   path: "/api/issues/{id}/checkout",
   tags: ["issues"],
   summary: "Check out an issue",
+  description:
+    "While the board or a user owns a block, an agent may not check the issue out of `blocked` (403), the same rule as for PATCH /api/issues/{id}. A board user may. The issue stays blocked and keeps its `unblockDescriptor`.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(checkoutIssueSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -4879,6 +4928,148 @@ registry.registerPath({
   tags: ["routines"],
   summary: "Fire a public routine trigger",
   request: { params: z.object({ publicId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+// ─── Event sources ───────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "post",
+  path: "/api/event-sources/public/{publicId}/events",
+  tags: ["event-sources"],
+  summary: "Deliver a signed external event",
+  description:
+    "Sender-facing ingress. Authenticated by the source's own secret, not by a Paperclip credential: " +
+    "send `Authorization: Bearer <secret>` for bearer sources, or `X-Paperclip-Timestamp` plus " +
+    "`X-Paperclip-Signature` (HMAC-SHA256 over `<timestamp>.<raw body>`) for HMAC sources. " +
+    "The body is capped at 64 KB. 202 means accepted; 200 `{duplicate:true}` means the delivery was already " +
+    "processed; 409 `{inProgress:true}` with `Retry-After` means another attempt holds the delivery; " +
+    "503 with `Retry-After` is a transient failure the sender should retry.",
+  request: {
+    params: z.object({ publicId: z.string() }),
+    body: jsonBody(genericV1EventSchema),
+  },
+  responses: {
+    200: r.ok(),
+    202: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
+    413: r.payloadTooLarge,
+    415: r.unsupportedMediaType,
+    422: r.unprocessable,
+    429: { description: "Rate limited", content: { "application/json": { schema: ErrorSchema } } },
+    503: { description: "Transient failure; retry", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/event-sources",
+  tags: ["event-sources"],
+  summary: "List event sources in a company",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({ includeArchived: z.enum(["true", "false", "1", "0"]).optional() }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/event-sources",
+  tags: ["event-sources"],
+  summary: "Create an event source",
+  description: "The response carries the ingress URL and signing secret. The secret is shown only here and on rotation.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(createEventSourceSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/event-sources/{id}",
+  tags: ["event-sources"],
+  summary: "Get an event source",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/event-sources/{id}",
+  tags: ["event-sources"],
+  summary: "Update an event source",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(updateEventSourceSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/event-sources/{id}",
+  tags: ["event-sources"],
+  summary: "Archive an event source",
+  description: "Soft delete: the source stops accepting events and its trigger subscriptions stay for audit.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/event-sources/{id}/rotate-secret",
+  tags: ["event-sources"],
+  summary: "Rotate an event source secret",
+  description: "Returns the new secret once. The previous secret stops working immediately.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(rotateEventSourceSecretSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/event-sources/{id}/test",
+  tags: ["event-sources"],
+  summary: "Dry-run an event payload against a source",
+  description: "Reports what each stage would do for the payload. Writes no issues, comments, or wakeups.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(testEventSourceSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/event-sources/{id}/deliveries",
+  tags: ["event-sources"],
+  summary: "List recent deliveries for an event source",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: listEventDeliveriesQuerySchema,
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/routines/{id}/event-groups",
+  tags: ["event-sources"],
+  summary: "List event groups (alert issues) of a routine",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: z.object({
+      open: z.enum(["true", "false", "1", "0"]).optional(),
+      limit: z.coerce.number().int().min(1).max(200).optional(),
+    }),
+  },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
 
@@ -5409,6 +5600,34 @@ registry.registerPath({
   request: { params: z.object({ companyId: z.string() }) },
   responses: {
     200: r.ok(observabilityHealthSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/usage",
+  tags: ["observability"],
+  summary: "Tokens, cost and duration of runs, grouped by one dimension",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityUsageQuerySchema },
+  responses: {
+    200: r.ok(observabilityUsageResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/failures",
+  tags: ["observability"],
+  summary: "Failed runs by cause or other dimension, with the count of all runs for a rate",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityFailuresQuerySchema },
+  responses: {
+    200: r.ok(observabilityFailuresResponseSchema),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
   },
@@ -10274,11 +10493,45 @@ registerCurrentRoute({
   summary: "Get wake diagnostics for an issue",
 });
 
+const issueSubtreeDiagnosticLastRunSchema = z
+  .object({
+    id: z.string().nullable().describe("Null for actors without company-scope read"),
+    status: z.string(),
+    agentId: z.string().nullable().describe("Null for actors without company-scope read"),
+    startedAt: z.string().nullable(),
+    finishedAt: z.string().nullable(),
+    createdAt: z.string(),
+    errorCode: z.string().nullable(),
+  })
+  .describe("Latest heartbeat run whose context issue is this node");
+
 registerCurrentRoute({
   method: "get",
   path: "/api/issues/{id}/diagnostics/subtree",
   tags: ["issues"],
   summary: "Get bounded subtree wake and blocker diagnostics for an issue",
+  responses: {
+    200: r.ok(
+      z
+        .object({
+          nodes: z.array(
+            z
+              .object({
+                issue: z.object({ id: z.string(), identifier: z.string().nullable(), title: z.string() }).passthrough(),
+                parentId: z.string().nullable(),
+                depth: z.number().int(),
+                lastRun: issueSubtreeDiagnosticLastRunSchema.nullable(),
+              })
+              .passthrough(),
+          ),
+        })
+        .passthrough(),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registerCurrentRoute({
@@ -10286,6 +10539,15 @@ registerCurrentRoute({
   path: "/api/issues/{id}/recovery-actions",
   tags: ["issues"],
   summary: "List issue recovery actions",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/execution/reconcile",
+  tags: ["issues"],
+  summary: "Reconcile stopped issue executions and queue a continuation",
+  body: reconcileIssueExecutionSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registerCurrentRoute({
@@ -10317,6 +10579,14 @@ registerCurrentRoute({
   path: "/api/issues/{id}/monitor/check-now",
   tags: ["issues"],
   summary: "Run an issue monitor check now",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/wait",
+  tags: ["issues"],
+  summary: "Wait on the caller's own issue and re-check it after a bounded delay",
+  body: issueWaitRequestSchema,
 });
 
 registerCurrentRoute({

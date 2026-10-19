@@ -14,6 +14,7 @@ import {
   type StartedSandboxCallbackBridgeServer,
 } from "./sandbox-callback-bridge.js";
 import type { RunProcessResult } from "./server-utils.js";
+import { isProcessAlive as isAlive } from "./test-support/process-liveness.js";
 
 const RUN_ID = "11111111-2222-4333-8444-555555555555";
 const BRIDGE_TOKEN = "lifecycle-test-token";
@@ -122,15 +123,6 @@ setInterval(() => {}, 1000);
 const roots: string[] = [];
 const pids: number[] = [];
 const stopFns: Array<() => Promise<void>> = [];
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 async function waitUntilDead(pid: number, timeoutMs: number): Promise<void> {
   await vi.waitFor(() => expect(isAlive(pid)).toBe(false), { timeout: timeoutMs, interval: 100 });

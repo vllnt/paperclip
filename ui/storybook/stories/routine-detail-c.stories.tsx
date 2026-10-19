@@ -257,6 +257,7 @@ function makeContext(
     variables: routineDetail.variables,
     env: routineDetail.env ?? null,
     automationWakeSettings: {},
+    runContextPolicy: null,
   };
   const editDraft: RoutineEditDraft = dirty
     ? { ...defaults, description: `${defaults.description}\n\nAlways CC the account owner.` }

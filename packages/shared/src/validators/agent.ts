@@ -1,5 +1,6 @@
 import { automationWakeSettingsSchema } from "../automation-wake.js";
 import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
+import { runContextPolicySchema } from "../run-context.js";
 import { agentAppearanceSchema } from "../agent-appearance.js";
 import { aiConnectionBindingSchema } from "../ai-connections.js";
 import { z } from "zod";
@@ -80,6 +81,7 @@ const agentHeartbeatConfigSchema = automationWakeSettingsSchema
 function agentRuntimeConfigSchemaWith<T extends z.ZodTypeAny>(aiConnection: T) {
   return z.object({
     aiConnection,
+    runContext: runContextPolicySchema.optional(),
     heartbeat: agentHeartbeatConfigSchema.optional(),
     debug: z.object({
       providerTrace: z.literal("raw").optional(),

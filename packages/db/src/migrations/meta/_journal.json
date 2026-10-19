@@ -2105,8 +2105,22 @@
     {
       "idx": 302,
       "version": "7",
-      "when": 1792347219961,
-      "tag": "0302_wide_dragon_man",
+      "when": 1792371010802,
+      "tag": "0302_wise_professor_monster",
+      "breakpoints": true
+    },
+    {
+      "idx": 303,
+      "version": "7",
+      "when": 1792426125272,
+      "tag": "0303_friendly_arclight",
+      "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1792426275289,
+      "tag": "0304_high_absorbing_man",
       "breakpoints": true
     }
   ]

@@ -32,6 +32,7 @@ const apiPrefixes: Record<string, string> = {
   "chat-channels.ts": "/api",
   "slack-tools.ts": "/api",
   "email.ts": "/api",
+  "event-sources.ts": "/api",
   "cloud.ts": "/api/cloud",
   "companies.ts": "/api/companies",
   "company-skills.ts": "/api",
@@ -81,6 +82,8 @@ const apiPrefixes: Record<string, string> = {
 const ROUTE_LITERAL_PATTERN =
   /router\.(get|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
 const ROUTER_METHOD_PATTERN = /router\.(get|post|put|patch|delete)\(/;
+const ROUTE_METHOD_LOOP_PATTERN =
+  /for\s*\(\s*const\s+method\s+of\s+\[([^\]]+)\][^)]*\)\s*\{\s*router\[method\]\(\s*["'`]([^"'`]+)["'`]/g;
 const HTTP_METHODS = new Set([
   "get",
   "put",
@@ -179,6 +182,20 @@ function loadActualRoutes() {
       continue;
     }
 
+    // `for (const method of ["get", "post"] as const) router[method]("/path", ...)`.
+    // Any other computed registration would be invisible here, so it fails the test.
+    const loopMatches = [...source.matchAll(ROUTE_METHOD_LOOP_PATTERN)].length;
+    if ((source.match(/\brouter\[/g) ?? []).length !== loopMatches) {
+      unknownRouteFiles.push(`${file} (computed router[...] registration)`);
+    }
+    for (const match of source.matchAll(ROUTE_METHOD_LOOP_PATTERN)) {
+      for (const method of match[1].match(/get|post|put|patch|delete/g) ?? []) {
+        routes.add(
+          `${method.toUpperCase()} ${normalizeExpressPath(resolveMountedPath(file, prefix, match[2]))}`,
+        );
+      }
+    }
+
     for (const match of source.matchAll(ROUTE_LITERAL_PATTERN)) {
       const method = match[1].toUpperCase();
       const routePath = match[2];
@@ -247,6 +264,37 @@ describe("openapi routes", () => {
       required: ["companyId"], additionalProperties: false,
     });
     expect(dismiss.description).toContain("viewers may dismiss their own");
+  });
+
+  it("documents event-source ingress as a public secret-authenticated operation and management as board-only", () => {
+    const { spec } = loadSpecRoutes();
+    const ingest = spec.paths["/api/event-sources/public/{publicId}/events"].post;
+    expect(ingest.security).toEqual([]);
+    expect(ingest["x-paperclip-authorization"]).toEqual({ actor: "public" });
+    for (const status of ["200", "202", "401", "404", "409", "413", "415", "422", "429", "503"]) {
+      expect(ingest.responses[status], `ingress response ${status}`).toBeDefined();
+    }
+    expect(ingest.requestBody.content["application/json"].schema.properties.dedupeKey).toBeDefined();
+
+    const create = spec.paths["/api/companies/{companyId}/event-sources"].post;
+    expect(create["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    expect(create.responses["201"]).toBeDefined();
+    for (const [route, method] of [
+      ["/api/event-sources/{id}", "patch"],
+      ["/api/event-sources/{id}", "delete"],
+      ["/api/event-sources/{id}/rotate-secret", "post"],
+    ] as const) {
+      expect(spec.paths[route][method]["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    }
+    for (const [route, method] of [
+      ["/api/companies/{companyId}/event-sources", "get"],
+      ["/api/event-sources/{id}", "get"],
+      ["/api/event-sources/{id}/test", "post"],
+      ["/api/event-sources/{id}/deliveries", "get"],
+      ["/api/routines/{id}/event-groups", "get"],
+    ] as const) {
+      expect(spec.paths[route][method]["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    }
   });
 
   it("documents exact failed-run selection and durable accepted retry responses", async () => {

@@ -3,7 +3,7 @@ title: Routines
 summary: Recurring task scheduling, triggers, and run history
 ---
 
-Routines are recurring tasks that fire on a schedule, webhook, or API call and create a heartbeat run for the assigned agent.
+Routines are recurring tasks that fire on a schedule, webhook, API call, or external event and create a heartbeat run for the assigned agent.
 
 ## List Routines
 
@@ -104,7 +104,7 @@ Restores a historical routine definition by creating a new latest revision copie
 POST /api/routines/{routineId}/triggers
 ```
 
-Three trigger kinds:
+Four trigger kinds:
 
 **Schedule** — fires on a cron expression:
 
@@ -139,6 +139,20 @@ Routine details retain the URL; rotate the secret if its value is lost.
   "kind": "api"
 }
 ```
+
+**Event** — subscribes the routine to a signed [event source](event-sources.md) and fires when a matching external alert arrives:
+
+```
+{
+  "kind": "event",
+  "eventSourceId": "{sourceId}",
+  "eventMatch": { "types": ["disk.*"], "minSeverity": "warning" },
+  "eventGrouping": { "repeatCommentCooldownSec": 900 },
+  "fallback": false
+}
+```
+
+Only `eventSourceId` is required. Repeats of an open alert are grouped onto one issue instead of creating duplicates, and the routine's `concurrencyPolicy`, noop-skip and activity gate do not apply. See [Event Sources](event-sources.md) for matching, grouping, fallback and validation rules.
 
 A routine can have multiple triggers of different kinds.
 
@@ -251,6 +265,16 @@ For local HTTPS testing, proxy an isolated test instance through Tailscale Serve
 use Funnel only if the sender is outside the tailnet. Existing routine and agent
 execution controls still apply, including the isolated-worktree execution gate.
 
+## Event Triggers and Event Groups
+
+Routines with an `event` trigger are woken by external alerts delivered to an event source (`POST /api/event-sources/public/{publicId}/events`). Event sources, the `paperclip.event.v1` wire format, signing, response codes, matching, grouping and the storm breaker are documented in [Event Sources](event-sources.md).
+
+```
+GET /api/routines/{routineId}/event-groups?open=true&limit=50
+```
+
+Lists the alert groups of the routine, newest activity first: the group's issue, `repeatCount`, `lastSeverity` and `lastState`. `open` defaults to `true`; `limit` is 1-200. Event runs appear in run history with `source` `event` and the statuses `issue_created`, `grouped` (comment on the open issue) and `recovered`.
+
 ## List Runs
 
 ```
@@ -272,6 +296,8 @@ Agents can read all routines in their company but can only create and manage rou
 | Rotate trigger secret | ✅ own only | ✅ |
 | Manual run | ✅ own only | ✅ |
 | Reassign to another agent | ❌ | ✅ |
+
+Agents can add `event` triggers to their own routines and read event sources and event groups. Creating, editing, rotating and archiving event sources is board-only.
 
 ## Routine Lifecycle
 
