@@ -20,6 +20,12 @@ import {
   browserUseSettingsSchema,
   browserUseViewportSchema,
   browserUseViewerSchema,
+  browserAgentActionSchema,
+  browserSignInInputSchema,
+  browserSignInStartSchema,
+  companyBrowserSettingsSchema,
+  createBrowserProfileSchema,
+  updateBrowserProfileSchema,
   slackToolCallSchema,
   slackSearchConfigSchema,
   // Agent
@@ -1257,6 +1263,7 @@ function registerCurrentRoute(input: {
   path: string;
   tags: string[];
   summary: string;
+  description?: string;
   query?: z.ZodTypeAny;
   body?: z.ZodTypeAny;
   responses?: Record<string, OpenApiResponse>;
@@ -1275,6 +1282,7 @@ function registerCurrentRoute(input: {
     path: input.path,
     tags: input.tags,
     summary: input.summary,
+    ...(input.description ? { description: input.description } : {}),
     ...(request ? { request } : {}),
     responses: input.responses ?? {
       200: r.ok(),
@@ -1287,6 +1295,7 @@ function registerCurrentRoute(input: {
 
 type OpenApiAuthLevel =
   | "public"
+  | "agent"
   | "agent_run"
   | "runtime_tools"
   | "authenticated"
@@ -1370,12 +1379,40 @@ const browserUseOperations = [
   ["put", "/api/companies/{companyId}/browser-use-cloud/grants/{grantId}/settings", "Update browser credential settings", browserUseSettingsSchema],
 ] as const;
 
+const BROWSER_BASE = "/api/companies/{companyId}/browser";
+const BROWSER_PROFILE = `${BROWSER_BASE}/profiles/{profileId}`;
+
+const browserBoardOperations = [
+  ["get", `${BROWSER_BASE}/overview`, "Read the company shared browser overview and profiles", undefined],
+  ["put", `${BROWSER_BASE}/settings`, "Turn the company shared browser on or off", companyBrowserSettingsSchema],
+  ["post", `${BROWSER_BASE}/profiles`, "Create a shared browser profile", createBrowserProfileSchema],
+  ["patch", BROWSER_PROFILE, "Update a browser profile's name, allowed domains or allowed agents", updateBrowserProfileSchema],
+  ["delete", BROWSER_PROFILE, "Delete a browser profile and its saved session", undefined],
+  ["post", `${BROWSER_PROFILE}/suspend`, "Suspend a browser profile", undefined],
+  ["post", `${BROWSER_PROFILE}/resume`, "Resume a suspended browser profile", undefined],
+  ["post", `${BROWSER_PROFILE}/signin`, "Start a board sign-in session on a profile", browserSignInStartSchema],
+  ["get", `${BROWSER_PROFILE}/signin/state`, "Read the page address, title and size of the sign-in session", undefined],
+  ["get", `${BROWSER_PROFILE}/signin/frame`, "Get the current sign-in page as a JPEG image", undefined],
+  ["post", `${BROWSER_PROFILE}/signin/input`, "Relay one click, key press, text or scroll to the sign-in page", browserSignInInputSchema],
+  ["post", `${BROWSER_PROFILE}/signin/end`, "End the sign-in session and save the session", undefined],
+] as const;
+
+const browserAgentOperations = [
+  ["get", `${BROWSER_BASE}/agent-profiles`, "List the browser profiles this agent may use", undefined],
+  ["post", `${BROWSER_PROFILE}/actions`, "Run one typed browser action on a profile the board allowed", browserAgentActionSchema],
+] as const;
+
+const AGENT_ONLY_OPERATIONS = new Set(
+  browserAgentOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
+);
+
 const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/event-sources",
   "PATCH /api/event-sources/{id}",
   "DELETE /api/event-sources/{id}",
   "POST /api/event-sources/{id}/rotate-secret",
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
+  ...browserBoardOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/gateway/test",
@@ -1632,6 +1669,7 @@ const CREATED_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/approvals",
   "POST /api/approvals/{id}/comments",
   "POST /api/companies/{companyId}/assets/images",
+  "POST /api/companies/{companyId}/browser/profiles",
   "POST /api/companies/{companyId}/logo",
   "POST /api/companies/{companyId}/onboarding-seed",
   "POST /api/cli-auth/challenges",
@@ -1728,6 +1766,7 @@ function resolveOperationAuthLevel(
   const key = operationKey(method, path);
   if (PUBLIC_OPERATIONS.has(key)) return "public";
   if (key === "POST /api/mcp/project-tools" || key === "POST /api/companies/{companyId}/slack/tasks/{issueId}/tools") return "agent_run";
+  if (AGENT_ONLY_OPERATIONS.has(key)) return "agent";
   if (RUNTIME_TOOLS_OPERATIONS.has(key)) return "runtime_tools";
   if (INSTANCE_ADMIN_OPERATIONS.has(key)) return "instance_admin";
   if (
@@ -1796,6 +1835,8 @@ function applyDocumentFixups(document: any): any {
       const authLevel = resolveOperationAuthLevel(method, path);
       if (authLevel === "public") {
         operation.security = [];
+      } else if (authLevel === "agent") {
+        operation.security = [securityRequirement(AGENT_BEARER_AUTH_SCHEME)];
       } else if (authLevel === "agent_run") {
         operation.security = [securityRequirement(AGENT_RUN_AUTH_SCHEME)];
       } else if (authLevel === "runtime_tools") {
@@ -1811,6 +1852,8 @@ function applyDocumentFixups(document: any): any {
           ? { actor: "board", instanceAdmin: true }
           : authLevel === "board"
             ? { actor: "board" }
+            : authLevel === "agent"
+              ? { actor: "agent" }
             : authLevel === "agent_run"
               ? { actor: "agent", heartbeatBound: true, taskBound: true }
             : authLevel === "runtime_tools"
@@ -2225,6 +2268,53 @@ for (const [method, path, summary, body] of browserUseOperations) {
     method, path, summary, body, tags: ["Browser Use Cloud"],
     ...(path.endsWith("/viewer") ? { query: browserUseViewerSchema.partial() } : {}),
     responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+  });
+}
+
+const browserAgentProfileListSchema = z.array(
+  z.object({ id: z.string().uuid(), name: z.string(), allowedDomains: z.array(z.string()) }).strict(),
+);
+
+const browserAgentActionResultSchema = z
+  .object({
+    ok: z.literal(true),
+    url: z.string(),
+    title: z.string(),
+    snapshot: z.string().nullable(),
+    note: z.string().nullable(),
+  })
+  .strict();
+
+const browserOperationNotes: Record<string, string> = {
+  [`PUT ${BROWSER_BASE}/settings`]:
+    "Off by default. While off, creating, changing, signing in to and acting on profiles return 404, the overview reports enabled=false, and the agent profile list is empty.",
+  [`POST ${BROWSER_PROFILE}/signin`]:
+    "Takes an exclusive lease on the profile for one board user. The browser runs on the control-plane host; a person drives it through the page image and relayed input.",
+  [`POST ${BROWSER_PROFILE}/signin/end`]:
+    "Closes the sign-in page, saves the session encrypted for this company, and releases the lease.",
+  [`GET ${BROWSER_BASE}/agent-profiles`]:
+    "Lists only the active profiles the board allowed this agent to use. Requires an agent credential; board credentials get 403.",
+  [`POST ${BROWSER_PROFILE}/actions`]:
+    "Runs one action from a closed set: navigate, snapshot, click, fill, press, scroll, wait, close. There is no script, cookie or storage action. Navigation is limited to https hosts in the profile's allowed domains. Password, one-time-code and card fields cannot be filled and are masked in snapshots. Requires an agent credential; board credentials get 403.",
+};
+
+const browserErrorResponses = {
+  400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable,
+};
+
+for (const [method, path, summary, body] of [...browserBoardOperations, ...browserAgentOperations]) {
+  const key = operationKey(method, path);
+  const success = path === `${BROWSER_BASE}/agent-profiles`
+    ? r.ok(browserAgentProfileListSchema)
+    : path === `${BROWSER_PROFILE}/actions`
+      ? r.ok(browserAgentActionResultSchema)
+      : path === `${BROWSER_PROFILE}/signin/frame`
+        ? { description: "Current page as a JPEG image", content: { "image/jpeg": { schema: { type: "string", format: "binary" } } } }
+        : r.ok();
+  registerCurrentRoute({
+    method, path, summary, body, tags: ["Shared Browser"],
+    description: browserOperationNotes[key],
+    responses: { 200: success, ...browserErrorResponses },
   });
 }
 

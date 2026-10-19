@@ -107,6 +107,7 @@ const SkillSources = lazy(() => import("./pages/SkillSources").then((m) => ({ de
 const SkillStudio = lazy(() => import("./pages/SkillStudio").then((m) => ({ default: m.SkillStudio })));
 const Secrets = lazy(() => import("./pages/Secrets").then((m) => ({ default: m.Secrets })));
 const CompanyEventSources = lazy(() => import("./pages/CompanyEventSources").then((m) => ({ default: m.CompanyEventSources })));
+const BrowserProfiles = lazy(() => import("./pages/BrowserProfiles").then((m) => ({ default: m.BrowserProfiles })));
 const CompanyImport = lazy(() => import("./pages/CompanyImport").then((m) => ({ default: m.CompanyImport })));
 const DesignGuide = lazy(() => import("./pages/DesignGuide").then((m) => ({ default: m.DesignGuide })));
 const InstanceExperimentalSettings = lazy(() => import("./pages/InstanceExperimentalSettings").then((m) => ({ default: m.InstanceExperimentalSettings })));
@@ -171,6 +172,7 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       <Route path="onboarding" element={<OnboardingRoutePage />} />
       <Route path="companies" element={<Companies />} />
       <Route path="company/settings" element={<CompanySettings />} />
+      <Route path="company/settings/browser" element={<BrowserProfiles />} />
       <Route path="company/settings/environments" element={<Navigate to="/company/settings/instance/environments" replace />} />
       <Route path="company/settings/cloud-upstream" element={<Navigate to="/company/export" replace />} />
       <Route element={<HiddenSettingsPageGate pageKey="company.members" />}>

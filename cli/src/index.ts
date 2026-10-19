@@ -52,6 +52,7 @@ import { registerEventSourceApiCommands } from "./commands/client/event-source-a
 import { registerAdapterCommands } from "./commands/client/adapter.js";
 import { registerManagedAgentCommands } from "./commands/managed-agent.js";
 import { registerAssetCommands } from "./commands/client/asset.js";
+import { registerBrowserCommands } from "./commands/client/browser.js";
 import { registerSkillCommands } from "./commands/client/skill.js";
 import { cliVersion } from "./version.js";
 import { installCommand } from "./commands/install.js";
@@ -267,6 +268,7 @@ registerEventSourceApiCommands(program);
 registerAdapterCommands(program);
 registerManagedAgentCommands(program);
 registerAssetCommands(program);
+registerBrowserCommands(program);
 registerSkillCommands(program);
 registerRoutineCommands(program);
 registerPipelineCommands(program);

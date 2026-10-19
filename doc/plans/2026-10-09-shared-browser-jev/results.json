@@ -1,0 +1,2139 @@
+{
+ "at": "2026-10-09T03:27:15.698Z",
+ "pricing": {
+  "anthropic/claude-haiku-4.5": {
+   "input": "0.000001",
+   "output": "0.000005",
+   "cachedInputTokens": "0.0000001",
+   "cacheCreationInputTokens": "0.00000125"
+  },
+  "anthropic/claude-sonnet-5": {
+   "input": "0.000002",
+   "output": "0.00001",
+   "cachedInputTokens": "0.0000002",
+   "cacheCreationInputTokens": "0.0000025"
+  }
+ },
+ "rows": [
+  {
+   "flow": "saucedemo-checkout",
+   "step": 1,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c5"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 319.088334,
+    "inputTokens": 794,
+    "costUsd": 0.00003334800000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 1
+    },
+    "goal_done_p": 0.01,
+    "needs_human_p": 0.04
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 271.989292,
+    "inputTokens": 794,
+    "costUsd": 0.00003334800000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 1
+    },
+    "goal_done_p": 0.01,
+    "needs_human_p": 0.04
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1416.6537090000002,
+    "inputTokens": 665,
+    "outputTokens": 39,
+    "costUsd": 0.0017200000000000002,
+    "page_state": "signed_out",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 1016.87725,
+    "inputTokens": 508,
+    "outputTokens": 41,
+    "costUsd": 0.000713,
+    "page_state": "signed_out",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 2,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c4"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 242.2800000000002,
+    "inputTokens": 799,
+    "costUsd": 0.000033558000000000006,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c4",
+    "next_action_conf": 0.99,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0.01,
+     "c4": 0.99,
+     "c5": 0
+    },
+    "goal_done_p": 0.01,
+    "needs_human_p": 0.04
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 289.7978330000001,
+    "inputTokens": 799,
+    "costUsd": 0.000033558000000000006,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c4",
+    "next_action_conf": 0.99,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0.01,
+     "c4": 0.99,
+     "c5": 0
+    },
+    "goal_done_p": 0.01,
+    "needs_human_p": 0.04
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 905.9837500000003,
+    "inputTokens": 674,
+    "outputTokens": 39,
+    "costUsd": 0.001738,
+    "page_state": "signed_out",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 724.7554999999993,
+    "inputTokens": 511,
+    "outputTokens": 41,
+    "costUsd": 0.000716,
+    "page_state": "signed_out",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 3,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c3"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 322.61133299999983,
+    "inputTokens": 808,
+    "costUsd": 0.000033936,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 0.68,
+    "next_action_p": {
+     "c1": 0.02,
+     "c2": 0,
+     "c3": 0.24,
+     "c4": 0,
+     "c5": 0.74
+    },
+    "goal_done_p": 0.01,
+    "needs_human_p": 0.04
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 270.7575000000006,
+    "inputTokens": 808,
+    "costUsd": 0.000033936,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 0.6,
+    "next_action_p": {
+     "c1": 0.03,
+     "c2": 0,
+     "c3": 0.29,
+     "c4": 0,
+     "c5": 0.68
+    },
+    "goal_done_p": 0.01,
+    "needs_human_p": 0.04
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1169.5493749999996,
+    "inputTokens": 672,
+    "outputTokens": 39,
+    "costUsd": 0.0017339999999999999,
+    "page_state": "signed_out",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 799.2964170000005,
+    "inputTokens": 514,
+    "outputTokens": 41,
+    "costUsd": 0.000719,
+    "page_state": "signed_out",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 4,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c6"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 251.21095799999966,
+    "inputTokens": 1336,
+    "costUsd": 0.00005611200000000001,
+    "page_state": "signed_in",
+    "page_state_conf": 0.8,
+    "next_action": "c6",
+    "next_action_conf": 0.8,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0.01,
+     "c3": 0,
+     "c4": 0.16,
+     "c5": 0,
+     "c6": 0.83
+    },
+    "goal_done_p": 0.01,
+    "needs_human_p": 0.06
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 325.37166699999943,
+    "inputTokens": 1336,
+    "costUsd": 0.00005611200000000001,
+    "page_state": "signed_in",
+    "page_state_conf": 0.8,
+    "next_action": "c6",
+    "next_action_conf": 0.88,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0.1,
+     "c5": 0,
+     "c6": 0.9
+    },
+    "goal_done_p": 0.01,
+    "needs_human_p": 0.06
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 958.5422080000008,
+    "inputTokens": 1417,
+    "outputTokens": 39,
+    "costUsd": 0.003224,
+    "page_state": "signed_in",
+    "next_action": "c6",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 721.9738750000015,
+    "inputTokens": 1097,
+    "outputTokens": 41,
+    "costUsd": 0.001302,
+    "page_state": "signed_in",
+    "next_action": "c6",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 5,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c3"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 480.7333749999998,
+    "inputTokens": 1339,
+    "costUsd": 0.000056238000000000006,
+    "page_state": "signed_in",
+    "page_state_conf": 0.92,
+    "next_action": "c3",
+    "next_action_conf": 0.51,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0.02,
+     "c3": 0.59,
+     "c4": 0.27,
+     "c5": 0,
+     "c6": 0.12
+    },
+    "goal_done_p": 0.09,
+    "needs_human_p": 0.07
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 283.00683299999946,
+    "inputTokens": 1339,
+    "costUsd": 0.000056238000000000006,
+    "page_state": "signed_in",
+    "page_state_conf": 0.91,
+    "next_action": "c3",
+    "next_action_conf": 0.58,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0.02,
+     "c3": 0.65,
+     "c4": 0.21,
+     "c5": 0,
+     "c6": 0.12
+    },
+    "goal_done_p": 0.09,
+    "needs_human_p": 0.07
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 916.9561250000006,
+    "inputTokens": 1420,
+    "outputTokens": 39,
+    "costUsd": 0.0032300000000000002,
+    "page_state": "signed_in",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 839.0884580000002,
+    "inputTokens": 1102,
+    "outputTokens": 41,
+    "costUsd": 0.001307,
+    "page_state": "signed_in",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 6,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c5"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 324.60349999999926,
+    "inputTokens": 949,
+    "costUsd": 0.000039858000000000004,
+    "page_state": "signed_in",
+    "page_state_conf": 0.99,
+    "next_action": "c5",
+    "next_action_conf": 0.98,
+    "next_action_p": {
+     "c1": 0.01,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0.98,
+     "c6": 0.01
+    },
+    "goal_done_p": 0.06,
+    "needs_human_p": 0.07
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 318.452041999999,
+    "inputTokens": 949,
+    "costUsd": 0.000039858000000000004,
+    "page_state": "signed_in",
+    "page_state_conf": 0.99,
+    "next_action": "c5",
+    "next_action_conf": 0.94,
+    "next_action_p": {
+     "c1": 0.03,
+     "c2": 0,
+     "c3": 0.01,
+     "c4": 0,
+     "c5": 0.95,
+     "c6": 0.01
+    },
+    "goal_done_p": 0.08,
+    "needs_human_p": 0.07
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 980.4757919999993,
+    "inputTokens": 850,
+    "outputTokens": 39,
+    "costUsd": 0.00209,
+    "page_state": "signed_in",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 799.7453749999986,
+    "inputTokens": 657,
+    "outputTokens": 41,
+    "costUsd": 0.0008619999999999999,
+    "page_state": "signed_in",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 7,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c6"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 244.7875839999997,
+    "inputTokens": 956,
+    "costUsd": 0.000040152000000000005,
+    "page_state": "signed_in",
+    "page_state_conf": 0.99,
+    "next_action": "c6",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 1
+    },
+    "goal_done_p": 0.04,
+    "needs_human_p": 0.05
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 300.69533299999966,
+    "inputTokens": 956,
+    "costUsd": 0.000040152000000000005,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c6",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 1
+    },
+    "goal_done_p": 0.04,
+    "needs_human_p": 0.04
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1206.3546249999981,
+    "inputTokens": 863,
+    "outputTokens": 39,
+    "costUsd": 0.002116,
+    "page_state": "signed_in",
+    "next_action": "c6",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 866.2456250000032,
+    "inputTokens": 662,
+    "outputTokens": 41,
+    "costUsd": 0.0008669999999999999,
+    "page_state": "signed_in",
+    "next_action": "c6",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 8,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c4"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 332.91849999999977,
+    "inputTokens": 963,
+    "costUsd": 0.000040446000000000005,
+    "page_state": "signed_in",
+    "page_state_conf": 0.99,
+    "next_action": "c4",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 1,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.04,
+    "needs_human_p": 0.04
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 269.9539169999989,
+    "inputTokens": 963,
+    "costUsd": 0.000040446000000000005,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c4",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 1,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.04
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1177.6209999999992,
+    "inputTokens": 876,
+    "outputTokens": 39,
+    "costUsd": 0.002142,
+    "page_state": "signed_in",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 844.5355000000018,
+    "inputTokens": 670,
+    "outputTokens": 51,
+    "costUsd": 0.000925,
+    "page_state": "signed_in",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 9,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c2"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 271.4626669999998,
+    "inputTokens": 961,
+    "costUsd": 0.000040362000000000004,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 1,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.04
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 321.70866699999897,
+    "inputTokens": 961,
+    "costUsd": 0.000040362000000000004,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 1,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.04
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 977.1917499999981,
+    "inputTokens": 864,
+    "outputTokens": 39,
+    "costUsd": 0.002118,
+    "page_state": "signed_in",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 690.3565420000014,
+    "inputTokens": 662,
+    "outputTokens": 41,
+    "costUsd": 0.0008669999999999999,
+    "page_state": "signed_in",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 10,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c1"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 359.02329100000134,
+    "inputTokens": 954,
+    "costUsd": 0.000040068,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c1",
+    "next_action_conf": 0.99,
+    "next_action_p": {
+     "c1": 0.99,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0.01,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.11,
+    "needs_human_p": 0.04
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 363.24833299999955,
+    "inputTokens": 954,
+    "costUsd": 0.000040068,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c1",
+    "next_action_conf": 0.98,
+    "next_action_p": {
+     "c1": 0.98,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0.02,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.11,
+    "needs_human_p": 0.04
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1381.29925,
+    "inputTokens": 852,
+    "outputTokens": 39,
+    "costUsd": 0.002094,
+    "page_state": "signed_in",
+    "next_action": "c1",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 878.4061669999974,
+    "inputTokens": 654,
+    "outputTokens": 51,
+    "costUsd": 0.000909,
+    "page_state": "signed_in",
+    "next_action": "c1",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 11,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c2"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 253.49004200000127,
+    "inputTokens": 1059,
+    "costUsd": 0.000044478000000000003,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 0.87,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0.89,
+     "c3": 0.01,
+     "c4": 0,
+     "c5": 0.04,
+     "c6": 0.06
+    },
+    "goal_done_p": 0.07,
+    "needs_human_p": 0.06
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 274.625,
+    "inputTokens": 1059,
+    "costUsd": 0.000044478000000000003,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 0.89,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0.91,
+     "c3": 0.01,
+     "c4": 0,
+     "c5": 0.04,
+     "c6": 0.04
+    },
+    "goal_done_p": 0.09,
+    "needs_human_p": 0.07
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1051.5239169999986,
+    "inputTokens": 996,
+    "outputTokens": 39,
+    "costUsd": 0.002382,
+    "page_state": "signed_in",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 725.8607499999998,
+    "inputTokens": 772,
+    "outputTokens": 51,
+    "costUsd": 0.0010270000000000001,
+    "page_state": "signed_in",
+    "next_action": "c2",
+    "goal_done_p": 1,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "saucedemo-checkout",
+   "step": 12,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": true,
+    "needs_human": false,
+    "next_action": "c5"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 320.8665000000001,
+    "inputTokens": 925,
+    "costUsd": 0.00003885,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 0.87,
+    "next_action_p": {
+     "c1": 0.01,
+     "c2": 0.09,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0.9
+    },
+    "goal_done_p": 0.93,
+    "needs_human_p": 0.04
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 237.28520800000115,
+    "inputTokens": 925,
+    "costUsd": 0.00003885,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 0.86,
+    "next_action_p": {
+     "c1": 0.01,
+     "c2": 0.1,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0.89
+    },
+    "goal_done_p": 0.92,
+    "needs_human_p": 0.04
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 991.5499999999993,
+    "inputTokens": 827,
+    "outputTokens": 39,
+    "costUsd": 0.002044,
+    "page_state": "signed_in",
+    "next_action": "c5",
+    "goal_done_p": 1,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 1075.793834,
+    "inputTokens": 631,
+    "outputTokens": 41,
+    "costUsd": 0.0008359999999999999,
+    "page_state": "signed_in",
+    "next_action": "c5",
+    "goal_done_p": 1,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "practice-login-retry",
+   "step": 1,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c2"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 310.38616700000057,
+    "inputTokens": 1127,
+    "costUsd": 0.000047334000000000005,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 1,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.05
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 265.52229200000147,
+    "inputTokens": 1127,
+    "costUsd": 0.000047334000000000005,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 1,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.05
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1453.2678749999977,
+    "inputTokens": 1057,
+    "outputTokens": 39,
+    "costUsd": 0.002504,
+    "page_state": "signed_out",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 717.9870410000003,
+    "inputTokens": 834,
+    "outputTokens": 51,
+    "costUsd": 0.0010890000000000001,
+    "page_state": "signed_out",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "practice-login-retry",
+   "step": 2,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c3"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 231.3733329999959,
+    "inputTokens": 1132,
+    "costUsd": 0.000047544000000000004,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 0.82,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0.85,
+     "c4": 0.15,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.05,
+    "needs_human_p": 0.05
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 314.4160000000047,
+    "inputTokens": 1132,
+    "costUsd": 0.000047544000000000004,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 0.76,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0.8,
+     "c4": 0.2,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.05,
+    "needs_human_p": 0.06
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1507.2969999999987,
+    "inputTokens": 1065,
+    "outputTokens": 39,
+    "costUsd": 0.00252,
+    "page_state": "signed_out",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 753.8184579999943,
+    "inputTokens": 836,
+    "outputTokens": 51,
+    "costUsd": 0.001091,
+    "page_state": "signed_out",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "practice-login-retry",
+   "step": 3,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c3"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 263.91425000000163,
+    "inputTokens": 1136,
+    "costUsd": 0.00004771200000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 1,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.05,
+    "needs_human_p": 0.06
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 259.6578339999978,
+    "inputTokens": 1136,
+    "costUsd": 0.00004771200000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 0.99,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0.99,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0.01
+    },
+    "goal_done_p": 0.05,
+    "needs_human_p": 0.05
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1047.6931669999976,
+    "inputTokens": 1061,
+    "outputTokens": 39,
+    "costUsd": 0.002512,
+    "page_state": "signed_out",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 1049.3345419999969,
+    "inputTokens": 836,
+    "outputTokens": 92,
+    "costUsd": 0.0012959999999999998,
+    "page_state": "signed_out",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "practice-login-retry",
+   "step": 4,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c1"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 271.15200000000186,
+    "inputTokens": 1126,
+    "costUsd": 0.00004729200000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c1",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 1,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.04,
+    "needs_human_p": 0.05
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 257.3249580000047,
+    "inputTokens": 1126,
+    "costUsd": 0.00004729200000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c1",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 1,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.04,
+    "needs_human_p": 0.05
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 897.3346250000031,
+    "inputTokens": 1059,
+    "outputTokens": 39,
+    "costUsd": 0.0025080000000000002,
+    "page_state": "signed_out",
+    "next_action": "c1",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 982.6275840000017,
+    "inputTokens": 835,
+    "outputTokens": 41,
+    "costUsd": 0.00104,
+    "page_state": "signed_out",
+    "next_action": "c1",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "practice-login-retry",
+   "step": 5,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c5"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 260.71820899999875,
+    "inputTokens": 1140,
+    "costUsd": 0.00004788000000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 1,
+     "c6": 0
+    },
+    "goal_done_p": 0.05,
+    "needs_human_p": 0.06
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 279.17454200000066,
+    "inputTokens": 1140,
+    "costUsd": 0.00004788000000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 0.99,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0.01,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0.99,
+     "c6": 0
+    },
+    "goal_done_p": 0.05,
+    "needs_human_p": 0.06
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1645.6400830000057,
+    "inputTokens": 1079,
+    "outputTokens": 39,
+    "costUsd": 0.002548,
+    "page_state": "signed_out",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 707.0525839999973,
+    "inputTokens": 846,
+    "outputTokens": 41,
+    "costUsd": 0.001051,
+    "page_state": "signed_out",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "practice-login-retry",
+   "step": 6,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c3"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 281.34004200000345,
+    "inputTokens": 1139,
+    "costUsd": 0.000047838000000000005,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 0.93,
+    "next_action_p": {
+     "c1": 0.06,
+     "c2": 0,
+     "c3": 0.94,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.06,
+    "needs_human_p": 0.05
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 262.7151670000021,
+    "inputTokens": 1139,
+    "costUsd": 0.000047838000000000005,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 0.92,
+    "next_action_p": {
+     "c1": 0.06,
+     "c2": 0,
+     "c3": 0.9299999999999999,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0.01
+    },
+    "goal_done_p": 0.05,
+    "needs_human_p": 0.06
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 972.3770420000001,
+    "inputTokens": 1067,
+    "outputTokens": 39,
+    "costUsd": 0.002524,
+    "page_state": "signed_out",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 742.4171249999999,
+    "inputTokens": 841,
+    "outputTokens": 51,
+    "costUsd": 0.001096,
+    "page_state": "signed_out",
+    "next_action": "c1",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "practice-login-retry",
+   "step": 7,
+   "truth": {
+    "page_state": "signed_in",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c4"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 316.9274590000059,
+    "inputTokens": 986,
+    "costUsd": 0.000041412,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c4",
+    "next_action_conf": 0.83,
+    "next_action_p": {
+     "c1": 0.13,
+     "c2": 0.01,
+     "c3": 0,
+     "c4": 0.86,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.21,
+    "needs_human_p": 0.06
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 257.5656250000029,
+    "inputTokens": 986,
+    "costUsd": 0.000041412,
+    "page_state": "signed_in",
+    "page_state_conf": 1,
+    "next_action": "c4",
+    "next_action_conf": 0.86,
+    "next_action_p": {
+     "c1": 0.11,
+     "c2": 0.01,
+     "c3": 0,
+     "c4": 0.88,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.26,
+    "needs_human_p": 0.07
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 965.747292,
+    "inputTokens": 884,
+    "outputTokens": 39,
+    "costUsd": 0.0021579999999999998,
+    "page_state": "signed_in",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 707.9458339999983,
+    "inputTokens": 680,
+    "outputTokens": 51,
+    "costUsd": 0.000935,
+    "page_state": "signed_in",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "practice-login-retry",
+   "step": 8,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": true,
+    "needs_human": false,
+    "next_action": "c3"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 288.2783749999944,
+    "inputTokens": 1123,
+    "costUsd": 0.00004716600000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c1",
+    "next_action_conf": 0.73,
+    "next_action_p": {
+     "c1": 0.78,
+     "c2": 0.1,
+     "c3": 0.1,
+     "c4": 0.01,
+     "c5": 0.01
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.05
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 277.3255419999987,
+    "inputTokens": 1123,
+    "costUsd": 0.00004716600000000001,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c1",
+    "next_action_conf": 0.73,
+    "next_action_p": {
+     "c1": 0.78,
+     "c2": 0.09,
+     "c3": 0.11,
+     "c4": 0.01,
+     "c5": 0.01
+    },
+    "goal_done_p": 0.04,
+    "needs_human_p": 0.05
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 7601.792416999997,
+    "inputTokens": 1040,
+    "outputTokens": 525,
+    "costUsd": 0.00733,
+    "page_state": "signed_out",
+    "next_action": "c1",
+    "goal_done_p": 0,
+    "needs_human_p": 1
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 686.2704169999997,
+    "inputTokens": 815,
+    "outputTokens": 41,
+    "costUsd": 0.00102,
+    "page_state": "signed_out",
+    "next_action": "c1",
+    "goal_done_p": 0,
+    "needs_human_p": 1
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 1,
+   "truth": {
+    "page_state": "captcha",
+    "goal_done": false,
+    "needs_human": true,
+    "next_action": "c4"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 273.33374999999796,
+    "inputTokens": 867,
+    "costUsd": 0.00003641400000000001,
+    "page_state": "captcha",
+    "page_state_conf": 0.42,
+    "next_action": "c5",
+    "next_action_conf": 0.89,
+    "next_action_p": {
+     "c1": 0.04,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0.05,
+     "c5": 0.91
+    },
+    "goal_done_p": 0.15,
+    "needs_human_p": 0.61
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 236.38529199999903,
+    "inputTokens": 867,
+    "costUsd": 0.00003641400000000001,
+    "page_state": "other",
+    "page_state_conf": 0.4,
+    "next_action": "c5",
+    "next_action_conf": 0.85,
+    "next_action_p": {
+     "c1": 0.03,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0.09,
+     "c5": 0.88
+    },
+    "goal_done_p": 0.13,
+    "needs_human_p": 0.63
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 2669.9649169999975,
+    "inputTokens": 749,
+    "outputTokens": 131,
+    "costUsd": 0.002808,
+    "page_state": "captcha",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 1
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 702.6553749999948,
+    "inputTokens": 571,
+    "outputTokens": 40,
+    "costUsd": 0.000771,
+    "page_state": "captcha",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 1
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 2,
+   "truth": {
+    "page_state": "error_page",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c2"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 296.72733299999527,
+    "inputTokens": 666,
+    "costUsd": 0.000027972000000000003,
+    "page_state": "error_page",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 0.92,
+    "next_action_p": {
+     "c1": 0.05,
+     "c2": 0.95,
+     "c3": 0
+    },
+    "goal_done_p": 0.02,
+    "needs_human_p": 0.08
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 335.36604100000113,
+    "inputTokens": 666,
+    "costUsd": 0.000027972000000000003,
+    "page_state": "error_page",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 0.89,
+    "next_action_p": {
+     "c1": 0.07,
+     "c2": 0.93,
+     "c3": 0
+    },
+    "goal_done_p": 0.02,
+    "needs_human_p": 0.09
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1569.1417920000022,
+    "inputTokens": 482,
+    "outputTokens": 80,
+    "costUsd": 0.001764,
+    "page_state": "error_page",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 1000.127625000001,
+    "inputTokens": 366,
+    "outputTokens": 51,
+    "costUsd": 0.000621,
+    "page_state": "error_page",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 3,
+   "truth": {
+    "page_state": "error_page",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c5"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 289.94383299999754,
+    "inputTokens": 1024,
+    "costUsd": 0.000043008000000000006,
+    "page_state": "error_page",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 0.99,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0.99,
+     "c6": 0.01
+    },
+    "goal_done_p": 0.17,
+    "needs_human_p": 0.05
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 258.41870900000504,
+    "inputTokens": 1024,
+    "costUsd": 0.000043008000000000006,
+    "page_state": "error_page",
+    "page_state_conf": 1,
+    "next_action": "c5",
+    "next_action_conf": 0.99,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0.99,
+     "c6": 0.01
+    },
+    "goal_done_p": 0.19,
+    "needs_human_p": 0.05
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1397.9669580000045,
+    "inputTokens": 910,
+    "outputTokens": 38,
+    "costUsd": 0.0022,
+    "page_state": "error_page",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 747.111458000014,
+    "inputTokens": 700,
+    "outputTokens": 41,
+    "costUsd": 0.000905,
+    "page_state": "error_page",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 4,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c3"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 304.612208999999,
+    "inputTokens": 787,
+    "costUsd": 0.000033054000000000006,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 1,
+     "c4": 0,
+     "c5": 0
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.57
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 383.35062499999185,
+    "inputTokens": 787,
+    "costUsd": 0.000033054000000000006,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 1,
+     "c4": 0,
+     "c5": 0
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.6
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 950.0380830000067,
+    "inputTokens": 628,
+    "outputTokens": 39,
+    "costUsd": 0.001646,
+    "page_state": "signed_out",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 856.2972080000036,
+    "inputTokens": 485,
+    "outputTokens": 41,
+    "costUsd": 0.00069,
+    "page_state": "signed_out",
+    "next_action": "c3",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 5,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c4"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 245.3526659999916,
+    "inputTokens": 791,
+    "costUsd": 0.000033222,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c4",
+    "next_action_conf": 0.99,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0.01,
+     "c4": 0.99,
+     "c5": 0
+    },
+    "goal_done_p": 0.06,
+    "needs_human_p": 0.14
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 277.0777919999964,
+    "inputTokens": 791,
+    "costUsd": 0.000033222,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c4",
+    "next_action_conf": 0.99,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 0,
+     "c3": 0.01,
+     "c4": 0.99,
+     "c5": 0
+    },
+    "goal_done_p": 0.06,
+    "needs_human_p": 0.32
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1297.8575839999976,
+    "inputTokens": 635,
+    "outputTokens": 39,
+    "costUsd": 0.00166,
+    "page_state": "signed_out",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 1102.591916999998,
+    "inputTokens": 486,
+    "outputTokens": 41,
+    "costUsd": 0.000691,
+    "page_state": "signed_out",
+    "next_action": "c4",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 6,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c5"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 243.95966600000975,
+    "inputTokens": 800,
+    "costUsd": 0.000033600000000000004,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 0.52,
+    "next_action_p": {
+     "c1": 0.01,
+     "c2": 0.01,
+     "c3": 0.62,
+     "c4": 0,
+     "c5": 0.36
+    },
+    "goal_done_p": 0.13,
+    "needs_human_p": 0.3
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 277.60870900000737,
+    "inputTokens": 800,
+    "costUsd": 0.000033600000000000004,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 0.62,
+    "next_action_p": {
+     "c1": 0.01,
+     "c2": 0.01,
+     "c3": 0.7,
+     "c4": 0,
+     "c5": 0.28
+    },
+    "goal_done_p": 0.13,
+    "needs_human_p": 0.2
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1796.0584159999999,
+    "inputTokens": 633,
+    "outputTokens": 39,
+    "costUsd": 0.001656,
+    "page_state": "signed_out",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 697.3121659999888,
+    "inputTokens": 489,
+    "outputTokens": 41,
+    "costUsd": 0.000694,
+    "page_state": "signed_out",
+    "next_action": "c5",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 7,
+   "truth": {
+    "page_state": "signed_out",
+    "goal_done": false,
+    "needs_human": true,
+    "next_action": "c1"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 259.01320900001156,
+    "inputTokens": 839,
+    "costUsd": 0.000035238000000000004,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 0.56,
+    "next_action_p": {
+     "c1": 0.03,
+     "c2": 0.01,
+     "c3": 0.65,
+     "c4": 0.28,
+     "c5": 0.03
+    },
+    "goal_done_p": 0.05,
+    "needs_human_p": 0.87
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 350.2621250000084,
+    "inputTokens": 839,
+    "costUsd": 0.000035238000000000004,
+    "page_state": "signed_out",
+    "page_state_conf": 1,
+    "next_action": "c3",
+    "next_action_conf": 0.59,
+    "next_action_p": {
+     "c1": 0.03,
+     "c2": 0.01,
+     "c3": 0.67,
+     "c4": 0.27,
+     "c5": 0.02
+    },
+    "goal_done_p": 0.05,
+    "needs_human_p": 0.88
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1317.723833000011,
+    "inputTokens": 689,
+    "outputTokens": 39,
+    "costUsd": 0.001768,
+    "page_state": "signed_out",
+    "next_action": "c1",
+    "goal_done_p": 0,
+    "needs_human_p": 1
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 758.9369169999991,
+    "inputTokens": 530,
+    "outputTokens": 51,
+    "costUsd": 0.000785,
+    "page_state": "signed_out",
+    "next_action": "c1",
+    "goal_done_p": 0,
+    "needs_human_p": 1
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 8,
+   "truth": {
+    "page_state": "other",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c2"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 323.6070420000033,
+    "inputTokens": 814,
+    "costUsd": 0.000034188000000000005,
+    "page_state": "other",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 1,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.02,
+    "needs_human_p": 0.03
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 309.75449999999546,
+    "inputTokens": 814,
+    "costUsd": 0.000034188000000000005,
+    "page_state": "other",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 1,
+    "next_action_p": {
+     "c1": 0,
+     "c2": 1,
+     "c3": 0,
+     "c4": 0,
+     "c5": 0,
+     "c6": 0
+    },
+    "goal_done_p": 0.02,
+    "needs_human_p": 0.03
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 1255.3131250000006,
+    "inputTokens": 650,
+    "outputTokens": 36,
+    "costUsd": 0.00166,
+    "page_state": "other",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": true,
+    "ms": 661.3470410000009,
+    "inputTokens": 495,
+    "outputTokens": 39,
+    "costUsd": 0.0006900000000000001,
+    "page_state": "other",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 9,
+   "truth": {
+    "page_state": "other",
+    "goal_done": false,
+    "needs_human": false,
+    "next_action": "c2"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 252.78633300001093,
+    "inputTokens": 960,
+    "costUsd": 0.00004032000000000001,
+    "page_state": "other",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 0.35,
+    "next_action_p": {
+     "c1": 0.02,
+     "c2": 0.46,
+     "c3": 0.07,
+     "c4": 0.41,
+     "c5": 0.01,
+     "c6": 0.03
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.02
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 286.5935419999878,
+    "inputTokens": 960,
+    "costUsd": 0.00004032000000000001,
+    "page_state": "other",
+    "page_state_conf": 1,
+    "next_action": "c2",
+    "next_action_conf": 0.35,
+    "next_action_p": {
+     "c1": 0.02,
+     "c2": 0.46,
+     "c3": 0.07,
+     "c4": 0.42,
+     "c5": 0.01,
+     "c6": 0.02
+    },
+    "goal_done_p": 0.03,
+    "needs_human_p": 0.03
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 5062.831541000007,
+    "inputTokens": 839,
+    "outputTokens": 392,
+    "costUsd": 0.0055980000000000005,
+    "page_state": "other",
+    "next_action": "c2",
+    "goal_done_p": 0,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": false,
+    "ms": 2447.2600410000014,
+    "error": "SyntaxError"
+   }
+  },
+  {
+   "flow": "hard-states",
+   "step": 10,
+   "truth": {
+    "page_state": "other",
+    "goal_done": true,
+    "needs_human": false,
+    "next_action": "c1"
+   },
+   "jev": {
+    "ok": true,
+    "ms": 248.93179200000304,
+    "inputTokens": 972,
+    "costUsd": 0.00004082400000000001,
+    "page_state": "other",
+    "page_state_conf": 1,
+    "next_action": "c1",
+    "next_action_conf": 0.14,
+    "next_action_p": {
+     "c1": 0.31,
+     "c2": 0.26,
+     "c3": 0.12,
+     "c4": 0.24,
+     "c5": 0.07
+    },
+    "goal_done_p": 0.08,
+    "needs_human_p": 0.03
+   },
+   "jev2": {
+    "ok": true,
+    "ms": 237.28366699999606,
+    "inputTokens": 972,
+    "costUsd": 0.00004082400000000001,
+    "page_state": "other",
+    "page_state_conf": 1,
+    "next_action": "c1",
+    "next_action_conf": 0.19,
+    "next_action_p": {
+     "c1": 0.35,
+     "c2": 0.33,
+     "c3": 0.09,
+     "c4": 0.2,
+     "c5": 0.03
+    },
+    "goal_done_p": 0.09,
+    "needs_human_p": 0.03
+   },
+   "anthropic/claude-sonnet-5": {
+    "ok": true,
+    "ms": 3515.1164169999975,
+    "inputTokens": 864,
+    "outputTokens": 257,
+    "costUsd": 0.004298,
+    "page_state": "other",
+    "next_action": "c1",
+    "goal_done_p": 1,
+    "needs_human_p": 0
+   },
+   "anthropic/claude-haiku-4.5": {
+    "ok": false,
+    "ms": 2590.2662500000006,
+    "error": "SyntaxError"
+   }
+  }
+ ]
+}
