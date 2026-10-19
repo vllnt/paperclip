@@ -28,11 +28,14 @@ packages/plugins/plugin-convex/tests/ui.spec.tsx
 packages/plugins/plugin-github/tests/sync-job-context.spec.ts
 packages/plugins/plugin-github/tests/sync-queued-ui.spec.tsx
 packages/plugins/plugin-github/tests/sync-scope-loss.spec.ts
+packages/shared/src/agent-config-merge-patch.test.ts
 packages/shared/src/command-action-rank.test.ts
 packages/shared/src/command-actions.test.ts
 packages/shared/src/company-environment-defaults.test.ts
+server/src/__tests__/agent-config-merge-patch.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
 server/src/__tests__/bundled-plugins.test.ts
+server/src/__tests__/decision-wakeup.test.ts
 server/src/__tests__/external-objects-service.test.ts
 server/src/__tests__/github-commit-details.test.ts
 server/src/__tests__/instance-settings-routes.test.ts

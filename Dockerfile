@@ -152,6 +152,7 @@ RUN pnpm --filter @paperclipai/plugin-sdk build
 # blank lines and # comments are ignored. The script that reads the list has its own test, run first.
 RUN node --test scripts/ci/run-image-build-vitest.test.mjs
 RUN sh scripts/ci/run-image-build-vitest.sh
+
 RUN pnpm check:token-gates
 # The GitHub launcher's retry of a busy or slow Paperclip server (bounded backoff, a clear final error); no database.
 RUN pnpm exec vitest run packages/adapter-utils/src/github-launcher-backoff.test.ts
