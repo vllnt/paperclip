@@ -9,7 +9,7 @@ const block = (overrides: Record<string, unknown>) => hardDeleteBlock(normalizeD
 describe("hardDeleteBlock", () => {
   it("lets an ordinary cloud preview or dev deployment through", () => {
     expect(block({})).toBeNull();
-    expect(block({ deploymentType: "dev", reference: "dev/ship-3561-x", previewIdentifier: null })).toBeNull();
+    expect(block({ deploymentType: "dev", reference: "dev/ship-101-x", previewIdentifier: null })).toBeNull();
   });
 
   it.each([

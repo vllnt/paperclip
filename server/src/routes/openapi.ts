@@ -6,6 +6,7 @@ import {
 import { Router } from "express";
 import { z } from "zod";
 import {
+  companyRunTiersSchema,
   createAiConnectionSchema,
   testAiGatewaySchema,
   aiConnectionLoginIntentSchema,
@@ -2042,6 +2043,33 @@ registry.registerPath({
   tags: ["companies"],
   summary: "Company stats",
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/run-tiers",
+  tags: ["companies"],
+  summary: "Get a company's run tiers and the tiers agents may set",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/run-tiers",
+  tags: ["companies"],
+  summary: "Replace a company's run tiers (board only)",
+  request: { params: z.object({ companyId: z.string() }), body: jsonBody(companyRunTiersSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/run-target-stats",
+  tags: ["companies"],
+  summary: "In-flight runs per provider pool and finished runs by run target source and tier",
+  request: { params: z.object({ companyId: z.string() }), query: z.object({ hours: z.string().optional() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -9477,11 +9505,21 @@ const convexReaperReportSchema = z.object({
   dryRun: z.boolean(),
   projects: z.array(z.object({
     convexProjectId: z.string(), name: z.string(), previews: z.number(), kept: z.number(),
+    ciMatched: z.number().optional().describe("Previews the company's CI preview template matched; absent without a template"),
     delete: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
     setExpiry: z.array(z.object({ name: z.string(), from: z.number().nullable(), to: z.number() })),
     deleted: z.array(z.string()), expirySet: z.array(z.string()),
     failed: z.array(z.object({ name: z.string(), error: z.string() })),
     skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+    dev: z.object({
+      listed: z.number(), kept: z.number(),
+      executed: z.boolean().describe("False for a plan only: dry run, dev policy off, or a pass an agent started"),
+      delete: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+      deleted: z.array(z.string()),
+      failed: z.array(z.object({ name: z.string(), error: z.string() })),
+      skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+      error: z.string().optional(),
+    }).optional().describe("Dev deployments older than the company's age limit; deleted only by the scheduled or a board-run reaper"),
     deferred: z.number().int().optional().describe("Previews not examined, and expiry changes not planned, because the time budget or the per-pass limit was reached; the next pass continues with the oldest"),
     error: z.string().optional(),
   })),
