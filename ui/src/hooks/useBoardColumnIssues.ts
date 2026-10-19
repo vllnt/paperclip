@@ -89,8 +89,7 @@ export function useBoardColumnIssues({
   const { serverData, ...columns } = useQueries({
     queries: ISSUE_STATUSES.map((status, index) => ({
       queryKey: [
-        ...queryKeys.issues.list(companyId ?? "__no-company__"),
-        "board-column",
+        ...queryKeys.issues.boardColumns(companyId ?? "__no-company__"),
         status,
         search,
         projectId ?? "__all-projects__",
@@ -125,7 +124,7 @@ export function useBoardColumnIssues({
   const retryFailedColumns = useCallback(() => {
     if (!companyId) return;
     void queryClient.refetchQueries({
-      queryKey: [...queryKeys.issues.list(companyId), "board-column"],
+      queryKey: queryKeys.issues.boardColumns(companyId),
       predicate: (query) => query.state.status === "error",
     });
   }, [companyId, queryClient]);

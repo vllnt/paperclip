@@ -17,14 +17,14 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 
 | Measure | Count |
 |---|---|
-| Documented operations | 895 |
-| Usable with a board API key | 867 |
+| Documented operations | 902 |
+| Usable with a board API key | 874 |
 | Instance-admin only | 6 |
 | Public | 20 |
 | Agent-run or runtime token only | 8 |
 | Called by the board UI | 702 |
-| Called by a CLI command | 367 |
-| **Called by the UI but no CLI command** | **400** |
+| Called by a CLI command | 374 |
+| **Called by the UI but no CLI command** | **399** |
 | Called by the UI; a generic CLI command may reach it | 2 |
 | UI calls not statically resolved | 12 |
 | CLI calls not statically resolved | 14 |
@@ -47,7 +47,7 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 | auth | 3 | 0 |
 | chat-channels | 43 | 43 |
 | cloud | 1 | 1 |
-| companies | 33 | 21 |
+| companies | 33 | 20 |
 | connection-intents | 5 | 5 |
 | costs | 16 | 0 |
 | dashboard | 1 | 0 |
@@ -489,7 +489,7 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 | `POST /api/companies/{companyId}/onboarding-seed` | Apply the onboarding seed Paperclip Cloud collected at signup | board or agent key |  |  |
 | `GET /api/companies/{companyId}/org.png` | Get org chart as PNG | board or agent key |  | `paperclipai org png` |
 | `GET /api/companies/{companyId}/org.svg` | Get org chart as SVG | board or agent key |  | `paperclipai org svg` |
-| `GET /api/companies/{companyId}/search` | Search company data | board or agent key | `searchApi.search` | **missing** |
+| `GET /api/companies/{companyId}/search` | Search company data | board or agent key | `searchApi.search` | `paperclipai search` |
 | `GET /api/companies/{companyId}/search/extract` | Extract company search matches | board or agent key |  |  |
 | `POST /api/companies/{companyId}/setup-token-login-sessions` | Start a company-and-environment Claude setup-token login session | board or agent key | `agentsApi.startClaudeSetupTokenLogin` | **missing** |
 | `GET /api/companies/{companyId}/setup-token-login-sessions/{sessionId}` | Read the status of a Claude setup-token login session | board or agent key | `agentsApi.getClaudeSetupTokenLoginStatus` | **missing** |
@@ -609,6 +609,7 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 
 | Operation | Summary | API key | UI caller | CLI |
 |---|---|---|---|---|
+| `GET /api/companies/{companyId}/environment-leases` | List a company's environment leases across environments, most recently used first (default status active,pending_cleanup). Board only; lease metadata is redacted | board or agent key |  | `paperclipai environment leases:list` |
 | `GET /api/companies/{companyId}/environments` | List environments for a company | board or agent key | `environmentsApi.list` | `paperclipai environment list` |
 | `POST /api/companies/{companyId}/environments` | Create an environment | board or agent key | `environmentsApi.create` | `paperclipai environment create` |
 | `GET /api/companies/{companyId}/environments/capabilities` | Get environment capabilities | board or agent key | `environmentsApi.capabilities` | `paperclipai environment capabilities` |
@@ -627,7 +628,7 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 | `GET /api/environments/{id}` | Get an environment | board or agent key |  | `paperclipai environment get` |
 | `PATCH /api/environments/{id}` | Update an environment | board or agent key | `environmentsApi.update` | `paperclipai environment update` |
 | `GET /api/environments/{id}/delete-blast-radius` | Get environment delete blast radius | board or agent key | `environmentsApi.deleteBlastRadius` | **missing** |
-| `GET /api/environments/{id}/leases` | List leases for an environment | board or agent key |  | `paperclipai environment leases` |
+| `GET /api/environments/{id}/leases` | List leases for an environment, optionally filtered by status | board or agent key |  | `paperclipai environment leases` |
 | `POST /api/environments/{id}/probe` | Probe an environment | board or agent key | `environmentsApi.probe` | `paperclipai environment probe` |
 | `GET /api/environments/{id}/secret-refs` | Describe an environment's config secret refs (name, status, owning company — never values) | board or agent key | `environmentsApi.secretRefs` | **missing** |
 
@@ -710,9 +711,11 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 | `GET /api/companies/{companyId}/chats` | List the current board user's agent conversations | board key | `agentChatsApi.list` | **missing** |
 | `GET /api/companies/{companyId}/chats/{agentRef}` | Get the current board user's conversation with an agent | board key | `agentChatsApi.get` | **missing** |
 | `POST /api/companies/{companyId}/chats/{agentRef}` | Open the current board user's conversation with an agent | board key | `agentChatsApi.ensure` | **missing** |
+| `POST /api/companies/{companyId}/issue-duplicate-pairs/{pairId}/label` | Label a scored duplicate pair as duplicate or keep both | board or agent key |  | `paperclipai issue duplicate-label` |
 | `GET /api/companies/{companyId}/issues` | List issues in a company | board or agent key | `issuesApi.list`, `issuesApi.listCompact` | `paperclipai issue list` |
 | `POST /api/companies/{companyId}/issues` | Create an issue | board or agent key | `issuesApi.create` | `paperclipai issue create` |
 | `POST /api/companies/{companyId}/issues/external-object-summaries` | Get external object status summaries for issues | board or agent key | `externalObjectsApi.getIssueSummaries` | **missing** |
+| `POST /api/companies/{companyId}/issues/similar` | Check a draft issue for likely duplicates before creating it | board or agent key |  | `paperclipai issue similar` |
 | `GET /api/companies/{companyId}/labels` | List labels in a company | board or agent key | `issuesApi.listLabels` | `paperclipai issue label:list` |
 | `POST /api/companies/{companyId}/labels` | Create a label | board or agent key | `issuesApi.createLabel` | `paperclipai issue label:create` |
 | `GET /api/feedback-traces/{traceId}` | Get a feedback trace | board or agent key |  | `paperclipai feedback trace` |
@@ -750,6 +753,7 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 | `GET /api/issues/{id}/documents/{key}/revisions` | List issue document revisions | board or agent key | `issuesApi.listDocumentRevisions` | `paperclipai issue document:revisions` |
 | `POST /api/issues/{id}/documents/{key}/revisions/{revisionId}/restore` | Restore a document revision | board or agent key | `issuesApi.restoreDocumentRevision` | `paperclipai issue document:restore` |
 | `POST /api/issues/{id}/documents/{key}/unlock` | Unlock an issue document | board or agent key | `issuesApi.unlockDocument` | `paperclipai issue document:unlock` |
+| `GET /api/issues/{id}/duplicate-pairs` | List scored duplicate candidates recorded for an issue | board or agent key |  | `paperclipai issue duplicate-pairs` |
 | `GET /api/issues/{id}/external-object-summary` | Get external object status summary for an issue | board or agent key | `externalObjectsApi.getIssueSummary` | **missing** |
 | `GET /api/issues/{id}/external-objects` | List external objects mentioned by an issue | board or agent key | `externalObjectsApi.listForIssue` | **missing** |
 | `POST /api/issues/{id}/external-objects/refresh` | Refresh external objects mentioned by an issue | board or agent key | `externalObjectsApi.refreshIssueObjects` | **missing** |
@@ -815,6 +819,12 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 | `GET /api/llms/agent-configuration.txt` | Get agent configuration as plain text (for LLM context) | board or agent key |  | `paperclipai llm agent-configuration` |
 | `GET /api/llms/agent-configuration/{adapterType}.txt` | Get agent configuration for a specific adapter type | board or agent key |  | `paperclipai llm agent-configuration:adapter` |
 | `GET /api/llms/agent-icons.txt` | Get agent icon names as plain text | board or agent key |  | `paperclipai llm agent-icons` |
+
+### observability
+
+| Operation | Summary | API key | UI caller | CLI |
+|---|---|---|---|---|
+| `GET /api/companies/{companyId}/observability/health` | Usage collector health for a company | board or agent key |  | `paperclipai observability health` |
 
 ### plugins
 
@@ -908,7 +918,9 @@ Regenerate with `pnpm --filter @paperclipai/server api:coverage`. Ranked gaps an
 
 | Operation | Summary | API key | UI caller | CLI |
 |---|---|---|---|---|
+| `GET /api/companies/{companyId}/deferred-wakes` | Get deferred-wake queue health for a company | board or agent key |  |  |
 | `GET /api/companies/{companyId}/heartbeat-runs` | List heartbeat runs for a company | board or agent key | `heartbeatsApi.list` | `paperclipai run list` |
+| `GET /api/companies/{companyId}/heartbeat-runs/stats` | Get heartbeat run stats and daily cap usage for a company | board or agent key |  | `paperclipai run stats` |
 | `GET /api/companies/{companyId}/live-runs` | List live runs for a company | board or agent key | `heartbeatsApi.liveRunsForCompany` | `paperclipai run live` |
 | `GET /api/companies/{companyId}/provider-traces` | List provider trace metadata for selected runs | board or agent key | `heartbeatsApi.providerTraceMetadata` | **missing** |
 | `GET /api/heartbeat-runs/{runId}` | Get a heartbeat run | board or agent key | `heartbeatsApi.get` | `paperclipai run get` |
@@ -1221,10 +1233,10 @@ These build their path at runtime (or dispatch generically, e.g. `/api/${resourc
 | `cli/src/commands/client/company.ts:1792` | POST | `transferPreviewPath` |
 | `cli/src/commands/client/company.ts:1796` | POST | `previewApiPath` |
 | `cli/src/commands/client/company.ts:1858` | POST | `importApiPath` |
-| `cli/src/commands/client/run.ts:176` | GET | ``${path}?${params.toString()}`` |
-| `cli/src/commands/client/run.ts:243` | GET | ``${path}?${params.toString()}`` |
+| `cli/src/commands/client/run.ts:248` | GET | ``${path}?${params.toString()}`` |
+| `cli/src/commands/client/run.ts:315` | GET | ``${path}?${params.toString()}`` |
 | `cli/src/commands/client/teams.ts:184` | POST | `catalogTeamCompanyPath(ctx.companyId, catalogRef, "preview")` |
 | `cli/src/commands/client/teams.ts:226` | POST | `catalogTeamCompanyPath(ctx.companyId, catalogRef, "install")` |
-| `cli/src/commands/client/workspace.ts:85` | POST | `path` |
-| `cli/src/commands/client/workspace.ts:86` | PATCH | `path` |
+| `cli/src/commands/client/workspace.ts:129` | POST | `path` |
+| `cli/src/commands/client/workspace.ts:130` | PATCH | `path` |
 | `cli/src/commands/client/auth.ts:180` | POST | ``${apiPath`/api/cli-auth/challenges/${id}`}/${action}`` |

@@ -142,6 +142,7 @@ import {
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { executionBlockerPredicate } from "./execution-blocker.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import {
@@ -6618,6 +6619,36 @@ export async function readIssueCommentRunLogText(run: {
   return content;
 }
 
+export interface IssueCreatedEvent {
+  id: string;
+  companyId: string;
+}
+
+let issueCreatedListener: ((event: IssueCreatedEvent) => void) | null = null;
+
+/**
+ * Registers the one listener told about every newly inserted issue, whichever path created it
+ * (root create, child create, plan decomposition, routines, chat, runtime delegation).
+ * It is not called when a create resolves to an existing issue. When the caller owns an open
+ * transaction the event can fire before that transaction commits, so listeners must tolerate an
+ * issue that is not visible yet. Pass `null` to remove it.
+ */
+export function setIssueCreatedListener(listener: ((event: IssueCreatedEvent) => void) | null): void {
+  issueCreatedListener = listener;
+}
+
+function notifyIssueCreated(event: IssueCreatedEvent): void {
+  if (!issueCreatedListener) return;
+  try {
+    issueCreatedListener(event);
+  } catch (error) {
+    logger.warn(
+      { err: error instanceof Error ? error.message : String(error), issueId: event.id },
+      "issue created listener failed",
+    );
+  }
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -9829,6 +9860,7 @@ export function issueService(db: Db) {
       ) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      const created: { event: IssueCreatedEvent | null } = { event: null };
       const persist = async (tx: DbTransaction) => {
         await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
         if (issueData.conversationAgentId && issueData.conversationUserId) {
@@ -10220,6 +10252,7 @@ export function issueService(db: Db) {
         );
 
         const [issue] = await tx.insert(issues).values(values).returning();
+        created.event = { id: issue.id, companyId: issue.companyId };
         await recordChatHandoff(tx, issue, actorRunId);
         if (idempotencyKey) {
           await tx.insert(issueCreateIdempotencyKeys).values({
@@ -10270,8 +10303,10 @@ export function issueService(db: Db) {
         );
         return withRelations;
       };
-      if (dbOrTx === db) return db.transaction(persist);
-      return persist(dbOrTx as DbTransaction);
+      const result =
+        dbOrTx === db ? await db.transaction(persist) : await persist(dbOrTx as DbTransaction);
+      if (created.event) notifyIssueCreated(created.event);
+      return result;
     },
 
     /**
@@ -11028,9 +11063,33 @@ export function issueService(db: Db) {
               eq(chatConversations.state, "waiting"), sql`exists (select 1 from chat_endpoints e
                 where e.id = ${chatConversations.endpointId} and e.company_id = ${chatConversations.companyId} and e.provider = 'slack')`));
         }
-        if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
+        // Compare against the row read under the lock, not the pre-lock snapshot.
+        if (updated.assigneeAgentId !== receiptExisting.assigneeAgentId || updated.assigneeUserId !== receiptExisting.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
+          // A recovery hold names the previous owner's run; the new owner
+          // cannot reconcile it, so supersede it with the ownership change.
+          const supersededAt = new Date();
+          const supersededNote = "Recovery closed because the task's owner changed. No work was replayed.";
+          await tx.update(issueRecoveryActions).set({
+            status: "resolved",
+            outcome: "cancelled",
+            resolvedAt: supersededAt,
+            updatedAt: supersededAt,
+            nextAction: supersededNote,
+            resolutionNote: supersededNote,
+            wakePolicy: null,
+            monitorPolicy: null,
+            evidence: sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
+              then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"owner_changed"'::jsonb)
+              else ${issueRecoveryActions.evidence} end`,
+          }).where(and(
+            eq(issueRecoveryActions.companyId, updated.companyId),
+            eq(issueRecoveryActions.sourceIssueId, updated.id),
+            executionBlockerPredicate(),
+            // An unsafe workspace stays held until repair, whoever owns the task.
+            sql`coalesce(${issueRecoveryActions.evidence}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'`,
+          ));
         }
         if (existing.status !== updated.status) {
           if (

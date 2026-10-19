@@ -11,8 +11,13 @@ import {
   createIssueThreadInteractionSchema,
   createIssueTreeHoldSchema,
   createIssueWorkProductSchema,
+  DUPLICATE_PAIR_LABELS,
   type FeedbackTrace,
+  findSimilarIssuesSchema,
+  type FindSimilarIssuesResult,
   type HeartbeatRun,
+  type IssueDuplicatePair,
+  labelDuplicatePairSchema,
   linkIssueApprovalSchema,
   previewIssueTreeControlSchema,
   rejectIssueThreadInteractionSchema,
@@ -50,6 +55,12 @@ interface IssueBaseOptions extends BaseClientOptions {
   match?: string;
 }
 
+interface IssueSimilarOptions extends BaseClientOptions {
+  title: string;
+  description?: string;
+  parentId?: string;
+}
+
 interface IssueCreateOptions extends BaseClientOptions {
   title: string;
   description?: string;
@@ -61,6 +72,8 @@ interface IssueCreateOptions extends BaseClientOptions {
   parentId?: string;
   requestDepth?: string;
   billingCode?: string;
+  adapterOverridesJson?: string;
+  adapterOverridesFile?: string;
 }
 
 interface IssueUpdateOptions extends BaseClientOptions {
@@ -74,8 +87,41 @@ interface IssueUpdateOptions extends BaseClientOptions {
   parentId?: string;
   requestDepth?: string;
   billingCode?: string;
+  adapterOverridesJson?: string;
+  adapterOverridesFile?: string;
   comment?: string;
   hiddenAt?: string;
+}
+
+interface AdapterOverridesOptions {
+  adapterOverridesJson?: string;
+  adapterOverridesFile?: string;
+}
+
+/**
+ * Reads `--adapter-overrides-json` or `--adapter-overrides-file`: per-issue
+ * assignee adapter overrides, as `{ "adapterConfig": {...}, "useProjectWorkspace": true }`.
+ * The command's payload schema validates the shape strictly.
+ *
+ * @returns the overrides object, `null` to clear them, or `undefined` when neither option is given.
+ */
+export async function parseAdapterOverridesOption(
+  opts: AdapterOverridesOptions,
+): Promise<Record<string, unknown> | null | undefined> {
+  if (opts.adapterOverridesJson !== undefined && opts.adapterOverridesFile !== undefined) {
+    throw new Error("Use only one of --adapter-overrides-json or --adapter-overrides-file.");
+  }
+  const raw =
+    opts.adapterOverridesFile !== undefined
+      ? await readFile(opts.adapterOverridesFile, "utf8")
+      : opts.adapterOverridesJson;
+  if (raw === undefined) return undefined;
+  const value = parseJson(raw);
+  if (value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error('Adapter overrides must be a JSON object, or null to clear them.');
+  }
+  return Object.fromEntries(Object.entries(value));
 }
 
 interface IssueCommentOptions extends BaseClientOptions {
@@ -288,9 +334,12 @@ export function registerIssueCommands(program: Command): void {
       .option("--parent-id <id>", "Parent issue ID")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
+      .option("--adapter-overrides-json <json>", "Per-issue assignee adapter overrides as JSON (see docs/cli)")
+      .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .action(async (opts: IssueCreateOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const assigneeAdapterOverrides = await parseAdapterOverridesOption(opts);
           const payload = createIssueSchema.parse({
             title: opts.title,
             description: opts.description,
@@ -302,10 +351,80 @@ export function registerIssueCommands(program: Command): void {
             parentId: opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
+            assigneeAdapterOverrides,
           });
 
           const created = await ctx.api.post<Issue>(apiPath`/api/companies/${ctx.companyId}/issues`, payload);
           printOutput(created, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("similar")
+      .description("Check a draft issue for likely duplicates before creating it")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .requiredOption("--title <title>", "Draft issue title")
+      .option("--description <text>", "Draft issue description")
+      .option("--parent-id <id>", "Parent issue ID")
+      .action(async (opts: IssueSimilarOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const payload = findSimilarIssuesSchema.parse({
+            title: opts.title,
+            description: opts.description,
+            parentId: opts.parentId,
+          });
+          const result = await ctx.api.post<FindSimilarIssuesResult>(
+            apiPath`/api/companies/${ctx.companyId}/issues/similar`,
+            payload,
+          );
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("duplicate-pairs")
+      .description("List scored duplicate candidates recorded for an issue")
+      .argument("<idOrIdentifier>", "Issue ID or identifier (e.g. PC-12)")
+      .action(async (idOrIdentifier: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const pairs = await ctx.api.get<IssueDuplicatePair[]>(
+            apiPath`/api/issues/${idOrIdentifier}/duplicate-pairs`,
+          );
+          printOutput(pairs, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("duplicate-label")
+      .description("Record whether a scored pair is a duplicate or should be kept as two issues")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .argument("<pairId>", "Duplicate pair ID from `issue duplicate-pairs`")
+      .argument("<label>", `One of: ${DUPLICATE_PAIR_LABELS.join(", ")}`)
+      .action(async (pairId: string, label: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const payload = labelDuplicatePairSchema.parse({ label });
+          const pair = await ctx.api.post<IssueDuplicatePair>(
+            apiPath`/api/companies/${ctx.companyId}/issue-duplicate-pairs/${pairId}/label`,
+            payload,
+          );
+          printOutput(pair, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }
@@ -328,11 +447,17 @@ export function registerIssueCommands(program: Command): void {
       .option("--parent-id <id>", "Parent issue ID")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
+      .option(
+        "--adapter-overrides-json <json>",
+        "Per-issue assignee adapter overrides as JSON; 'null' clears them (see docs/cli)",
+      )
+      .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .option("--comment <text>", "Optional comment to add with update")
       .option("--hidden-at <iso8601|null>", "Set hiddenAt timestamp or literal 'null'")
       .action(async (issueId: string, opts: IssueUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
+          const assigneeAdapterOverrides = await parseAdapterOverridesOption(opts);
           const payload = updateIssueSchema.parse({
             title: opts.title,
             description: opts.description,
@@ -344,6 +469,7 @@ export function registerIssueCommands(program: Command): void {
             parentId: opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
+            assigneeAdapterOverrides,
             comment: opts.comment,
             hiddenAt: parseHiddenAt(opts.hiddenAt),
           });

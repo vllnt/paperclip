@@ -29,7 +29,7 @@ export const pipelineStageColumnTones: Record<string, typeof defaultPipelineStag
     bodyOver: "bg-green-100/65 dark:bg-green-950/30",
   },
   cancelled: {
-    outer: "border-neutral-300/70 bg-muted/25 opacity-85 dark:border-neutral-700/70 dark:bg-neutral-900/20",
+    outer: "border-border bg-muted/25 opacity-85",
     header: "border-border/70 text-muted-foreground/80",
     meta: "border-border/70",
     body: "bg-muted/20",

@@ -3,7 +3,7 @@
 Goal (bntvllnt, 2026-10-08): everything a human does in the board UI can be done
 with an API key (no browser session), a `paperclipai` CLI command, and the
 OpenAPI document, so that one Paperclip instance can drive another. The work is
-generic; anthm is only the first company to use it.
+generic and suitable for any company.
 
 The per-operation matrix is generated: [`doc/api-coverage-matrix.md`](../api-coverage-matrix.md).
 Regenerate it with `pnpm --filter @paperclipai/server api:coverage`.
@@ -43,7 +43,7 @@ Runtime exceptions to the matrix's "API key" column:
 |---|---|---|
 | `POST /api/plugins/{pluginId}/actions/{key}` and `/bridge/action` | board | Any authenticated actor reaches the plugin. Each plugin decides; the GitHub plugin's `boardScope` rejects agents and requires `companyId`. |
 | `/api/cli-auth/*`, `/api/auth/*` | board | Session or login-flow specific by design. |
-| Cloud-tenant deployments | — | Board keys never carry instance admin (rows are purged on each trusted-header login). The vllnt deployment uses `authenticated` mode, so this does not apply there. |
+| Cloud-tenant deployments | — | Board keys never carry instance admin (rows are purged on each trusted-header login). This does not apply to standalone `authenticated` deployments. |
 
 ## Operator gaps, ranked by pain
 

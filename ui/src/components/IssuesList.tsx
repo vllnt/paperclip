@@ -148,7 +148,7 @@ const progressSegmentClasses: Record<IssueStatus, string> = {
   in_review: "bg-violet-500",
   done: "bg-green-500",
   blocked: "bg-red-500",
-  cancelled: "bg-neutral-400",
+  cancelled: "bg-status-neutral",
 };
 
 /* ── View state ── */

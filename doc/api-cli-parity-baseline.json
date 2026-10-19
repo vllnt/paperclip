@@ -105,6 +105,7 @@
     "GET /api/companies/{companyId}/decision-triage/{sourceKind}/{sourceId}",
     "GET /api/companies/{companyId}/decisions",
     "GET /api/companies/{companyId}/decisions/stats",
+    "GET /api/companies/{companyId}/deferred-wakes",
     "GET /api/companies/{companyId}/email/connections",
     "GET /api/companies/{companyId}/export/fidelity",
     "GET /api/companies/{companyId}/folders",
