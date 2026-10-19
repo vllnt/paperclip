@@ -1,3 +1,4 @@
+cli/src/__tests__/agent-lifecycle.test.ts
 cli/src/__tests__/search-parity.test.ts
 packages/adapter-utils/src/directory-merge-lock.test.ts
 packages/adapter-utils/src/log-value-redaction.test.ts
