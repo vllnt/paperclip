@@ -2,6 +2,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from "dri
 import { routineRuns, routines, routineTriggers, type Db } from "@paperclipai/db";
 import { ROUTINE_GATE_LIMITS, type RoutineGateResult } from "@paperclipai/shared";
 import { logger } from "../../middleware/logger.js";
+import { sampleGateText } from "./command.js";
 import { createSemaphore, type Semaphore } from "../event-sources/semaphore.js";
 import type { GateRunner } from "./runner.js";
 import {
@@ -168,31 +169,21 @@ export function createGateWorker(db: Db) {
         gateResult = exhaustedResult();
       } else {
         const last = await lastCommittedResult(run);
-        let environmentKey = "unresolved";
-        try {
-          environmentKey = await runner.resolveEnvironmentId(routine.companyId, routine.assigneeAgentId);
-        } catch {
-          // The run reports the same failure with its own classification.
-        }
-        const outcome = await state.instance.run(() =>
-          environmentSemaphore(state, environmentKey).run(() =>
-            runner.run({
-              companyId: routine.companyId,
-              routine: { id: routine.id, assigneeAgentId: routine.assigneeAgentId },
-              gate,
-              context: {
-                routineId: routine.id,
-                triggerKind: run.source,
-                lastResultFingerprint: last?.fingerprint ?? null,
-                lastDispatchedAt: last?.triggeredAt ?? null,
-                event: gateEvent(run),
-              },
-            }),
-          ),
-        ).catch((error: unknown): { result: RoutineGateResult; stdout: string; retryable: boolean } => ({
+        const outcome = await runner.run({
+          companyId: routine.companyId,
+          routine: { id: routine.id, assigneeAgentId: routine.assigneeAgentId },
+          gate,
+          context: {
+            routineId: routine.id,
+            triggerKind: run.source,
+            lastResultFingerprint: last?.fingerprint ?? null,
+            lastDispatchedAt: last?.triggeredAt ?? null,
+            event: gateEvent(run),
+          },
+        }).catch((error: unknown): { result: RoutineGateResult; stdout: string; retryable: boolean } => ({
           result: {
             ...exhaustedResult(),
-            detail: `gate run failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200),
+            detail: sampleGateText(`gate run failed: ${error instanceof Error ? error.message : String(error)}`, 200),
           },
           stdout: "",
           retryable: true,
@@ -238,14 +229,25 @@ export function createGateWorker(db: Db) {
     const row = await db.select().from(routineRuns).where(eq(routineRuns.id, runId)).then((rows) => rows[0] ?? null);
     if (!row || row.status !== "gating") return;
     const routine = await db.select().from(routines).where(eq(routines.id, row.routineId)).then((rows) => rows[0] ?? null);
-    const staleSec = gateClaimStalenessSec(routine?.gate);
-    const claimed = await claim(runId, staleSec);
-    if (!claimed) return;
-    if (!routine) {
-      await context.handlers.abandon({ run: claimed, routine: null, error: new Error("Routine no longer exists") });
-      return;
+    let environmentKey = "unresolved";
+    if (routine) {
+      try {
+        environmentKey = await context.runner.resolveEnvironmentId(routine.companyId, routine.assigneeAgentId);
+      } catch {
+        // The run reports the same failure with its own classification.
+      }
     }
-    await execute(claimed, routine, context, staleSec);
+    // Waiting for capacity must not age a claim: only admitted execution owns a lease.
+    await state.instance.run(() => environmentSemaphore(state, environmentKey).run(async () => {
+      const staleSec = gateClaimStalenessSec(routine?.gate);
+      const claimed = await claim(runId, staleSec);
+      if (!claimed) return;
+      if (!routine) {
+        await context.handlers.abandon({ run: claimed, routine: null, error: new Error("Routine no longer exists") });
+        return;
+      }
+      await execute(claimed, routine, context, staleSec);
+    }));
   }
 
   /** Processes one gating row to a decision; safe to call twice for the same row. */

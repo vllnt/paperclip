@@ -157,11 +157,11 @@ export function classifyGateExecution(
   ) {
     return { ...base, class: "overflow", detail: "output exceeded the buffer limit" };
   }
-  if (code === null) return { ...base, class: "transport", detail: message.slice(0, 200) || "no exit code" };
+  if (code === null) return { ...base, class: "transport", detail: sampleGateText(message, 200) || "no exit code" };
   if (code === 0) return { ...base, class: "ok", detail: null };
   if (code === 1) return { ...base, class: "skip", detail: null };
   if (code === 124 || code === 137) return { ...base, class: "timeout", detail: "ended by the remote timeout" };
-  if (code === 255) return { ...base, class: "transport", detail: message.slice(0, 200) || "ssh connection failed" };
+  if (code === 255) return { ...base, class: "transport", detail: sampleGateText(message, 200) || "ssh connection failed" };
   if (
     code === GATE_WRAPPER_EXIT.mktemp ||
     code === GATE_WRAPPER_EXIT.write ||

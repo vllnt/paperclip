@@ -133,7 +133,7 @@ export function createGateRunner(deps: GateRunnerDeps) {
         resultFingerprint: null,
         stdoutSample: "",
         stderrTail: "",
-        detail,
+        detail: sampleGateText(detail, 200),
         ...extra,
       },
       stdout: "",

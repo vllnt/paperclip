@@ -252,6 +252,16 @@ describe("gateResultFingerprint", () => {
   });
 });
 
+describe("gate failure privacy", () => {
+  it.each([255, undefined])("redacts transport details before truncation for exit %s", (code) => {
+    const syntheticToken = ["ghp", "abcdefghijklmnopqrstuvwxyz0123456789"].join("_");
+    const outcome = classifyGateExecution({ ok: false, error: { code, message: `${"x".repeat(180)} ${syntheticToken}` } });
+    expect(outcome.detail).not.toContain(syntheticToken.slice(0, 15));
+    expect(outcome.detail).toContain("REDACTED");
+    expect(Buffer.byteLength(outcome.detail!)).toBeLessThanOrEqual(200);
+  });
+});
+
 describe("gateScriptSha", () => {
   it("is the sha256 of the content", () => {
     expect(gateScriptSha("")).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
