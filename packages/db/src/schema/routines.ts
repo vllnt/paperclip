@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
   boolean,
@@ -18,7 +19,18 @@ import { projects } from "./projects.js";
 import { goals } from "./goals.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 import { folders } from "./folders.js";
-import type { AutomationWakeSettings, RoutineEnvConfig, RoutineNoopSkipSettings, RoutineRevisionSnapshotV1, RoutineVariable, RoutineWebhookDelivery } from "@paperclipai/shared";
+import { eventDeliveries, eventSources } from "./event_sources.js";
+import type {
+  AutomationWakeSettings,
+  EventGrouping,
+  EventMatch,
+  RoutineEnvConfig,
+  RoutineNoopSkipSettings,
+  RoutineRevisionSnapshotV1,
+  RoutineVariable,
+  RoutineWebhookDelivery,
+  RunContextPolicy,
+} from "@paperclipai/shared";
 
 export const routines = pgTable(
   "routines",
@@ -44,6 +56,7 @@ export const routines = pgTable(
     env: jsonb("env").$type<RoutineEnvConfig>(),
     automationWakeSettings: jsonb("automation_wake_settings").$type<AutomationWakeSettings>().notNull().default({}),
     routineNoopSkipSettings: jsonb("routine_noop_skip_settings").$type<RoutineNoopSkipSettings>().notNull().default({}),
+    runContextPolicy: jsonb("run_context_policy").$type<RunContextPolicy>(),
     latestRevisionId: uuid("latest_revision_id"),
     latestRevisionNumber: integer("latest_revision_number").notNull().default(1),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
@@ -125,6 +138,11 @@ export const routineTriggers = pgTable(
     secretId: uuid("secret_id").references(() => companySecrets.id, { onDelete: "set null" }),
     signingMode: text("signing_mode"),
     replayWindowSec: integer("replay_window_sec"),
+    // `event` triggers only: subscription to an event source plus its match filter and grouping.
+    eventSourceId: uuid("event_source_id").references(() => eventSources.id, { onDelete: "cascade" }),
+    eventMatch: jsonb("event_match").$type<EventMatch>(),
+    eventGrouping: jsonb("event_grouping").$type<EventGrouping>(),
+    fallback: boolean("fallback").notNull().default(false),
     lastRotatedAt: timestamp("last_rotated_at", { withTimezone: true }),
     lastResult: text("last_result"),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
@@ -140,6 +158,9 @@ export const routineTriggers = pgTable(
     nextRunIdx: index("routine_triggers_next_run_idx").on(table.nextRunAt),
     publicIdIdx: index("routine_triggers_public_id_idx").on(table.publicId),
     publicIdUq: uniqueIndex("routine_triggers_public_id_uq").on(table.publicId),
+    eventSourceIdx: index("routine_triggers_event_source_idx")
+      .on(table.eventSourceId)
+      .where(sql`${table.eventSourceId} is not null`),
   }),
 );
 
@@ -161,6 +182,8 @@ export const routineRuns = pgTable(
     linkedIssueId: uuid("linked_issue_id").references(() => issues.id, { onDelete: "set null" }),
     coalescedIntoRunId: uuid("coalesced_into_run_id"),
     failureReason: text("failure_reason"),
+    // `event` runs: the delivery that produced the run, so a re-claimed delivery can skip routines that already succeeded.
+    eventDeliveryId: uuid("event_delivery_id").references(() => eventDeliveries.id, { onDelete: "set null" }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -177,6 +200,9 @@ export const routineRuns = pgTable(
     dispatchFingerprintIdx: index("routine_runs_dispatch_fingerprint_idx").on(table.routineId, table.dispatchFingerprint),
     linkedIssueIdx: index("routine_runs_linked_issue_idx").on(table.linkedIssueId),
     idempotencyIdx: index("routine_runs_trigger_idempotency_idx").on(table.triggerId, table.idempotencyKey),
+    eventDeliveryIdx: index("routine_runs_event_delivery_idx")
+      .on(table.eventDeliveryId, table.routineId)
+      .where(sql`${table.eventDeliveryId} is not null`),
   }),
 );
 
@@ -190,3 +216,31 @@ export const routineWebhookTestReceipts = pgTable("routine_webhook_test_receipts
 }, (table) => ({
   deliveryUq: uniqueIndex("routine_webhook_test_receipts_delivery_uq").on(table.triggerId, table.deliveryKeyHash),
 }));
+
+/**
+ * Single source of truth for event-group cooldown and repeat counting. The
+ * group's issue keeps `originKind = routine_execution` and
+ * `originFingerprint = fingerprint`; this row carries what the issue cannot.
+ */
+export const routineEventGroups = pgTable(
+  "routine_event_groups",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+    routineId: uuid("routine_id").notNull().references(() => routines.id, { onDelete: "cascade" }),
+    fingerprint: text("fingerprint").notNull(),
+    issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    lastCommentAt: timestamp("last_comment_at", { withTimezone: true }),
+    repeatCount: integer("repeat_count").notNull().default(0),
+    lastSeverity: text("last_severity").notNull(),
+    lastState: text("last_state").notNull(),
+  },
+  (table) => ({
+    groupUq: uniqueIndex("routine_event_groups_routine_fingerprint_issue_uq").on(table.routineId, table.fingerprint, table.issueId),
+    routineFingerprintIdx: index("routine_event_groups_routine_fingerprint_idx").on(table.routineId, table.fingerprint),
+    issueIdx: index("routine_event_groups_issue_idx").on(table.issueId),
+    companyIdx: index("routine_event_groups_company_idx").on(table.companyId),
+  }),
+);

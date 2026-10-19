@@ -6,6 +6,7 @@ import {
 import { automationWakeSettingsSchema } from "../automation-wake.js";
 import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
 import { DUPLICATE_DETECTION_MODES } from "../duplicate-detection.js";
+import { runContextPolicySchema } from "../run-context.js";
 import { objectWithoutDefaults } from "./partial.js";
 
 const logoAssetIdSchema = z.string().guid().nullable().optional();
@@ -44,6 +45,7 @@ export const updateCompanySchema = objectWithoutDefaults(
       duplicateDetectionMode: z.enum(DUPLICATE_DETECTION_MODES).optional(),
       automationWakeSettings: automationWakeSettingsSchema.optional(),
       routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
+      runContextPolicy: runContextPolicySchema.nullable().optional(),
       feedbackDataSharingEnabled: z.boolean().optional(),
       feedbackDataSharingConsentAt: z.coerce.date().nullable().optional(),
       feedbackDataSharingConsentByUserId: z.string().min(1).nullable().optional(),
