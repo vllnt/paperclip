@@ -2,6 +2,7 @@
 
 import { act } from "react";
 import type { ReactNode } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueFiltersPopover } from "./IssueFiltersPopover";
@@ -28,8 +29,13 @@ vi.mock("@/components/ui/button", () => ({
   ),
 }));
 
+const checkboxRenders = vi.hoisted(() => ({ count: 0 }));
+
 vi.mock("@/components/ui/checkbox", () => ({
-  Checkbox: ({ checked }: { checked?: boolean }) => <input type="checkbox" checked={checked} readOnly />,
+  Checkbox: ({ checked, onCheckedChange }: { checked?: boolean; onCheckedChange?: (checked: boolean) => void }) => {
+    checkboxRenders.count += 1;
+    return <input type="checkbox" checked={checked} onChange={(event) => onCheckedChange?.(event.target.checked)} />;
+  },
 }));
 
 vi.mock("./StatusIcon", () => ({
@@ -144,6 +150,163 @@ describe("IssueFiltersPopover", () => {
     expect(container.querySelector('[data-testid="popover-content"]')?.querySelectorAll(".overflow-y-auto").length).toBe(0);
 
     act(() => root.unmount());
+  });
+
+  describe("deferred option lists", () => {
+    const projects = Array.from({ length: 40 }, (_, index) => ({ id: `project-${index + 1}`, name: `Project ${index + 1}` }));
+    const labels = Array.from({ length: 40 }, (_, index) => ({ id: `label-${index + 1}`, name: `Label ${index + 1}`, color: "#336699" }));
+    const agents = Array.from({ length: 40 }, (_, index) => ({ id: `agent-${index + 1}`, name: `Agent ${index + 1}` }));
+    const workspaces = Array.from({ length: 40 }, (_, index) => ({ id: `workspace-${index + 1}`, name: `Workspace ${index + 1}` }));
+    const renderPopover = (root: ReturnType<typeof createRoot>, presentation: "streamlined" | "legacy") =>
+      root.render(
+        <IssueFiltersPopover
+          presentation={presentation}
+          state={defaultIssueFilterState}
+          onChange={vi.fn()}
+          activeFilterCount={0}
+          currentUserId="user-1"
+          agents={agents}
+          projects={projects}
+          labels={labels}
+          workspaces={workspaces}
+          enableExternalObjectFilters={false}
+        />,
+      );
+    const renderProjects = (
+      root: ReturnType<typeof createRoot>,
+      selected: string[],
+      options: { onChange?: () => void; projects?: typeof projects } = {},
+    ) =>
+      root.render(
+        <IssueFiltersPopover
+          presentation="streamlined"
+          state={{ ...defaultIssueFilterState, projects: selected }}
+          onChange={options.onChange ?? vi.fn()}
+          activeFilterCount={selected.length}
+          projects={options.projects ?? projects}
+          enableExternalObjectFilters={false}
+        />,
+      );
+    const rows = (key: string) => container.querySelectorAll(`[data-filter-options="${key}"] label`).length;
+    const projectCheckbox = (name: string) =>
+      Array.from(container.querySelectorAll('[data-filter-options="projects"] label'))
+        .find((label) => label.textContent === name)
+        ?.querySelector("input");
+
+    it.each(["streamlined", "legacy"] as const)("paints the sections first and fills the long lists in a later pass (%s)", async (presentation) => {
+      const root = createRoot(container);
+      await act(async () => {
+        flushSync(() => renderPopover(root, presentation));
+
+        // First paint: the sections and their fixed rows are there, the long lists are empty.
+        expect(container.querySelector('[data-filter-options="projects"]')).not.toBeNull();
+        expect(container.querySelector('[data-filter-options="labels"]')).not.toBeNull();
+        expect(container.querySelector('[data-filter-options="workspaces"]')).not.toBeNull();
+        expect(rows("projects")).toBe(0);
+        expect(rows("labels")).toBe(0);
+        expect(rows("workspaces")).toBe(0);
+        expect(rows("responsible")).toBe(2);
+        expect(container.textContent).toContain("No responsible");
+        expect(container.textContent).toContain("Me");
+        expect(container.textContent).toContain("Status");
+      });
+
+      // Deferred pass: every option is there, with the same markup as before.
+      expect(rows("projects")).toBe(40);
+      expect(rows("labels")).toBe(40);
+      expect(rows("workspaces")).toBe(40);
+      expect(rows("responsible")).toBe(2 + 40);
+      expect(container.querySelector('[data-filter-options="projects"]')?.textContent).toContain("Project 40");
+      expect(container.querySelector('[data-filter-options="labels"] span[style]')).not.toBeNull();
+
+      await act(async () => root.unmount());
+    });
+
+    it("checks preselected rows only once the list has filled and follows later state changes", async () => {
+      const root = createRoot(container);
+      await act(async () => {
+        flushSync(() => renderProjects(root, ["project-2"]));
+        expect(rows("projects")).toBe(0);
+      });
+
+      expect(rows("projects")).toBe(40);
+      expect(projectCheckbox("Project 2")?.checked).toBe(true);
+      expect(projectCheckbox("Project 3")?.checked).toBe(false);
+
+      // Same options, new selection: the filled rows must show the new state.
+      await act(async () => renderProjects(root, ["project-3"]));
+      expect(projectCheckbox("Project 2")?.checked).toBe(false);
+      expect(projectCheckbox("Project 3")?.checked).toBe(true);
+
+      await act(async () => root.unmount());
+    });
+
+    it("toggles a row of the deferred list through onChange", async () => {
+      const root = createRoot(container);
+      const onChange = vi.fn();
+      await act(async () => renderProjects(root, [], { onChange }));
+
+      await act(async () => projectCheckbox("Project 3")?.click());
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ projects: ["project-3"] });
+
+      await act(async () => root.unmount());
+    });
+
+    it("does not queue another pass over the list when the parent re-renders with equal options", async () => {
+      const root = createRoot(container);
+      await act(async () => renderProjects(root, []));
+      expect(rows("projects")).toBe(40);
+
+      // Baseline: the same options array, a new selection.
+      checkboxRenders.count = 0;
+      await act(async () => renderProjects(root, ["project-1"]));
+      const sameReference = checkboxRenders.count;
+
+      // Callers rebuild the array with `.map(...)` on every render: equal content, new reference.
+      checkboxRenders.count = 0;
+      await act(async () => renderProjects(root, [], { projects: projects.map((project) => ({ ...project })) }));
+      expect(checkboxRenders.count).toBe(sameReference);
+      expect(rows("projects")).toBe(40);
+
+      await act(async () => root.unmount());
+    });
+
+    it("narrows and restores a long list through its search once the list has filled", async () => {
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(
+          <IssueFiltersPopover
+            presentation="streamlined"
+            state={defaultIssueFilterState}
+            onChange={vi.fn()}
+            activeFilterCount={0}
+            projects={projects}
+            enableExternalObjectFilters={false}
+          />,
+        );
+      });
+      expect(rows("projects")).toBe(40);
+
+      const input = container.querySelector<HTMLInputElement>('input[aria-label="Search projects"]');
+      expect(input).not.toBeNull();
+      await act(async () => {
+        const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        valueSetter?.call(input, "Project 40");
+        input?.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(rows("projects")).toBe(1);
+      expect(container.querySelector('[data-filter-options="projects"]')?.textContent).toContain("Project 40");
+
+      await act(async () => {
+        const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        valueSetter?.call(input, "");
+        input?.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(rows("projects")).toBe(40);
+
+      await act(async () => root.unmount());
+    });
   });
 
   it("restores per-section scrolling and hides added option searches in legacy presentation", () => {
