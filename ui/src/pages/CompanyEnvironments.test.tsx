@@ -155,6 +155,10 @@ const mockAgentsApi = vi.hoisted(() => ({
   list: vi.fn(),
   update: vi.fn(),
 }));
+const mockResourceCapacityApi = vi.hoisted(() => ({
+  instance: vi.fn(),
+  company: vi.fn(),
+}));
 
 vi.mock("@/context/CompanyContext", () => ({
   useCompany: () => ({
@@ -187,6 +191,10 @@ vi.mock("@/api/secrets", () => ({
 
 vi.mock("@/api/agents", () => ({
   agentsApi: mockAgentsApi,
+}));
+
+vi.mock("@/api/resourceCapacity", () => ({
+  resourceCapacityApi: mockResourceCapacityApi,
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -535,6 +543,11 @@ describe("CompanyEnvironments — test provider button", () => {
     }));
     mockAgentsApi.list.mockResolvedValue([]);
     mockAgentsApi.update.mockResolvedValue({});
+    mockResourceCapacityApi.company.mockResolvedValue({
+      generatedAt: "2026-10-09T12:00:00.000Z",
+      companyId: "company-1",
+      environments: [],
+    });
     // Each probe stays pending until its resolver is called, so the testing
     // state remains observable and can be settled per environment.
     mockEnvironmentsApi.probe.mockImplementation(
@@ -588,6 +601,64 @@ describe("CompanyEnvironments — test provider button", () => {
     expect(buttonsAfter[1].textContent?.trim()).toBe("Test provider");
     expect(buttonsAfter[1].disabled).toBe(false);
     expect(mockEnvironmentsApi.probe).toHaveBeenCalledExactlyOnceWith("env-1", "company-1");
+  });
+
+  it("shows CPU, memory and disk on the environments the company's agents run on", async () => {
+    const GIB = 1024 ** 3;
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mockEnvironmentsApi.list.mockResolvedValue([
+      { id: "env-1", name: "Worker", driver: "ssh", description: null, config: { host: "worker.example.invalid" } },
+      { id: "env-2", name: "Beta", driver: "sandbox", description: null, config: { provider: "e2b" } },
+      { id: "env-3", name: "Unused", driver: "ssh", description: null, config: { host: "unused.example.invalid" } },
+    ]);
+    const snapshot = {
+      metricLevels: {},
+      sampledAt: new Date().toISOString(),
+      lastSuccessAt: new Date().toISOString(),
+      readingStatus: "ok",
+      cpuCount: 8,
+      load1: 1,
+      load5: 2,
+      load15: 3,
+      loadPerCore: 0.25,
+      memTotalBytes: 16 * GIB,
+      memAvailableBytes: 8 * GIB,
+      disks: [{ labels: ["workspaces"], totalBytes: 100 * GIB, freeBytes: 3 * GIB, freePercent: 3 }],
+    };
+    mockResourceCapacityApi.company.mockResolvedValue({
+      generatedAt: "2026-10-09T12:00:00.000Z",
+      companyId: "company-1",
+      environments: [
+        { ...snapshot, environmentId: "env-1", environmentName: "Worker", driver: "ssh", sampling: "sampled", level: "critical" },
+        { ...snapshot, environmentId: "env-2", environmentName: "Beta", driver: "sandbox", sampling: "unsupported", level: "unknown" },
+      ],
+    });
+
+    await act(async () => {
+      root!.render(renderCompanyEnvironments(queryClient));
+    });
+    await flushReact();
+
+    expect(mockResourceCapacityApi.company).toHaveBeenCalledWith("company-1");
+    const text = container.textContent ?? "";
+    expect(text).toContain("Critical");
+    expect(text).toContain("disk workspaces 3.0 GiB free (3%) · memory 8.0 GiB of 16.0 GiB available · load 0.25/core");
+    expect(text.match(/disk workspaces/g)).toHaveLength(1);
+  });
+
+  it("says when resource capacity cannot be loaded and still lists environments", async () => {
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mockResourceCapacityApi.company.mockRejectedValue(new ApiError("Server unavailable", 503, null));
+
+    await act(async () => {
+      root!.render(renderCompanyEnvironments(queryClient));
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("Resource capacity is unavailable: Server unavailable.");
+    expect(testProviderButtons(container)).toHaveLength(2);
   });
 
   it("explains that successful sandbox provider tests use a temporary sandbox", async () => {

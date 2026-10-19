@@ -57,7 +57,18 @@ describe("the GitHub credentials route and a caller that gave up", () => {
     return { request, answered, abandon: () => { request.destroy(); answered.catch(() => undefined); } };
   }
 
-  it("answers with the resolver's decision, and hands it the run, the operation and a live signal", async () => {
+  it.each([
+    { name: "normal operation", requestOperation: operation },
+    {
+      name: "forged caller and operation identities",
+      requestOperation: {
+        ...operation,
+        caller: { agentId: "other-agent", runId: "other-run" },
+        agentId: "other-agent",
+        runId: "other-run",
+      },
+    },
+  ])("answers with the resolver's decision, and hands it the run, the operation and a live signal ($name)", async ({ requestOperation }) => {
     await start();
     let seen: Seen | null = null;
     access.resolve.mockImplementation(async (_db: unknown, run: unknown, reported: unknown, options?: { signal?: AbortSignal }) => {
@@ -66,11 +77,14 @@ describe("the GitHub credentials route and a caller that gave up", () => {
       return { status: "available", env: { GH_TOKEN: "t" } };
     });
 
-    const response = await ask().answered;
+    const response = await ask({ operation: requestOperation }).answered;
 
     expect(response.status).toBe(200);
     expect(JSON.parse(response.body)).toEqual({ status: "available", env: { GH_TOKEN: "t" } });
-    expect((seen as Seen | null)?.operation).toEqual(operation);
+    expect((seen as Seen | null)?.operation).toEqual({
+      ...operation,
+      caller: { agentId: "agent-1", runId: "run-1" },
+    });
     expect((seen as Seen | null)?.signal?.aborted).toBe(false);
   });
 

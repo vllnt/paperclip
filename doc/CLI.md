@@ -544,7 +544,7 @@ npx paperclipai agent pause <agent-id>
 npx paperclipai agent resume <agent-id>
 npx paperclipai agent approve <agent-id>
 npx paperclipai agent terminate <agent-id>
-npx paperclipai agent heartbeat:invoke <agent-id>
+npx paperclipai agent heartbeat:invoke <agent-id> [--issue <issue-id>]
 npx paperclipai agent claude-login <agent-id>
 npx paperclipai agent local-cli <agent-id-or-shortname> --company-id <company-id>
 ```
@@ -1078,6 +1078,18 @@ npx paperclipai environment update <environment-id> --payload-json '{...}'
 npx paperclipai environment delete <environment-id>
 npx paperclipai environment probe <environment-id>
 npx paperclipai environment probe-config --company-id <company-id> --payload-json '{...}'
+```
+
+Resource capacity: free disk, available memory and load per CPU core, with a
+level (`ok`, `low`, `critical`, or `unknown` when nothing was measured in the
+last 15 minutes). Members and agents of a company see the environments its
+agents run on; `--instance` (every server host and environment) is for instance
+admins.
+
+```sh
+npx paperclipai capacity --company-id <company-id>
+npx paperclipai capacity --instance
+npx paperclipai environment capacity <environment-id>
 ```
 
 ```sh
