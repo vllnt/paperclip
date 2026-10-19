@@ -18,6 +18,10 @@ const PROVIDER_QUOTA_RE = new RegExp(
     String.raw`out\s+of\s+extra\s+usage`,
     String.raw`insufficient_quota`,
     String.raw`exceeded\s+your\s+current\s+quota`,
+    // xAI answers an empty team balance with a 403, not a 429, and names no reset.
+    String.raw`used\s+all\s+available\s+credits`,
+    String.raw`monthly\s+spending\s+limit`,
+    String.raw`personal-team-blocked:spending-limit`,
     String.raw`anthropic-ratelimit-unified-status\s*:\s*rejected`,
   ].join("|"),
   "i",
