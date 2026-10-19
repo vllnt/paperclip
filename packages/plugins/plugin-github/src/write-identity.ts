@@ -31,7 +31,7 @@ import { boardScope, requireInstanceAdmin } from "./setup.js";
 import { GitHubError, type GitHubClient } from "./github.js";
 import { SKILLS_LOCK_FILE, TIERS_FILE, parseAgentMergeablePaths, parseProtectedPaths, protectedFiles, protectedPatterns, skillsLockException, splitReleased, type AgentMergeableRule, type ChangedFile } from "./protected-paths.js";
 import type { Catalog, Repository } from "./contracts.js";
-import { UserAuthorization, UserAuthorizationError, type FenceStatus } from "./user-authorization.js";
+import { UserAuthorization, UserAuthorizationError, type FenceStatus, type UserAuthorizationState } from "./user-authorization.js";
 import { CLOCK_SKEW_ALERT_MS } from "./clock.js";
 import { checkGitObjectForSigning, parseSshSigningKey, sshSign, type SshSigningKey } from "./ssh-signature.js";
 import { createWriteAlerts } from "./write-alerts.js";
@@ -358,9 +358,12 @@ export function registerWriteIdentity(
     return key;
   }
 
-  /** The authorizing person, once the fence was verified recently. Throws a user-facing reason otherwise. */
-  async function fencedUser(companyId: string): Promise<{ login: string; userId: string }> {
-    const state = await users.state(companyId);
+  /**
+   * The authorizing person, once the fence was verified recently. Throws a user-facing reason otherwise.
+   * `read` is the authorization the same decision has just read; without it the authorization is read now.
+   */
+  async function fencedUser(companyId: string, read?: UserAuthorizationState | null): Promise<{ login: string; userId: string }> {
+    const state = read === undefined ? await users.state(companyId) : read;
     if (!state) throw new Denied("Authorize the GitHub user for this company first (user-authorization.start).");
     if (state.needsReauthorization) throw new Denied(state.needsReauthorization);
     const fence = state.fence;
@@ -813,6 +816,8 @@ export function registerWriteIdentity(
     merge?: boolean; autoMerge?: boolean; retarget?: boolean; workflowPush?: GitHubWorkflowPush; route?: string;
     /** The agent and run that made the call, from the host (never from the command): scoped grants match on the agent. */
     agentId?: string | null; runId?: string | null;
+    /** The authorization the caller has just read, so the first gate does not read it again. */
+    authorization?: UserAuthorizationState | null;
   }) {
     if (!current.enabled) throw new Denied("GitHub writes are switched off for this company (write identity kill switch).");
     if (input.repository === null && input.action !== "project") {
@@ -824,7 +829,7 @@ export function registerWriteIdentity(
     const byBase = off.includes("editWorkflows") && input.repository !== null ? input.workflowPush : undefined;
     const refused = byBase ? off.filter(action => action !== "editWorkflows") : off;
     if (refused.length) throw new Denied(privilegedRefusal(current.privileged, refused, input.agentId));
-    const user = await fencedUser(companyId);
+    const user = await fencedUser(companyId, input.authorization);
     // Phase 1: no auto-merge and no merge queue as the App user (GitHub would merge later, unchecked).
     if (input.autoMerge) throw new Denied(`Agents do not enable auto-merge or the merge queue: a human must merge this pull request, ${current.userLogin ?? "the App user"} in the GitHub web UI.`);
     // A pull request checked against one base could otherwise be retargeted (for example to main) after the merge guard.
@@ -946,7 +951,7 @@ export function registerWriteIdentity(
       const action = request.action ?? "other";
       const granted = await authorizeUserWrite(companyId, current, { repository, action, privileged: request.privileged, pullRequest: request.pullRequest, expectedHeadSha: request.expectedHeadSha,
         merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true, workflowPush: request.workflowPush, route: request.route,
-        agentId: request.agentId, runId: request.runId });
+        agentId: request.agentId, runId: request.runId, authorization: state });
       return {
         identity: "user", credential: { token: granted.token, ...granted.user },
         ...(await signing()), bodyFooter: current.bodyFooter, ...(granted.evidence ? { evidence: granted.evidence } : {}),

@@ -1,6 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import { pluginState, plugins, type Db } from "@paperclipai/db";
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import {
   GITHUB_WRITE_IDENTITY_STATE,
   classifyGitHubCommand,
@@ -24,6 +25,7 @@ import {
   type GitHubWriteIdentityPolicy,
   type PaperclipPluginManifestV1,
 } from "@paperclipai/shared";
+import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { protectedBranchRefusal } from "./github-protected-branches.js";
 
@@ -543,12 +545,51 @@ export function registerGitHubWriteIdentityWorkers(workers: Pick<PluginWorkerMan
   pluginWorkers = workers;
 }
 
-async function callPlugin(record: GitHubIdentityPolicyRecord, key: string | undefined, companyId: string, params: Record<string, unknown>, timeoutMs: number) {
-  if (!key || !record.ready || record.ambiguous || !pluginWorkers) return null;
-  return pluginWorkers.call(record.pluginId, "performAction", {
-    key, params: { companyId, ...params }, companyId,
-    actorContext: { type: "system", userId: null, agentId: null, runId: null, companyId },
-  }, timeoutMs);
+/** Why the GitHub plugin gave no usable answer. */
+type GitHubPluginCallFailure = "timeout" | "worker_error" | "invalid_response" | "not_ready" | "ambiguous";
+
+/**
+ * An error's class name and code, only when they look like identifiers. Never
+ * its message, stack or data: provider errors may include credentials.
+ */
+function errorIdentifiers(error: unknown): { errorName?: string; errorCode?: number | string } {
+  if (!error || typeof error !== "object") return {};
+  const { name, code } = error as { name?: unknown; code?: unknown };
+  return {
+    ...(typeof name === "string" && /^[A-Z][A-Za-z0-9]{0,63}$/.test(name) ? { errorName: name } : {}),
+    ...(Number.isSafeInteger(code) ? { errorCode: code as number } : {}),
+    ...(typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? { errorCode: code } : {}),
+  };
+}
+
+/**
+ * Asks the GitHub plugin one question. Null when it gives no usable answer, so
+ * the caller fails closed; that failure is logged once, without error text,
+ * parameters or the answer.
+ */
+async function askPlugin<T>(
+  record: GitHubIdentityPolicyRecord, key: string | undefined, companyId: string,
+  params: Record<string, unknown>, schema: z.ZodType<T>, timeoutMs: number,
+): Promise<T | null> {
+  const startedAt = Date.now();
+  const fail = (outcome: GitHubPluginCallFailure, error?: unknown): null => {
+    logger.warn({
+      companyId, pluginId: record.pluginId, actionKey: key ?? null, outcome, elapsedMs: Date.now() - startedAt, ...errorIdentifiers(error),
+    }, "GitHub plugin gave no usable answer; the operation fails closed");
+    return null;
+  };
+  if (record.ambiguous) return fail("ambiguous");
+  if (!key || !record.ready || !pluginWorkers) return fail("not_ready");
+  try {
+    const parsed = schema.safeParse(await pluginWorkers.call(record.pluginId, "performAction", {
+      key, params: { companyId, ...params }, companyId,
+      actorContext: { type: "system", userId: null, agentId: null, runId: null, companyId },
+    }, timeoutMs));
+    return parsed.success ? parsed.data : fail("invalid_response");
+  } catch (error) {
+    const timedOut = (error as { code?: unknown } | null)?.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT;
+    return fail(timedOut ? "timeout" : "worker_error", error);
+  }
 }
 
 /**
@@ -564,21 +605,17 @@ export async function resolveGitHubWriteIdentityDecision(
   const policy = record === undefined ? await loadGitHubIdentityPolicy(db, input.companyId) : record;
   if (!policy) return null;
   const { operation } = input;
-  try {
-    const raw = await callPlugin(policy, policy.manifest.projectRepositories?.writeIdentityAction, input.companyId, {
-      repository: operation.repository, access: operation.access, action: operation.action, privileged: operation.privileged,
-      wiki: operation.wiki, pullRequest: operation.pullRequest, expectedHeadSha: operation.expectedHeadSha,
-      ...(operation.merge ? { merge: true } : {}), ...(operation.autoMerge ? { autoMerge: true } : {}), ...(operation.retarget ? { retarget: true } : {}),
-      ...(operation.workflowPush ? { workflowPush: operation.workflowPush } : {}),
-      ...(operation.route ? { route: operation.route } : {}),
-      ...(operation.caller ? { agentId: operation.caller.agentId, runId: operation.caller.runId } : {}),
-      ...(input.fallback ? { fallback: true } : {}),
-    }, 15_000);
-    return raw === null ? UNAVAILABLE : decisionSchema.parse(raw) as GitHubWriteIdentityDecision;
-  } catch {
-    // Provider errors may include credentials; expose only a safe reason.
-    return UNAVAILABLE;
-  }
+  const decision = await askPlugin(policy, policy.manifest?.projectRepositories?.writeIdentityAction, input.companyId, {
+    repository: operation.repository, access: operation.access, action: operation.action, privileged: operation.privileged,
+    wiki: operation.wiki, pullRequest: operation.pullRequest, expectedHeadSha: operation.expectedHeadSha,
+    ...(operation.merge ? { merge: true } : {}), ...(operation.autoMerge ? { autoMerge: true } : {}), ...(operation.retarget ? { retarget: true } : {}),
+    ...(operation.workflowPush ? { workflowPush: operation.workflowPush } : {}),
+    ...(operation.route ? { route: operation.route } : {}),
+    ...(operation.caller ? { agentId: operation.caller.agentId, runId: operation.caller.runId } : {}),
+    ...(input.fallback ? { fallback: true } : {}),
+  }, decisionSchema, 15_000);
+  // Provider errors may include credentials; expose only a safe reason.
+  return decision === null ? UNAVAILABLE : decision as GitHubWriteIdentityDecision;
 }
 
 const signSchema = z.union([
@@ -590,10 +627,6 @@ const signSchema = z.union([
 export async function resolveGitHubSignature(db: Db, companyId: string, payload: string): Promise<GitHubSignDecision> {
   const record = await loadGitHubIdentityPolicy(db, companyId);
   if (!record) return { unavailable: "Commit signing needs the GitHub plugin's App user identity for this company." };
-  try {
-    const raw = await callPlugin(record, record.manifest.projectRepositories?.signCommitAction, companyId, { payload }, 15_000);
-    return raw === null ? { unavailable: "Commit signing is temporarily unavailable." } : signSchema.parse(raw);
-  } catch {
-    return { unavailable: "Commit signing is temporarily unavailable." };
-  }
+  const decision = await askPlugin(record, record.manifest?.projectRepositories?.signCommitAction, companyId, { payload }, signSchema, 15_000);
+  return decision ?? { unavailable: "Commit signing is temporarily unavailable." };
 }
