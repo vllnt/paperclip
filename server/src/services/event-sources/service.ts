@@ -35,6 +35,7 @@ import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import { routineService } from "../routines.js";
 import { secretService } from "../secrets.js";
 import { verifyBearerAuthorization, verifyHmacSha256Signature } from "../webhook-auth.js";
+import { registerGatedEventHooks, type GatedEventSettlement } from "../routine-gates/hooks.js";
 import { previewEventRoutine } from "./event-dispatch.js";
 import { pruneEventData } from "./prune.js";
 import { normalizeEvent } from "./normalizers.js";
@@ -200,7 +201,8 @@ function isSuccessfulOutcome(outcome: EventRoutineOutcome | undefined): boolean 
 
 function summarizeOutcomes(outcomes: EventRoutineOutcome[]): EventDeliveryStatus {
   const succeeded = outcomes.filter((outcome) => isSuccessfulOutcome(outcome));
-  if (succeeded.some((o) => o.status === "issue_created" || o.status === "grouped" || o.status === "recovered")) {
+  // A run parked behind a gate script counts as dispatched; its final outcome lands on the delivery later.
+  if (succeeded.some((o) => o.status === "issue_created" || o.status === "grouped" || o.status === "recovered" || o.status === "gating")) {
     return "dispatched";
   }
   if (succeeded.some((o) => o.status === "storm_folded")) return "storm_folded";
@@ -759,6 +761,72 @@ export function eventSourceService(
       },
     };
   }
+
+  // ── gated runs ────────────────────────────────────────────────────────────
+
+  /**
+   * A routine's gate script finished after the delivery was answered `gating`: record the final
+   * outcome on the delivery. If the routine failed permanently, A's promise that an alert never
+   * vanishes silently still holds, so the source's fallback routines take over now, exactly as they
+   * would have had the failure been immediate.
+   */
+  async function settleGatedOutcome(settlement: GatedEventSettlement): Promise<void> {
+    const { deliveryId, routineId, outcome } = settlement;
+    if (!deliveryId) return;
+    const mergeInto = async (id: string, value: EventRoutineOutcome) => {
+      await db.execute(sql`
+        update event_deliveries
+        set routine_outcomes = routine_outcomes || jsonb_build_object(${id}::text, ${JSON.stringify(value)}::jsonb)
+        where id = ${deliveryId}
+      `);
+    };
+    await mergeInto(routineId, outcome);
+    if (outcome.status !== "failed_permanent") return;
+
+    const delivery = await db
+      .select({ sourceId: eventDeliveries.sourceId, outcomes: eventDeliveries.routineOutcomes })
+      .from(eventDeliveries)
+      .where(eq(eventDeliveries.id, deliveryId))
+      .then((rows) => rows[0] ?? null);
+    if (!delivery) return;
+    const source = await getSourceRow(delivery.sourceId).catch(() => null);
+    if (!source) return;
+    const event = settlement.event as NormalizedEvent;
+    const subscribers = await findSubscribers(source, event);
+    const fallbackIds = new Set(subscribers.fallback.map((subscriber) => subscriber.routine.id));
+    const outcomes: Record<string, EventRoutineOutcome> = { ...(delivery.outcomes ?? {}), [routineId]: outcome };
+    // The fallback applies only when every routine that took the event on a regular trigger failed permanently.
+    const regular = Object.entries(outcomes).filter(([id]) => !fallbackIds.has(id));
+    const fallbackNeeded = regular.length > 0 && regular.every(([, value]) => value.status === "failed_permanent");
+    if (!fallbackNeeded) return;
+    for (const subscriber of subscribers.fallback) {
+      if (isSuccessfulOutcome(outcomes[subscriber.routine.id])) continue;
+      const fallbackOutcome = await dispatchGate.run(() =>
+        routinesSvc.dispatchEvent({
+          routine: subscriber.routine,
+          trigger: subscriber.trigger,
+          event,
+          deliveryId,
+          ...stormSlotFor(source.id),
+          now: new Date(now()),
+        }),
+      );
+      outcomes[subscriber.routine.id] = fallbackOutcome;
+      await mergeInto(subscriber.routine.id, fallbackOutcome);
+    }
+  }
+
+  registerGatedEventHooks(db, {
+    settle: settleGatedOutcome,
+    stormSlotForDelivery: async (deliveryId) => {
+      const delivery = await db
+        .select({ sourceId: eventDeliveries.sourceId })
+        .from(eventDeliveries)
+        .where(eq(eventDeliveries.id, deliveryId))
+        .then((rows) => rows[0] ?? null);
+      return delivery ? stormSlotFor(delivery.sourceId) : null;
+    },
+  });
 
   // ── dry run ───────────────────────────────────────────────────────────────
 

@@ -1,5 +1,6 @@
 import type { AutomationWakeSettings } from "../automation-wake.js";
 import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
+import type { TransientRetryPolicy } from "../transient-retry-policy.js";
 import type { DuplicateDetectionMode } from "../duplicate-detection.js";
 import type { RunContextPolicy } from "../run-context.js";
 import type {
@@ -36,6 +37,7 @@ export interface Company {
   automationWakeSettings: AutomationWakeSettings;
   routineNoopSkipSettings: RoutineNoopSkipSettings;
   runContextPolicy: RunContextPolicy | null;
+  transientRetryPolicy: TransientRetryPolicy;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

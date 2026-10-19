@@ -4940,6 +4940,26 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/routines/{id}/gate/test",
+  tags: ["routines"],
+  summary: "Test a routine gate without dispatching",
+  description:
+    "Runs the configured gate once without creating a routine run, issue, or wake. " +
+    "Available to board users and the routine's assigned agent. Returns the redacted gate result " +
+    "and a verdict of wake, skip, fail_open, or unavailable. Returns 422 when no gate is configured.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/routines/{id}/triggers",
   tags: ["routines"],
   summary: "Create a routine trigger",
@@ -5155,11 +5175,37 @@ registry.registerPath({
   path: "/api/companies/{companyId}/goals",
   tags: ["goals"],
   summary: "Create a goal",
+  description:
+    "Only the board may set `kind`, `horizon`, `targetDate` or `successCriteria`, or change or delete a short term goal or a " +
+    "milestone, because the company focus shows them to every agent. Anyone else gets 403.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createGoalSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/goals/focus",
+  tags: ["goals"],
+  summary: "Get the company's current focus",
+  description:
+    "Active short-horizon goals, nearest target date first, with progress and open milestones. Agents read this to choose what to " +
+    "work on; it also appears as `companyFocus` in an issue's heartbeat context.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/goals/progress",
+  tags: ["goals"],
+  summary: "Get progress for every goal in a company",
+  description:
+    "Keyed by goal ID. Counts tasks linked to the goal or any goal below it; cancelled, hidden and conversation tasks do not count.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -5176,11 +5222,14 @@ registry.registerPath({
   path: "/api/goals/{id}",
   tags: ["goals"],
   summary: "Update a goal",
+  description:
+    "Only the board may set `kind`, `horizon`, `targetDate` or `successCriteria`, or change or delete a short term goal or a " +
+    "milestone, because the company focus shows them to every agent. Anyone else gets 403.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateGoalSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
 
 registry.registerPath({
@@ -5188,8 +5237,9 @@ registry.registerPath({
   path: "/api/goals/{id}",
   tags: ["goals"],
   summary: "Delete a goal",
+  description: "Only the board may delete a short term goal or a milestone. Anyone else gets 403.",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 // ─── Secrets ─────────────────────────────────────────────────────────────────

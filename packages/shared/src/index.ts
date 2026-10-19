@@ -371,6 +371,7 @@ export * from "./google-workspace-connectors.js";
 export * from "./asana-connectors.js";
 export * from "./github-connectors.js";
 export * from "./company-archive.js";
+export * from "./goal-text.js";
 export {
   BLOCKED_MCP_PROVIDERS,
   SELF_SERVE_MCP_CANDIDATES,
@@ -496,6 +497,9 @@ export {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   GOAL_LEVELS,
   GOAL_STATUSES,
+  GOAL_KINDS,
+  GOAL_HORIZONS,
+  COMPANY_FOCUS_GUIDANCE,
   PROJECT_STATUSES,
   ENVIRONMENT_DRIVERS,
   ENVIRONMENT_STATUSES,
@@ -683,6 +687,8 @@ export {
   type IssueExecutionDecisionOutcome,
   type GoalLevel,
   type GoalStatus,
+  type GoalKind,
+  type GoalHorizon,
   type ProjectStatus,
   type EnvironmentDriver,
   type EnvironmentStatus,
@@ -1275,6 +1281,11 @@ export type {
   IssueTreePreviewTotals,
   IssueTreePreviewWarning,
   Goal,
+  GoalProgress,
+  CompanyFocus,
+  CompanyFocusGoal,
+  CompanyFocusMilestone,
+  IssueCompanyFocus,
   Approval,
   ApprovalComment,
   BudgetPolicy,
@@ -2896,5 +2907,7 @@ export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";
 export * from "./automation-wake.js";
 export * from "./routine-noop-skip.js";
+export * from "./routine-gate.js";
 export * from "./event-sources.js";
 export * from "./run-context.js";
+export * from "./transient-retry-policy.js";
