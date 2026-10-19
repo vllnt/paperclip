@@ -45,6 +45,32 @@ object: `adapterConfig` (keys that override the agent's adapter config for runs 
 `useProjectWorkspace` (boolean). Unknown keys are rejected before the request is sent. Use only one of the
 two options.
 
+### Issue Recovery Actions
+
+```sh
+# Open recovery actions across a company, newest first
+npx paperclipai issue recovery-actions:list [-C <company-id>] [--status active,escalated] [--limit 50] [--json]
+
+# The open recovery action of one issue
+npx paperclipai issue recovery-actions <issue-id>
+
+# Resolve a recovery action
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  [--action-id <id>] [--resolution-note "..."]
+
+# Resolve an execution recovery with a reconciliation (board only)
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  --reconciliation-run-id <run-id> --provider-stopped --action-outcome completed \
+  --outcome-evidence "..." [--workspace-repair-evidence "..."]
+```
+
+`recovery-actions:list` statuses are `active`, `escalated`, `resolved`, and
+`cancelled`; the default is the open ones (`active,escalated`). The limit is
+1-200 (default 50). The list is read-only and does not re-check stale actions.
+For `recovery:resolve`, any reconciliation flag sends an `executionReconciliation`
+object; `--provider-stopped` is required in that case, and evidence texts need
+20-12000 characters.
+
 ### Issue Tree
 
 ```sh
@@ -202,6 +228,25 @@ npx paperclipai approval resubmit <approval-id> [--payload '{"..."}']
 
 # Comment
 npx paperclipai approval comment <approval-id> --body "..."
+```
+
+## Event Source Commands
+
+External signed events that wake routines. See `docs/api/event-sources.md`.
+
+```sh
+npx paperclipai event-sources list --company-id <id> [--include-archived]
+
+# Board only. The ingress URL and signing secret are shown once.
+npx paperclipai event-sources create --company-id <id> --name "Gatus" [--signing-mode hmac_sha256|bearer] [--normalizer generic_v1|gatus]
+
+# Board only. The previous secret stops working immediately.
+npx paperclipai event-sources rotate <source-id>
+
+# Dry run: shows each stage and writes nothing
+npx paperclipai event-sources test <source-id> --file event.json
+
+npx paperclipai event-sources deliveries <source-id> [--status failed] [--limit 50] [--cursor <cursor>]
 ```
 
 ## Activity Commands

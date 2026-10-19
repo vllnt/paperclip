@@ -79,6 +79,8 @@ describe("CompanySettingsNav", () => {
     expect(getCompanySettingsTab("/PAP/company/settings/access")).toBe("members");
     expect(getCompanySettingsTab("/company/settings/invites")).toBe("members");
     expect(getCompanySettingsTab("/PAP/company/settings/secrets")).toBe("secrets");
+    expect(getCompanySettingsTab("/company/settings/event-sources")).toBe("event-sources");
+    expect(getCompanySettingsTab("/PAP/company/settings/event-sources")).toBe("event-sources");
     expect(getCompanySettingsTab("/company/settings/instance/profile")).toBe("instance-profile");
     expect(getCompanySettingsTab("/PAP/company/settings/instance/general")).toBe("general");
     expect(getCompanySettingsTab("/company/settings/instance/environments")).toBe("instance-environments");
@@ -125,6 +127,7 @@ describe("CompanySettingsNav", () => {
           { value: "import", label: "Import" },
           { value: "members", label: "Members" },
           { value: "secrets", label: "Secrets" },
+          { value: "event-sources", label: "Event sources" },
           { value: "instance-profile", label: "Profile" },
           { value: "instance-environments", label: "Environments" },
           { value: "instance-access", label: "Access" },
@@ -166,6 +169,7 @@ describe("CompanySettingsNav", () => {
       "import",
       "members",
       "secrets",
+      "event-sources",
       "instance-profile",
       "instance-environments",
       "instance-access",
