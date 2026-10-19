@@ -1206,4 +1206,128 @@ describe("issue execution policy routes", () => {
       }),
     );
   });
+
+  describe("POST /issues/:id/wait", () => {
+    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const assigneeAgentId = "33333333-3333-4333-8333-333333333333";
+    const otherAgentId = "44444444-4444-4444-8444-444444444444";
+    const waitingIssue = (overrides: Record<string, unknown> = {}) => ({
+      id: issueId,
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-4320",
+      title: "Ship and wait for CI",
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+      monitorAttemptCount: 0,
+      ...overrides,
+    });
+    const agentActor = (agentId: string): TestActor => ({
+      type: "agent",
+      agentId,
+      companyId: "company-1",
+      runId: null,
+    });
+
+    function useIssue(issue: ReturnType<typeof waitingIssue>) {
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+      }));
+      mockDbSelectWhere.mockImplementation(() => ({
+        then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+          Promise.resolve([issue]).then(onFulfilled, onRejected),
+      }) as any);
+    }
+
+    async function waitApp(actor?: TestActor) {
+      vi.doMock("../services/activity-log.js", async () => ({
+        ...(await vi.importActual<typeof import("../services/activity-log.js")>("../services/activity-log.js")),
+        logActivity: mockLogActivity,
+      }));
+      return createApp(actor);
+    }
+
+    it("lets the assignee agent wait on its own issue without changing its status", async () => {
+      useIssue(waitingIssue());
+      const before = Date.now();
+
+      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+        .post(`/api/issues/${issueId}/wait`)
+        .send({ in: "10m", reason: "CI on PR #4320 head abc123" });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ issueId, status: "in_progress", reason: "CI on PR #4320 head abc123" });
+      const nextCheckAt = new Date(res.body.nextCheckAt).getTime();
+      expect(nextCheckAt - before).toBeGreaterThanOrEqual(10 * 60_000);
+      expect(nextCheckAt - before).toBeLessThan(10 * 60_000 + 5_000);
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      const [, patch] = mockIssueService.update.mock.calls[0] as unknown as [string, Record<string, any>];
+      expect(patch.status).toBeUndefined();
+      expect(patch.monitorNextCheckAt).toEqual(new Date(res.body.nextCheckAt));
+      expect(patch.executionPolicy.monitor).toMatchObject({
+        notes: "Waiting: CI on PR #4320 head abc123",
+        scheduledBy: "assignee",
+      });
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.monitor_scheduled",
+          actorType: "agent",
+          actorId: assigneeAgentId,
+          details: expect.objectContaining({ source: "issue.wait", reason: "CI on PR #4320 head abc123" }),
+        }),
+      );
+    });
+
+    it("refuses an agent waiting on an issue assigned to someone else", async () => {
+      useIssue(waitingIssue());
+
+      const res = await request(await waitApp(agentActor(otherAgentId)))
+        .post(`/api/issues/${issueId}/wait`)
+        .send({ in: "10m", reason: "CI" });
+
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([["30s"], ["25h"], ["later"]])("rejects the out-of-bounds delay %s", async (delay) => {
+      useIssue(waitingIssue());
+
+      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+        .post(`/api/issues/${issueId}/wait`)
+        .send({ in: delay, reason: "CI" });
+
+      expect(res.status).toBe(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([["todo"], ["blocked"], ["done"]])("rejects a wait on a %s issue", async (status) => {
+      useIssue(waitingIssue({ status }));
+
+      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+        .post(`/api/issues/${issueId}/wait`)
+        .send({ in: "10m", reason: "CI" });
+
+      expect(res.status).toBe(422);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("lets a board user schedule the wait for the assignee", async () => {
+      useIssue(waitingIssue({ status: "in_review" }));
+
+      const res = await request(await waitApp())
+        .post(`/api/issues/${issueId}/wait`)
+        .send({ in: 900, reason: "Preview deploy" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("in_review");
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+    });
+  });
 });
