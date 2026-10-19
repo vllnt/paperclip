@@ -3,6 +3,23 @@ import { issueIdEqualsText } from "./issue-id-match.js";
 import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
+import {
+  agentEnvBindingPrefix,
+  COOLDOWN_READ_FAILURE_BASE_MS,
+  HARNESS_FALLBACK_RETRY_REASON,
+  HARNESS_FALLBACK_WAKE_REASON,
+  applyClaimedHarnessDispatch,
+  checkRunHarnessCompatibility,
+  classifyQuotaFailure,
+  harnessFallbackService,
+  isLlmHarnessAdapterType,
+  overridesForHarnessTarget,
+  primaryHarnessDispatch,
+  readAgentFallbacks,
+  readClaimedHarnessDispatch,
+  reclassifyProviderQuotaResult,
+  type HarnessDispatch,
+} from "./harness-fallback.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
 
@@ -61,6 +78,11 @@ import {
   registerAdapterExecutionControl,
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
+import {
+  acknowledgeAdapterSteering,
+  clearAdapterSteering,
+  setAdapterSteeringHandle,
+} from "./adapter-steering.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
@@ -79,6 +101,11 @@ import {
   type DurableChatWakeupRequest,
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
+import {
+  cleanupHeartbeatRemoteRunTemp,
+  prepareHeartbeatRemoteRunTemp,
+  type HeartbeatRemoteRunTemp,
+} from "./heartbeat-remote-run-temp.js";
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
@@ -198,7 +225,7 @@ import {
   toolProfiles,
   workspaceOperations,
 } from "@paperclipai/db";
-import { conflict, HttpError, notFound } from "../errors.js";
+import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import {
   decideIssueAssignmentWakeRefusal,
@@ -647,6 +674,7 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { createRunLogChunkCompactor } from "./run-log-chunk-compactor.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -712,9 +740,14 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
+import {
+  drainRunsInParallel,
+  shutdownTerminationGraceMs,
+  stopRunProcessForShutdown,
+  type ShutdownRunOutcome,
+} from "../shutdown.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
-const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
 
@@ -747,6 +780,8 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
+  "agent.harness_fallback_activated",
+  "agent.harness_fallback_returned",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
@@ -939,6 +974,7 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE =
 const GITHUB_PR_WORKFLOW_SKILL_KEY =
   "paperclipai/bundled/software-development/github-pr-workflow";
 const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
+  "harness_model_incompatible",
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
   "low_trust_boundary_mismatch",
@@ -1512,8 +1548,6 @@ export function getTaskDrainStatus(): {
   };
 }
 
-const INLINE_BASE64_IMAGE_DATA_RE =
-  /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 type RuntimeConfigSecretResolver = Pick<
   ReturnType<typeof secretService>,
   | "resolveAdapterConfigForRuntime"
@@ -1669,6 +1703,8 @@ export async function resolveExecutionRunAdapterConfig(input: {
   projectId?: string | null;
   routineId?: string | null;
   executionRunConfig: Record<string, unknown>;
+  /** Binding path prefix of the agent's own env; set for a fallback target. */
+  agentEnvPathPrefix?: string;
   projectEnv: unknown;
   routineEnv?: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
@@ -1773,6 +1809,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
             consumerId: input.agentId,
             responsibleUserId: input.responsibleUserId ?? null,
           },
+          { envPathPrefix: input.agentEnvPathPrefix },
         )),
       );
       if (
@@ -1910,7 +1947,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
             : {}),
         }
       : undefined,
-    { adapterType: input.adapterType ?? null },
+    { adapterType: input.adapterType ?? null, envPathPrefix: input.agentEnvPathPrefix },
   );
   if (Object.keys(environmentEnvResolution.env).length > 0) {
     resolvedConfig.env = {
@@ -2125,6 +2162,18 @@ export interface ProviderQuotaRetryPolicy {
   maxRetryMs: number;
   /** Per agent and UTC day: quota failures exempt from maxDailyRuns. Later ones count. */
   maxDailyUncountedRuns: number;
+}
+
+/**
+ * An agent with a harness fallback chain is gated by its per-target harness
+ * cooldowns, which end at the provider's reset and let one run probe the
+ * primary. The shared provider-quota lane would hold that probe a second time
+ * on its own backoff, and would stretch a capacity failure's retries to its
+ * hours-long ceiling before the chain could take over. The lane applies to
+ * agents without a chain.
+ */
+function usesHarnessFallbackChain(agent: Pick<typeof agents.$inferSelect, "fallbacks">) {
+  return readAgentFallbacks(agent.fallbacks).length > 0;
 }
 
 /**
@@ -3639,6 +3688,9 @@ const heartbeatRunListColumns = {
   stdoutExcerpt: sql<string | null>`NULL`.as("stdoutExcerpt"),
   stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
   errorCode: heartbeatRuns.errorCode,
+  executedAdapterType: heartbeatRuns.executedAdapterType,
+  executedModel: heartbeatRuns.executedModel,
+  fallbackReason: heartbeatRuns.fallbackReason,
   externalRunId: heartbeatRuns.externalRunId,
   processPid: heartbeatRuns.processPid,
   processGroupId: heartbeatRunProcessGroupIdColumn,
@@ -4016,28 +4068,6 @@ export function boundHeartbeatRunEventPayloadForStorage(
 ): Record<string, unknown> {
   const bounded = boundRunEventValue(payload, 0, new WeakSet());
   return parseObject(bounded) ?? { _truncated: true };
-}
-
-function redactInlineBase64ImageData(chunk: string) {
-  return chunk.replace(
-    INLINE_BASE64_IMAGE_DATA_RE,
-    (_match, prefix: string, data: string, suffix: string) =>
-      `${prefix}[omitted base64 image data: ${data.length} chars]${suffix}`,
-  );
-}
-
-export function compactRunLogChunk(
-  chunk: string,
-  maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
-) {
-  const normalized = redactSensitiveText(redactInlineBase64ImageData(chunk));
-  if (normalized.length <= maxChars) return normalized;
-
-  const headChars = Math.max(0, Math.floor(maxChars * 0.6));
-  const tailChars = Math.max(0, Math.floor(maxChars * 0.25));
-  const omittedChars = Math.max(0, normalized.length - headChars - tailChars);
-  const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
-  return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
 }
 
 function normalizeMaxConcurrentRuns(value: unknown) {
@@ -9383,6 +9413,12 @@ export async function persistHeartbeatRunProcessMetadata(
   });
 }
 
+/**
+ * `resultJson` key written with a run's `interrupted` status by the shutdown
+ * drain: `pending` until its follow-up writes finish, then `complete`.
+ */
+const SHUTDOWN_DRAIN_MARKER_KEY = "shutdownDrain";
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -10020,6 +10056,7 @@ export function heartbeatService(
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
+  const harnessFallback = harnessFallbackService(db);
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
@@ -10051,6 +10088,18 @@ export function heartbeatService(
       const policy = parseHeartbeatPolicy(agent);
       if (!policy.wakeOnDemand) return "heartbeat.wakeOnDemand.disabled";
       return (await getHeartbeatDailyCapBlock(agent, policy))?.reason ?? null;
+    },
+    // The same slot count as the deferred-wake sweep: running runs against
+    // the agent's limit. Queued work waits its turn and does not starve
+    // stranded issues behind a standing queue.
+    getAgentFreeRunSlots: async (agentId) => {
+      const agent = await getAgent(agentId);
+      if (!agent) return null;
+      const [row] = await db
+        .select({ running: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
+      return Math.max(0, parseHeartbeatPolicy(agent).maxConcurrentRuns - Number(row?.running ?? 0));
     },
   });
   const runDispatch = createRunDispatch(db);
@@ -15188,8 +15237,16 @@ export function heartbeatService(
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
+    opts: { abortSignal?: AbortSignal } = {},
   ) {
     shutdownInProgress = true;
+    // Aborted by the shutdown budget: write nothing, and let the drain run.
+    const aborted = () => ({
+      mode: "aborted" as const,
+      skipDrain: false as const,
+      activeRunIds: [] as string[],
+    });
+    if (opts.abortSignal?.aborted) return aborted();
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
@@ -15242,6 +15299,9 @@ export function heartbeatService(
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
+    // The last point to give up: from the first snapshot write on, the
+    // preparation finishes, and the shutdown waits for it before the drain.
+    if (opts.abortSignal?.aborted) return aborted();
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
@@ -15782,10 +15842,19 @@ export function heartbeatService(
     };
   }
 
+  /**
+   * Ends this boot's running runs for a graceful shutdown. The runs are ended
+   * in parallel, and with `deadlineAt` (epoch ms) each run's grace is capped so
+   * that its termination, SIGKILL and verify end by the deadline. A run that
+   * cannot be stopped does not stop the drain of the others: it is reported as
+   * `terminate_failed` and left `running` for the reaper, because its process
+   * may still be alive. Every run gets one reported outcome.
+   */
   async function drainRunningRunsForShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    opts: { deadlineAt?: number; abortSignal?: AbortSignal } = {},
   ) {
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
@@ -15794,6 +15863,7 @@ export function heartbeatService(
         interruptedRunIds: [],
         retryRunIds: [],
         restartSuspendedRunIds: [],
+        outcomes: [],
       };
     }
     const activeRuns = await db
@@ -15815,13 +15885,14 @@ export function heartbeatService(
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
     const restartSuspendedRunIds: string[] = [];
+    const outcomes: ShutdownRunOutcome[] = [];
 
-    for (const { run, agent } of activeRuns) {
+    const drainOne = async ({ run, agent }: (typeof activeRuns)[number]): Promise<ShutdownRunOutcome> => {
       // Shutdown owns only this boot's legacy executions. Expired foreign
       // owners belong to the reaper, not another container's drain.
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
-          run.controllerBootId !== legacyControllerBootId) continue;
-      if (isNativeRunnerOwnershipHeld(run)) continue;
+          run.controllerBootId !== legacyControllerBootId) return { runId: run.id, outcome: "foreign_owner" };
+      if (isNativeRunnerOwnershipHeld(run)) return { runId: run.id, outcome: "native_runner_owned" };
       if (
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
@@ -15882,29 +15953,42 @@ export function heartbeatService(
           },
         });
         restartSuspendedRunIds.push(run.id);
-        continue;
+        return { runId: run.id, outcome: "restart_suspended" };
       }
       const message = `Interrupted by graceful server shutdown (${signal})`;
       const running = runningProcesses.get(run.id);
+      let stopFailure: ShutdownRunOutcome | null;
       try {
-        if (run.runtimeMode === "native") {
-          await cancelHeartbeatNativeRun({
-            db,
-            runId: run.id,
-            reason: message,
-            runtimeMode: run.runtimeMode,
-          });
-        }
-        if (running) {
-          await terminateHeartbeatRunProcess({
-            pid: running.child.pid,
-            processGroupId: running.processGroupId,
-            graceMs: Math.max(1, running.graceSec) * 1000,
-          });
-        }
+        stopFailure = await stopRunProcessForShutdown({
+          runId: run.id,
+          signal,
+          log: logger,
+          stop: async () => {
+            if (run.runtimeMode === "native") {
+              await cancelHeartbeatNativeRun({
+                db,
+                runId: run.id,
+                reason: message,
+                runtimeMode: run.runtimeMode,
+              });
+            }
+            if (running) {
+              await terminateHeartbeatRunProcess({
+                pid: running.child.pid,
+                processGroupId: running.processGroupId,
+                graceMs: shutdownTerminationGraceMs(running.graceSec, opts.deadlineAt),
+              });
+            }
+          },
+        });
       } finally {
         runningProcesses.delete(run.id);
       }
+      // A run whose process may still be alive is left for the reaper.
+      if (stopFailure) return stopFailure;
+      // After the drain deadline nothing new is written: the run stays
+      // `running`, its process is gone, and the next start reaps it.
+      if (opts.abortSignal?.aborted) return { runId: run.id, outcome: "deadline_skipped" };
 
       const persistedCancellationResult =
         run.runtimeMode === "native"
@@ -15921,59 +16005,37 @@ export function heartbeatService(
           error: message,
           errorCode: "server_shutdown_interrupted",
           signal,
-          resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
-            conversationContinuationEligible: await runUsedConversationAdapter(db, run),
-            resultJson: persistedCancellationResult,
-            errorCode: "server_shutdown_interrupted",
-            errorMessage: message,
-          }),
+          resultJson: {
+            ...mergeRunStopMetadataForAgent(agent, "interrupted", {
+              conversationContinuationEligible: await runUsedConversationAdapter(db, run),
+              resultJson: persistedCancellationResult,
+              errorCode: "server_shutdown_interrupted",
+              errorMessage: message,
+            }),
+            // Written with the status: until the follow-ups below mark it
+            // complete, the next start finishes them (repairIncompleteShutdownDrains).
+            [SHUTDOWN_DRAIN_MARKER_KEY]: { phase: "pending", signal, at: now.toISOString() },
+          },
         },
       );
-      if (!interruptedStatus.updated || !interruptedStatus.run) continue;
-      let interrupted = interruptedStatus.run;
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: now,
-        error: null,
-      });
-      interrupted =
-        (await classifyAndPersistRunLiveness(
-          interrupted,
-          parseObject(interrupted.resultJson),
-        )) ?? interrupted;
+      if (!interruptedStatus.updated || !interruptedStatus.run) return { runId: run.id, outcome: "not_running" };
+      const retry = await completeShutdownDrainFollowups(interruptedStatus.run, agent, signal, now);
+      if (retry) retryRunIds.push(retry.id);
+      interruptedRunIds.push(interruptedStatus.run.id);
+      return { runId: run.id, outcome: "interrupted" };
+    };
 
-      await releaseEnvironmentLeasesForRun({
-        runId: interrupted.id,
-        companyId: interrupted.companyId,
-        agentId: interrupted.agentId,
-        status: interrupted.status,
-        failureReason: interrupted.error ?? undefined,
-      });
-
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
-      if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
-      } else {
-        retryRunIds.push(retry.id);
-      }
-
-      await appendRunEvent(interrupted, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message,
-        payload: {
-          signal,
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(retry ? { retryRunId: retry.id } : {}),
-        },
-      });
-
-      await finalizeAgentStatus(run.agentId, "interrupted", message, {
-        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-      });
-      interruptedRunIds.push(interrupted.id);
-    }
+    outcomes.push(...await drainRunsInParallel({
+      rows: activeRuns,
+      runIdOf: (row) => row.run.id,
+      drainOne: async (row) => {
+        // After the drain deadline no new per-run drain starts.
+        if (opts.abortSignal?.aborted) return { runId: row.run.id, outcome: "deadline_skipped" };
+        return drainOne(row);
+      },
+      signal,
+      log: logger,
+    }));
 
     if (interruptedRunIds.length > 0) {
       logger.warn(
@@ -15992,7 +16054,105 @@ export function heartbeatService(
       interruptedRunIds,
       retryRunIds,
       restartSuspendedRunIds,
+      outcomes,
     };
+  }
+
+  /**
+   * Everything a graceful shutdown does for a run after its status became
+   * `interrupted`: the wakeup, the liveness class, the leases, the retry or the
+   * issue release, the run event and the agent status. Each step is idempotent,
+   * so a later start can run them again for a run whose drain was cut (see
+   * `repairIncompleteShutdownDrains`). The last write marks the drain complete.
+   */
+  async function completeShutdownDrainFollowups(
+    interruptedRun: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    signal: "SIGINT" | "SIGTERM",
+    now: Date,
+  ) {
+    const message = `Interrupted by graceful server shutdown (${signal})`;
+    let interrupted = interruptedRun;
+    await setWakeupStatus(interrupted.wakeupRequestId, "cancelled", {
+        finishedAt: now,
+        error: null,
+      });
+    interrupted =
+      (await classifyAndPersistRunLiveness(
+        interrupted,
+        parseObject(interrupted.resultJson),
+      )) ?? interrupted;
+
+    await releaseEnvironmentLeasesForRun({
+      runId: interrupted.id,
+      companyId: interrupted.companyId,
+      agentId: interrupted.agentId,
+      status: interrupted.status,
+      failureReason: interrupted.error ?? undefined,
+    });
+
+    const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+    if (!retry) {
+      await releaseIssueExecutionAndPromote(interrupted);
+    }
+
+    await appendRunEvent(interrupted, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message,
+      payload: {
+        signal,
+        ...(interrupted.processPid ? { processPid: interrupted.processPid } : {}),
+        ...(interrupted.processGroupId ? { processGroupId: interrupted.processGroupId } : {}),
+        ...(retry ? { retryRunId: retry.id } : {}),
+      },
+    });
+
+    await finalizeAgentStatus(interrupted.agentId, "interrupted", message, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(interrupted),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), ${`{${SHUTDOWN_DRAIN_MARKER_KEY},phase}`}::text[], '"complete"'::jsonb, true)`,
+      })
+      .where(eq(heartbeatRuns.id, interrupted.id));
+    return retry;
+  }
+
+  /**
+   * At startup: finishes the shutdown drain of every run whose status became
+   * `interrupted` but whose follow-ups never completed (the process was killed
+   * mid-drain). Without this, such a run has no retry and may keep its issue
+   * lock, and neither the orphan reap (it selects `running`) nor the stale-lock
+   * sweep recreates them.
+   */
+  async function repairIncompleteShutdownDrains(now = new Date()) {
+    const rows = await db
+      .select({ run: heartbeatRuns, agent: agents })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "server_shutdown_interrupted"),
+        sql`${heartbeatRuns.resultJson} -> ${SHUTDOWN_DRAIN_MARKER_KEY} ->> 'phase' = 'pending'`,
+      ));
+    const repairedRunIds: string[] = [];
+    for (const { run, agent } of rows) {
+      const marker = parseObject(parseObject(run.resultJson)[SHUTDOWN_DRAIN_MARKER_KEY]);
+      const signal = marker.signal === "SIGINT" ? "SIGINT" : "SIGTERM";
+      try {
+        await completeShutdownDrainFollowups(run, agent, signal, now);
+        repairedRunIds.push(run.id);
+      } catch (err) {
+        logger.error({ err, runId: run.id }, "failed to finish an interrupted shutdown drain");
+      }
+    }
+    if (rows.length > 0) {
+      logger.warn({ found: rows.length, repairedRunIds }, "finished shutdown drains that a restart cut");
+    }
+    return { found: rows.length, repairedRunIds };
   }
 
   /**
@@ -16008,6 +16168,7 @@ export function heartbeatService(
     const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
     if (
       !policy.enabled ||
+      usesHarnessFallbackChain(agent) ||
       run.status !== "failed" ||
       readHeartbeatRunErrorFamily(run) !== "provider_quota" ||
       parseObject(run.resultJson).providerQuotaBeforeUsefulAction !== true
@@ -16049,6 +16210,9 @@ export function heartbeatService(
       eq(heartbeatRuns.companyId, agent.companyId),
       inArray(heartbeatRuns.agentId, laneAgentIds),
       eq(heartbeatRuns.runtimeMode, "legacy"),
+      // The lane is the agent's primary harness and model. A run that a
+      // harness fallback sent elsewhere says nothing about this provider.
+      isNull(heartbeatRuns.fallbackReason),
     );
     const providerOutcome = and(
       inArray(heartbeatRuns.status, ["succeeded", "failed", "timed_out"]),
@@ -16145,6 +16309,7 @@ export function heartbeatService(
   ) {
     if (agent.adapterType === "paperclip_runner") return false;
     if (!parseHeartbeatPolicy(agent).providerQuotaRetry.enabled) return false;
+    if (usesHarnessFallbackChain(agent)) return false;
     if (operatorRequestedRetryNow(run)) return false;
     if (!(await readProviderQuotaLaneState(agent, run.id)).inQuotaState) return false;
     const now = new Date();
@@ -16421,6 +16586,9 @@ export function heartbeatService(
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      contextPatch?: Record<string, unknown>;
+      /** The retry is due no earlier than this time. */
+      notBefore?: Date;
     },
   ) {
     if (run.errorCode === "provider_tool_definition_invalid") {
@@ -16582,16 +16750,21 @@ export function heartbeatService(
       }
     }
 
+    // A retry never lands before the provider reset, nor while every
+    // harness/model of the agent is cooling down from a quota failure.
+    const storedAgentForQuota = run.runtimeMode === "native" ? null : await getAgent(run.agentId).catch(() => null);
+    const quotaHeldUntil = storedAgentForQuota
+      ? await harnessFallback.heldUntil(storedAgentForQuota, now)
+      : null;
+    const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
+      .filter((value): value is Date => value !== null)
+      .reduce<Date | null>((latest, value) => (!latest || value > latest ? value : latest), null);
     const schedule =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      notBefore && notBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(
-              0,
-              transientRetryNotBefore.getTime() - now.getTime(),
-            ),
+            dueAt: notBefore,
+            delayMs: Math.max(0, notBefore.getTime() - now.getTime()),
           }
         : baseSchedule;
 
@@ -16714,9 +16887,11 @@ export function heartbeatService(
         providerQuotaKey:
           providerQuotaRetry ||
           (transientRecovery?.errorFamily === "provider_quota" &&
-            parseHeartbeatPolicy(agent).providerQuotaRetry.enabled)
+            parseHeartbeatPolicy(agent).providerQuotaRetry.enabled &&
+            !usesHarnessFallbackChain(agent))
             ? providerQuotaKeyForAgent(agent)
             : undefined,
+        ...(opts?.contextPatch ?? {}),
       },
       "normal_model",
     );
@@ -18203,6 +18378,133 @@ export function heartbeatService(
     return { start, end };
   }
 
+  /** Notes on a held queued run when it can start; written once per cooldown end. */
+  async function recordProviderQuotaWait(run: typeof heartbeatRuns.$inferSelect, heldUntil: Date) {
+    const waitUntil = heldUntil.toISOString();
+    // A merge in SQL: a comment wake can coalesce into this queued run while
+    // we hold it, and a read-modify-write of the snapshot would drop it.
+    const [held] = await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ providerQuotaWaitUntil: waitUntil })}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.status, "queued"),
+        sql`coalesce(${heartbeatRuns.contextSnapshot}->>'providerQuotaWaitUntil', '') <> ${waitUntil}`,
+      ))
+      .returning();
+    if (!held) return;
+    await appendRunEvent(held, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: `Waiting for the provider quota to reset; this run starts at or after ${waitUntil}`,
+      payload: { providerQuotaWaitUntil: waitUntil },
+    }).catch(() => undefined);
+  }
+
+  /**
+   * After a failed legacy run that hit a provider usage limit before useful
+   * work (or a capacity limit whose bounded retries are spent), cools the
+   * harness/model that ran down until the provider's reset, or a bounded
+   * backoff when none is known. With a healthy fallback the same wake is
+   * re-dispatched there once; otherwise every retry and new wake waits for
+   * the cooldown (see scheduleBoundedRetryForRun and claimQueuedRun).
+   */
+  async function handleProviderQuotaFailure(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    executedAgent: typeof agents.$inferSelect;
+    storedAgent: typeof agents.$inferSelect;
+    phase: "failure" | "retry_exhausted";
+  }): Promise<{ redispatched: boolean; awaitingRetryExhaustion: boolean; deferUntil: Date | null }> {
+    const none = { redispatched: false, awaitingRetryExhaustion: false, deferUntil: null };
+    const { run, executedAgent, storedAgent } = input;
+    if (run.runtimeMode === "native") return none;
+    const dispatch = readClaimedHarnessDispatch(run.runnerProfileJson) ?? primaryHarnessDispatch(storedAgent);
+    if (!isLlmHarnessAdapterType(dispatch.adapterType)) return none;
+    const outputTokens = asNumber(parseObject(run.usageJson).outputTokens, 0);
+    let usefulWork = outputTokens > 0;
+    if (!usefulWork) {
+      const evidence = await buildRunLivenessInput(run, parseObject(run.resultJson))
+        .then((liveness) => liveness.evidence)
+        .catch(() => null);
+      // An unreadable evidence lookup fails closed: the failure still has to
+      // read as a provider quota error, and cooling down is the safe side.
+      usefulWork = !!evidence && (
+        (evidence.issueCommentsCreated ?? 0) > 0 ||
+        (evidence.documentRevisionsCreated ?? 0) > 0 ||
+        (evidence.workProductsCreated ?? 0) > 0 ||
+        (evidence.activityEventsCreated ?? 0) > 0);
+    }
+    const decision = classifyQuotaFailure({
+      status: run.status,
+      errorCode: run.errorCode,
+      errorFamily: readHeartbeatRunErrorFamily(run),
+      errorMessage: run.error,
+      retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+      usefulWork,
+    });
+    if (!decision.trigger) return none;
+    if (decision.requiresRetryExhaustion && input.phase !== "retry_exhausted") {
+      return { ...none, awaitingRetryExhaustion: true };
+    }
+    const reason = `provider_${decision.kind}`;
+    const cooled = await harnessFallback.coolDown({
+      agent: storedAgent,
+      targetKey: dispatch.targetKey,
+      reason,
+      resetAt: decision.resetAt,
+      sourceRunId: run.id,
+    }).catch((err) => {
+      // Fail closed: without a recorded cooldown the normal 30 second retry
+      // would send this wake straight back at the exhausted target.
+      logger.warn({ err, runId: run.id, target: dispatch.targetKey }, "quota cooldown could not be recorded; deferring this wake");
+      return null;
+    });
+    if (!cooled) {
+      return { ...none, deferUntil: new Date(Date.now() + COOLDOWN_READ_FAILURE_BASE_MS) };
+    }
+    const { until, nextTarget } = cooled;
+    if (!until) return none;
+    const context = parseObject(run.contextSnapshot);
+    const alreadyRedispatched = readNonEmptyString(parseObject(context.harnessFallbackRedispatch).fromRunId) !== null;
+    await appendRunEvent(run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: `Harness ${dispatch.targetKey} cooled down until ${until.toISOString()} (${reason})`,
+      payload: {
+        harnessTarget: dispatch.targetKey,
+        reason,
+        cooldownUntil: until.toISOString(),
+        resetKnown: decision.resetAt !== null,
+        nextTarget: nextTarget?.key ?? null,
+        alreadyRedispatched,
+      },
+    });
+    // A wake gets one re-dispatch. A failed fallback run defers the wake to its
+    // own cooldown end instead of hopping to the next target a moment later.
+    if (alreadyRedispatched) return { ...none, deferUntil: until };
+    if (!nextTarget) return none;
+    const scheduled = await scheduleBoundedRetryForRun(run, executedAgent, {
+      retryReason: HARNESS_FALLBACK_RETRY_REASON,
+      wakeReason: HARNESS_FALLBACK_WAKE_REASON,
+      maxAttempts: executionRetryAttemptCount(run, HARNESS_FALLBACK_RETRY_REASON) + 1,
+      delayMs: 0,
+      contextPatch: {
+        harnessFallbackRedispatch: {
+          fromRunId: run.id,
+          fromTarget: dispatch.targetKey,
+          toTarget: nextTarget.key,
+          reason,
+        },
+      },
+    });
+    return { ...none, redispatched: scheduled.outcome === "scheduled" };
+  }
+
   /**
    * The single definition of how many runs `maxDailyRuns` counts, per agent,
    * in one UTC day. The cap check (`getHeartbeatDailyCapBlock`), the run
@@ -18237,6 +18539,13 @@ export function heartbeatService(
       gte(heartbeatRuns.startedAt, window.start),
       lt(heartbeatRuns.startedAt, window.end),
       notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+      // A run that a harness fallback re-dispatched is charged once, on the successor.
+      sql`not exists (
+        select 1 from heartbeat_runs fallback_successor
+        where fallback_successor.company_id = ${heartbeatRuns.companyId}
+          and fallback_successor.retry_of_run_id = ${heartbeatRuns.id}
+          and fallback_successor.scheduled_retry_reason = ${HARNESS_FALLBACK_RETRY_REASON}
+      )`,
       ...(options.agentId ? [eq(heartbeatRuns.agentId, options.agentId)] : []),
       ...(options.excludeRunId ? [sql`${heartbeatRuns.id} <> ${options.excludeRunId}`] : []),
     ];
@@ -18820,6 +19129,22 @@ export function heartbeatService(
     }
     if (await waitForProviderQuotaLane(run, agent)) return null;
 
+    const harnessDecision = await harnessFallback.resolveDispatch(agent);
+    if (harnessDecision.heldUntil && run.runtimeMode !== "native") {
+      // Every harness/model of this agent is out of provider quota. Leave the
+      // run queued: the scheduler tick claims it once a target recovers, and
+      // the daily run cap is not charged for the wait.
+      await recordProviderQuotaWait(run, harnessDecision.heldUntil);
+      return null;
+    }
+    const harnessDispatch: HarnessDispatch = harnessDecision.dispatch;
+    const adapterDispatchPatch = JSON.stringify({ adapterDispatch: harnessDispatch });
+    const harnessDispatchColumns = {
+      executedAdapterType: harnessDispatch.adapterType,
+      executedModel: harnessDispatch.model,
+      fallbackReason: harnessDispatch.fallbackReason,
+    };
+
     const issueId = readNonEmptyString(context.issueId);
     if (issueId && activeRunExecutions.size > 0) {
       // Native finalization publishes success before workspace synchronization,
@@ -19158,7 +19483,8 @@ export function heartbeatService(
                   .update(heartbeatRuns)
                   .set({
                     status: "running",
-                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${adapterDispatchPatch}::jsonb`,
+                    ...harnessDispatchColumns,
                     ...legacyControllerClaim(run.runtimeMode),
                     responsibleUserId,
                     startedAt: lockedRun.startedAt ?? claimedAt,
@@ -19260,7 +19586,8 @@ export function heartbeatService(
                 .update(heartbeatRuns)
                 .set({
                   status: "running",
-                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${adapterDispatchPatch}::jsonb`,
+                  ...harnessDispatchColumns,
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
@@ -19327,7 +19654,8 @@ export function heartbeatService(
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
           const claimValues = {
             status: "running",
-            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${adapterDispatchPatch}::jsonb`,
+            ...harnessDispatchColumns,
             ...legacyControllerClaim(run.runtimeMode),
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
@@ -19350,6 +19678,11 @@ export function heartbeatService(
           });
         });
     if (!claimed) return null;
+    if (harnessDispatch.target === "primary") {
+      await harnessFallback.notePrimaryDispatched(agent, claimed.id).catch((err) => {
+        logger.warn({ err, runId: claimed.id }, "failed to record the return to the primary harness");
+      });
+    }
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -22516,6 +22849,10 @@ export function heartbeatService(
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
+    let remoteRunTempLocation: HeartbeatRemoteRunTemp["cleanupLocation"] | null = null;
+    // Set when the adapter proves its last remote process exited, which a
+    // timeout or a dropped SSH channel does not.
+    let remoteProviderStopped = false;
     let nativeSessionResumeScheduled = false;
     let nativeOwnershipHeld = false;
     let nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
@@ -22543,8 +22880,8 @@ export function heartbeatService(
     let readFailureReportSecrets: () => string[] = () => [];
 
     try {
-      const agent = await getAgent(run.agentId);
-      if (!agent) {
+      const storedAgent = await getAgent(run.agentId);
+      if (!storedAgent) {
         await setRunStatus(runId, "failed", {
           error: "Agent not found",
           errorCode: "agent_not_found",
@@ -22559,6 +22896,11 @@ export function heartbeatService(
         return;
       }
 
+      const claimedHarnessDispatch = readClaimedHarnessDispatch(run.runnerProfileJson);
+      const agent = applyClaimedHarnessDispatch(storedAgent, claimedHarnessDispatch);
+      if (!agent) {
+        throw new Error("Agent fallback target changed during startup; start a new turn with the updated agent.");
+      }
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
       const selectedAdapter = claimedAdapterType(run);
@@ -23675,7 +24017,7 @@ export function heartbeatService(
       });
       const mergedConfig = {
         ...workspaceManagedConfig,
-        ...(issueAssigneeOverrides?.adapterConfig ?? {}),
+        ...overridesForHarnessTarget(issueAssigneeOverrides?.adapterConfig, claimedHarnessDispatch),
         // The base below is already task-owned. Keep directory transport while
         // preserving isolated mode and the mandatory sandbox preflight.
         ...(useIsolatedTaskDirectory ? { workspaceStrategy: { type: "project_primary" } } : {}),
@@ -23735,6 +24077,7 @@ export function heartbeatService(
           routineId: routineEnvContext.routineId,
           responsibleUserId,
           executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
+          agentEnvPathPrefix: agentEnvBindingPrefix(storedAgent, claimedHarnessDispatch),
           projectEnv: aiBinding ? stripAiAuthBindings(projectContext?.env) : projectContext?.env ?? null,
           routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
           secretsSvc,
@@ -23915,6 +24258,14 @@ export function heartbeatService(
         });
       const configuredModel =
         readConfiguredModelFromAdapterConfig(runtimeConfig);
+      const harnessCompatibility = checkRunHarnessCompatibility({
+        adapterType: agent.adapterType,
+        config: runtimeConfig,
+        fallback: claimedHarnessDispatch?.target === "fallback",
+      });
+      if (!harnessCompatibility.ok) {
+        throw unprocessable(harnessCompatibility.message, { code: harnessCompatibility.code });
+      }
       if (context.refreshTools === true && agent.adapterType !== "paperclip_runner") {
         const capability = getServerAdapter(agent.adapterType).supportsToolRefreshOnResume;
         const canRefresh = typeof capability === "function" ? capability(runtimeConfig) : capability === true;
@@ -23931,10 +24282,20 @@ export function heartbeatService(
         preserveLegacySessionWithoutConfigMetadata:
           acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
       });
+      const previousIssueHarness = issueId
+        ? await harnessFallback.previousIssueHarness(agent, issueId, run.id)
+        : null;
+      const harnessSwitched =
+        previousIssueHarness !== null && previousIssueHarness !== agent.adapterType;
       const resetTaskSession =
-        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset || harnessSwitched;
       const sessionResetReason =
-        sessionConfigFreshness.reasons.join("; ") || null;
+        [
+          ...sessionConfigFreshness.reasons,
+          ...(harnessSwitched
+            ? [`the harness changed from ${previousIssueHarness} to ${agent.adapterType}`]
+            : []),
+        ].join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
       const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
         db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
@@ -24930,6 +25291,30 @@ export function heartbeatService(
         }
       } else {
         delete context.paperclipScratch;
+        // A remote run gets its own temp directory on the target, so agents
+        // do not fill the worker's shared /tmp.
+        try {
+          const existingRuntimeEnv = parseObject(runtimeConfig.env);
+          const remoteTemp = await prepareHeartbeatRemoteRunTemp({
+            native: agent.adapterType === "paperclip_runner",
+            runId: run.id,
+            target: executionTarget,
+            env: existingRuntimeEnv,
+          });
+          if (remoteTemp) {
+            remoteRunTempLocation = remoteTemp.cleanupLocation;
+            runtimeConfig = {
+              ...runtimeConfig,
+              env: { ...existingRuntimeEnv, ...remoteTemp.env },
+            };
+            context.paperclipScratch = remoteTemp.scratchContext;
+          }
+        } catch (remoteTempError) {
+          logger.warn(
+            { err: remoteTempError, runId: run.id, agentId: agent.id },
+            "failed to prepare the remote run temp directory; continuing without it",
+          );
+        }
       }
       const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
         target: executionTarget,
@@ -25252,6 +25637,9 @@ export function heartbeatService(
       } = { current: null };
       let stdoutExcerpt = "";
       let stderrExcerpt = "";
+      // Set once the run log is open. Both the success and the error path call it before they
+      // finalize the log, so the text that a stream held back is written, redacted.
+      let flushLogTails: () => Promise<void> = async () => {};
       let outputSeq = Number(run.lastOutputSeq ?? 0);
       let lastOutputFlushAt: Date | null = run.lastOutputAt ?? null;
       let lastLogRuntimeStatusTouchMs = 0;
@@ -25380,10 +25768,12 @@ export function heartbeatService(
 
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
-        const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-          const sanitizedChunk = compactRunLogChunk(
-            redactCurrentUserText(chunk, currentUserRedactionOptions),
-          );
+        const compactLogChunk = createRunLogChunkCompactor();
+        const emitLogChunk = async (
+          stream: "stdout" | "stderr",
+          sanitizedChunk: string,
+        ) => {
+          if (sanitizedChunk === "") return;
           if (stream === "stdout")
             stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
           if (stream === "stderr")
@@ -25454,6 +25844,30 @@ export function heartbeatService(
               truncated: payloadChunk.length !== sanitizedChunk.length,
             },
           });
+        };
+        const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+          await emitLogChunk(
+            stream,
+            compactLogChunk.compact(
+              stream,
+              redactCurrentUserText(chunk, currentUserRedactionOptions),
+            ),
+          );
+        };
+        // Each stream holds back the end of its last chunk until the token is whole. Call this
+        // before the run log is finalized, so that text is redacted and written, never lost.
+        flushLogTails = async () => {
+          const streams: Array<"stdout" | "stderr"> = ["stdout", "stderr"];
+          for (const stream of streams) {
+            try {
+              await emitLogChunk(stream, compactLogChunk.flush(stream));
+            } catch (err) {
+              logger.warn(
+                { err, runId, stream },
+                "failed to write the held tail of the run log",
+              );
+            }
+          }
         };
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
@@ -25568,6 +25982,13 @@ export function heartbeatService(
             message: event.message,
             payload: event.payload,
           });
+          try {
+            await acknowledgeAdapterSteering(run.id, event);
+          } catch (err) {
+            // The message reached the agent; its comment stays queued, so the
+            // worst case is a duplicate delivery on the next wake.
+            logger.warn({ err, runId: run.id }, "failed to settle steered comment");
+          }
         };
 
         const adapter = getServerAdapter(agent.adapterType);
@@ -27013,6 +27434,7 @@ export function heartbeatService(
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
+                  remoteProviderStopped = false;
                   return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
                     getFreshSessionHandoff,
                     runId: run.id,
@@ -27046,7 +27468,10 @@ export function heartbeatService(
                         issueId,
                       );
                     },
-                    onProviderStopped: collectStoppedInstructions,
+                    onProviderStopped: async () => {
+                      remoteProviderStopped = true;
+                      await collectStoppedInstructions();
+                    },
                     onDispatch: markDispatchStarted,
                     signal: executionControl.controller.signal,
                     ...(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? {
@@ -27069,6 +27494,7 @@ export function heartbeatService(
                         }
                       },
                     } : {}),
+                    onSteeringReady: (handle) => setAdapterSteeringHandle(run.id, handle),
                     onCancellationReady: async () => {
                       await registerAdapterExecutionControl(run.id, executionControl);
                       const current = await getRun(run.id);
@@ -27097,6 +27523,7 @@ export function heartbeatService(
           }
           if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
+          if (run.runtimeMode !== "native") adapterResult = reclassifyProviderQuotaResult(adapterResult, new Date(), agent.adapterType);
           // A returned result can include a failed restore. Keep the workspace
           // barrier closed until required files have been restored.
           // If recording the barrier itself fails, propagate as a run failure
@@ -27509,6 +27936,7 @@ export function heartbeatService(
           sha256?: string | null;
           compressed: boolean;
         } | null = null;
+        await flushLogTails();
         if (handle) {
           logSummary = await runLogStore.finalize(handle);
         }
@@ -27918,7 +28346,28 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+          const harnessFallbackOutcome = outcome === "failed" && !isMaxTurnExhaustionRun(livenessRun)
+            ? await handleProviderQuotaFailure({
+                run: livenessRun,
+                executedAgent: agent,
+                storedAgent,
+                phase: "failure",
+              }).catch((err) => {
+                logger.warn({ err, runId: livenessRun.id }, "harness fallback scheduling failed; using the normal retry path");
+                return { redispatched: false, awaitingRetryExhaustion: false, deferUntil: null };
+              })
+            : null;
+          if (harnessFallbackOutcome?.redispatched) {
+            await appendRunEvent(livenessRun, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: "Re-dispatched this wake once on a fallback harness",
+              payload: { retryReason: HARNESS_FALLBACK_RETRY_REASON },
+            });
+          } else if (harnessFallbackOutcome?.deferUntil) {
+            await scheduleBoundedRetryForRun(livenessRun, agent, { notBefore: harnessFallbackOutcome.deferUntil });
+          } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
               await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -27944,7 +28393,20 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            await scheduleBoundedRetryForRun(livenessRun, agent);
+            const transientRetry = await scheduleBoundedRetryForRun(livenessRun, agent);
+            if (
+              transientRetry.outcome === "retry_exhausted" &&
+              harnessFallbackOutcome?.awaitingRetryExhaustion
+            ) {
+              await handleProviderQuotaFailure({
+                run: livenessRun,
+                executedAgent: agent,
+                storedAgent,
+                phase: "retry_exhausted",
+              }).catch((err) => {
+                logger.warn({ err, runId: livenessRun.id }, "harness fallback after exhausted retries failed");
+              });
+            }
           } else if (
             outcome === "failed" &&
             !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
@@ -28269,6 +28731,7 @@ export function heartbeatService(
           sha256?: string | null;
           compressed: boolean;
         } | null = null;
+        await flushLogTails();
         if (handle) {
           try {
             logSummary = await runLogStore.finalize(handle);
@@ -28671,6 +29134,7 @@ export function heartbeatService(
           }
           await releaseIssueExecutionAndPromote(livenessRun, {
             suppressImmediateRecovery:
+              livenessRun.errorCode === "harness_model_incompatible" ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
               ) !== null ||
@@ -28797,6 +29261,35 @@ export function heartbeatService(
               },
             );
           }
+          if (
+            remoteRunTempLocation &&
+            latestRun &&
+            isHeartbeatRunTerminalStatus(latestRun.status)
+          ) {
+            // Without proof that the remote process stopped, the directory
+            // stays for the SSH run directory reaper; a sandbox keeps it until
+            // the sandbox goes away. No dispatched adapter means no process.
+            const remoteTempCleanup = await cleanupHeartbeatRemoteRunTemp({
+              location: remoteRunTempLocation,
+              stopProven:
+                remoteProviderStopped ||
+                !(legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld),
+            }).catch((err) => {
+              logger.warn(
+                { err, runId: run.id },
+                "failed to remove the remote run temp directory",
+              );
+              return null;
+            });
+            if (remoteTempCleanup === "stop_unproven" || remoteTempCleanup === "symlink") {
+              logger.warn(
+                { runId: run.id, reason: remoteTempCleanup },
+                remoteTempCleanup === "symlink"
+                  ? "kept the remote run temp directory: a link or a file replaced a directory in its path"
+                  : "kept the remote run temp directory: nothing proves the remote process stopped",
+              );
+            }
+          }
           // A retained or unverified process stays above this release boundary.
           // If no stopped-copy capture occurred, preserve an explicit loss report.
           const uncapturedInstructions = await instructionCopies.reportUnavailable(run.companyId, run.id);
@@ -28903,6 +29396,7 @@ export function heartbeatService(
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
         }
+        clearAdapterSteering(run.id);
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
@@ -32974,6 +33468,7 @@ export function heartbeatService(
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
+    repairIncompleteShutdownDrains,
     drainActiveRunExecutions,
     startTaskDrain,
     stopTaskDrain,

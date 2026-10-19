@@ -8,7 +8,8 @@ import {
   ROUTINE_RUN_UNCHANGED_SKIP_REASON,
 } from "./routine-noop-skip.js";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { verifyBearerAuthorization, verifyGithubHmacSignature, verifyHmacSha256Signature } from "./webhook-auth.js";
+import { and, asc, desc, eq, exists, gt, ilike, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -20,6 +21,7 @@ import {
   companySecrets,
   documentRevisions,
   documents,
+  eventSources,
   executionWorkspaces,
   folders,
   goals,
@@ -29,6 +31,7 @@ import {
   pluginManagedResources,
   plugins,
   projects,
+  routineEventGroups,
   routineRevisions,
   routineRuns,
   routineDocuments,
@@ -39,8 +42,11 @@ import {
 import type {
   CreateRoutine,
   CreateRoutineTrigger,
+  EventGrouping,
+  ListRoutinesQuery,
   Routine,
   RoutineDetail,
+  RoutineEventGroup,
   RoutineDescriptionDocument,
   RoutineListItem,
   RoutineManagedByPlugin,
@@ -88,6 +94,7 @@ import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./is
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
+import { createEventRoutineDispatcher, EventDispatchError } from "./event-sources/event-dispatch.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
@@ -310,6 +317,8 @@ function isSubHourlyCronExpression(expression: string, timeZone: string, after: 
 
 function nextResultText(status: string, issueId?: string | null) {
   if (status === "issue_created" && issueId) return `Created execution issue ${issueId}`;
+  if (status === "grouped") return "Added a comment to the open event group issue";
+  if (status === "recovered") return "Commented that the event recovered";
   if (status === "coalesced") return "Coalesced into an existing live execution issue";
   if (status === "skipped_paused") return "Skipped because the project is paused";
   if (status === "skipped") return "Skipped because a live execution issue already exists";
@@ -317,12 +326,6 @@ function nextResultText(status: string, issueId?: string | null) {
   if (status === "completed") return "Execution issue completed";
   if (status === "failed") return "Execution failed";
   return status;
-}
-
-function normalizeWebhookTimestampMs(rawTimestamp: string) {
-  const parsed = Number(rawTimestamp);
-  if (!Number.isFinite(parsed)) return null;
-  return parsed > 1e12 ? parsed : parsed * 1000;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -403,8 +406,8 @@ function sanitizeRoutineVariableInputs(
   }));
 }
 
-function assertScheduleCompatibleVariables(variables: RoutineVariable[]) {
-  const missingDefaults = variables
+function requiredVariablesWithoutDefault(variables: RoutineVariable[]) {
+  return variables
     .filter((variable) => variable.required)
     .filter((variable) => {
       try {
@@ -414,9 +417,23 @@ function assertScheduleCompatibleVariables(variables: RoutineVariable[]) {
       }
     })
     .map((variable) => variable.name);
+}
+
+function assertScheduleCompatibleVariables(variables: RoutineVariable[]) {
+  const missingDefaults = requiredVariablesWithoutDefault(variables);
   if (missingDefaults.length > 0) {
     throw unprocessable(
       `Scheduled routines require defaults for required variables: ${missingDefaults.join(", ")}`,
+    );
+  }
+}
+
+// Event dispatch passes no variables, so a required variable without a default can never resolve.
+function assertEventCompatibleVariables(variables: RoutineVariable[]) {
+  const missingDefaults = requiredVariablesWithoutDefault(variables);
+  if (missingDefaults.length > 0) {
+    throw unprocessable(
+      `Event triggers require defaults for required routine variables: ${missingDefaults.join(", ")}`,
     );
   }
 }
@@ -596,6 +613,15 @@ function routineRevisionSnapshotTrigger(trigger: RoutineTriggerRow): RoutineRevi
     publicId: trigger.publicId,
     signingMode: trigger.signingMode as RoutineRevisionSnapshotV1["triggers"][number]["signingMode"],
     replayWindowSec: trigger.replayWindowSec,
+    // Only `event` triggers carry these, so snapshots of every other kind keep their stored shape.
+    ...(trigger.kind === "event"
+      ? {
+        eventSourceId: trigger.eventSourceId,
+        eventMatch: trigger.eventMatch ?? null,
+        eventGrouping: trigger.eventGrouping ?? null,
+        fallback: trigger.fallback,
+      }
+      : {}),
   };
 }
 
@@ -1305,6 +1331,8 @@ export function routineService(
           eq(routineRuns.companyId, routine.companyId),
           eq(routineRuns.routineId, routine.id),
           sql`${routineRuns.status} not in ('skipped', 'coalesced')`,
+          // Event runs are driven by external alerts, not by the schedule this gate paces.
+          sql`${routineRuns.source} <> 'event'`,
         ),
       )
       .orderBy(desc(routineRuns.triggeredAt), desc(routineRuns.id))
@@ -1752,6 +1780,94 @@ export function routineService(
     return !(await evaluateActivityGate(routine, new Date(), { ignoreOwnDispatchAudits: true })).fire;
   }
 
+  /**
+   * Checks an `event` trigger against the routine it would fire. These rules are
+   * re-checked at dispatch, because the routine can change after the trigger exists.
+   */
+  async function assertEventTriggerAllowed(
+    routine: typeof routines.$inferSelect,
+    config: { eventSourceId: string; eventGrouping?: EventGrouping | null },
+    variables: RoutineVariable[] = routine.variables ?? [],
+    options: { allowArchivedSource?: boolean } = {},
+  ) {
+    const source = await db
+      .select({ companyId: eventSources.companyId, archived: eventSources.archived })
+      .from(eventSources)
+      .where(eq(eventSources.id, config.eventSourceId))
+      .then((rows) => rows[0] ?? null);
+    if (!source || source.companyId !== routine.companyId) throw unprocessable("Event source not found in this company");
+    if (source.archived && !options.allowArchivedSource) throw unprocessable("Event source is archived");
+    if (await getManagedRoutineBinding(routine)) {
+      throw unprocessable("Event triggers are not supported on plugin-managed routines");
+    }
+    assertEventCompatibleVariables(variables);
+    const issueMode = config.eventGrouping?.issueMode;
+    if (issueMode && typeof issueMode === "object") {
+      if (!routine.assigneeAgentId) throw unprocessable("appendToIssueId requires the routine to have a default agent");
+      const target = await db
+        .select({ companyId: issues.companyId, assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueMode.appendToIssueId))
+        .then((rows) => rows[0] ?? null);
+      if (!target || target.companyId !== routine.companyId) throw unprocessable("appendToIssueId issue not found in this company");
+      if (target.assigneeAgentId !== routine.assigneeAgentId) {
+        throw unprocessable("appendToIssueId must be assigned to the routine's default agent");
+      }
+    }
+  }
+
+  async function resolveLatestRevisionResponsibleUserId(executor: Db, routine: typeof routines.$inferSelect) {
+    if (!routine.latestRevisionId) return null;
+    return executor
+      .select({
+        responsibleUserId: routineRevisions.responsibleUserId,
+        snapshot: routineRevisions.snapshot,
+      })
+      .from(routineRevisions)
+      .where(and(
+        eq(routineRevisions.companyId, routine.companyId),
+        eq(routineRevisions.routineId, routine.id),
+        eq(routineRevisions.id, routine.latestRevisionId),
+      ))
+      .then((rows) => {
+        const row = rows[0] ?? null;
+        const snapshot = row?.snapshot as RoutineRevisionSnapshotV1 | undefined;
+        return row?.responsibleUserId ?? snapshot?.routine.responsibleUserId ?? null;
+      });
+  }
+
+  /**
+   * Re-validates, right before an event dispatch, everything that was checked
+   * when the trigger was created: the routine may have changed since. Every
+   * failure here is permanent, so the source's fallback can take over.
+   */
+  async function prepareEventRoutine(routine: typeof routines.$inferSelect) {
+    const assigneeAgentId = routine.assigneeAgentId;
+    if (!assigneeAgentId) throw new EventDispatchError("Default agent required", "permanent");
+    await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
+    if (await getManagedRoutineBinding(routine)) {
+      throw new EventDispatchError("Event triggers are not supported on plugin-managed routines", "permanent");
+    }
+    // Event dispatch passes no variables.
+    const resolvedVariables = resolveRoutineVariableValues(routine.variables ?? [], { source: "api" });
+    const variables = { ...getBuiltinRoutineVariableValues(), ...resolvedVariables };
+    return {
+      assigneeAgentId,
+      routineDescription: interpolateRoutineTemplate(routine.description, variables),
+    };
+  }
+
+  const eventDispatcher = createEventRoutineDispatcher({
+    db,
+    issueSvc,
+    heartbeat,
+    finalizeRun,
+    updateRoutineTouchedState,
+    prepareRoutine: prepareEventRoutine,
+    resolveResponsibleUserId: async (executor, routine) =>
+      (await resolveLatestRevisionResponsibleUserId(executor, routine)) ?? routine.responsibleUserId ?? null,
+  });
+
   async function dispatchRoutineRun(input: {
     routine: typeof routines.$inferSelect;
     trigger: typeof routineTriggers.$inferSelect | null;
@@ -1877,24 +1993,7 @@ export function routineService(
 
       const triggeredAt = new Date();
       const manualRunnerUserId = input.source === "manual" ? input.actor?.userId ?? null : null;
-      const latestRevisionResponsibleUserId = input.routine.latestRevisionId
-        ? await txDb
-            .select({
-              responsibleUserId: routineRevisions.responsibleUserId,
-              snapshot: routineRevisions.snapshot,
-            })
-            .from(routineRevisions)
-            .where(and(
-              eq(routineRevisions.companyId, input.routine.companyId),
-              eq(routineRevisions.routineId, input.routine.id),
-              eq(routineRevisions.id, input.routine.latestRevisionId),
-            ))
-            .then((rows) => {
-              const row = rows[0] ?? null;
-              const snapshot = row?.snapshot as RoutineRevisionSnapshotV1 | undefined;
-              return row?.responsibleUserId ?? snapshot?.routine.responsibleUserId ?? null;
-            })
-        : null;
+      const latestRevisionResponsibleUserId = await resolveLatestRevisionResponsibleUserId(txDb, input.routine);
       const responsibleUserId =
         manualRunnerUserId ?? latestRevisionResponsibleUserId ?? input.routine.responsibleUserId ?? null;
       const [createdRun] = await txDb
@@ -2116,15 +2215,38 @@ export function routineService(
 
   return {
     evaluateActivityGate,
+    /** The `source = "event"` branch of dispatch: groups, comments, wakes. Never throws; failures are classified. */
+    dispatchEvent: eventDispatcher.dispatch,
     get: getRoutineById,
     getTrigger: getTriggerById,
 
     list: async (
       companyId: string,
-      filters?: { projectId?: string | null },
+      filters: ListRoutinesQuery = {},
     ): Promise<RoutineListItem[]> => {
       const conditions = [eq(routines.companyId, companyId)];
-      if (filters?.projectId) conditions.push(eq(routines.projectId, filters.projectId));
+      if (filters.projectId) conditions.push(eq(routines.projectId, filters.projectId));
+      if (filters.assigneeAgentId) conditions.push(eq(routines.assigneeAgentId, filters.assigneeAgentId));
+      if (filters.folderId === "none") conditions.push(isNull(routines.folderId));
+      else if (filters.folderId) conditions.push(eq(routines.folderId, filters.folderId));
+      if (filters.status) conditions.push(eq(routines.status, filters.status));
+      if (filters.q) {
+        const pattern = `%${filters.q.replace(/[\\%_]/g, (character) => `\\${character}`)}%`;
+        const textMatch = or(ilike(routines.title, pattern), ilike(routines.description, pattern));
+        if (textMatch) conditions.push(textMatch);
+      }
+      if (filters.trigger) {
+        const liveTriggers = db
+          .select({ id: routineTriggers.id })
+          .from(routineTriggers)
+          .where(and(
+            eq(routineTriggers.companyId, companyId),
+            eq(routineTriggers.routineId, routines.id),
+            eq(routineTriggers.archived, false),
+            ...(filters.trigger === "manual" ? [] : [eq(routineTriggers.kind, filters.trigger)]),
+          ));
+        conditions.push(filters.trigger === "manual" ? not(exists(liveTriggers)) : exists(liveTriggers));
+      }
 
       const rows = await db
         .select()
@@ -2383,6 +2505,22 @@ export function routineService(
       if (enabledScheduleTriggers) {
         assertScheduleCompatibleVariables(nextVariables);
       }
+      if (patch.variables !== undefined || patch.title !== undefined || patch.description !== undefined) {
+        const enabledEventTriggers = await db
+          .select({ id: routineTriggers.id })
+          .from(routineTriggers)
+          .where(
+            and(
+              eq(routineTriggers.routineId, existing.id),
+              eq(routineTriggers.kind, "event"),
+              eq(routineTriggers.enabled, true),
+              eq(routineTriggers.archived, false),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows.length > 0);
+        if (enabledEventTriggers) assertEventCompatibleVariables(nextVariables);
+      }
       const responsibleUserId = await resolveRoutineResponsibleUserId(
         db,
         existing.companyId,
@@ -2580,6 +2718,10 @@ export function routineService(
         };
       }
 
+      if (input.kind === "event") {
+        await assertEventTriggerAllowed(routine, { eventSourceId: input.eventSourceId, eventGrouping: input.eventGrouping });
+      }
+
       const { trigger, revision } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routine.id} for update`);
@@ -2599,6 +2741,10 @@ export function routineService(
             secretId,
             signingMode: input.kind === "webhook" ? input.signingMode : null,
             replayWindowSec: input.kind === "webhook" ? input.replayWindowSec : null,
+            eventSourceId: input.kind === "event" ? input.eventSourceId : null,
+            eventMatch: input.kind === "event" ? input.eventMatch ?? null : null,
+            eventGrouping: input.kind === "event" ? input.eventGrouping ?? null : null,
+            fallback: input.kind === "event" ? input.fallback : false,
             lastRotatedAt: input.kind === "webhook" ? new Date() : null,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2631,6 +2777,24 @@ export function routineService(
       let nextRunAt = existing.nextRunAt;
       let cronExpression = existing.cronExpression;
       let timezone = existing.timezone;
+
+      const touchesEventFields = patch.eventSourceId !== undefined
+        || patch.eventMatch !== undefined
+        || patch.eventGrouping !== undefined
+        || patch.fallback !== undefined;
+      if (touchesEventFields && existing.kind !== "event") {
+        throw unprocessable("Only event triggers have eventSourceId, eventMatch, eventGrouping or fallback");
+      }
+      if (existing.kind === "event") {
+        const nextEventSourceId = patch.eventSourceId ?? existing.eventSourceId;
+        const nextEventGrouping = patch.eventGrouping === undefined ? existing.eventGrouping : patch.eventGrouping;
+        const enabling = patch.enabled === true && !existing.enabled;
+        if (nextEventSourceId && (enabling || patch.eventSourceId !== undefined || patch.eventGrouping !== undefined)) {
+          const routine = await getRoutineById(existing.routineId);
+          if (!routine) throw notFound("Routine not found");
+          await assertEventTriggerAllowed(routine, { eventSourceId: nextEventSourceId, eventGrouping: nextEventGrouping });
+        }
+      }
 
       if (existing.kind === "schedule") {
         const routine = await getRoutineById(existing.routineId);
@@ -2669,6 +2833,14 @@ export function routineService(
             nextRunAt,
             signingMode: patch.signingMode === undefined ? existing.signingMode : patch.signingMode,
             replayWindowSec: patch.replayWindowSec === undefined ? existing.replayWindowSec : patch.replayWindowSec,
+            ...(existing.kind === "event"
+              ? {
+                eventSourceId: patch.eventSourceId ?? existing.eventSourceId,
+                eventMatch: patch.eventMatch === undefined ? existing.eventMatch : patch.eventMatch,
+                eventGrouping: patch.eventGrouping === undefined ? existing.eventGrouping : patch.eventGrouping,
+                fallback: patch.fallback ?? existing.fallback,
+              }
+              : {}),
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: new Date(),
@@ -2810,6 +2982,16 @@ export function routineService(
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      for (const triggerSnapshot of snapshot.triggers) {
+        if (triggerSnapshot.kind !== "event" || !triggerSnapshot.enabled) continue;
+        if (!triggerSnapshot.eventSourceId) throw unprocessable("Event trigger snapshot has no event source");
+        await assertEventTriggerAllowed(
+          existingRoutine,
+          { eventSourceId: triggerSnapshot.eventSourceId, eventGrouping: triggerSnapshot.eventGrouping },
+          routineSnapshot.variables,
+          { allowArchivedSource: true },
+        );
+      }
 
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
@@ -2916,6 +3098,10 @@ export function routineService(
             secretId: triggerSnapshot.kind === "webhook" ? (current?.secretId ?? webhookSecret?.secretId ?? null) : null,
             signingMode: triggerSnapshot.kind === "webhook" ? triggerSnapshot.signingMode : null,
             replayWindowSec: triggerSnapshot.kind === "webhook" ? triggerSnapshot.replayWindowSec : null,
+            eventSourceId: triggerSnapshot.kind === "event" ? triggerSnapshot.eventSourceId ?? null : null,
+            eventMatch: triggerSnapshot.kind === "event" ? triggerSnapshot.eventMatch ?? null : null,
+            eventGrouping: triggerSnapshot.kind === "event" ? triggerSnapshot.eventGrouping ?? null : null,
+            fallback: triggerSnapshot.kind === "event" ? triggerSnapshot.fallback ?? false : false,
             nextRunAt: restoredNextRunAt,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
@@ -3069,59 +3255,31 @@ export function routineService(
             // Accept X-Hub-Signature-256 (GitHub/Sentry) or fall back to the
             // generic X-Paperclip-Signature header so operators can use github_hmac
             // mode with either header convention.
-            const providedSignature = (input.hubSignatureHeader ?? input.signatureHeader)?.trim() ?? "";
-            if (!providedSignature) throw unauthorized();
-            const expectedHmac = crypto
-              .createHmac("sha256", secretValue)
-              .update(rawBody)
-              .digest("hex");
-            const normalizedSignature = providedSignature.replace(/^sha256=/, "");
-            const normalizedBuf = Buffer.from(normalizedSignature);
-            const expectedBuf = Buffer.from(expectedHmac);
-            const valid =
-              normalizedBuf.length === expectedBuf.length &&
-              crypto.timingSafeEqual(normalizedBuf, expectedBuf);
+            const valid = verifyGithubHmacSignature({
+              secret: secretValue,
+              rawBody,
+              signature: input.hubSignatureHeader ?? input.signatureHeader,
+            });
             if (!valid) throw unauthorized();
           } else if (trigger.signingMode === "bearer") {
             const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
-            const expected = `Bearer ${secretValue}`;
-            const provided = input.authorizationHeader?.trim() ?? "";
-            const expectedBuf = Buffer.from(expected);
-            const providedBuf = Buffer.alloc(expectedBuf.length);
-            providedBuf.write(provided.slice(0, expectedBuf.length));
-            const valid =
-              provided.length === expected.length &&
-              crypto.timingSafeEqual(providedBuf, expectedBuf);
-            if (!valid) {
+            if (!verifyBearerAuthorization({ secret: secretValue, authorizationHeader: input.authorizationHeader })) {
               throw unauthorized();
             }
           } else {
             const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
             const rawBody = input.rawBody ?? Buffer.from(JSON.stringify(input.payload ?? {}));
-            const providedSignature = input.signatureHeader?.trim() ?? "";
-            const providedTimestamp = input.timestampHeader?.trim() ?? "";
-            if (!providedSignature || !providedTimestamp) throw unauthorized();
-            const tsMillis = normalizeWebhookTimestampMs(providedTimestamp);
-            if (tsMillis == null) throw unauthorized();
-            const replayWindowSec = trigger.replayWindowSec ?? 300;
-            if (Math.abs(Date.now() - tsMillis) > replayWindowSec * 1000) {
-              throw unauthorized();
-            }
-            const expectedHmac = crypto
-              .createHmac("sha256", secretValue)
-              .update(`${providedTimestamp}.`)
-              .update(rawBody)
-              .digest("hex");
-            const normalizedSignature = providedSignature.replace(/^sha256=/, "");
-            const providedBuf = Buffer.from(normalizedSignature);
-            const expectedBuf = Buffer.from(expectedHmac);
-            const valid =
-              providedBuf.length === expectedBuf.length &&
-              crypto.timingSafeEqual(providedBuf, expectedBuf);
-            if (!valid) throw unauthorized();
+            const verification = verifyHmacSha256Signature({
+              secret: secretValue,
+              rawBody,
+              signatureHeader: input.signatureHeader,
+              timestampHeader: input.timestampHeader,
+              replayWindowSec: trigger.replayWindowSec ?? 300,
+            });
+            if (!verification.valid) throw unauthorized();
             hmacReplayKey = `webhook-hmac:${crypto
               .createHash("sha256")
-              .update(`${trigger.id}:${providedTimestamp}:${expectedHmac}`)
+              .update(`${trigger.id}:${verification.timestamp}:${verification.expectedHmac}`)
               .digest("hex")}`;
           }
         } catch (error) {
@@ -3201,6 +3359,49 @@ export function routineService(
         idempotencyKey: deliveryKey,
         rejectIdempotencyReplay: hmacReplayKey !== null,
       });
+    },
+
+    /** Event groups of a routine, newest activity first; `open` keeps those whose issue is still open and visible. */
+    listEventGroups: async (
+      routineId: string,
+      filters: { open?: boolean; limit?: number } = {},
+    ): Promise<RoutineEventGroup[]> => {
+      const routine = await getRoutineById(routineId);
+      if (!routine) throw notFound("Routine not found");
+      const rows = await db
+        .select({
+          group: routineEventGroups,
+          issueIdentifier: issues.identifier,
+          issueStatus: issues.status,
+          issueTitle: issues.title,
+        })
+        .from(routineEventGroups)
+        .innerJoin(issues, eq(issues.id, routineEventGroups.issueId))
+        .where(
+          and(
+            eq(routineEventGroups.companyId, routine.companyId),
+            eq(routineEventGroups.routineId, routine.id),
+            ...(filters.open ? [isNull(issues.hiddenAt), inArray(issues.status, OPEN_ISSUE_STATUSES)] : []),
+          ),
+        )
+        .orderBy(desc(routineEventGroups.lastSeenAt), desc(routineEventGroups.id))
+        .limit(Math.min(Math.max(filters.limit ?? 100, 1), 200));
+      return rows.map((row) => ({
+        id: row.group.id,
+        companyId: row.group.companyId,
+        routineId: row.group.routineId,
+        fingerprint: row.group.fingerprint,
+        issueId: row.group.issueId,
+        issueIdentifier: row.issueIdentifier ?? null,
+        issueStatus: row.issueStatus,
+        issueTitle: row.issueTitle,
+        firstSeenAt: row.group.firstSeenAt,
+        lastSeenAt: row.group.lastSeenAt,
+        lastCommentAt: row.group.lastCommentAt,
+        repeatCount: row.group.repeatCount,
+        lastSeverity: row.group.lastSeverity as RoutineEventGroup["lastSeverity"],
+        lastState: row.group.lastState as RoutineEventGroup["lastState"],
+      }));
     },
 
     listRuns: async (routineId: string, limit = 50): Promise<RoutineRunSummary[]> => {

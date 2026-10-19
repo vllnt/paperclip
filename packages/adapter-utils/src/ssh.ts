@@ -14,7 +14,9 @@ import {
   retryTransientGitBundleTransfer,
   SSH_SIGNAL_TERMINATION_MESSAGE_PREFIX,
 } from "./git-workspace-sync.js";
+import type { ChildProcess } from "node:child_process";
 import type { RunProcessResult } from "./server-utils.js";
+import type { SshMultiplex } from "./ssh-multiplex.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { MERGE_STAGING_TAR_EXCLUDE, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
@@ -26,6 +28,13 @@ import {
   parseRemoteProcessTreeStopSummary,
   type RemoteProcessTreeStopSummary,
 } from "./remote-process-identity.js";
+import {
+  appendResourceProbe,
+  createResourceProbeMarker,
+  parseResourceProbeOutput,
+  splitResourceProbeOutput,
+  type ResourceProbeReading,
+} from "./resource-probe.js";
 import {
   createRuntimeProgressReporter,
   type RuntimeProgressDirection,
@@ -56,6 +65,9 @@ export function createSshCommandManagedRuntimeRunner(input: {
   spec: SshRemoteExecutionSpec;
   defaultCwd?: string | null;
   maxBufferBytes?: number | null;
+  // Share a master connection for this runner's commands. Only for runners
+  // whose commands are all short (the callback bridge).
+  multiplex?: SshMultiplex | null;
 }): CommandManagedRuntimeRunner {
   const defaultCwd = input.defaultCwd?.trim() || input.spec.remoteCwd;
   const maxBufferBytes =
@@ -86,9 +98,12 @@ export function createSshCommandManagedRuntimeRunner(input: {
 
       try {
         const result = await runSshCommand(input.spec, remoteCommand, {
+          multiplex: input.multiplex,
+          signal: commandInput.signal,
           stdin: commandInput.stdin,
           timeoutMs: commandInput.timeoutMs,
           maxBuffer: maxBufferBytes,
+          storeHints: { cwd, env: commandInput.env },
         });
         if (result.stdout) await commandInput.onLog?.("stdout", result.stdout);
         if (result.stderr) await commandInput.onLog?.("stderr", result.stderr);
@@ -207,10 +222,11 @@ async function execFileText(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
-    execFile(
+    const child = execFile(
       file,
       args,
       {
@@ -228,7 +244,38 @@ async function execFileText(
         });
       },
     );
+    superviseSshChild(child, options.signal);
   });
+}
+
+// A multiplexed `ssh` hands its pipes to the master connection, so they stay
+// open until the remote command ends, also after this process killed the
+// local `ssh`. Once a child this process killed (timeout, abort, output limit)
+// has exited, close this side of its pipes, so the caller is not held until
+// the remote command ends. On abort, stop the child: SIGTERM, then SIGKILL
+// after 5 s.
+function superviseSshChild(child: ChildProcess, signal: AbortSignal | undefined): void {
+  child.once("exit", () => {
+    if (!child.killed) return;
+    child.stdin?.destroy();
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  });
+  if (!signal) return;
+  let escalation: NodeJS.Timeout | null = null;
+  const onAbort = () => {
+    child.kill("SIGTERM");
+    escalation = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    escalation.unref?.();
+  };
+  const dispose = () => {
+    signal.removeEventListener("abort", onAbort);
+    if (escalation) clearTimeout(escalation);
+  };
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
+  child.once("close", dispose);
+  child.once("error", dispose);
 }
 
 async function spawnText(
@@ -238,12 +285,14 @@ async function spawnText(
     stdin?: string;
     timeout?: number;
     maxBuffer?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
     const child = spawn(file, args, {
       stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
     });
+    superviseSshChild(child, options.signal);
 
     const maxBuffer = options.maxBuffer ?? 1024 * 128;
     let stdout = "";
@@ -474,6 +523,94 @@ export async function untrackedSshSyncBackDependencyDirNames(localDir: string): 
     maxBuffer: 64 * 1024 * 1024,
   }).then((result) => new Set(result.stdout.split("\0").flatMap((entry) => entry.split("/"))), () => null);
   return tracked ? SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES.filter((name) => !tracked.has(name)) : [];
+}
+
+/**
+ * The pnpm store every process of an SSH environment shares. It sits under the
+ * environment's root, so it is on the same filesystem as the run directories
+ * and pnpm can hard-link packages from it instead of copying them into each
+ * run's `node_modules`. It is outside every `runs/<runId>`, so the run reaper
+ * never removes it. One environment has one root and one SSH user, so the store
+ * is shared by that environment's runs and by nothing else.
+ */
+export function sshSharedPnpmStoreDir(remoteWorkspacePath: string): string | null {
+  const root = remoteWorkspacePath;
+  if (!path.posix.isAbsolute(root) || root === "/" || root.endsWith("/") || path.posix.normalize(root) !== root) {
+    return null;
+  }
+  return path.posix.join(root, ".paperclip-runtime", "pnpm-store");
+}
+
+/**
+ * What the remote prelude may look at to see whether the caller already chose a
+ * pnpm store. Nothing here changes the command: `cwd` is only where a project
+ * `.npmrc` is looked for, and `env` is only read for a store or a user config.
+ */
+export interface SshStoreHints {
+  cwd?: string | null;
+  env?: Record<string, string>;
+}
+
+const STORE_KEY_PATTERN = /^npm_config_store_dir$/i;
+const USERCONFIG_KEY_PATTERN = /^npm_config_userconfig$/i;
+
+/**
+ * Shell for the prelude of every remote command: sets `npm_config_store_dir` to
+ * the environment's shared store, but only when nothing else chose a store. The
+ * order, highest first: an environment variable the caller passes, the project's
+ * `.npmrc` (`store-dir`) or `pnpm-workspace.yaml` (`storeDir`) in the working
+ * directory or any parent, the worker user's `.npmrc` or pnpm `rc`, then this
+ * default. It is one place for every way a process starts on a worker, so no
+ * caller adds its own.
+ */
+function sharedPnpmStorePrelude(remoteWorkspacePath: string, hints: SshStoreHints): string[] {
+  const store = sshSharedPnpmStoreDir(remoteWorkspacePath);
+  const env = hints.env ?? {};
+  if (!store || Object.keys(env).some((key) => STORE_KEY_PATTERN.test(key))) return [];
+  const userConfigKey = Object.keys(env).find((key) => USERCONFIG_KEY_PATTERN.test(key));
+  const userConfig = userConfigKey ? shellQuote(env[userConfigKey] ?? "") : '"${npm_config_userconfig:-$HOME/.npmrc}"';
+  const dir = hints.cwd ? shellQuote(hints.cwd) : '"$PWD"';
+  const npmrcSetsStore = "grep -Eq '^[[:space:]]*(store-dir|store_dir|storeDir)[[:space:]]*=' ";
+  const hasProjectOrUserStore = [
+    "paperclip_sets_store() {",
+    'd=$1; while :; do',
+    `if [ -f "$d/.npmrc" ] && ${npmrcSetsStore}"$d/.npmrc"; then return 0; fi;`,
+    `if [ -f "$d/pnpm-workspace.yaml" ] && grep -Eq '^[[:space:]]*storeDir[[:space:]]*:' "$d/pnpm-workspace.yaml"; then return 0; fi;`,
+    'case "$d" in /) break ;; /*) d=$(dirname "$d") ;; *) break ;; esac;',
+    "done;",
+    'for f in "$2" "${XDG_CONFIG_HOME:-$HOME/.config}/pnpm/rc"; do',
+    `if [ -f "$f" ] && ${npmrcSetsStore}"$f"; then return 0; fi;`,
+    "done;",
+    "return 1;",
+    "}",
+  ].join(" ");
+  return [
+    `{ paperclip_store=${shellQuote(store)}; ${hasProjectOrUserStore}; if paperclip_sets_store ${dir} ${userConfig}; then :; else export npm_config_store_dir="$paperclip_store"; fi; }`,
+  ];
+}
+
+/**
+ * The shell every remote command starts with: the login profiles, so a worker
+ * that exposes `node` or an agent CLI only through them resolves it, then the
+ * shared pnpm store default. `buildSshSpawnTarget` and `runSshCommand` both use
+ * it, so a process started either way gets the same environment.
+ *
+ * @param redirect - The redirections of each profile. A launch that carries its
+ *   run marker and the command's input on stdin passes `</dev/null` as well, so
+ *   no profile can read them.
+ */
+function sshRemotePrelude(
+  config: SshConnectionConfig,
+  hints: SshStoreHints,
+  redirect = ">/dev/null 2>&1",
+): string[] {
+  return [
+    `if [ -f /etc/profile ]; then . /etc/profile ${redirect} || true; fi`,
+    `if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" ${redirect} || true; fi`,
+    `if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" ${redirect} || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" ${redirect} || true; fi`,
+    `if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" ${redirect} || true; fi`,
+    ...sharedPnpmStorePrelude(config.remoteWorkspacePath, hints),
+  ];
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
@@ -711,6 +848,17 @@ async function readLocalGitWorkspaceSnapshot(localDir: string): Promise<LocalGit
   } catch {
     return null;
   }
+}
+
+/**
+ * The commit a run's workspace upload starts from: the local HEAD, read the same
+ * way the upload reads it. The server records it before the upload, so the
+ * reaper knows which commits already exist on the host without asking the
+ * worker. Null when the workspace is not a git repository with a commit.
+ */
+export async function readSshWorkspaceSeed(localDir: string): Promise<string | null> {
+  const snapshot = await readLocalGitWorkspaceSnapshot(localDir);
+  return snapshot && /^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(snapshot.headCommit) ? snapshot.headCommit.toLowerCase() : null;
 }
 
 /**
@@ -1301,18 +1449,27 @@ export async function runSshCommand(
   remoteCommand: string,
   options: {
     env?: Record<string, string>;
+    /** Share a master connection (short commands only); see `ssh-multiplex.ts`. */
+    multiplex?: SshMultiplex | null;
+    /** Stops the command: the local `ssh` gets SIGTERM, then SIGKILL after 5 s. */
+    signal?: AbortSignal;
     stdin?: string;
     timeoutMs?: number;
     maxBuffer?: number;
     /** `false`: source no login profile and start `/bin/sh` and `/usr/bin/env` by path. */
     loginProfiles?: boolean;
+    /** What the caller already chose for pnpm; see {@link SshStoreHints}. It does not change the command. */
+    storeHints?: SshStoreHints;
   } = {},
 ): Promise<SshCommandResult> {
+  options.signal?.throwIfAborted();
   let cleanup: () => Promise<void> = () => Promise.resolve();
+  const channel = await options.multiplex?.channel(config);
+  let killed = false;
   try {
     const auth = await createSshAuthArgs(config);
     cleanup = auth.cleanup;
-    const sshArgs = [...auth.args];
+    const sshArgs = [...auth.args, ...(channel?.args ?? [])];
     const envEntries = Object.entries(options.env ?? {})
       .filter((entry): entry is [string, string] => typeof entry[1] === "string");
     for (const [key] of envEntries) {
@@ -1337,12 +1494,10 @@ export async function runSshCommand(
     const [env, sh] = profiles ? ["env", "sh"] : ["/usr/bin/env", "/bin/sh"];
     const remoteScript = [
       ...(profiles
-        ? [
-            'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-            'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-            'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-            'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-          ]
+        ? sshRemotePrelude(config, {
+            cwd: options.storeHints?.cwd,
+            env: { ...(options.storeHints?.env ?? {}), ...(options.env ?? {}) },
+          })
         : []),
       envArgs.length > 0
         ? `exec ${env} ${envArgs.join(" ")} ${sh} -c ${shellQuote(remoteCommand)}`
@@ -1361,12 +1516,18 @@ export async function runSshCommand(
           stdin: options.stdin,
           timeout: options.timeoutMs ?? 15_000,
           maxBuffer: options.maxBuffer ?? 1024 * 128,
+          signal: options.signal,
         })
       : await execFileText("ssh", sshArgs, {
           timeout: options.timeoutMs ?? 15_000,
           maxBuffer: options.maxBuffer ?? 1024 * 128,
+          signal: options.signal,
         });
+  } catch (error) {
+    killed = options.signal?.aborted === true || (error as { killed?: unknown } | null)?.killed === true;
+    throw error;
   } finally {
+    await channel?.done({ killed });
     await cleanup();
   }
 }
@@ -1439,12 +1600,8 @@ export async function buildSshSpawnTarget(input: {
   // .bash_profile typically sources .bashrc itself; only source .bashrc
   // directly when no .bash_profile exists, so a host that adds nvm in
   // .bashrc still resolves node without a double-run of the setup.
-  const profileLines = (redirect: string) => [
-    `if [ -f /etc/profile ]; then . /etc/profile ${redirect} || true; fi`,
-    `if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" ${redirect} || true; fi`,
-    `if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" ${redirect} || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" ${redirect} || true; fi`,
-    `if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" ${redirect} || true; fi`,
-  ];
+  const prelude = (redirect?: string) =>
+    sshRemotePrelude(input.spec, { cwd: input.spec.remoteCwd, env: input.env }, redirect);
   const execLine = envArgs.length > 0
     ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
     : `exec ${remoteCommandParts}`;
@@ -1452,7 +1609,7 @@ export async function buildSshSpawnTarget(input: {
   const marker = runId && SSH_RUN_ID_PATTERN.test(runId) ? createRemoteRunMarker() : null;
   let remoteScript: string;
   if (!runId || !marker) {
-    remoteScript = [...profileLines(">/dev/null 2>&1"), `cd ${shellQuote(input.spec.remoteCwd)}`, execLine].join(" && ");
+    remoteScript = [...prelude(), `cd ${shellQuote(input.spec.remoteCwd)}`, execLine].join(" && ");
   } else {
     const remoteRoot = sshRemoteRootWord(input.spec.remoteWorkspacePath);
     const launchId = randomBytes(8).toString("hex");
@@ -1463,7 +1620,7 @@ export async function buildSshSpawnTarget(input: {
     // a stop that comes meanwhile still proves its group.
     const leaderScript = (group: boolean) => [
       ...buildRemoteRunRecordLines({ remoteRoot, runId, launchId, markerSha256: marker.entrySha256, group }),
-      ...profileLines("</dev/null >/dev/null 2>&1"),
+      ...prelude("</dev/null >/dev/null 2>&1"),
       `cd ${shellQuote(input.spec.remoteCwd)} || exit $?`,
       execLine,
     ].join("\n");
@@ -1868,11 +2025,18 @@ export async function prepareWorkspaceForSshExecution(input: {
       snapshot: gitSnapshot,
       onProgress: input.onProgress,
     });
+    // The history is already there, so only the working tree goes over. The
+    // dependency and cache trees the repository does not track are left behind,
+    // as sync-back leaves them: the run installs its own on the worker.
     await syncDirectoryToSsh({
       spec: input.spec,
       localDir: input.localDir,
       remoteDir,
-      exclude: [".git", ".paperclip-runtime"],
+      exclude: [
+        ".git",
+        ".paperclip-runtime",
+        ...sshSyncBackDependencyExcludes(await untrackedSshSyncBackDependencyDirNames(input.localDir)),
+      ],
       onProgress: input.onProgress,
       progressLabel: "workspace",
     });
@@ -1999,15 +2163,28 @@ export async function restoreWorkspaceFromSshExecution(input: {
   });
 }
 
+/**
+ * Creates and enters the remote workspace root and returns its path. With
+ * `probeResources`, the same SSH command also reads the worker's CPU count,
+ * load, memory and the root's free disk; a probe failure never fails the
+ * command, and `resourceProbe` is null when the probe printed nothing.
+ */
 export async function ensureSshWorkspaceReady(
   config: SshConnectionConfig,
-): Promise<{ remoteCwd: string }> {
-  const result = await runSshCommand(
-    config,
-    `mkdir -p ${shellQuote(config.remoteWorkspacePath)} && cd ${shellQuote(config.remoteWorkspacePath)} && pwd`,
-  );
+  options: { probeResources?: boolean } = {},
+): Promise<{ remoteCwd: string; resourceProbe: ResourceProbeReading | null }> {
+  const root = shellQuote(config.remoteWorkspacePath);
+  const command = `mkdir -p ${root} && cd ${root} && pwd`;
+  if (!options.probeResources) {
+    const result = await runSshCommand(config, command);
+    return { remoteCwd: result.stdout.trim(), resourceProbe: null };
+  }
+  const marker = createResourceProbeMarker();
+  const result = await runSshCommand(config, appendResourceProbe(command, marker));
+  const { head, probe } = splitResourceProbeOutput(result.stdout, marker);
   return {
-    remoteCwd: result.stdout.trim(),
+    remoteCwd: head.trim(),
+    resourceProbe: probe === null ? null : parseResourceProbeOutput(probe),
   };
 }
 
@@ -2169,6 +2346,8 @@ export async function startSshEnvLabFixture(input: {
   // a regression test can force the start-failure cleanup path without a
   // real 10 second wait.
   readinessTimeoutMs?: number;
+  // Test-only. Extra sshd_config lines, for example `MaxSessions 3`.
+  sshdConfigExtra?: readonly string[];
 }): Promise<SshEnvLabFixtureState> {
   // Resolve a relative statePath against the current working directory once,
   // up front. Every derived path (rootDir and the persisted statePath field)
@@ -2247,6 +2426,7 @@ export async function startSshEnvLabFixture(input: {
       "PrintMotd no",
       "UseDNS no",
       "Subsystem sftp internal-sftp",
+      ...(input.sshdConfigExtra ?? []),
       "",
     ].join("\n"),
     { mode: 0o600 },

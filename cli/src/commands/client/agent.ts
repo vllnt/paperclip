@@ -1,11 +1,13 @@
 import { Command } from "commander";
 import {
+  agentFallbacksSchema,
   agentSkillSyncSchema,
   createAgentSchema,
   resetAgentSessionSchema,
   updateAgentInstructionsBundleSchema,
   updateAgentInstructionsPathSchema,
   updateAgentPermissionsSchema,
+  updateAgentMergePatchSchema,
   updateAgentSchema,
   upsertAgentInstructionsFileSchema,
   wakeAgentSchema,
@@ -17,6 +19,7 @@ import {
   removeMaintainerOnlySkillSymlinks,
   resolvePaperclipSkillsDir,
 } from "@paperclipai/adapter-utils/server-utils";
+import { buildAgentConfigMergePatch, readConfigPath } from "./agent-config.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -55,6 +58,10 @@ interface AgentWakeOptions extends BaseClientOptions {
   payload?: string;
   idempotencyKey?: string;
   forceFreshSession?: boolean;
+}
+
+interface AgentFallbacksSetOptions extends BaseClientOptions {
+  fallbacksJson: string;
 }
 
 interface AgentJsonPayloadOptions extends BaseClientOptions {
@@ -389,9 +396,121 @@ export function registerAgentCommands(program: Command): void {
       .action(async (agentId: string, opts: AgentJsonPayloadOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
-          const payload = updateAgentSchema.parse(parseJson(opts.payloadJson));
+          const body = parseJson(opts.payloadJson);
+          const mergeMode = typeof body === "object" && body !== null && "mergeConfig" in body && body.mergeConfig === true;
+          const payload = (mergeMode ? updateAgentMergePatchSchema : updateAgentSchema).parse(body);
           const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, payload);
           printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  const config = agent
+    .command("config")
+    .description("Read or change one agent config value without resending the rest (secrets stay untouched)");
+
+  addCommonClientOptions(
+    config
+      .command("get")
+      .description("Print adapterConfig and runtimeConfig, or one dotted path (secrets stay redacted)")
+      .argument("<agentId>", "Agent ID")
+      .argument("[path]", "Dotted path, e.g. runtimeConfig.heartbeat")
+      .action(async (agentId: string, configPath: string | undefined, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const row = await ctx.api.get<Agent>(apiPath`/api/agents/${agentId}`);
+          const value = readConfigPath({ ...row }, configPath);
+          printOutput(value === undefined ? null : value, { json: true });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    config
+      .command("set")
+      .description(
+        "Merge config changes into an agent: path=value pairs (values parse as JSON, otherwise as text). " +
+          "Only the named keys change.",
+      )
+      .argument("<agentId>", "Agent ID")
+      .argument("[assignments...]", "e.g. runtimeConfig.heartbeat.maxDailyRuns=64 adapterConfig.model=gpt-5")
+      .option("--unset <path...>", "Remove these dotted paths, e.g. adapterConfig.env.DEBUG")
+      .option("--dry-run", "Print the merge patch without sending it")
+      .action(
+        async (
+          agentId: string,
+          assignments: string[],
+          opts: BaseClientOptions & { unset?: string[]; dryRun?: boolean },
+        ) => {
+          try {
+            const body = { mergeConfig: true as const, ...buildAgentConfigMergePatch(assignments, opts.unset ?? []) };
+            if (opts.dryRun) {
+              printOutput(body, { json: true });
+              return;
+            }
+            const ctx = resolveCommandContext(opts);
+            const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, body);
+            printOutput(updated, { json: ctx.json });
+          } catch (err) {
+            handleCommandError(err);
+          }
+        },
+      ),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("fallbacks:set")
+      .description(
+        "Set an agent's ordered harness/model fallback chain. Env values that hold credentials must be secret references.",
+      )
+      .argument("<agentId>", "Agent ID")
+      .requiredOption(
+        "--fallbacks-json <json>",
+        'Fallback entries, for example [{"adapterType":"codex_local","model":"gpt-5.5","effort":"high","env":{"OPENAI_API_KEY":{"type":"secret_ref","secretId":"<id>"}}}]',
+      )
+      .action(async (agentId: string, opts: AgentFallbacksSetOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const fallbacks = agentFallbacksSchema.parse(parseJson(opts.fallbacksJson));
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, { fallbacks });
+          printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("fallbacks:clear")
+      .description("Remove an agent's fallback chain; runs use only the primary harness and model")
+      .argument("<agentId>", "Agent ID")
+      .action(async (agentId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, { fallbacks: [] });
+          printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("cooldowns:clear")
+      .description("Clear an agent's provider quota cooldowns so its next run may use any harness and model")
+      .argument("<agentId>", "Agent ID")
+      .action(async (agentId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const result = await ctx.api.post(apiPath`/api/agents/${agentId}/harness-cooldowns/clear`, {});
+          printOutput(result, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }
@@ -421,7 +540,6 @@ export function registerAgentCommands(program: Command): void {
     ["resume", "resume", "Resume an agent"],
     ["approve", "approve", "Approve a pending agent"],
     ["terminate", "terminate", "Terminate an agent"],
-    ["heartbeat:invoke", "heartbeat/invoke", "Invoke an agent heartbeat"],
     ["claude-login", "claude-login", "Trigger Claude login for an agent"],
   ] as const) {
     addCommonClientOptions(
@@ -440,6 +558,24 @@ export function registerAgentCommands(program: Command): void {
         }),
     );
   }
+
+  addCommonClientOptions(
+    agent
+      .command("heartbeat:invoke")
+      .description("Invoke an agent heartbeat, optionally for one assigned issue")
+      .argument("<agentId>", "Agent ID")
+      .option("--issue <issueId>", "Wake the agent for this issue (sends payload.issueId)")
+      .action(async (agentId: string, opts: BaseClientOptions & { issue?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const body = opts.issue ? { payload: { issueId: opts.issue } } : {};
+          const result = await ctx.api.post(`${apiPath`/api/agents/${agentId}`}/heartbeat/invoke`, body);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
 
   addCommonClientOptions(
     agent

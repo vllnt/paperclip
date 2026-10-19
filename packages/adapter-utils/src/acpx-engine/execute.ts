@@ -49,6 +49,7 @@ import {
   type AcpxTerminalSessionFailureDiagnostic,
 } from "./terminal-session-failure.js";
 export type { AcpxTerminalSessionFailure } from "./terminal-session-failure.js";
+import { resolveCodexHomeSeedSelection, seedCodexHomeFiles } from "../codex-home-seed.js";
 import type { WorkspaceRestoreFailureCode, WorkspaceRestoreOutcome } from "../workspace-restore-merge.js";
 import {
   classifyWorkspaceRestoreFailure,
@@ -1013,6 +1014,7 @@ async function prepareManagedCodexHome(input: {
   sourceHome: string;
   targetHome: string;
   apiKey?: string;
+  codexHomeSeed?: unknown;
   onLog: AdapterExecutionContext["onLog"];
 }): Promise<string> {
   const { sourceHome, targetHome, apiKey, onLog } = input;
@@ -1041,6 +1043,15 @@ async function prepareManagedCodexHome(input: {
     const source = path.join(sourceHome, name);
     if (await pathExists(source)) await ensureCopiedFile(path.join(targetHome, name), source);
   }
+
+  // Opt-in worker files (global AGENTS.md, files it includes, hooks.json).
+  // Nothing is copied unless `codexHomeSeed` or PAPERCLIP_CODEX_HOME_SEED says so.
+  await seedCodexHomeFiles({
+    sourceHome,
+    targetHome,
+    selection: resolveCodexHomeSeedSelection(input.codexHomeSeed),
+    onLog,
+  });
 
   await onLog(
     "stdout",
@@ -1334,6 +1345,7 @@ async function prepareCodexSkillRuntime(input: {
       sourceHome: sourceCodexHome,
       targetHome: managedCodexHome,
       apiKey,
+      codexHomeSeed: input.config.codexHomeSeed,
       onLog: input.onLog,
     });
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);

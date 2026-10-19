@@ -11,6 +11,7 @@ import {
 } from "../../../services/issue-queued-comment-queue.js";
 import { selectInCommentBatches } from "../../../services/comment-id-batches.js";
 import { logActivity as persistActivityLogRow, type ActivityPublication } from "../../../services/activity-log.js";
+import { adapterSteeringAvailable, pendingAdapterSteeringCommentIds } from "../../../services/adapter-steering.js";
 import { decideQueuedCommentWakeLookup } from "../domain/policy.js";
 import { parseObject, readNonEmptyString } from "../domain/values.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
@@ -157,6 +158,7 @@ function buildTransaction(tx: Db, companyId: string, deps: QueuedCommentQueuePos
         activeRun,
         assignedAgentAdapterType: assignedAgent?.adapterType ?? null,
         queuedCommentCount: comments.length,
+        activeRunTakesLiveInput: adapterSteeringAvailable(activeRun?.id),
       });
       const steeringDisposition: IssueQueuedCommentQueue["steeringDisposition"] =
         steering.kind === "probe" ? "temporarily_unavailable" : steering.kind;
@@ -171,6 +173,7 @@ function buildTransaction(tx: Db, companyId: string, deps: QueuedCommentQueuePos
         comments,
         actorType: actor.actorType,
         actorId: actor.actorId,
+        pendingSteeringCommentIds: state === "deferred" ? pendingAdapterSteeringCommentIds(activeRun?.id) : undefined,
       });
     },
 
