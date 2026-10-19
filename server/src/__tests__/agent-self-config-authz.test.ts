@@ -38,10 +38,17 @@ describe("agent self-config protected field diff", () => {
     })).toEqual([]);
   });
 
-  it("keeps the stored aiConnection when the patch leaves it empty, like the route does", () => {
+  it("keeps the stored aiConnection when the patch omits it, and treats an explicit null as unbinding, like the route does", () => {
     expect(changesFor({ runtimeConfig: { heartbeat: { maxDailyRuns: 5, maxConcurrentRuns: 1 } } })).toEqual([]);
     expect(changesFor({ runtimeConfig: { aiConnection: null, heartbeat: { maxDailyRuns: 5, maxConcurrentRuns: 1 } } }))
-      .toEqual([]);
+      .toEqual(["runtimeConfig.aiConnection"]);
+    // Nothing is unbound on an agent that has no binding.
+    const unbound = { ...stored, runtimeConfig: { heartbeat: { maxDailyRuns: 5, maxConcurrentRuns: 1 } } };
+    expect(collectAgentProtectedConfigChanges(unbound, agentProtectedConfigAfterPatch(
+      unbound,
+      { runtimeConfig: { aiConnection: null, heartbeat: { maxDailyRuns: 5, maxConcurrentRuns: 1 } } },
+      false,
+    ))).toEqual([]);
     expect(changesFor({
       runtimeConfig: { aiConnection: { ...aiConnection, provider: "openai" }, heartbeat: { maxDailyRuns: 5, maxConcurrentRuns: 1 } },
     })).toEqual(["runtimeConfig.aiConnection"]);

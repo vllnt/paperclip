@@ -88,7 +88,27 @@ export type DeferredWakeCandidate = {
   selfReblockWake?: SelfReblockWakeMarker | null;
   /** Set while the self-reblock limit holds the wake back; the drain skips it until then. */
   selfReblockParkedUntil?: Date | null;
+  /** Set while a per-agent automation-wake window holds the wake back; the drain skips it until then. */
+  automationCoalescedUntil?: Date | null;
 };
+
+/** Admission of an automation wake through the agent's serialized window; a hold keeps the wake deferred. */
+export type AutomationWakeAdmissionInput = {
+  companyId: string;
+  agentId: string;
+  reason: string | null;
+  issueId: string | null;
+  now: Date;
+  /**
+   * Hold instead of waiting when another transaction owns the agent's window lock. A release
+   * drain can reach several agents while holding earlier windows; waiting on each would let
+   * two drains lock the same agents in opposite order and deadlock.
+   */
+  nonblocking?: boolean;
+};
+export type AutomationWakeAdmission =
+  | { hold: true; holdUntil: Date }
+  | { hold: false; admittedAt?: Date };
 
 export type PromoteDeferredWakeInput = {
   companyId: string;
@@ -103,6 +123,8 @@ export type PromoteDeferredWakeInput = {
   payload: Record<string, unknown>;
   responsibleUserId: string;
   sessionBefore: string | null;
+  /** The window admission time, stamped as the run's creation time so it opens the agent's next window. */
+  admittedAt?: Date;
   /** Only a proven failed-chat retry may retain its original retry lineage. */
   authorizedFailedChatRetry?: boolean;
   now: Date;
@@ -124,6 +146,24 @@ export interface WakeQueueTransaction {
     finishingRunAgentId: string;
     queuedCommentIds: string[];
   }): Promise<{ liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean }>;
+  /**
+   * Runs the agent's automation-window admission inside this transaction, under the
+   * per-agent window lock, before a deferred wake may start a run.
+   */
+  admitAutomationWake(input: AutomationWakeAdmissionInput): Promise<AutomationWakeAdmission>;
+  /**
+   * Keeps a held automation wake as the issue's coalesced deferred receipt (merging into an
+   * existing one) so the deferred-wake sweep delivers it through ordinary admission.
+   */
+  parkHeldAutomationWake(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    reason: string;
+    contextSnapshot: Record<string, unknown>;
+    notBefore: Date;
+    now: Date;
+  }): Promise<void>;
   /** Cancels the wake with `status = 'deferred_issue_execution'` as an atomic compare-and-set guard. */
   cancelDeferredWake(input: {
     companyId: string;
@@ -250,6 +290,8 @@ export interface WakeQueueTransaction {
     contextSnapshot: Record<string, unknown>;
     responsibleUserId: string;
     sessionBefore: string | null;
+    /** The window admission time, stamped as the run's creation time so it opens the agent's next window. */
+    admittedAt?: Date;
     now: Date;
   }): Promise<RunSummary>;
 }

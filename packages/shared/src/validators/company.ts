@@ -3,7 +3,10 @@ import {
   COMPANY_STATUSES,
   ISSUE_THREAD_INTERACTION_RESOLVER_POLICIES,
 } from "../constants.js";
+import { automationWakeSettingsSchema } from "../automation-wake.js";
+import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
 import { DUPLICATE_DETECTION_MODES } from "../duplicate-detection.js";
+import { runContextPolicySchema } from "../run-context.js";
 import { transientRetryPolicySchema } from "../transient-retry-policy.js";
 import { objectWithoutDefaults } from "./partial.js";
 
@@ -41,6 +44,9 @@ export const updateCompanySchema = objectWithoutDefaults(
       requireBoardApprovalForNewAgents: z.boolean().optional(),
       interactionResolverGovernance: interactionResolverGovernanceSchema.optional(),
       duplicateDetectionMode: z.enum(DUPLICATE_DETECTION_MODES).optional(),
+      automationWakeSettings: automationWakeSettingsSchema.optional(),
+      routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
+      runContextPolicy: runContextPolicySchema.nullable().optional(),
       transientRetryPolicy: transientRetryPolicySchema.optional(),
       feedbackDataSharingEnabled: z.boolean().optional(),
       feedbackDataSharingConsentAt: z.coerce.date().nullable().optional(),

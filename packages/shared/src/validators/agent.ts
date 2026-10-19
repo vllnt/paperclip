@@ -1,3 +1,6 @@
+import { automationWakeSettingsSchema } from "../automation-wake.js";
+import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
+import { runContextPolicySchema } from "../run-context.js";
 import { agentAppearanceSchema } from "../agent-appearance.js";
 import { aiConnectionBindingSchema } from "../ai-connections.js";
 import { z } from "zod";
@@ -70,21 +73,34 @@ export const createAgentInstructionsBundleSchema = z.object({
   }),
 });
 
-export const agentRuntimeConfigSchema = z.object({
-  aiConnection: aiConnectionBindingSchema.optional(),
-  transientRetryPolicy: transientRetryPolicySchema.optional(),
-  debug: z.object({
-    providerTrace: z.literal("raw").optional(),
-  }).strict().optional(),
-}).catchall(z.unknown()).superRefine((value, ctx) => {
-  if (Object.prototype.hasOwnProperty.call(value, "modelProfiles")) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["modelProfiles"],
-      message: "runtimeConfig.modelProfiles is no longer supported",
-    });
-  }
-});
+const agentHeartbeatConfigSchema = automationWakeSettingsSchema
+  .extend({ routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional() })
+  .catchall(z.unknown());
+
+// Create and update share every runtimeConfig rule; only an update may send
+// `aiConnection: null`, which explicitly unbinds the managed AI connection.
+function agentRuntimeConfigSchemaWith<T extends z.ZodTypeAny>(aiConnection: T) {
+  return z.object({
+    aiConnection,
+    runContext: runContextPolicySchema.optional(),
+    transientRetryPolicy: transientRetryPolicySchema.optional(),
+    heartbeat: agentHeartbeatConfigSchema.optional(),
+    debug: z.object({
+      providerTrace: z.literal("raw").optional(),
+    }).strict().optional(),
+  }).catchall(z.unknown()).superRefine((value, ctx) => {
+    if (Object.prototype.hasOwnProperty.call(value, "modelProfiles")) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["modelProfiles"],
+        message: "runtimeConfig.modelProfiles is no longer supported",
+      });
+    }
+  });
+}
+
+export const agentRuntimeConfigSchema = agentRuntimeConfigSchemaWith(aiConnectionBindingSchema.optional());
+export const updateAgentRuntimeConfigSchema = agentRuntimeConfigSchemaWith(aiConnectionBindingSchema.nullable().optional());
 
 export const createAgentSchema = z.object({
   name: z.string().min(1),
@@ -156,6 +172,7 @@ export const updateAgentSchema = objectWithoutDefaults(
   .partial()
   .extend({
     permissions: z.never().optional(),
+    runtimeConfig: updateAgentRuntimeConfigSchema.optional(),
     replaceAdapterConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),
     spentMonthlyCents: z.number().int().nonnegative().optional(),

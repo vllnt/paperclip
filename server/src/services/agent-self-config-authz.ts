@@ -231,13 +231,28 @@ export function collectAgentProtectedConfigChanges(
 }
 
 /**
+ * The runtimeConfig a PATCH stores: the request replaces the stored config, but
+ * an omitted `aiConnection` keeps the stored binding and an explicit `null`
+ * unbinds (the key is dropped, never persisted as null).
+ */
+export function mergePatchedRuntimeConfig(
+  existing: Record<string, unknown>,
+  requested: Record<string, unknown>,
+): Record<string, unknown> {
+  const { aiConnection, ...rest } = requested;
+  if (aiConnection === null) return rest;
+  return aiConnection || !existing.aiConnection ? requested : { ...requested, aiConnection: existing.aiConnection };
+}
+
+/**
  * Applies `PATCH /agents/:id` merge rules to the protected fields: adapterConfig
  * merges into the stored config unless `replaceAdapterConfig` is set or the
  * adapter type changes (which keeps the stored adapter-agnostic keys such as
  * `env` and `cwd` that the request omits), runtimeConfig replaces the stored
  * config but keeps the
- * stored `aiConnection` when the request leaves it empty, and omitted top-level
- * fields keep their stored value. Callers restore redacted `env` echoes first.
+ * stored `aiConnection` when the request leaves it empty (an explicit `null`
+ * drops it), and omitted top-level fields keep their stored value. Callers
+ * restore redacted `env` echoes first.
  */
 export function agentProtectedConfigAfterPatch(
   existing: AgentProtectedConfigState,
@@ -263,11 +278,9 @@ export function agentProtectedConfigAfterPatch(
 
   const existingRuntimeConfig = recordOrEmpty(existing.runtimeConfig);
   const requestedRuntimeConfig = isRecord(patch.runtimeConfig) ? patch.runtimeConfig : null;
-  const runtimeConfig = !requestedRuntimeConfig
-    ? existingRuntimeConfig
-    : (requestedRuntimeConfig.aiConnection || !existingRuntimeConfig.aiConnection
-      ? requestedRuntimeConfig
-      : { ...requestedRuntimeConfig, aiConnection: existingRuntimeConfig.aiConnection });
+  const runtimeConfig = requestedRuntimeConfig
+    ? mergePatchedRuntimeConfig(existingRuntimeConfig, requestedRuntimeConfig)
+    : existingRuntimeConfig;
 
   return {
     adapterType,

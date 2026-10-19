@@ -16,6 +16,7 @@ function makeCompany(overrides: Partial<Company>): Company {
     spentMonthlyCents: 0,
     requireBoardApprovalForNewAgents: false,
     duplicateDetectionMode: "off",
+    runContextPolicy: null,
     feedbackDataSharingEnabled: false,
     feedbackDataSharingConsentAt: null,
     feedbackDataSharingConsentByUserId: null,
@@ -27,6 +28,8 @@ function makeCompany(overrides: Partial<Company>): Company {
     updatedAt: new Date(),
     ...overrides,
     interactionResolverGovernance: overrides.interactionResolverGovernance ?? {},
+    automationWakeSettings: overrides.automationWakeSettings ?? {},
+    routineNoopSkipSettings: overrides.routineNoopSkipSettings ?? {},
     transientRetryPolicy: overrides.transientRetryPolicy ?? {},
   };
 }

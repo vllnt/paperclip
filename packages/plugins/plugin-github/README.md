@@ -302,6 +302,13 @@ paperclipai plugin action "$PLUGIN" user-authorization.poll -C "$ANTHM" --params
 `user-authorization.check` re-runs the fence check; `user-authorization.status`
 shows the person, token expiry and the last check (never a token). Any drift
 turns writes off; fix it, then save the policy with `"enabled": true` again.
+A 401 alone never does: the plugin refreshes the user token with the stored
+refresh token and retries once, and only GitHub refusing that refresh
+(`bad_refresh_token`) confirms a revocation. A network failure, a 401 no refresh
+confirmed or a refused App JWT pauses writes until the next good check. Token
+expiry and App JWTs follow GitHub's clock (the `Date` of its answers): a host
+clock more than a minute off is logged, shown as `fence.clockSkewSeconds` and
+recorded as `github.clock_skew` in the company activity.
 The kill switch is the same save with `"enabled": false`: writes stop at the
 next command, reads continue.
 

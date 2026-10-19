@@ -376,6 +376,44 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
   });
 
+  it("defaults automation wake settings to empty and persists a settings-only update", async () => {
+    const { routine, svc } = await seedFixture();
+    expect(routine.automationWakeSettings).toEqual({});
+
+    const settings = { minSecondsBetweenAutomationWakes: 120, byWakeReason: { issue_monitor_due: 30 } };
+    const updated = await svc.update(routine.id, { automationWakeSettings: settings }, {});
+    expect(updated?.automationWakeSettings).toEqual(settings);
+
+    const stored = await svc.get(routine.id);
+    expect(stored?.automationWakeSettings).toEqual(settings);
+
+    const cleared = await svc.update(routine.id, { automationWakeSettings: {} }, {});
+    expect(cleared?.automationWakeSettings).toEqual({});
+  });
+
+  it("rejects a stale wake-settings save and ignores an unchanged one", async () => {
+    const { routine, svc } = await seedFixture();
+    const newer = { minSecondsBetweenAutomationWakes: 600 };
+    await svc.update(routine.id, { automationWakeSettings: newer }, {});
+
+    // A stale editor started from {} and tries to write {} back with a new title.
+    await expect(
+      svc.update(
+        routine.id,
+        {
+          title: "Title from a stale editor",
+          automationWakeSettings: { minSecondsBetweenAutomationWakes: 5 },
+          baseAutomationWakeSettings: {},
+        },
+        {},
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+
+    // Sending the stored value unchanged is not a write.
+    await svc.update(routine.id, { title: "Title only", automationWakeSettings: newer, baseAutomationWakeSettings: newer }, {});
+    expect((await svc.get(routine.id))?.automationWakeSettings).toEqual(newer);
+  });
+
   it("filters listed routines by project", async () => {
     const { companyId, agentId, projectId, routine, svc } = await seedFixture();
     const otherProjectId = randomUUID();

@@ -2,13 +2,14 @@
 # No image here comes from Docker Hub: its anonymous pull limit returned 429 on
 # GitHub-hosted runners, and a failed release build cuts no release. Each
 # reference names a mirror and pins the index digest docker.io serves for the
-# same tag, so the bytes are identical. Docker library images come from
-# Docker's ECR Public mirror; other Docker Hub images come from mirror.gcr.io,
-# which serves only what it has cached. The BuildKit image is pinned the same
-# way in the workflows' setup-buildx-action steps. To bump a pin, read the new
-# digest with `docker buildx imagetools inspect docker.io/<image>:<tag>`,
-# confirm the mirror returns the same digest, and replace the @sha256 part.
-FROM public.ecr.aws/docker/library/node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS base
+# same tag, so the bytes are identical. Images come from mirror.gcr.io, which
+# serves only what it has cached. Docker's ECR Public mirror is not used: its
+# anonymous data limit also returned 429 on GitHub-hosted runners. The BuildKit
+# image is pinned the same way in the workflows' setup-buildx-action steps. To
+# bump a pin, read the new digest with
+# `docker buildx imagetools inspect docker.io/<image>:<tag>`, confirm the
+# mirror returns the same digest, and replace the @sha256 part.
+FROM mirror.gcr.io/library/node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
