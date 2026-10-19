@@ -1509,6 +1509,23 @@ export async function runSshCommand(
   }
 }
 
+const SSH_RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Where an SSH worker keeps the launch records of a heartbeat run:
+ * `<remoteRoot>/.paperclip-runtime/processes/<runId>`. Only a heartbeat run id
+ * (a UUID) gets records, so the last segment never aliases another directory.
+ * It lies outside `runs/<runId>`, which holds only the run's workspace copy.
+ *
+ * @param remoteRoot - The environment's `remoteWorkspacePath`.
+ * @param runId - The heartbeat run id.
+ * @returns The directory path.
+ */
+export function sshRunProcessRecordDir(remoteRoot: string, runId: string): string {
+  if (!SSH_RUN_ID_PATTERN.test(runId)) throw new Error("SSH launch records need a heartbeat run id.");
+  return path.posix.join(remoteRoot, ".paperclip-runtime", "processes", runId);
+}
+
 export async function buildSshSpawnTarget(input: {
   spec: SshRemoteExecutionSpec;
   command: string;
