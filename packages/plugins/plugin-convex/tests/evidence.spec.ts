@@ -52,6 +52,19 @@ describe("what counts as evidence that a preview's work is finished", () => {
     expect(project.kept).toBe(1);
   });
 
+  it("reads the branches again when it deletes: a branch pushed again after the plan keeps the preview", async () => {
+    const f = await setup({ configs: { [COMPANY_A]: baseConfig({ reaper: { enabled: true } }) } });
+    f.convex.add(deployment("gone-idle", { lastDeployTime: NOW - 48 * HOUR }));
+    // The plan reads the branch list once (the branch is gone). The delete reads it again, and by then the branch exists with an old commit.
+    f.github.onBranchList = reads => { if (reads === 2) f.github.branches.set("gone-idle", new Date(NOW - 70 * HOUR).toISOString()); };
+    await f.h.runJob("convex-reaper");
+    const project = (await f.h.performAction<any>("reaper.report", {}, member(COMPANY_A))).projects[0];
+    expect(project.delete.map((item: any) => item.name)).toEqual(["gone-idle"]);
+    expect(project.deleted).toEqual([]);
+    expect(project.skipped[0].reason).toMatch(/No closed pull request and no idle gone branch/);
+    expect(f.convex.deletes()).toHaveLength(0);
+  });
+
   it("keeps a preview whose branch is gone but was deployed within the activity window", async () => {
     const f = await setup();
     f.convex.add(deployment("gone-fresh", { lastDeployTime: NOW - 2 * HOUR }));

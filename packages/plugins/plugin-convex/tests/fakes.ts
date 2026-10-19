@@ -136,6 +136,9 @@ export class FakeGitHub {
   /** The token can read pull requests but not branches (answers 404, as a restricted fine-grained token does). */
   branchesHidden = false;
   validTokens = new Set<string>(["gh-token"]);
+  /** Called before each full branch list is answered, with the number of lists read so far: lets a test change GitHub between the plan and the delete. */
+  onBranchList: ((reads: number) => void) | null = null;
+  private branchListReads = 0;
 
   fetch: FetchLike = async (url, init) => {
     this.calls.push(url);
@@ -158,6 +161,7 @@ export class FakeGitHub {
       }));
     }
     if (repoPath === "/branches") {
+      if (page === 1) this.onBranchList?.(++this.branchListReads);
       if (this.branchesHidden) return json(404, { message: "Not Found" });
       const names = [...this.branches.keys(), ...Array.from({ length: this.extraBranches }, (_, i) => `filler-branch-${i}`)];
       return json(200, slice(names).map(name => ({ name })));
