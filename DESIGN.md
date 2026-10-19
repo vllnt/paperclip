@@ -24,10 +24,28 @@ Existing tiers already in index.css (~80+ tokens) — extraction maps to these o
 2. **Brand tier** — agent gradients `--agent-1a/1b..10a/10b` (fixed hex) and status hues `--status-task-*` / `--status-agent-*` (WCAG-tuned; see inline comments).
 3. **Domain tier** — match-chip tokens `--chip-match-*`, annotation highlights `--paperclip-doc-annotation-highlight-*`, plus motion/typography tokens.
 
+### Black-and-white theme
+
+Light is pure white surfaces with pure black ink; dark is pure black surfaces with pure white ink (`--background` / `--foreground`). The semantic tier holds no grey value: each neutral is the foreground mixed into the background (opaque fills, so sticky headers and covers stay opaque) or into `transparent` (borders and secondary text). Elevation is a 1 px border, never a grey fill.
+
+| Need | Use |
+|---|---|
+| Page, card, popover, sidebar surface | `bg-background` / `bg-card` / `bg-popover` / `bg-sidebar` (all the same pure surface) |
+| Hover, selected row, quiet chip or track | `bg-accent` / `bg-muted` |
+| Strong selection, primary action | `bg-primary text-primary-foreground` (inverted pill) |
+| Primary text / secondary text | `text-foreground` / `text-muted-foreground` |
+| Divider, card edge | `border-border` |
+| Form-control border | `border-input` |
+| Backlog, cancelled, idle status | `bg-status-neutral` / `text-status-neutral` |
+| Links and focus | `text-link`, `ring-ring` |
+| Chart series | `--chart-1..5`, or the `--status-*` hues |
+
+Gray-family Tailwind classes (`gray`, `zinc`, `neutral`, `slate`, `stone`) and grey colour literals are rejected by `scripts/check-grey-gate.mjs`, which runs inside `pnpm check:token-gates`. Mark a deliberate exception with `grey-gate: allow <reason>` on the same or previous line. Brand artwork (`--agent-*`, `--pill-guy-*`, `--app-logo-*`) and user-chosen colours are exempt. The mode switch is System (default), Light, Dark (`ThemeModeSwitch`, stored in `localStorage["paperclip.theme"]`, applied before first paint by `ui/index.html`). Token values, contrast numbers and exceptions: `doc/plans/2026-10-09-bw-theme.md`.
+
 ## Principles
 
 1. **One way to say each thing.** One component per job. One Button, one Card, one Badge, one Table, one EmptyState. Variants are props, not new components. Before creating a component, prove no existing one covers the job.
-2. **Tokens are the only source of visual values.** All color, spacing, radius, type size/weight, shadow, and motion values come from the token layer. No hex, no raw px, no ad-hoc Tailwind arbitrary values (`p-[13px]`) in components. If a needed value doesn't exist, add a token — don't inline it. Tailwind palette classes (`bg-red-500`, `text-zinc-400`, etc.) ARE hardcoded values in spirit: they name a literal color, not a semantic role. They are in-scope debt scheduled for a dedicated future run (Run 4, cluster-by-cluster mapping to semantic tokens per doc/design/DECISION-SHEET.md B2) and are not currently gated by check-token-gates. Exception (doc/design/DECISION-SHEET.md B1 user ruling): first-party intentional one-off decoration on demo/UX-lab surfaces stays inline and allowlisted rather than minted as singleton tokens.
+2. **Tokens are the only source of visual values.** All color, spacing, radius, type size/weight, shadow, and motion values come from the token layer. No hex, no raw px, no ad-hoc Tailwind arbitrary values (`p-[13px]`) in components. If a needed value doesn't exist, add a token — don't inline it. Tailwind palette classes (`bg-red-500`, `text-zinc-400`, etc.) ARE hardcoded values in spirit: they name a literal color, not a semantic role. They are in-scope debt scheduled for a dedicated future run (Run 4, cluster-by-cluster mapping to semantic tokens per doc/design/DECISION-SHEET.md B2) and are not currently gated by check-token-gates, except the grey family, which `check-grey-gate` rejects (see "Black-and-white theme"). Exception (doc/design/DECISION-SHEET.md B1 user ruling): first-party intentional one-off decoration on demo/UX-lab surfaces stays inline and allowlisted rather than minted as singleton tokens.
 3. **Spacing routes through tokens; the scale comes later.** During simplification, extract every spacing and radius value verbatim into tokens — do not normalize, round, or invent a scale. The final scale is a design decision made by a human after reviewing the token audit. Structural rules apply now: vertical rhythm within a container uses one gap value, not per-element margins, and siblings never carry both margin and gap.
 4. **Hierarchy through structure, not decoration.** Prefer position, size, and weight over borders, backgrounds, and dividers. Every border, divider, and background fill must justify itself; when in doubt, remove it. A screen should survive the removal of one visual layer.
 5. **Status is systematic.** States like running / paused / blocked / awaiting-approval / over-budget map to a single semantic status token set used identically everywhere (badge, row, chart, log). An operator learns the vocabulary once.

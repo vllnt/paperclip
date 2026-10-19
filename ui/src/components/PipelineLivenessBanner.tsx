@@ -116,7 +116,7 @@ export function PipelineLivenessBanner({
           {view.permissionKey ? (
             <p className="text-sm opacity-85">
               Required permission:{" "}
-              <code className="rounded-sm bg-black/10 px-1 py-0.5 text-xs font-medium dark:bg-white/10">
+              <code className="rounded-sm bg-foreground/10 px-1 py-0.5 text-xs font-medium">
                 {view.permissionKey}
               </code>{" "}
               on the target pipeline.

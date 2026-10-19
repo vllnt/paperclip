@@ -11,14 +11,21 @@ import {
   createIssueThreadInteractionSchema,
   createIssueTreeHoldSchema,
   createIssueWorkProductSchema,
+  DUPLICATE_PAIR_LABELS,
   type FeedbackTrace,
+  issueWaitRequestSchema,
+  findSimilarIssuesSchema,
+  type FindSimilarIssuesResult,
   type HeartbeatRun,
+  type IssueDuplicatePair,
+  labelDuplicatePairSchema,
   linkIssueApprovalSchema,
   previewIssueTreeControlSchema,
   rejectIssueThreadInteractionSchema,
   releaseIssueTreeHoldSchema,
   respondIssueThreadInteractionSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   restoreIssueDocumentRevisionSchema,
   updateIssueSchema,
   updateIssueWorkProductSchema,
@@ -42,12 +49,19 @@ import {
   normalizeFeedbackTraceExportFormat,
   serializeFeedbackTraces,
 } from "./feedback.js";
+import { formatIssueTree, type IssueTreeResponse } from "./issue-tree.js";
 
 interface IssueBaseOptions extends BaseClientOptions {
   status?: string;
   assigneeAgentId?: string;
   projectId?: string;
   match?: string;
+}
+
+interface IssueSimilarOptions extends BaseClientOptions {
+  title: string;
+  description?: string;
+  parentId?: string;
 }
 
 interface IssueCreateOptions extends BaseClientOptions {
@@ -61,6 +75,8 @@ interface IssueCreateOptions extends BaseClientOptions {
   parentId?: string;
   requestDepth?: string;
   billingCode?: string;
+  adapterOverridesJson?: string;
+  adapterOverridesFile?: string;
 }
 
 interface IssueUpdateOptions extends BaseClientOptions {
@@ -74,8 +90,65 @@ interface IssueUpdateOptions extends BaseClientOptions {
   parentId?: string;
   requestDepth?: string;
   billingCode?: string;
+  adapterOverridesJson?: string;
+  adapterOverridesFile?: string;
   comment?: string;
   hiddenAt?: string;
+  unblockOwner?: string;
+  unblockAction?: string;
+}
+
+type UnblockOwner = "board" | { agentId: string } | { userId: string };
+
+/**
+ * Parses `--unblock-owner`: `board`, `agent:<id>` or `user:<id>`.
+ * @returns the descriptor owner the API expects.
+ */
+export function parseUnblockOwner(value: string): UnblockOwner {
+  const trimmed = value.trim();
+  if (trimmed === "board") return "board";
+  const match = /^(agent|user):(.+)$/.exec(trimmed);
+  if (!match) throw new Error(`Invalid --unblock-owner "${value}". Use board, agent:<agent-id> or user:<user-id>.`);
+  return match[1] === "agent" ? { agentId: match[2] } : { userId: match[2] };
+}
+
+function unblockDescriptorFromOptions(opts: IssueUpdateOptions) {
+  if (opts.unblockOwner === undefined && opts.unblockAction === undefined) return undefined;
+  if (!opts.unblockOwner || !opts.unblockAction) {
+    throw new Error("--unblock-owner and --unblock-action go together.");
+  }
+  return { owner: parseUnblockOwner(opts.unblockOwner), action: opts.unblockAction };
+}
+
+interface AdapterOverridesOptions {
+  adapterOverridesJson?: string;
+  adapterOverridesFile?: string;
+}
+
+/**
+ * Reads `--adapter-overrides-json` or `--adapter-overrides-file`: per-issue
+ * assignee adapter overrides, as `{ "adapterConfig": {...}, "useProjectWorkspace": true }`.
+ * The command's payload schema validates the shape strictly.
+ *
+ * @returns the overrides object, `null` to clear them, or `undefined` when neither option is given.
+ */
+export async function parseAdapterOverridesOption(
+  opts: AdapterOverridesOptions,
+): Promise<Record<string, unknown> | null | undefined> {
+  if (opts.adapterOverridesJson !== undefined && opts.adapterOverridesFile !== undefined) {
+    throw new Error("Use only one of --adapter-overrides-json or --adapter-overrides-file.");
+  }
+  const raw =
+    opts.adapterOverridesFile !== undefined
+      ? await readFile(opts.adapterOverridesFile, "utf8")
+      : opts.adapterOverridesJson;
+  if (raw === undefined) return undefined;
+  const value = parseJson(raw);
+  if (value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error('Adapter overrides must be a JSON object, or null to clear them.');
+  }
+  return Object.fromEntries(Object.entries(value));
 }
 
 interface IssueCommentOptions extends BaseClientOptions {
@@ -146,6 +219,17 @@ interface IssueRecoveryResolveOptions extends BaseClientOptions {
   outcome: string;
   sourceIssueStatus: string;
   resolutionNote?: string;
+}
+
+interface IssueTreeOptions extends BaseClientOptions {
+  companyId?: string;
+}
+
+interface IssueExecutionReconcileOptions extends BaseClientOptions {
+  outcome: string;
+  note: string;
+  expectedRunId?: string;
+  workspaceRepairNote?: string;
 }
 
 interface InteractionAcceptOptions extends BaseClientOptions {
@@ -288,9 +372,12 @@ export function registerIssueCommands(program: Command): void {
       .option("--parent-id <id>", "Parent issue ID")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
+      .option("--adapter-overrides-json <json>", "Per-issue assignee adapter overrides as JSON (see docs/cli)")
+      .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .action(async (opts: IssueCreateOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const assigneeAdapterOverrides = await parseAdapterOverridesOption(opts);
           const payload = createIssueSchema.parse({
             title: opts.title,
             description: opts.description,
@@ -302,10 +389,80 @@ export function registerIssueCommands(program: Command): void {
             parentId: opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
+            assigneeAdapterOverrides,
           });
 
           const created = await ctx.api.post<Issue>(apiPath`/api/companies/${ctx.companyId}/issues`, payload);
           printOutput(created, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("similar")
+      .description("Check a draft issue for likely duplicates before creating it")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .requiredOption("--title <title>", "Draft issue title")
+      .option("--description <text>", "Draft issue description")
+      .option("--parent-id <id>", "Parent issue ID")
+      .action(async (opts: IssueSimilarOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const payload = findSimilarIssuesSchema.parse({
+            title: opts.title,
+            description: opts.description,
+            parentId: opts.parentId,
+          });
+          const result = await ctx.api.post<FindSimilarIssuesResult>(
+            apiPath`/api/companies/${ctx.companyId}/issues/similar`,
+            payload,
+          );
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("duplicate-pairs")
+      .description("List scored duplicate candidates recorded for an issue")
+      .argument("<idOrIdentifier>", "Issue ID or identifier (e.g. PC-12)")
+      .action(async (idOrIdentifier: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const pairs = await ctx.api.get<IssueDuplicatePair[]>(
+            apiPath`/api/issues/${idOrIdentifier}/duplicate-pairs`,
+          );
+          printOutput(pairs, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("duplicate-label")
+      .description("Record whether a scored pair is a duplicate or should be kept as two issues")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .argument("<pairId>", "Duplicate pair ID from `issue duplicate-pairs`")
+      .argument("<label>", `One of: ${DUPLICATE_PAIR_LABELS.join(", ")}`)
+      .action(async (pairId: string, label: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const payload = labelDuplicatePairSchema.parse({ label });
+          const pair = await ctx.api.post<IssueDuplicatePair>(
+            apiPath`/api/companies/${ctx.companyId}/issue-duplicate-pairs/${pairId}/label`,
+            payload,
+          );
+          printOutput(pair, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }
@@ -328,12 +485,24 @@ export function registerIssueCommands(program: Command): void {
       .option("--parent-id <id>", "Parent issue ID")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
+      .option(
+        "--adapter-overrides-json <json>",
+        "Per-issue assignee adapter overrides as JSON; 'null' clears them (see docs/cli)",
+      )
+      .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .option("--comment <text>", "Optional comment to add with update")
       .option("--hidden-at <iso8601|null>", "Set hiddenAt timestamp or literal 'null'")
+      .option(
+        "--unblock-owner <owner>",
+        "Who must act on a blocked issue: board, agent:<id> or user:<id> (agents may name only board or themselves)",
+      )
+      .option("--unblock-action <text>", "The exact action that unblocks the issue (with --unblock-owner)")
       .action(async (issueId: string, opts: IssueUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
+          const assigneeAdapterOverrides = await parseAdapterOverridesOption(opts);
           const payload = updateIssueSchema.parse({
+            unblockDescriptor: unblockDescriptorFromOptions(opts),
             title: opts.title,
             description: opts.description,
             status: opts.status,
@@ -344,6 +513,7 @@ export function registerIssueCommands(program: Command): void {
             parentId: opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
+            assigneeAdapterOverrides,
             comment: opts.comment,
             hiddenAt: parseHiddenAt(opts.hiddenAt),
           });
@@ -536,6 +706,65 @@ export function registerIssueCommands(program: Command): void {
             resolutionNote: opts.resolutionNote,
           });
           const result = await ctx.api.post(apiPath`/api/issues/${issueId}/recovery-actions/resolve`, payload);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("tree")
+      .description("Show an issue and its sub-issues as a tree with status, assignee, and last run")
+      .argument("<issueId>", "Root issue ID")
+      .option("-C, --company-id <id>", "Company ID (only used to show agent names)")
+      .action(async (issueId: string, opts: IssueTreeOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const tree = await ctx.api.get<IssueTreeResponse>(apiPath`/api/issues/${issueId}/diagnostics/subtree`);
+          if (ctx.json) {
+            printOutput(tree, { json: true });
+            return;
+          }
+          const agentNames = new Map<string, string>();
+          if (ctx.companyId) {
+            try {
+              const agentRows = (await ctx.api.get<Array<{ id: string; name: string }>>(
+                apiPath`/api/companies/${ctx.companyId}/agents`,
+              )) ?? [];
+              for (const row of agentRows) agentNames.set(row.id, row.name);
+            } catch {
+              // Names are a convenience; fall back to agent ids when the list is not readable.
+            }
+          }
+          for (const line of formatIssueTree(tree ?? { nodes: [] }, agentNames)) console.log(line);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("reconcile")
+      .description("Record stopped execution outcomes and continue an issue")
+      .argument("<issueId>", "Issue ID")
+      .requiredOption("--outcome <outcome>", "done, none, or mixed")
+      .requiredOption("--note <text>", "Evidence for the observed execution outcome")
+      .option("--expected-run-id <id>", "Require this latest stopped run")
+      .option("--workspace-repair-note <text>", "Evidence that an unsafe workspace was repaired")
+      .action(async (issueId: string, opts: IssueExecutionReconcileOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const payload = reconcileIssueExecutionSchema.parse({
+            outcome: opts.outcome,
+            note: opts.note,
+            expectedRunId: opts.expectedRunId,
+            workspaceRepairNote: opts.workspaceRepairNote,
+          });
+          const result = await ctx.api.post(apiPath`/api/issues/${issueId}/execution/reconcile`, payload);
           printOutput(result, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
@@ -1313,6 +1542,28 @@ export function registerIssueCommands(program: Command): void {
 
   addCommonClientOptions(
     issue
+      .command("wait")
+      .description(
+        "End your turn with a wait: Paperclip re-checks this issue after the delay and wakes you. " +
+          "Use it instead of leaving a background process (CI watch, sleep loop, port wait) running.",
+      )
+      .argument("<issueId>", "Issue ID (must be assigned to you)")
+      .requiredOption("--in <duration>", "Delay before the re-check: 1m to 24h, e.g. 10m, 90s, 1h30m")
+      .requiredOption("--reason <text>", 'What you are waiting for, e.g. "CI on PR #4320 head abc123"')
+      .action(async (issueId: string, opts: IssueWaitOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const payload = issueWaitRequestSchema.parse({ in: opts.in, reason: opts.reason });
+          const result = await ctx.api.post(apiPath`/api/issues/${issueId}/wait`, payload);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
       .command("release")
       .description("Release issue execution locks; clear the assignee only for unfinished issues")
       .argument("<issueId>", "Issue ID")
@@ -1326,6 +1577,11 @@ export function registerIssueCommands(program: Command): void {
         }
       }),
   );
+}
+
+interface IssueWaitOptions extends BaseClientOptions {
+  in: string;
+  reason: string;
 }
 
 function parseCsv(value: string | undefined): string[] {

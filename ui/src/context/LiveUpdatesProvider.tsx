@@ -44,6 +44,12 @@ import {
   clearIssueExecutionRun,
   removeLiveRunById,
 } from "../lib/optimistic-issue-runs";
+import {
+  isIssueListQueryAffected,
+  mergeIssueListScopes,
+  resolveIssueListScope,
+  type IssueListScope,
+} from "../lib/issue-list-invalidation";
 import { queryKeys } from "../lib/queryKeys";
 import { extractCompanyPrefixFromPath, toCompanyRelativePath } from "../lib/company-routes";
 import { useLocation } from "../lib/router";
@@ -293,6 +299,10 @@ function isPageForegrounded(): boolean {
   return true;
 }
 
+function isPageVisible(): boolean {
+  return typeof document !== "undefined" && document.visibilityState === "visible";
+}
+
 function resolveVisibleIssueRouteContext(
   queryClient: QueryClient,
   pathname: string,
@@ -479,17 +489,20 @@ function invalidateVisibleIssueRunQueries(
   payload: Record<string, unknown>,
   options?: VisibleRouteOptions,
 ): boolean {
-  const context = resolveVisibleIssueRouteContext(
-    queryClient,
-    pathname,
-    options,
-  );
+  // Refreshing the open issue's run queries needs a visible page, not a focused
+  // one: an unfocused window (second monitor, split screen) still shows the run,
+  // and the idle poll is slow enough that it should not be the only refresh.
+  const context = resolveVisibleIssueRouteContext(queryClient, pathname, {
+    isForegrounded: options?.isForegrounded ?? isPageVisible(),
+  });
   if (!context) return false;
 
   const runId = readString(payload.runId);
   const agentId = readString(payload.agentId);
+  const issueId = readString(payload.issueId);
   const matchesVisibleIssue =
     (runId !== null && context.runIds.has(runId)) ||
+    (issueId !== null && context.issueRefs.has(issueId)) ||
     (!!agentId &&
       !!context.assigneeAgentId &&
       agentId === context.assigneeAgentId);
@@ -1248,6 +1261,71 @@ function invalidateHeartbeatProgressQueries(
   }
 }
 
+// An issue-list invalidation refetches every company issue list at once (each
+// board column, the task list, inbox lists). Steady agent activity fills every
+// 300ms batcher window, so issue lists get their own longer window: the first
+// event refreshes them at once and always gets one trailing refresh; events
+// inside a window collapse into the next one. The server caches compact issue
+// lists for 2s after computing them, so the immediate refresh can be served a
+// response from before the change; the window is long enough that the trailing
+// refresh reads past that cache.
+const ISSUE_LIST_INVALIDATION_WINDOW_MS = 3_000;
+const issueListInvalidationWindows = new WeakMap<
+  QueryClient,
+  Map<string, { pending: IssueListScope | null }>
+>();
+
+// An event that can only change one card in place (a comment, a priority edit)
+// refreshes just the board columns holding that issue; see
+// `resolveIssueListScope`. Anything else refreshes every list.
+function invalidateCompanyIssueLists(
+  queryClient: QueryClient,
+  companyId: string,
+  scope: IssueListScope,
+) {
+  queryClient.invalidateQueries(
+    scope === "all"
+      ? { queryKey: queryKeys.issues.list(companyId) }
+      : {
+          queryKey: queryKeys.issues.list(companyId),
+          predicate: (query) => isIssueListQueryAffected(query.queryKey, companyId, scope),
+        },
+  );
+  queryClient.invalidateQueries({
+    queryKey: queryKeys.issues.listMineByMe(companyId),
+  });
+  queryClient.invalidateQueries({
+    queryKey: queryKeys.issues.listTouchedByMe(companyId),
+  });
+  queryClient.invalidateQueries({
+    queryKey: queryKeys.issues.listUnreadTouchedByMe(companyId),
+  });
+}
+
+function scheduleCompanyIssueListInvalidation(
+  queryClient: QueryClient,
+  companyId: string,
+  scope: IssueListScope,
+) {
+  const windows = issueListInvalidationWindows.get(queryClient) ?? new Map();
+  issueListInvalidationWindows.set(queryClient, windows);
+  const open = windows.get(companyId);
+  if (open) {
+    open.pending = mergeIssueListScopes(open.pending, scope);
+    return;
+  }
+  const refresh = (refreshScope: IssueListScope, trailingScope: IssueListScope | null) => {
+    invalidateCompanyIssueLists(queryClient, companyId, refreshScope);
+    const window = { pending: trailingScope };
+    windows.set(companyId, window);
+    setTimeout(() => {
+      windows.delete(companyId);
+      if (window.pending) refresh(window.pending, null);
+    }, ISSUE_LIST_INVALIDATION_WINDOW_MS);
+  };
+  refresh(scope, scope);
+}
+
 function invalidateActivityQueries(
   queryClient: ReturnType<typeof useQueryClient>,
   companyId: string,
@@ -1298,18 +1376,11 @@ function invalidateActivityQueries(
       // An ancestor hold or reparenting changes descendants' effective pause.
       queryClient.invalidateQueries({ queryKey: ["issues", "tree-control-state"] });
     }
-    queryClient.invalidateQueries({
-      queryKey: queryKeys.issues.list(companyId),
-    });
-    queryClient.invalidateQueries({
-      queryKey: queryKeys.issues.listMineByMe(companyId),
-    });
-    queryClient.invalidateQueries({
-      queryKey: queryKeys.issues.listTouchedByMe(companyId),
-    });
-    queryClient.invalidateQueries({
-      queryKey: queryKeys.issues.listUnreadTouchedByMe(companyId),
-    });
+    scheduleCompanyIssueListInvalidation(
+      queryClient,
+      companyId,
+      resolveIssueListScope(queryClient, companyId, { entityId, action, details }),
+    );
     if (entityId) {
       const selfCommentActivity =
         (action === "issue.comment_added" ||

@@ -89,6 +89,7 @@ import type {
   IssueReviewAttentionPath,
   IssueBlockedInboxAttention,
   IssueBlockedInboxIssueRef,
+  IssueChanges,
   IssueRelationIssueSummary,
   IssueWatchdogSummary,
   LowTrustBoundary,
@@ -104,8 +105,18 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
+import {
+  assertAgentMayChangeBlock,
+  checkoutKeepsHumanOwnedBlock,
+  handsBlockToHuman,
+  HUMAN_OWNED_BLOCK_MESSAGE,
+  isHumanOwnedBlock,
+  notHumanOwnedBlockCondition,
+  type IssueCheckoutActor,
+  type NativeStatusProjectionActor,
+} from "./routable-blocked.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -139,9 +150,11 @@ import {
 } from "./native-runtime/native-chat-review-presentation.js";
 import {
   buildInitialIssueMonitorFields,
+  buildIssueMonitorClearedPatch,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { executionBlockerPredicate } from "./execution-blocker.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import {
@@ -1991,6 +2004,7 @@ type IssueWakeDiagnosticsWakeRequestRow = {
   claimedAt: Date | null;
   finishedAt: Date | null;
   error: string | null;
+  payload?: Record<string, unknown> | null;
 };
 type IssueWakeDiagnosticsActivityRow = {
   action: string;
@@ -2016,6 +2030,16 @@ type IssueSubtreeDiagnosticsWakeRequestRow =
   };
 type IssueSubtreeDiagnosticsActivityRow = IssueWakeDiagnosticsActivityRow & {
   issueId: string;
+};
+type IssueSubtreeDiagnosticsLastRunRow = {
+  issueId: string;
+  id: string;
+  status: string;
+  agentId: string;
+  startedAt: Date | string | null;
+  finishedAt: Date | string | null;
+  createdAt: Date | string;
+  errorCode: string | null;
 };
 type IssueSubtreeDiagnosticsBlockerResultRow =
   IssueSubtreeDiagnosticsBlockerRow & {
@@ -6618,6 +6642,56 @@ export async function readIssueCommentRunLogText(run: {
   return content;
 }
 
+/**
+ * The fields that clear an issue's monitor because its assignee agent changes.
+ * A monitor and its note belong to the agent that scheduled them, so release and
+ * checkout clear it the way a PATCH reassignment does. Null when nothing is armed.
+ * The persisted reason is `invalid_assignee` so a rolled-back image can still
+ * read the execution state; the activity details say "reassigned".
+ */
+function monitorClearedForAssigneeChange(
+  issue: typeof issues.$inferSelect,
+  nextAssigneeAgentId: string | null,
+) {
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+  if (!policy?.monitor && !issue.monitorNextCheckAt) return null;
+  if (issue.assigneeAgentId === nextAssigneeAgentId) return null;
+  return {
+    ...buildIssueMonitorClearedPatch({ issue, policy, clearReason: "invalid_assignee" }),
+    monitorNotes: null,
+  };
+}
+
+export interface IssueCreatedEvent {
+  id: string;
+  companyId: string;
+}
+
+let issueCreatedListener: ((event: IssueCreatedEvent) => void) | null = null;
+
+/**
+ * Registers the one listener told about every newly inserted issue, whichever path created it
+ * (root create, child create, plan decomposition, routines, chat, runtime delegation).
+ * It is not called when a create resolves to an existing issue. When the caller owns an open
+ * transaction the event can fire before that transaction commits, so listeners must tolerate an
+ * issue that is not visible yet. Pass `null` to remove it.
+ */
+export function setIssueCreatedListener(listener: ((event: IssueCreatedEvent) => void) | null): void {
+  issueCreatedListener = listener;
+}
+
+function notifyIssueCreated(event: IssueCreatedEvent): void {
+  if (!issueCreatedListener) return;
+  try {
+    issueCreatedListener(event);
+  } catch (error) {
+    logger.warn(
+      { err: error instanceof Error ? error.message : String(error), issueId: event.id },
+      "issue created listener failed",
+    );
+  }
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -8652,6 +8726,7 @@ export function issueService(db: Db) {
           claimedAt: agentWakeupRequests.claimedAt,
           finishedAt: agentWakeupRequests.finishedAt,
           error: agentWakeupRequests.error,
+          payload: agentWakeupRequests.payload,
         })
         .from(agentWakeupRequests)
         .where(
@@ -8876,6 +8951,7 @@ export function issueService(db: Db) {
       const truncatedBlockerIssueIds = new Set<string>();
       const truncatedWakeIssueIds = new Set<string>();
       const truncatedActivityIssueIds = new Set<string>();
+      const lastRunByIssueId = new Map<string, IssueSubtreeDiagnosticsLastRunRow>();
 
       if (nodeIds.length > 0) {
         const nodeIdValues = sql.join(
@@ -9028,11 +9104,35 @@ export function issueService(db: Db) {
           rows.push(normalized);
           activityRecordsByIssueId.set(normalized.issueId, rows);
         }
+
+        // Latest run per node, one batched query. Runs link to an issue through
+        // their context snapshot (heartbeat_runs_company_ctx_issue_created_idx).
+        const rawLastRunRows = Array.from(
+          await db.execute(sql`
+          SELECT DISTINCT ON (run.context_snapshot ->> 'issueId')
+            run.context_snapshot ->> 'issueId' AS "issueId",
+            run.id,
+            run.status,
+            run.agent_id AS "agentId",
+            run.started_at AS "startedAt",
+            run.finished_at AS "finishedAt",
+            run.created_at AS "createdAt",
+            run.error_code AS "errorCode"
+          FROM heartbeat_runs run
+          WHERE run.company_id = ${issue.companyId}
+            AND (run.context_snapshot ->> 'issueId') IN (${nodeIdValues})
+          ORDER BY run.context_snapshot ->> 'issueId', run.created_at DESC, run.id DESC
+        `),
+        ) as IssueSubtreeDiagnosticsLastRunRow[];
+        for (const row of rawLastRunRows) {
+          lastRunByIssueId.set(row.issueId, row);
+        }
       }
 
       return {
         nodes,
         blockersByIssueId,
+        lastRunByIssueId,
         readinessByIssueId: readiness,
         wakeRequestsByIssueId,
         activityRecordsByIssueId,
@@ -9829,6 +9929,7 @@ export function issueService(db: Db) {
       ) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      const created: { event: IssueCreatedEvent | null } = { event: null };
       const persist = async (tx: DbTransaction) => {
         await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
         if (issueData.conversationAgentId && issueData.conversationUserId) {
@@ -10220,6 +10321,7 @@ export function issueService(db: Db) {
         );
 
         const [issue] = await tx.insert(issues).values(values).returning();
+        created.event = { id: issue.id, companyId: issue.companyId };
         await recordChatHandoff(tx, issue, actorRunId);
         if (idempotencyKey) {
           await tx.insert(issueCreateIdempotencyKeys).values({
@@ -10270,8 +10372,10 @@ export function issueService(db: Db) {
         );
         return withRelations;
       };
-      if (dbOrTx === db) return db.transaction(persist);
-      return persist(dbOrTx as DbTransaction);
+      const result =
+        dbOrTx === db ? await db.transaction(persist) : await persist(dbOrTx as DbTransaction);
+      if (created.event) notifyIssueCreated(created.event);
+      return result;
     },
 
     /**
@@ -10626,6 +10730,13 @@ export function issueService(db: Db) {
         actorRunId?: string | null;
         actorRunStopId?: string | null;
         actorUserId?: string | null;
+        /**
+         * Names a platform caller that writes on its own account. The write is then held to the
+         * human-owned block rule in its `WHERE`: it does not match a block that the board or a
+         * person owns, and the call resolves with that row unchanged, with nothing else written. A
+         * caller that must know whether its values landed compares them with the row.
+         */
+        systemActor?: NativeStatusProjectionActor;
         companyGuard?: string;
       },
       dbOrTx: any = db,
@@ -10673,6 +10784,7 @@ export function issueService(db: Db) {
         actorRunId,
         actorRunStopId,
         actorUserId,
+        systemActor,
         companyGuard,
         ...issueData
       } = data;
@@ -10753,6 +10865,9 @@ export function issueService(db: Db) {
       ) {
         patch.unblockDescriptor = null;
         patch.blockedTransitionAt = null;
+        patch.blockedOwnerNotifiedAt = null;
+      } else if (handsBlockToHuman(existing, issueData)) {
+        patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
       }
       if (issueData.requestDepth !== undefined) {
@@ -10947,6 +11062,9 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Only a human lifts a human-owned block. An agent, and any write that names no actor at
+        // all, is refused. A named system actor is held by the `WHERE` of the write instead.
+        if (actorAgentId || (!actorUserId && !systemActor)) assertAgentMayChangeBlock(receiptExisting, issueData);
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.
@@ -11015,10 +11133,15 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(idPredicate)
+          .where(systemActor ? and(idPredicate, notHumanOwnedBlockCondition(issues)) : idPredicate)
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-        if (!updated) return null;
+        if (!updated) {
+          if (!systemActor || !isHumanOwnedBlock(receiptExisting)) return null;
+          const [held] = await withIssueLabels(tx, [receiptExisting]);
+          const noChanges: IssueChanges = {};
+          return { ...held, changes: noChanges };
+        }
         await recordChatCompletion(tx, receiptExisting, updated);
         // An operator explicitly choosing a disposition owns that decision,
         // including choosing In Review while the conversation is Idle.
@@ -11028,9 +11151,33 @@ export function issueService(db: Db) {
               eq(chatConversations.state, "waiting"), sql`exists (select 1 from chat_endpoints e
                 where e.id = ${chatConversations.endpointId} and e.company_id = ${chatConversations.companyId} and e.provider = 'slack')`));
         }
-        if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
+        // Compare against the row read under the lock, not the pre-lock snapshot.
+        if (updated.assigneeAgentId !== receiptExisting.assigneeAgentId || updated.assigneeUserId !== receiptExisting.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
+          // A recovery hold names the previous owner's run; the new owner
+          // cannot reconcile it, so supersede it with the ownership change.
+          const supersededAt = new Date();
+          const supersededNote = "Recovery closed because the task's owner changed. No work was replayed.";
+          await tx.update(issueRecoveryActions).set({
+            status: "resolved",
+            outcome: "cancelled",
+            resolvedAt: supersededAt,
+            updatedAt: supersededAt,
+            nextAction: supersededNote,
+            resolutionNote: supersededNote,
+            wakePolicy: null,
+            monitorPolicy: null,
+            evidence: sql`case when ${issueRecoveryActions.evidence} ? 'automaticRecovery'
+              then jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"owner_changed"'::jsonb)
+              else ${issueRecoveryActions.evidence} end`,
+          }).where(and(
+            eq(issueRecoveryActions.companyId, updated.companyId),
+            eq(issueRecoveryActions.sourceIssueId, updated.id),
+            executionBlockerPredicate(),
+            // An unsafe workspace stays held until repair, whoever owns the task.
+            sql`coalesce(${issueRecoveryActions.evidence}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'`,
+          ));
         }
         if (existing.status !== updated.status) {
           if (
@@ -11409,12 +11556,27 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
+    /**
+     * Assigns the issue to the agent and moves it to `in_progress`.
+     *
+     * Agents and automatic system checkouts may not take an issue out of a block that the board
+     * or a person owns, the same rule as `update`. The rule is part of the `WHERE` of the write, so a
+     * descriptor that changes after the caller read the issue still stops it. The call fails with
+     * a 403 and the issue stays blocked.
+     *
+     * The caller must say who it is, so no caller skips the rule by forgetting to. A board user
+     * may check the issue out; automatic heartbeat wakes do not carry that authority.
+     *
+     * @param actor - Who asks for the checkout. Only a `board` actor may lift a human-owned block.
+     */
     checkout: async (
       id: string,
       agentId: string,
       expectedStatuses: string[],
       checkoutRunId: string | null,
+      actor: IssueCheckoutActor,
     ) => {
+      const keepHumanOwnedBlock = checkoutKeepsHumanOwnedBlock(actor);
       const issueCompany = await db
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -11426,6 +11588,11 @@ export function issueService(db: Db) {
       });
 
       const now = new Date();
+      const previousIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         issueCompany.companyId,
         id,
@@ -11496,6 +11663,7 @@ export function issueService(db: Db) {
       const updated = await db
         .update(issues)
         .set({
+          ...(previousIssue ? monitorClearedForAssigneeChange(previousIssue, agentId) : {}),
           assigneeAgentId: agentId,
           assigneeUserId: null,
           checkoutRunId,
@@ -11510,6 +11678,7 @@ export function issueService(db: Db) {
             inArray(issues.status, expectedStatuses),
             or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
             executionLockCondition,
+            keepHumanOwnedBlock ? notHumanOwnedBlockCondition(issues) : undefined,
           ),
         )
         .returning()
@@ -11524,6 +11693,7 @@ export function issueService(db: Db) {
         .select({
           id: issues.id,
           status: issues.status,
+          unblockDescriptor: issues.unblockDescriptor,
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
@@ -11533,6 +11703,10 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
 
       if (!current) throw notFound("Issue not found");
+
+      if (keepHumanOwnedBlock && expectedStatuses.includes("blocked") && isHumanOwnedBlock(current)) {
+        throw forbidden(HUMAN_OWNED_BLOCK_MESSAGE);
+      }
 
       if (
         current.assigneeAgentId === agentId &&
@@ -11629,6 +11803,7 @@ export function issueService(db: Db) {
                   isNull(issues.assigneeAgentId),
                   eq(issues.assigneeAgentId, agentId),
                 ),
+                keepHumanOwnedBlock ? notHumanOwnedBlockCondition(issues) : undefined,
               ),
             )
             .returning()
@@ -11867,11 +12042,13 @@ export function issueService(db: Db) {
         const isTerminal = existing.status === "done" || existing.status === "cancelled";
         const releaseStatus =
           existing.status === "in_progress" ? "todo" : existing.status;
+        const releasedAssigneeAgentId = isTerminal ? existing.assigneeAgentId : null;
         const updated = await tx
           .update(issues)
           .set({
+            ...(isTerminal ? {} : monitorClearedForAssigneeChange(existing, releasedAssigneeAgentId)),
             status: releaseStatus,
-            assigneeAgentId: isTerminal ? existing.assigneeAgentId : null,
+            assigneeAgentId: releasedAssigneeAgentId,
             checkoutRunId: null,
             executionRunId: null,
             executionAgentNameKey: null,

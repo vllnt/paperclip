@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
+import { runWithPaperclipTempRun } from "@paperclipai/adapter-utils/paperclip-temp";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 
 // Every test in this file needs a real teardown, so the mock below delegates
@@ -113,8 +114,9 @@ function subscriptionAuthJson(accountId: string, lastRefresh: string, marker: st
 
 // Enumerate the host staged-home temp dirs `stageCodexHomeForSync` created for a
 // given runId (`paperclip-codex-home-sync-<runId>-<random>` under os.tmpdir()).
-// A unique per-test runId scopes the match to this run's staging dirs only, so
-// the assertion is not disturbed by other tests/processes sharing the tmp dir.
+// The server runs each run in `runWithPaperclipTempRun`, which puts the run id
+// in the name. A unique per-test runId scopes the match to this run's staging
+// dirs only, so other tests/processes sharing the tmp dir do not disturb it.
 async function listCodexHomeSyncDirs(runId: string): Promise<string[]> {
   const prefix = `paperclip-codex-home-sync-${runId}-`;
   const entries = await fs.readdir(os.tmpdir());
@@ -1177,7 +1179,7 @@ describe("codex_local ACP lane", () => {
     // `disposeStaged`, fired only when the runtime is dropped. So after a CLEAN
     // turn the engine caches the staged runtime warm and its host staged home is
     // still on disk for the next compatible resume to reuse.
-    const runId = `run-keep-staged-home-${randomUUID()}`;
+    const runId = randomUUID();
     const root = await makeTempRoot("paperclip-codex-acp-keep-staged-");
     const localCwd = path.join(root, "worktree");
     const remoteCwd = path.join(root, "remote-workspace");
@@ -1207,7 +1209,7 @@ describe("codex_local ACP lane", () => {
       stagedRuntimes,
       stagingLocks: new Map(),
     });
-    const result = await execute(
+    const result = await runWithPaperclipTempRun(runId, () => execute(
       buildContext(localCwd, {
         runId,
         config: {
@@ -1231,7 +1233,7 @@ describe("codex_local ACP lane", () => {
         } as never,
         authToken: "real-run-jwt",
       }),
-    );
+    ));
 
     expect(result.exitCode).toBe(0);
     // Guardrail: `teardown` ran the copy-back but left the host staged home in
@@ -1255,7 +1257,7 @@ describe("codex_local ACP lane", () => {
     // failed turn), the one-time `disposeStaged` fires and removes the host
     // staged-home temp dir — while the per-run copy-back (`teardown`) STILL fires
     // on the unclean exit path, so a rotated sandbox credential is never lost.
-    const runId = `run-drop-staged-home-${randomUUID()}`;
+    const runId = randomUUID();
     const root = await makeTempRoot("paperclip-codex-acp-drop-staged-");
     const localCwd = path.join(root, "worktree");
     const remoteCwd = path.join(root, "remote-workspace");
@@ -1285,7 +1287,7 @@ describe("codex_local ACP lane", () => {
       stagedRuntimes,
       stagingLocks: new Map(),
     });
-    const result = await execute(
+    const result = await runWithPaperclipTempRun(runId, () => execute(
       buildContext(localCwd, {
         runId,
         config: {
@@ -1309,7 +1311,7 @@ describe("codex_local ACP lane", () => {
         } as never,
         authToken: "real-run-jwt",
       }),
-    );
+    ));
 
     expect(result.exitCode).toBe(1);
     // Guardrail: the dropped staged runtime disposed its host staged home and

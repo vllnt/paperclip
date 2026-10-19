@@ -24,7 +24,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { cn, SIDEBAR_RAIL_HIDDEN_LABEL } from "../lib/utils";
-import { ThemeToggle } from "./ThemeToggle";
+import { ThemeModeSwitch } from "./ThemeModeSwitch";
 import { SidebarServerInfo } from "./SidebarServerInfo";
 
 const INVITES_PATH = "/company/settings/members?tab=invites";
@@ -169,7 +169,7 @@ export function SidebarAccountMenu({
   }
 
   return (
-    <div className="bg-border/50 px-3 py-2 dark:bg-muted">
+    <div className="border-t border-border px-3 py-2">
       <div className={cn("flex items-center gap-0.5", !rail && "px-2")}>
         <Popover open={open} onOpenChange={setOpen}>
           <PopoverTrigger asChild>
@@ -251,7 +251,7 @@ export function SidebarAccountMenu({
                 external
                 onClick={() => setOpen(false)}
               />
-              <ThemeToggle variant="compact-menu-action" onAfterToggle={() => setOpen(false)} />
+              <ThemeModeSwitch />
               {deploymentMode === "authenticated" ? (
                 <button
                   type="button"

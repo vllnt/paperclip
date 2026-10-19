@@ -78,6 +78,7 @@ export type {
   EnvironmentDeleteReusableLeaseHolder,
   EnvironmentDeleteBlockedReason,
   EnvironmentLease,
+  CompanyEnvironmentLeaseListItem,
   EnvironmentProbeResult,
   FakeSandboxEnvironmentConfig,
   LocalEnvironmentConfig,
@@ -275,6 +276,7 @@ export type {
 } from "./adapter-skills.js";
 export type {
   Agent,
+  AgentWaitState,
   AgentAccessState,
   AgentChainOfCommandEntry,
   AgentDetail,
@@ -661,6 +663,7 @@ export type {
   IssueWakeDiagnosticWakeRequest,
   IssueWakeDiagnosticsResponse,
   IssueSubtreeDiagnosticNode,
+  IssueSubtreeDiagnosticLastRun,
   IssueSubtreeDiagnosticEdge,
   IssueSubtreeDiagnosticsResponse,
   IssueBlockerAttention,
@@ -902,6 +905,10 @@ export type {
   AgentRuntimeState,
   AgentTaskSession,
   AgentWakeupRequest,
+  DeferredWakeAgentStats,
+  DeferredWakeParkedBreakdown,
+  DeferredWakeStats,
+  DeferredWakeSweepCounters,
   InstanceSchedulerHeartbeatAgent,
 } from "./heartbeat.js";
 export type { LiveEvent } from "./live.js";
