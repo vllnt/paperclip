@@ -315,9 +315,9 @@ describe("source detail: test send and deliveries", () => {
       type: "disk.usage",
       severity: "critical",
       state: "problem",
-      dedupeKey: "vm141/disk.usage:/",
-      title: "worker-ops: / at 93%",
-      labels: { host_id: "vm141" },
+      dedupeKey: "example-host/disk.usage:/",
+      title: "example-worker: / at 93%",
+      labels: { host_id: "example-host" },
     },
     errors: [],
     outcome: "dispatched",
@@ -329,7 +329,7 @@ describe("source detail: test send and deliveries", () => {
         assigneeAgentId: "a1",
         assigneeAgentName: "Hawkeye",
         fallback: false,
-        groupKey: "upkeep:vm141/disk.usage:/",
+        groupKey: "upkeep:example-host/disk.usage:/",
         action: "new_issue",
       },
     ],
@@ -354,7 +354,7 @@ describe("source detail: test send and deliveries", () => {
     expect(result.textContent).toContain("Matched triggers");
     expect(result.textContent).toContain("Disk watch");
     expect(result.textContent).toContain("Agent: Hawkeye");
-    expect(result.textContent).toContain("upkeep:vm141/disk.usage:/");
+    expect(result.textContent).toContain("upkeep:example-host/disk.usage:/");
     expect(result.textContent).toContain("Opens a new issue and wakes the agent");
   });
 

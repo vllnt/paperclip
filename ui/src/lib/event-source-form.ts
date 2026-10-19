@@ -48,9 +48,9 @@ export type EventSourceFormErrors = Partial<
 >;
 
 export const GATUS_ENDPOINT_MAP_EXAMPLE = `{
-  "core/vm141-disk": {
+  "core/example-host-disk": {
     "type": "disk.usage",
-    "labels": { "host_id": "vm141", "check": "disk.usage" }
+    "labels": { "host_id": "example-host", "check": "disk.usage" }
   }
 }`;
 
@@ -230,10 +230,10 @@ export function sampleTestPayload(normalizer: EventNormalizer): Record<string, u
     type: "disk.usage",
     severity: "critical",
     state: "problem",
-    dedupeKey: "vm141/disk.usage:/",
-    title: "worker-ops: / at 93%",
+    dedupeKey: "example-host/disk.usage:/",
+    title: "example-worker: / at 93%",
     summary: "Root filesystem usage crossed the critical threshold.",
-    labels: { host_id: "vm141", host: "worker-ops", check: "disk.usage" },
+    labels: { host_id: "example-host", host: "example-worker", check: "disk.usage" },
     occurredAt: new Date().toISOString(),
   };
 }

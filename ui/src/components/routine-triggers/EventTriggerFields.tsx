@@ -247,7 +247,7 @@ function LabelPairsEditor({
               ariaLabel={`Label ${index + 1} values`}
               values={pair.values}
               onChange={(values) => updatePair(pair.id, { values })}
-              placeholder="vm141, vm142"
+              placeholder="example-host, vm142"
               disabled={disabled}
             />
           </div>

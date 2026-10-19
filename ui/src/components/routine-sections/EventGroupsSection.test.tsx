@@ -31,10 +31,10 @@ function group(overrides: Partial<EventGroup> = {}): EventGroup {
   return {
     id: "g1",
     routineId: "routine-1",
-    fingerprint: "upkeep:vm141/disk.usage:/",
+    fingerprint: "upkeep:example-host/disk.usage:/",
     issueId: "issue-uuid-1",
-    issueIdentifier: "VLL-77",
-    issueTitle: "worker-ops: / at 93%",
+    issueIdentifier: "EXAMPLE-123",
+    issueTitle: "example-worker: / at 93%",
     issueStatus: "in_progress",
     firstSeenAt: "2026-10-18T08:00:00Z",
     lastSeenAt: "2026-10-18T11:55:00Z",
@@ -90,13 +90,13 @@ describe("EventGroupsSection", () => {
 
     expect(routineEventGroups).toHaveBeenCalledWith("routine-1", { open: true });
     const row = container.querySelector("tbody tr")!;
-    expect(row.textContent).toContain("VLL-77");
-    expect(row.textContent).toContain("worker-ops: / at 93%");
-    expect(row.textContent).toContain("upkeep:vm141/disk.usage:/");
+    expect(row.textContent).toContain("EXAMPLE-123");
+    expect(row.textContent).toContain("example-worker: / at 93%");
+    expect(row.textContent).toContain("upkeep:example-host/disk.usage:/");
     expect(row.textContent).toContain("14");
     expect(row.textContent).toContain("in progress");
     expect(row.textContent).toContain("critical");
-    expect(row.querySelector("a")?.getAttribute("href")).toBe("/issues/VLL-77");
+    expect(row.querySelector("a")?.getAttribute("href")).toBe("/issues/EXAMPLE-123");
     expect(row.querySelectorAll("time")).toHaveLength(3);
   });
 

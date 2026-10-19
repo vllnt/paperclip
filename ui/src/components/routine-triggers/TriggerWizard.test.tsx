@@ -169,7 +169,7 @@ it("collects filter values and sends them with the finished draft", async () => 
   await act(async () => button("Add label filter").click());
   await setValue(container.querySelector('input[aria-label="Label 1 name"]') as HTMLInputElement, "host_id");
   const values = container.querySelector('input[aria-label="Label 1 values"]') as HTMLInputElement;
-  await setValue(values, "vm141, vm142");
+  await setValue(values, "example-host, vm142");
 
   await act(async () => button("Continue").click());
   await act(async () => button("Add event trigger").click());
@@ -179,7 +179,7 @@ it("collects filter values and sends them with the finished draft", async () => 
     sourceId: SOURCE_ID,
     types: ["disk.*"],
     minSeverity: "warning",
-    labels: [expect.objectContaining({ key: "host_id", values: ["vm141", "vm142"] })],
+    labels: [expect.objectContaining({ key: "host_id", values: ["example-host", "vm142"] })],
   });
 });
 

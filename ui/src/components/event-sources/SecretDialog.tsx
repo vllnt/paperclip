@@ -27,9 +27,9 @@ const EXAMPLE_EVENT = `{
   "type": "disk.usage",
   "severity": "critical",
   "state": "problem",
-  "dedupeKey": "vm141/disk.usage:/",
-  "title": "worker-ops: / at 93%",
-  "labels": { "host_id": "vm141" },
+  "dedupeKey": "example-host/disk.usage:/",
+  "title": "example-worker: / at 93%",
+  "labels": { "host_id": "example-host" },
   "occurredAt": "2026-10-18T12:00:00Z"
 }`;
 

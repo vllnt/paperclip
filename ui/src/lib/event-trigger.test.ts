@@ -133,7 +133,7 @@ describe("buildEventTriggerPayload", () => {
       sources: ["gatus"],
       types: ["disk.*"],
       minSeverity: "warning",
-      labels: [newLabelPair("host_id", ["vm141"]), newLabelPair("check", ["disk.usage", "disk.inodes"])],
+      labels: [newLabelPair("host_id", ["example-host"]), newLabelPair("check", ["disk.usage", "disk.inodes"])],
       fallback: true,
       cooldownMinutes: "1.5",
       onRecovery: "comment_only",
@@ -144,7 +144,7 @@ describe("buildEventTriggerPayload", () => {
       sources: ["gatus"],
       types: ["disk.*"],
       minSeverity: "warning",
-      labels: { host_id: "vm141", check: ["disk.usage", "disk.inodes"] },
+      labels: { host_id: "example-host", check: ["disk.usage", "disk.inodes"] },
     });
     expect(payload.eventGrouping).toMatchObject({
       repeatCommentCooldownSec: 90,
