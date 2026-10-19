@@ -41,7 +41,9 @@ export async function runPeriodicHeartbeatRecovery(heartbeat: RecoveryHeartbeat)
       reconciled.continuationRequeued > 0 ||
       reconciled.successfulRunHandoffEscalated > 0 ||
       reconciled.successfulRunHandoffRetried > 0 ||
-      reconciled.escalated > 0
+      reconciled.escalated > 0 ||
+      reconciled.dispatchDeferredForCapacity > 0 ||
+      reconciled.failed > 0
     ) {
       logger.warn(
         { promotedScheduledRetries: promotion?.promoted ?? 0, promotedScheduledRetryRunIds: promotion?.runIds ?? [], ...reconciled },
