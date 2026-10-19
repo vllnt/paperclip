@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { activityLog, agents, companies, companyMemberships, createDb, issueWorkProducts, issues } from "@paperclipai/db";
+import { activityLog, agents, companies, companyMemberships, createDb, heartbeatRuns, issueWorkProducts, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -34,6 +34,7 @@ describeEmbeddedPostgres("issue git routes", () => {
     await db.delete(activityLog);
     await db.delete(issueWorkProducts);
     await db.delete(issues);
+    await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
@@ -181,6 +182,38 @@ describeEmbeddedPostgres("issue git routes", () => {
     expect(denied.status).toBe(403);
     expect(allowed.status).toBe(201);
     expect(read.status).toBe(200);
+  });
+
+  it("keeps a status-only recovery run from linking or unlinking, like other deliverable changes", async () => {
+    const { companyId, issueId } = await seed();
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId, companyId, name: "Recovery agent", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    await db.update(issues).set({ assigneeUserId: null, assigneeAgentId: agentId }).where(eq(issues.id, issueId));
+    const statusOnlyRunId = randomUUID();
+    const normalRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        id: statusOnlyRunId, companyId, agentId, status: "running",
+        contextSnapshot: { recoveryIntent: "status_only", allowDeliverableWork: false, allowDocumentUpdates: false, resumeRequiresNormalModel: true },
+      },
+      { id: normalRunId, companyId, agentId, status: "running", contextSnapshot: {} },
+    ]);
+    const agentActor = (runId: string) => ({ type: "agent", agentId, companyId, source: "agent_key", runId });
+    const linked = await request(appFor(board([companyId]))).post(`/api/issues/${issueId}/git/pull-requests`).send({ repository: "acme/app", number: 7 });
+    const productId = linked.body.pullRequests[0].workProductId as string;
+    const before = await db.select().from(issueWorkProducts);
+
+    const statusOnly = appFor(agentActor(statusOnlyRunId));
+    expect((await request(statusOnly).post(`/api/issues/${issueId}/git/pull-requests`).send({ repository: "acme/app", number: 8 })).status).toBe(403);
+    expect((await request(statusOnly).delete(`/api/issues/${issueId}/git/pull-requests/${productId}`)).status).toBe(403);
+    expect((await request(statusOnly).get(`/api/issues/${issueId}/git`)).status).toBe(200);
+    expect(await db.select().from(issueWorkProducts)).toEqual(before);
+
+    const normal = appFor(agentActor(normalRunId));
+    expect((await request(normal).post(`/api/issues/${issueId}/git/pull-requests`).send({ repository: "acme/app", number: 8 })).status).toBe(201);
   });
 
   it("keeps an agent from another company out", async () => {

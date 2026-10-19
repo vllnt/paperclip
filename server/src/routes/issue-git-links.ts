@@ -1,6 +1,7 @@
 import { Router } from "express";
 import type { Request } from "express";
-import type { Db } from "@paperclipai/db";
+import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
 import { isUuidLike, linkIssuePullRequestSchema, normalizeIssueIdentifier } from "@paperclipai/shared";
 import { forbidden, unprocessable } from "../errors.js";
 import { validate } from "../middleware/validate.js";
@@ -62,10 +63,30 @@ export function issueGitLinkRoutes(db: Db, options: { git?: ReturnType<typeof is
     return issue;
   }
 
-  function assertMayLink(req: Request, issue: { assigneeAgentId: string | null }) {
-    if (req.actor.type === "agent" && issue.assigneeAgentId !== req.actor.agentId) {
+  /**
+   * A pull request is a deliverable. A status-only recovery run is told it may not change
+   * deliverables, so it may not change links either; the work-product routes enforce the same rule.
+   */
+  async function assertRunMayChangeDeliverables(req: Request, companyId: string) {
+    const runId = req.actor.type === "agent" ? req.actor.runId?.trim() : null;
+    if (!runId) return;
+    const [run] = await db
+      .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, context: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return;
+    const context = run.context && typeof run.context === "object" && !Array.isArray(run.context) ? (run.context as Record<string, unknown>) : {};
+    if (context.recoveryIntent === "status_only" && context.allowDeliverableWork === false) {
+      throw forbidden("Status-only recovery runs cannot change pull request links");
+    }
+  }
+
+  async function assertMayLink(req: Request, issue: { assigneeAgentId: string | null; companyId: string }) {
+    if (req.actor.type !== "agent") return;
+    if (issue.assigneeAgentId !== req.actor.agentId) {
       throw forbidden("Agents can only link pull requests on tasks assigned to them");
     }
+    await assertRunMayChangeDeliverables(req, issue.companyId);
   }
 
   router.get("/issues/:id/git", async (req, res) => {
@@ -77,7 +98,7 @@ export function issueGitLinkRoutes(db: Db, options: { git?: ReturnType<typeof is
   router.post("/issues/:id/git/pull-requests", validate(linkIssuePullRequestSchema), async (req, res) => {
     const issue = await findIssue(req, res);
     if (!issue) return;
-    assertMayLink(req, issue);
+    await assertMayLink(req, issue);
 
     const body = req.body as { url?: string; repository?: string; number?: number; closes?: boolean };
     const reference = body.url
@@ -113,7 +134,7 @@ export function issueGitLinkRoutes(db: Db, options: { git?: ReturnType<typeof is
   router.delete("/issues/:id/git/pull-requests/:workProductId", async (req, res) => {
     const issue = await findIssue(req, res);
     if (!issue) return;
-    assertMayLink(req, issue);
+    await assertMayLink(req, issue);
     const workProductId = req.params.workProductId as string;
     if (!isUuidLike(workProductId)) {
       res.status(404).json({ error: "Pull request link not found" });
