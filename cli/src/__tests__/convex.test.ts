@@ -107,9 +107,10 @@ describe("paperclipai convex", () => {
     expect(process.exitCode).toBeUndefined();
   });
 
-  it("reap --dry-run is still accepted, sends dryRun true and prints the plan", async () => {
-    const report = reportOf({ dryRun: true, quota: { count: 250, quota: 300, percent: 83.3, alert: true, partial: false },
-      projects: [{ ...project, previews: 3, delete: [{ name: "old-1", reason: "pull request #1 is merged" }], setExpiry: [1], kept: 2 }] });
+  it("reap --dry-run sends dryRun true and prints the plan", async () => {
+    const report = { at: "2026-10-09T12:00:00.000Z", dryRun: true, errors: [], quota: { count: 250, quota: 300, percent: 83.3, alert: true, partial: false },
+      projects: [{ name: "app", previews: 3, ciMatched: 2, delete: [{ name: "old-1", reason: "pull request #1 is merged" }, { name: "old-2", reason: "superseded by pr4320-run101-s1-a2" }], deleted: [], setExpiry: [1], expirySet: [], kept: 2, failed: [], skipped: [],
+        dev: { listed: 4, delete: [{ name: "dev-old", reason: "dev deployment unused for 12 days (limit 7)" }], deleted: [], kept: 3, failed: [], skipped: [], executed: false } }] };
     const fetchMock = respond(report);
     vi.stubGlobal("fetch", fetchMock);
     await program().parseAsync(["convex", "deployments", "reap", "--dry-run", "-C", COMPANY_ID, ...BASE], { from: "user" });
@@ -118,6 +119,10 @@ describe("paperclipai convex", () => {
     expect(text).toContain("DRY RUN");
     expect(text).toContain("would delete old-1: pull request #1 is merged");
     expect(text).toContain("83.3%");
+    expect(text).toContain("would delete old-2: superseded by pr4320-run101-s1-a2");
+    expect(text).toContain("CI template matched 2 of 3 previews");
+    expect(text).toContain("dev: 4 listed");
+    expect(text).toContain("would delete dev-old: dev deployment unused for 12 days (limit 7)");
     expect(process.exitCode).toBeUndefined();
   });
 

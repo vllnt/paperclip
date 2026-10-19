@@ -25,7 +25,8 @@ const project = { convexProjectId: "100", name: "app", previews: 12, delete: [{ 
 const report = {
   at: "2026-10-09T12:00:00.000Z", trigger: "schedule", dryRun: true, errors: [] as string[],
   quota: { count: 250, quota: 300, percent: 83.3, partial: false, alert: true },
-  projects: [project],
+  projects: [{ ...project, ciMatched: 9,
+    dev: { listed: 9, delete: [{ name: "dev-old", previewIdentifier: "dev/ship-1", reason: "dev deployment unused for 12 days (limit 7)" }], deleted: [], kept: 8, failed: [], skipped: [], executed: false } }],
 };
 const deferred = <T,>() => { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; };
 const ready = () => screen.findByRole("heading", { level: 2, name: "Connection" });
@@ -43,6 +44,8 @@ describe("Convex page", () => {
     expect(screen.getByText(/Off, dry run only/)).toBeTruthy();
     expect(screen.getByRole("region", { name: "Last reaper report" }).textContent).toMatch(/250.*of 300.*83\.3%/);
     expect(screen.getByText(/at or above the alert threshold/)).toBeTruthy();
+    expect(screen.getByLabelText("Last reaper report").textContent).toMatch(/CI template matched 9 of 12 previews/);
+    expect(screen.getByLabelText("Last reaper report").textContent).toMatch(/Dev deployments.*9 listed.*1 would be deleted/s);
     expect(document.body.textContent).not.toMatch(/secret_ref|secretId|token value/i);
   });
 

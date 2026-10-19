@@ -183,6 +183,14 @@ function ReaperReportView({ report }: { report: Report | null }) {
       <tbody>{report.projects.map(project => <ProjectRow key={project.convexProjectId} project={project} dryRun={report.dryRun} />)}</tbody>
     </ScrollTable> : <p className="pcx-note">No mapped projects were checked.</p>}
     {details.map(project => <ProjectDetails key={project.convexProjectId} project={project} dryRun={report.dryRun} />)}
+    {report.projects.some(project => project.ciMatched !== undefined) ? <p className="pcx-note">{report.projects.filter(project => project.ciMatched !== undefined).map(project => `${project.name}: CI template matched ${project.ciMatched} of ${project.previews} previews`).join(" · ")}</p> : null}
+    {report.projects.some(project => project.dev) ? <div>
+      <h3>Dev deployments</h3>
+      {report.projects.map(project => project.dev ? <p key={project.convexProjectId} className={project.dev.error || project.dev.failed.length ? "pcx-error" : undefined}>
+        {project.name}: {project.dev.listed} listed, {project.dev.executed ? `${project.dev.deleted.length} deleted` : `${project.dev.delete.length} would be deleted (plan only)`}, {project.dev.kept} kept
+        {project.dev.failed.length ? `, ${project.dev.failed.length} failed` : ""}{project.dev.error ? ` · ${project.dev.error}` : ""}
+      </p> : null)}
+    </div> : null}
   </Section>;
 }
 
