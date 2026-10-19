@@ -2111,7 +2111,7 @@ describe("SSH run directory reaper", () => {
     const host = await startHost("SSH reaper hidden untracked test");
     if (!host) return;
     const run = await host.gitRun();
-    const clone = kind === "primary" ? await host.hostClone(run.workspace) : null;
+    const clone = kind === "legacy" ? null : await host.hostClone(run.workspace);
     await git(run.workspace, ["config", "status.showUntrackedFiles", "no"]);
     if (kind === "legacy") await git(run.workspace, ["update-ref", "refs/remotes/origin/main", run.seed]);
     const workspace = kind === "extra worktree" ? path.join(run.runDir, "extra-tree") : run.workspace;
@@ -2122,18 +2122,18 @@ describe("SSH run directory reaper", () => {
     const result = kind === "legacy" ? await host.reapLegacy(run.runId) : await host.reap(run.runId);
 
     if (clone) {
-      const ref = `refs/paperclip/preserved/${run.runId}/worktree`;
+      const ref = `refs/paperclip/preserved/${run.runId}/${kind === "primary" ? "worktree" : "worktree-dirty-0"}`;
       expect(result).toMatchObject({ outcome: "removed", preserved: [ref] });
       await git(clone, ["fetch", "-q", host.preservedBundle(run.runId), `${ref}:${ref}`]);
       expect(await git(clone, ["show", `${ref}:only-copy.txt`])).toBe("never committed");
       await expect(stat(run.runDir)).rejects.toMatchObject({ code: "ENOENT" });
     } else {
-      expect(result).toMatchObject({ outcome: "kept", reason: kind === "legacy" ? "dirty" : "worktree_dirty" });
+      expect(result).toMatchObject({ outcome: "kept", reason: "dirty" });
       await expect(readFile(path.join(workspace, "only-copy.txt"), "utf8")).resolves.toBe("never committed\n");
     }
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
-  it("preserves the branch of a clean extra worktree and keeps the directory when an extra worktree has uncommitted work", async () => {
+  it("preserves the branch of a clean extra worktree and the uncommitted work of a dirty one, then removes both directories", async () => {
     const host = await startHost("SSH reaper worktree test");
     if (!host) return;
     const clean = await host.gitRun();
@@ -2150,10 +2150,16 @@ describe("SSH run directory reaper", () => {
     await expect(host.reap(clean.runId)).resolves.toMatchObject({
       outcome: "removed", preserved: [`refs/paperclip/preserved/${clean.runId}/side-branch`],
     });
-    await expect(host.reap(dirty.runId)).resolves.toMatchObject({ outcome: "kept", reason: "worktree_dirty" });
+    const dirtyClone = await host.hostClone(dirty.workspace);
+    await expect(host.reap(dirty.runId)).resolves.toMatchObject({
+      outcome: "removed", preserved: [`refs/paperclip/preserved/${dirty.runId}/worktree-dirty-0`],
+    });
 
     await expect(stat(clean.runDir)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(path.join(dirtyTree, "uncommitted.txt"), "utf8")).resolves.toBe("wip\n");
+    await expect(stat(dirty.runDir)).rejects.toMatchObject({ code: "ENOENT" });
+    const saved = `refs/paperclip/preserved/${dirty.runId}/worktree-dirty-0`;
+    await git(dirtyClone, ["fetch", "-q", host.preservedBundle(dirty.runId), `${saved}:${saved}`]);
+    expect(await git(dirtyClone, ["show", `${saved}:uncommitted.txt`])).toBe("wip");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("keeps an unrestored run directory that is not a git repository", async () => {
@@ -2430,8 +2436,15 @@ describe("SSH run directory reaper", () => {
         },
       },
       {
-        name: "a worktree linked into it",
+        name: "a worktree linked into it, inside the run directory",
         reason: "linked_worktree",
+        setup: async (run) => {
+          await git(run.workspace, ["worktree", "add", "-q", "--detach", path.join(path.dirname(run.workspace), `agent-tree-${randomUUID()}`)]);
+        },
+      },
+      {
+        name: "a worktree linked into it, outside the run directory",
+        reason: "external_worktree",
         setup: async (run, host) => {
           await git(run.workspace, ["worktree", "add", "-q", "--detach", path.join(host.rootDir, `agent-tree-${randomUUID()}`)]);
         },
@@ -2753,10 +2766,11 @@ describe("SSH run directory reaper", () => {
       await expect(stat(canary)).rejects.toMatchObject({ code: "ENOENT" });
     }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
-    it("is not run by the status check of an extra worktree", async () => {
+    it("is not run by the status check or the save of an extra worktree", async () => {
       const host = await startHost("SSH reaper filter worktree test");
       if (!host) return;
       const run = await host.gitRun();
+      const clone = await host.hostClone(run.workspace);
       const extra = path.join(run.runDir, "extra-tree");
       await git(run.workspace, ["worktree", "add", "-q", "--detach", extra]);
       const canary = await plantFilter(host, run.workspace);
@@ -2764,8 +2778,11 @@ describe("SSH run directory reaper", () => {
 
       const result = await host.reap(run.runId);
 
-      expect(result).toMatchObject({ outcome: "kept", reason: "worktree_dirty" });
+      const saved = `refs/paperclip/preserved/${run.runId}/worktree-dirty-0`;
+      expect(result).toMatchObject({ outcome: "removed", preserved: [saved] });
       await expect(stat(canary)).rejects.toMatchObject({ code: "ENOENT" });
+      await git(clone, ["fetch", "-q", host.preservedBundle(run.runId), `${saved}:${saved}`]);
+      expect(await git(clone, ["show", `${saved}:tracked.txt`])).toBe("BASE");
     }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
     it("is not run when its name has dots in it", async () => {
