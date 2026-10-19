@@ -25,6 +25,7 @@ packages/adapters/codex-local/src/company-model-catalog.test.ts
 packages/adapters/codex-local/src/server/execute.remote.test.ts
 packages/adapters/codex-local/src/server/runtime-config.test.ts
 packages/adapters/codex-local/src/server/test.remote.test.ts
+packages/db/src/heartbeat-runs-issue-or-task-index-migration.test.ts
 packages/plugins/plugin-convex/tests/ci-previews.spec.ts
 packages/plugins/plugin-convex/tests/client.spec.ts
 packages/plugins/plugin-convex/tests/contract.spec.ts

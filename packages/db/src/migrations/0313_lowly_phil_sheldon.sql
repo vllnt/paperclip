@@ -1,0 +1,18 @@
+-- A run's issue as recovery and the attention feed read it: issueId, else taskId.
+-- Without this index, "runs of this issue" lookups (recovery's live-path checks)
+-- scan heartbeat_runs and read (detoast) every run's context_snapshot. Queries
+-- must use this exact expression for the planner to use the index.
+--
+-- Lock: the build holds a SHARE lock on heartbeat_runs and reads every run's
+-- context_snapshot once. Reads continue; run inserts and updates wait until the
+-- build commits. The time grows with the context_snapshot TOAST size:
+--   SELECT pg_size_pretty(pg_total_relation_size('heartbeat_runs'));
+-- On a large instance, build the same index first without blocking writes:
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS "heartbeat_runs_company_issue_or_task_idx" ON "heartbeat_runs" USING btree ("company_id", (coalesce("context_snapshot"->>'issueId', "context_snapshot"->>'taskId')));
+-- IF NOT EXISTS then makes this migration a no-op. A failed or cancelled
+-- concurrent build leaves an invalid index under this name, which IF NOT EXISTS
+-- also keeps. Before you migrate, this must return true:
+--   SELECT indisvalid FROM pg_index WHERE indexrelid = 'heartbeat_runs_company_issue_or_task_idx'::regclass;
+-- If it returns false, drop the index (DROP INDEX CONCURRENTLY "heartbeat_runs_company_issue_or_task_idx";) and build it again.
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: The migration runner applies every migration inside BEGIN/COMMIT, so CREATE INDEX CONCURRENTLY cannot run here. Operators can build the same index CONCURRENTLY under the same name first, which IF NOT EXISTS adopts; otherwise the one-time build lock is described above.
+CREATE INDEX IF NOT EXISTS "heartbeat_runs_company_issue_or_task_idx" ON "heartbeat_runs" USING btree ("company_id", (coalesce("context_snapshot"->>'issueId', "context_snapshot"->>'taskId')));
