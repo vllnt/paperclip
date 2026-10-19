@@ -47,6 +47,12 @@ export function isRuntimeGitHubHttpRequest(method: string | undefined, url: stri
   return !!method && !!url && method.toUpperCase() === "POST" && /^\/runtime-tools\/github\/(?:credentials|sign)\/?$/.test(normalizePath(url));
 }
 
+/** Board keystrokes sent to a shared browser sign-in: the typed text can be a password or one-time code. */
+export function isBrowserSignInInputHttpRequest(method: string | undefined, url: string | undefined): boolean {
+  return !!method && !!url && method.toUpperCase() === "POST" &&
+    /^\/api\/companies\/[^/]+\/browser\/profiles\/[^/]+\/signin\/input\/?$/.test(normalizePath(url));
+}
+
 /** Provider payloads are private even when a method/signature is rejected. */
 export function isPrivateWebhookHttpRequest(
   method: string | undefined,

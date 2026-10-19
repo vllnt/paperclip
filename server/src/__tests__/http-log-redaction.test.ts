@@ -783,3 +783,53 @@ describe("HTTP logger redaction", () => {
     },
   );
 });
+
+describe("browser sign-in input failure logs", () => {
+  const companyId = "11111111-1111-4111-8111-111111111111";
+  const profileId = "22222222-2222-4222-8222-222222222222";
+  const route = `/api/companies/${companyId}/browser/profiles/${profileId}/signin/input`;
+
+  async function failingSignInApp(signInInput: () => Promise<never>) {
+    const { browserProfileRoutes } = await import("../routes/browser-profiles.js");
+    type Service = NonNullable<Parameters<typeof browserProfileRoutes>[1]>;
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.use((req, _res, next) => {
+      req.actor = {
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        companyIds: [companyId],
+        memberships: [{ companyId, membershipRole: "owner", status: "active" }],
+        isInstanceAdmin: false,
+      };
+      next();
+    });
+    app.use("/api", browserProfileRoutes({} as never, { signInInput } as unknown as Service));
+    app.use(errorHandler);
+    return { app, output: () => chunks.join("") };
+  }
+
+  it.each([
+    ["409 when the live browser already closed", 409, "PASSWORD-CANARY-409"],
+    ["400 when the text is too long", 400, `PASSWORD-CANARY-400-${"x".repeat(500)}`],
+    ["500 when the browser fails", 500, "PASSWORD-CANARY-500"],
+  ])("keeps typed text out of the log on %s", async (_label, status, text) => {
+    const { app, output } = await failingSignInApp(async () => {
+      if (status === 409) throw new HttpError(409, "Start a sign-in session first", { code: "signin_not_active" });
+      throw new Error("browser input failed");
+    });
+    await request(app).post(route).send({ type: "type", text }).expect(status);
+    const log = output();
+    expect(log).toContain(`"statusCode":${status}`);
+    expect(log).not.toContain("PASSWORD-CANARY");
+  });
+});

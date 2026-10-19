@@ -3,6 +3,7 @@ import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import {
+  isBrowserSignInInputHttpRequest,
   isRuntimeGitHubHttpRequest,
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
@@ -166,8 +167,12 @@ export function createHttpLogger(baseLogger: Logger) {
     customProps(req, res) {
       if (res.statusCode >= 400) {
         const ctx = (res as any).__errorContext;
-        if (isRuntimeGitHubHttpRequest(req.method, requestClassificationUrl(req))) {
-          // Command arguments (message bodies) and git objects stay out of logs.
+        if (
+          isRuntimeGitHubHttpRequest(req.method, requestClassificationUrl(req)) ||
+          isBrowserSignInInputHttpRequest(req.method, requestClassificationUrl(req))
+        ) {
+          // Command arguments (message bodies), git objects and sign-in
+          // keystrokes (passwords, one-time codes) stay out of logs.
           return { reqBody: "[REDACTED]" };
         }
         if (isPrivateWebhook(req)) {
