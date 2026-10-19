@@ -4,6 +4,7 @@ packages/adapter-utils/src/paperclip-temp.test.ts
 packages/adapter-utils/src/remote-process-identity.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-idle-poll.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-lifecycle.test.ts
+packages/adapter-utils/src/test-support/process-liveness.test.ts
 packages/adapter-utils/src/workspace-restore-merge.test.ts
 packages/adapters/claude-local/src/current-model-catalog.test.ts
 packages/adapters/codex-local/src/company-model-catalog.test.ts
