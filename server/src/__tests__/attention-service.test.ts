@@ -1027,6 +1027,42 @@ describeEmbeddedPostgres("attention service", () => {
     expect(feed.items.filter((item) => item.sourceKind === "failed_run")).toEqual([]);
   });
 
+  it("supersedes an exhausted run only by a later run of the same agent on the same issue", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("ATS");
+    const [issueA, issueB] = [
+      await insertIssue({ companyId, identifier: "ATS-1", title: "Issue A", status: "in_progress" }),
+      await insertIssue({ companyId, identifier: "ATS-2", title: "Issue B", status: "in_progress" }),
+    ];
+    const at = (second: number) => new Date(Date.UTC(2026, 6, 9, 12, 0, second));
+    const run = (agentId: string, contextSnapshot: Record<string, unknown>, second: number, status = "succeeded") => ({
+      id: randomUUID(), companyId, agentId, invocationSource: "automation", status, contextSnapshot,
+      createdAt: at(second), updatedAt: at(second), finishedAt: at(second),
+    });
+    // Each exhausted run, and the runs around it that do or do not supersede it.
+    const byTaskId = run(workerId, { taskId: issueA }, 0, "failed");
+    const byOtherAgent = run(workerId, { issueId: issueB }, 0, "failed");
+    const byEarlierRun = run(reviewerId, { issueId: issueA }, 10, "failed");
+    const withoutIssue = run(reviewerId, { issueId: "" }, 20, "failed");
+    const exhausted = [byTaskId, byOtherAgent, byEarlierRun, withoutIssue];
+    await db.insert(heartbeatRuns).values([
+      ...exhausted,
+      run(workerId, { issueId: issueA }, 5), // issueId equals byTaskId's taskId: supersedes it
+      run(reviewerId, { issueId: issueB }, 5), // another agent on byOtherAgent's issue: does not
+      run(reviewerId, { issueId: issueA }, 9), // before byEarlierRun: does not
+      run(reviewerId, { issueId: issueB }, 11), // after byEarlierRun but another issue: does not
+      run(reviewerId, {}, 21), // no issue after withoutIssue: supersedes it
+    ]);
+    await db.insert(heartbeatRunEvents).values(exhausted.map((row) => ({
+      companyId, runId: row.id, agentId: row.agentId, seq: 1, eventType: "lifecycle", createdAt: row.createdAt,
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+    })));
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id).sort())
+      .toEqual([byOtherAgent.id, byEarlierRun.id].sort());
+  });
+
   it("enriches interaction details with project, workspace, plan metadata, and images", async () => {
     const { companyId, workerId } = await seedCompany("ATE");
     const projectId = randomUUID();
