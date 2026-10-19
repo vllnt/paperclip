@@ -178,7 +178,11 @@ function toSnapshot(row: TargetRow | null, now: Date): ResourceCapacitySnapshot 
 function localEnvironmentSnapshot(instance: TargetRow | null, now: Date): ResourceCapacitySnapshot {
   const snapshot = toSnapshot(instance, now);
   const metricLevels: ResourceCapacityMetricLevels = {};
-  for (const key of ["disk:workspaces", "memory", "load"] as const) {
+  const workspaceDisk = snapshot.disks.find((disk) => disk.labels.includes("workspaces"));
+  // Shared disks are classified under their first label, which may be data or runLogs.
+  const workspaceLevel = workspaceDisk ? snapshot.metricLevels[`disk:${workspaceDisk.labels[0]}`] : undefined;
+  if (workspaceLevel) metricLevels["disk:workspaces"] = workspaceLevel;
+  for (const key of ["memory", "load"] as const) {
     const level = snapshot.metricLevels[key];
     if (level) metricLevels[key] = level;
   }

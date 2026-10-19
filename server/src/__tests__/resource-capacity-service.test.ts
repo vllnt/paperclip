@@ -11,9 +11,11 @@ import {
   instanceSettings,
   resourceCapacitySamples,
   resourceCapacityTargets,
+  type Db,
 } from "@paperclipai/db";
 import {
   RESOURCE_CAPACITY_STALE_AFTER_MS,
+  classifyResourceCapacityReading,
   type EnvironmentLeaseStatus,
   type ResourceCapacityReading,
 } from "@paperclipai/shared";
@@ -61,6 +63,47 @@ async function closedLoopbackPort(): Promise<number> {
   if (!address || typeof address === "string") throw new Error("no port");
   return address.port;
 }
+
+it("reports a critically full shared instance disk in local environment views", async () => {
+  const local = { id: randomUUID(), name: "Local", driver: "local", status: "active" };
+  const sharedReading = reading(1, {
+    disks: [{ labels: ["data", "runLogs", "workspaces"], totalBytes: 100 * GIB, freeBytes: GIB }],
+  });
+  const metricLevels = classifyResourceCapacityReading(sharedReading, {});
+  const db = {
+    select: () => ({
+      from: (table: unknown) => ({
+        where: async () => {
+          if (table === environments) return [local];
+          if (table === resourceCapacityTargets) return [target];
+          throw new Error("Unexpected capacity query");
+        },
+      }),
+    }),
+  } as unknown as Db;
+  const svc = resourceCapacityService(db, { hostname: "test-host" });
+  const target = {
+    targetKey: svc.currentInstanceKey,
+    latestReading: sharedReading,
+    latestSampledAt: at(0),
+    latestStatus: "ok",
+    metricLevels,
+    metricSampledAt: Object.fromEntries(Object.keys(metricLevels).map((key) => [key, at(0).toISOString()])),
+  };
+
+  expect(metricLevels).toEqual({ "disk:data": "critical", memory: "ok", load: "ok" });
+  expect(await svc.getCurrentInstanceLevel(at(1))).toMatchObject({ level: "critical" });
+  const detail = await svc.getEnvironmentDetail(local.id, { companyIds: null }, at(1));
+  expect(detail?.environment).toMatchObject({ environmentId: local.id, level: "critical" });
+  expect(detail?.environment.metricLevels).toEqual({ "disk:workspaces": "critical", memory: "ok", load: "ok" });
+  expect(detail?.environment.disks).toEqual([
+    { labels: ["workspaces"], totalBytes: 100 * GIB, freeBytes: GIB, freePercent: 1 },
+  ]);
+
+  const stale = new Date(at(0).getTime() + RESOURCE_CAPACITY_STALE_AFTER_MS + 1);
+  const staleDetail = await svc.getEnvironmentDetail(local.id, { companyIds: null }, stale);
+  expect(staleDetail?.environment).toMatchObject({ level: "unknown", metricLevels: {} });
+});
 
 describeEmbeddedPostgres("resource capacity service", () => {
   let db!: ReturnType<typeof createDb>;
