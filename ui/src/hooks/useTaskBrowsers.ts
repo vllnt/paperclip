@@ -8,12 +8,12 @@ import { taskBrowsersRefetchInterval } from "@/lib/live-run-polling";
  * Lists the browser sessions of an issue.
  *
  * @param issueId - The issue whose sessions to list.
- * @param runExpected - True while a run is live or expected. Defaults to true,
- * which keeps the fast cadence for callers that cannot tell. Observers of one
- * issue share one timer and the shortest interval wins, so the issue page
- * passes one value (from `isRunExpectedOnIssue`) to all of them.
+ * @param runExpected - True while a run is live or expected. Required, so a
+ * new caller has to decide. Observers of one issue share one timer and the
+ * shortest interval wins, so the issue page passes one value (from
+ * `isRunExpectedOnIssue`) to all of them.
  */
-export function useTaskBrowsers(issueId?: string, runExpected = true) {
+export function useTaskBrowsers(issueId: string | undefined, runExpected: boolean) {
   return useQuery({
     queryKey: ["task-browsers", issueId],
     queryFn: () => browserUseApi.list(issueId!),

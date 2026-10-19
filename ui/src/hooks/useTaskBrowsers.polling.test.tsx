@@ -29,7 +29,7 @@ const runningBrowser: TaskBrowser = {
   createdAt: "2026-10-09T12:00:00.000Z",
 };
 
-function Probe({ runExpected }: { runExpected?: boolean }) {
+function Probe({ runExpected }: { runExpected: boolean }) {
   useTaskBrowsers("issue-1", runExpected);
   return null;
 }
@@ -39,7 +39,7 @@ describe("useTaskBrowsers polling", () => {
   let host: HTMLDivElement;
   let queryClient: QueryClient;
 
-  async function render(runExpected?: boolean) {
+  async function render(runExpected: boolean) {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
@@ -70,12 +70,6 @@ describe("useTaskBrowsers polling", () => {
     host.remove();
     queryClient.clear();
     vi.useRealTimers();
-  });
-
-  it("polls every few seconds by default", async () => {
-    await render();
-    await advance(30_000);
-    expect(listMock.mock.calls.length).toBeGreaterThanOrEqual(9);
   });
 
   it("polls every few seconds while a run is expected", async () => {

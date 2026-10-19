@@ -1,6 +1,10 @@
 import { TextAttachmentContext } from "../context/TextAttachmentContext";
 import { useTaskBrowsers, useBrowserArrivals } from "@/hooks/useTaskBrowsers";
-import { isRunExpectedOnIssue, liveRunsRefetchInterval } from "@/lib/live-run-polling";
+import {
+  ISSUE_PAGE_RUN_POLL_MS,
+  isRunExpectedOnIssue,
+  liveRunsRefetchInterval,
+} from "@/lib/live-run-polling";
 import { WorkspaceExportRecovery } from "../components/WorkspaceExportRecovery";
 import { DispositionRecoveryProvider } from "../components/DispositionRecoveryNotice";
 import { readTaskRecordSelection } from "@/plugins/task-record-panels";
@@ -1481,8 +1485,10 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   });
   const resolvedLiveRuns = liveRuns ?? [];
   const liveRunCount = resolvedLiveRuns.length;
-  const activeRunQueryEnabled =
-    !!executionRunId || issueStatus === "in_progress";
+  const activeRunQueryEnabled = shouldTrackIssueActiveRun({
+    status: issueStatus,
+    executionRunId,
+  });
   const {
     data: activeRun = null,
     isFetched: activeRunFetched,
@@ -3348,7 +3354,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       queryKey: queryKeys.issues.liveRuns(issueId!),
       queryFn: () => heartbeatsApi.liveRunsForIssue(issueId!),
       enabled: !!issueId,
-      refetchInterval: liveRunsRefetchInterval(runExpected, 3000),
+      refetchInterval: liveRunsRefetchInterval(runExpected, ISSUE_PAGE_RUN_POLL_MS),
       select: (runs) => runs.length,
       placeholderData: keepPreviousDataForSameQueryTail<LiveRunForIssue[]>(
         issueId ?? "pending",
@@ -3363,9 +3369,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   >({
     queryKey: queryKeys.issues.activeRun(issueId!),
     queryFn: () => heartbeatsApi.activeRunForIssue(issueId!),
-    enabled:
-      !!issueId && (!!issue?.executionRunId || issue?.status === "in_progress"),
-    refetchInterval: liveRunCount > 0 ? false : 3000,
+    enabled: !!issueId && shouldTrackIssueActiveRun(issue),
+    refetchInterval: liveRunCount > 0 ? false : ISSUE_PAGE_RUN_POLL_MS,
     select: (run) => !!run,
     placeholderData: keepPreviousDataForSameQueryTail<ActiveRunForIssue | null>(
       issueId ?? "pending",

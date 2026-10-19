@@ -1,5 +1,14 @@
+import type { Issue } from "@paperclipai/shared";
+import { shouldTrackIssueActiveRun } from "./issueActiveRun";
+
 /** Poll cadence while a run is live or expected on the open issue. */
 export const LIVE_RUN_FAST_POLL_MS = 1_000;
+
+/**
+ * Cadence of the issue page's own run queries (live-run count and active run).
+ * The chat tab keeps `LIVE_RUN_FAST_POLL_MS`.
+ */
+export const ISSUE_PAGE_RUN_POLL_MS = 3_000;
 
 /** Cadence for browser-session discovery while a run is live or expected. */
 export const TASK_BROWSER_ACTIVE_POLL_MS = 3_000;
@@ -18,11 +27,7 @@ interface PolledBrowserList {
   state: { data: ReadonlyArray<{ status: string }> | undefined };
 }
 
-interface RunExpectationIssue {
-  id: string;
-  status: string;
-  executionRunId?: string | null;
-}
+type RunExpectationIssue = Pick<Issue, "id" | "status" | "executionRunId">;
 
 /** Browser session states that end the session; every other state is still changing. */
 const SETTLED_BROWSER_STATUSES: ReadonlySet<string> = new Set(["closed", "failed"]);
@@ -47,7 +52,7 @@ export function isRunExpectedOnIssue(
   companyLiveRuns: ReadonlyArray<{ issueId?: string | null }> | null | undefined,
 ): boolean {
   if (!issue) return false;
-  if (issue.executionRunId || issue.status === "in_progress") return true;
+  if (shouldTrackIssueActiveRun(issue)) return true;
   return (companyLiveRuns ?? []).some((run) => run.issueId === issue.id);
 }
 

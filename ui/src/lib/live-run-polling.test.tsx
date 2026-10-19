@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Issue } from "@paperclipai/shared";
 import {
   LIVE_RUN_FAST_POLL_MS,
   LIVE_RUN_IDLE_POLL_MS,
@@ -64,7 +65,11 @@ describe("taskBrowsersRefetchInterval", () => {
 });
 
 describe("isRunExpectedOnIssue", () => {
-  const todo = { id: "issue-1", status: "todo", executionRunId: null };
+  const todo: Pick<Issue, "id" | "status" | "executionRunId"> = {
+    id: "issue-1",
+    status: "todo",
+    executionRunId: null,
+  };
 
   it("expects no run on an idle issue", () => {
     expect(isRunExpectedOnIssue(todo, [])).toBe(false);
