@@ -74,11 +74,13 @@ import {
   type Http2TelemetryEventName,
 } from "./duplex-observability.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
+import { openSshMultiplex, type SshMultiplex } from "./ssh-multiplex.js";
 import {
   ensureCommandResolvable,
   resolveCommandForLogs,
   runChildProcess,
   type RunProcessResult,
+  type ChildProcessStdinWriter,
   type TerminalResultCleanupOptions,
 } from "./server-utils.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
@@ -286,6 +288,12 @@ export interface AdapterExecutionTargetProcessOptions {
    * after local child close or a remotely observed exit, including nonzero exits. */
   onProcessStopped?: () => void;
   terminalResultCleanup?: TerminalResultCleanupOptions;
+  /**
+   * Keep stdin open after the initial `stdin` write and hand the caller a
+   * writer. Only local and SSH targets have live stdin; sandbox targets never
+   * call it, so callers must treat a missing writer as "no live stdin".
+   */
+  onStdinReady?: (writer: ChildProcessStdinWriter) => void;
   /**
    * Sandbox-only: factory from the Paperclip bridge handle that streams the
    * CLI's stdout/stderr during the run. When provided, the batched provider
@@ -680,12 +688,16 @@ type AdapterCommandCapableExecutionTarget = AdapterSshExecutionTarget | AdapterS
 // bridge limit change never resizes this buffer as a side effect.
 const SSH_COMMAND_MAX_BUFFER_BYTES = 1024 * 1024;
 
-function adapterExecutionTargetCommandRunner(target: AdapterCommandCapableExecutionTarget): CommandManagedRuntimeRunner {
+function adapterExecutionTargetCommandRunner(
+  target: AdapterCommandCapableExecutionTarget,
+  options: { multiplex?: SshMultiplex | null } = {},
+): CommandManagedRuntimeRunner {
   if (target.transport === "ssh") {
     return createSshCommandManagedRuntimeRunner({
       spec: target.spec,
       defaultCwd: target.remoteCwd,
       maxBufferBytes: SSH_COMMAND_MAX_BUFFER_BYTES,
+      multiplex: options.multiplex,
     });
   }
   return requireSandboxRunner(target);
@@ -918,6 +930,7 @@ export async function runAdapterExecutionTargetProcess(
     cwd: options.cwd,
     env,
     stdin: options.stdin,
+    onStdinReady: options.onStdinReady,
     timeoutSec: options.timeoutSec,
     graceSec: options.graceSec,
     onLog: options.onLog,
@@ -955,6 +968,7 @@ export async function runAdapterExecutionTargetShellCommand(
         const result = await runSshCommand(target.spec, command, {
           env,
           timeoutMs: (options.timeoutSec ?? 15) * 1000,
+          storeHints: { cwd: options.cwd },
         });
         if (result.stdout) await onLog("stdout", result.stdout);
         if (result.stderr) await onLog("stderr", result.stderr);
@@ -4486,7 +4500,6 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // input.hostApiUrl stays available as an explicit override seam.
   const hostApiUrl = input.hostApiUrl?.trim() || resolveDefaultPaperclipApiUrl();
   const shellCommand = adapterExecutionTargetShellCommand(target);
-  const runner = adapterExecutionTargetCommandRunner(target);
   const bridgeTimeoutMs =
     typeof input.timeoutSec === "number" && Number.isFinite(input.timeoutSec) && input.timeoutSec > 0
       ? Math.trunc(input.timeoutSec * 1000)
@@ -4498,6 +4511,12 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   );
 
   const bridgeAsset = await createSandboxCallbackBridgeAsset();
+  // Over SSH every bridge step is a short command, so the steps share one
+  // master connection per environment and target instead of one login each.
+  // The agent's own session does not use it. The hold ends when the bridge
+  // stops, and on a failed start.
+  const multiplex = target.transport === "ssh" ? openSshMultiplex(target.spec, target.environmentId) : null;
+  const runner = adapterExecutionTargetCommandRunner(target, { multiplex });
 
   // The provider-scoped telemetry facade for the fixed duplex observability
   // surface. It maps the raw provider key through the allowlist one time, so no
@@ -5008,6 +5027,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       worker?.stop(),
       bridgeAsset.cleanup(),
     ]);
+    await multiplex?.release();
     throw error;
   }
 
@@ -5038,6 +5058,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         worker?.stop(),
         bridgeAsset.cleanup(),
       ]);
+      await multiplex?.release();
     },
   };
 }

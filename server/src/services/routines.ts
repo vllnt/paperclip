@@ -3971,6 +3971,49 @@ export function routineService(
       }));
     },
 
+    /** Event groups of a routine, newest activity first; `open` keeps those whose issue is still open and visible. */
+    listEventGroups: async (
+      routineId: string,
+      filters: { open?: boolean; limit?: number } = {},
+    ): Promise<RoutineEventGroup[]> => {
+      const routine = await getRoutineById(routineId);
+      if (!routine) throw notFound("Routine not found");
+      const rows = await db
+        .select({
+          group: routineEventGroups,
+          issueIdentifier: issues.identifier,
+          issueStatus: issues.status,
+          issueTitle: issues.title,
+        })
+        .from(routineEventGroups)
+        .innerJoin(issues, eq(issues.id, routineEventGroups.issueId))
+        .where(
+          and(
+            eq(routineEventGroups.companyId, routine.companyId),
+            eq(routineEventGroups.routineId, routine.id),
+            ...(filters.open ? [isNull(issues.hiddenAt), inArray(issues.status, OPEN_ISSUE_STATUSES)] : []),
+          ),
+        )
+        .orderBy(desc(routineEventGroups.lastSeenAt), desc(routineEventGroups.id))
+        .limit(Math.min(Math.max(filters.limit ?? 100, 1), 200));
+      return rows.map((row) => ({
+        id: row.group.id,
+        companyId: row.group.companyId,
+        routineId: row.group.routineId,
+        fingerprint: row.group.fingerprint,
+        issueId: row.group.issueId,
+        issueIdentifier: row.issueIdentifier ?? null,
+        issueStatus: row.issueStatus,
+        issueTitle: row.issueTitle,
+        firstSeenAt: row.group.firstSeenAt,
+        lastSeenAt: row.group.lastSeenAt,
+        lastCommentAt: row.group.lastCommentAt,
+        repeatCount: row.group.repeatCount,
+        lastSeverity: row.group.lastSeverity as RoutineEventGroup["lastSeverity"],
+        lastState: row.group.lastState as RoutineEventGroup["lastState"],
+      }));
+    },
+
     listRuns: async (routineId: string, limit = 50): Promise<RoutineRunSummary[]> => {
       const cappedLimit = Math.max(1, Math.min(limit, 200));
       const rows = await db

@@ -101,7 +101,7 @@ export function protectedFiles(files: readonly ChangedFile[], patterns: readonly
   return [...new Set(touched.filter(path => patterns.some(pattern => matchesProtectedPath(pattern, path))))].sort();
 }
 
-/** Whether a repository is a control repository: the full list applies, and no opt-in can release anything of it. */
+/** Whether a repository is a control repository: the full list applies, and no opt-in can release a control path or a tiers path. */
 export function isControlRepository(repository: string, tiers: string[] | null): boolean {
   return tiers !== null || CONTROL_REPOSITORIES.includes(repository.toLowerCase());
 }
@@ -170,9 +170,12 @@ export function isCodeownersPath(path: string): boolean {
 
 /**
  * Whether the opt-in releases one protected file: `allow` covers it, no `exclude` does, and it is not a CODEOWNERS, control
- * or tiers path. Those last three win over any config, so no change of the config can release them.
+ * or tiers path. Those last three win over any config, so no change of the config can release them. A path that is not in
+ * its normal form (a `.`, `..` or empty segment, as in `.github/../scripts/x`) is never released: it could match `allow`
+ * by its first segments and name a control path.
  */
 export function releasedByOptIn(rule: AgentMergeableRule, path: string, tiers: string[] | null): boolean {
+  if (path.split("/").some(segment => segment === "" || segment === "." || segment === "..")) return false;
   if (!rule.allow.some(pattern => matchesProtectedPath(pattern, path))) return false;
   if (rule.exclude.some(pattern => matchesProtectedPath(pattern, path))) return false;
   if (isCodeownersPath(path)) return false;
@@ -180,11 +183,13 @@ export function releasedByOptIn(rule: AgentMergeableRule, path: string, tiers: s
 }
 
 /**
- * Splits the protected files of a pull request into those the opt-in releases and those it does not. A control repository
- * (or one with a tiers file) is never released. One unreleased file keeps the refusal for the whole pull request.
+ * Splits the protected files of a pull request into those the opt-in releases and those it does not. Nothing is released
+ * without a rule for the repository, nor for a repository with a tiers file. A control repository without one can opt in,
+ * but its control paths stay refused (see `releasedByOptIn`). One unreleased file keeps the refusal for the whole pull request.
  */
-export function splitReleased(touched: readonly string[], rule: AgentMergeableRule | null, repository: string, tiers: string[] | null): { released: string[]; kept: string[] } {
-  if (!rule || isControlRepository(repository, tiers)) return { released: [], kept: [...touched] };
+export function splitReleased(touched: readonly string[], rule: AgentMergeableRule | null, tiers: string[] | null): { released: string[]; kept: string[] } {
+  // `!== null`, not a truthiness test: a tiers value that is not exactly null (even `undefined`) releases nothing.
+  if (!rule || tiers !== null) return { released: [], kept: [...touched] };
   const released = touched.filter(path => releasedByOptIn(rule, path, tiers));
   return { released, kept: touched.filter(path => !released.includes(path)) };
 }

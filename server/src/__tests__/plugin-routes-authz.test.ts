@@ -745,6 +745,7 @@ describe.sequential("plugin tool and bridge authz", () => {
         runId: null,
         companyId: null,
         isInstanceAdmin: true,
+        source: "session",
       },
       renderEnvironment: null,
     });
@@ -782,6 +783,7 @@ describe.sequential("plugin tool and bridge authz", () => {
         agentId: null,
         runId: runA,
         companyId: companyA,
+        source: "session",
       },
       renderEnvironment: null,
     });
@@ -842,6 +844,7 @@ describe.sequential("plugin tool and bridge authz", () => {
         agentId: agentA,
         runId: runA,
         companyId: companyA,
+        source: "agent_jwt",
       },
       renderEnvironment: null,
     });
@@ -871,6 +874,7 @@ describe.sequential("plugin tool and bridge authz", () => {
         agentId: agentA,
         runId: runA,
         companyId: companyA,
+        source: "agent_jwt",
       },
       renderEnvironment: null,
     });
