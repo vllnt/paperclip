@@ -44,6 +44,7 @@ interface ExportHeader {
  * run instead of starting over.
  */
 async function findResumePoint(file: string): Promise<{ header: ExportHeader | null; point: ResumePoint | null }> {
+  const size = (await fs.stat(file)).size;
   const lines = createInterface({ input: createReadStream(file), crlfDelay: Infinity });
   let offset = 0;
   let lineNumber = 0;
@@ -67,7 +68,9 @@ async function findResumePoint(file: string): Promise<{ header: ExportHeader | n
         until: record.data.requestedUntil ?? null,
       };
     }
-    if (record.kind === "run.end" && typeof record.data.cursor === "string") {
+    // readline also yields an unterminated final line. Replay that run so
+    // appending never joins two JSON records on the same line.
+    if (record.kind === "run.end" && typeof record.data.cursor === "string" && offset <= size) {
       point = { cursor: record.data.cursor, length: offset };
     }
   }

@@ -10,6 +10,7 @@ import { SetupService, boardScope, requireInstanceAdmin as requireAdmin } from "
 import { registerAgentBots } from "./agent-bots.js";
 import { registerAgentTools } from "./agent-tools.js";
 import { registerWriteIdentity } from "./write-identity.js";
+import { CLOCK_SKEW_ALERT_MS } from "./clock.js";
 import { registerNativeGitHub } from "./native-github.js";
 import type { AllowedOwner, AppIdentity, ConnectionState, Status } from "./contracts.js";
 import { header, verifyGitHubSignature } from "./github-webhooks.js";
@@ -201,6 +202,10 @@ export function register(ctx: PluginContext, github = new GitHubClient()) {
   // is reserved for one company; an unreadable policy throws, which the client
   // treats as an App-user company with an empty fence. Other companies keep
   // their App's write tokens.
+  // GitHub tokens follow GitHub's clock; a host clock this far off needs an operator (VLL-1192).
+  github.clock.onSkewChange = skewMs => Math.abs(skewMs) > CLOCK_SKEW_ALERT_MS
+    ? ctx.logger.warn("This host's clock differs from GitHub's by more than a minute; GitHub tokens follow GitHub's clock", { skewSeconds: Math.round(skewMs / 1000) })
+    : ctx.logger.info("This host's clock agrees with GitHub's again", {});
   github.appUserFence = async appId => {
     const companyId = (await appRegistry())[appId];
     return companyId === undefined ? null : identity.appUserFence(companyId);

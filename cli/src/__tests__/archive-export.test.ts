@@ -104,6 +104,31 @@ describe("archive export command", () => {
     ]);
   });
 
+  it("replays a run whose final record was cut off before its newline", async () => {
+    const out = path.join(dir, "missing-newline.ndjson");
+    writeFileSync(out, [
+      line("export.header", { include: ["run"], since: null }),
+      line("run", { id: "run-1" }, "run-1"),
+      line("run.end", { cursor: "c1" }, "run-1"),
+      line("run", { id: "run-2" }, "run-2"),
+      line("run.end", { cursor: "c2" }, "run-2"),
+    ].join("\n"));
+    const fetchMock = vi.fn().mockResolvedValueOnce(ndjson([
+      line("export.header", {}),
+      line("run", { id: "run-2" }, "run-2"),
+      line("run.end", { cursor: "c2" }, "run-2"),
+      line("export.end", { runs: 1, next: null }),
+    ]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["archive", "export", "-C", COMPANY_ID, "-o", out, "--resume"]);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toContain("cursor=c1");
+    const records = readFileSync(out, "utf8").trim().split("\n").map((entry) => JSON.parse(entry));
+    expect(records.filter((record) => record.kind === "run.end").map((record) => record.runId))
+      .toEqual(["run-1", "run-2"]);
+  });
+
   it("refuses to resume a file exported with other options", async () => {
     const out = path.join(dir, "other.ndjson");
     writeFileSync(out, `${line("export.header", { include: ["run"], since: null })}\n${line("run.end", { cursor: "c1" }, "run-1")}\n`);

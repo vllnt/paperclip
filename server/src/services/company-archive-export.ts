@@ -18,9 +18,10 @@ import {
 } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 import { heartbeatService } from "./heartbeat.js";
 import { getRunLogStore, type RunLogStore } from "./run-log-store.js";
-import { createRunReadRedaction, type RunReadRedactor } from "./run-read-redaction.js";
+import { createPemTextRedactor, createRunReadRedaction, type RunReadRedactor } from "./run-read-redaction.js";
 
 const EVENT_PAGE_SIZE = 1000;
 
@@ -155,6 +156,7 @@ export function companyArchiveExportService(db: Db, deps: CompanyArchiveExportDe
     }
     const lines = createInterface({ input, crlfDelay: Infinity });
     let lineNumber = 0;
+    const pemRedactors = new Map<string, ReturnType<typeof createPemTextRedactor>>();
     try {
       for await (const text of lines) {
         lineNumber += 1;
@@ -165,10 +167,25 @@ export function companyArchiveExportService(db: Db, deps: CompanyArchiveExportDe
         } catch {
           parsed = null;
         }
-        const line = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        const line: Record<string, unknown> = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
           ? { ...(parsed as Record<string, unknown>), line: lineNumber }
           // A torn last line (crash mid-append) stays visible as raw text.
           : { line: lineNumber, raw: text };
+        if ("chunk" in line && typeof line.chunk === "string") {
+          // Log chunks can split a PEM anywhere. Keep state per output stream
+          // and attempt so an unfinished key cannot hide unrelated diagnostics.
+          const streamKey = JSON.stringify([line.stream ?? null, line.attemptId ?? null]);
+          let redactPem = pemRedactors.get(streamKey);
+          if (!redactPem) {
+            redactPem = createPemTextRedactor();
+            pemRedactors.set(streamKey, redactPem);
+          }
+          line.chunk = redactPem.redact(line.chunk);
+        } else if ("raw" in line && [...pemRedactors.values()].some((scanner) => scanner.hasOpenBlock())) {
+          // A torn JSON line cannot be assigned to a stream safely. If a key is
+          // still open, omit its raw bytes without changing any stream state.
+          line.raw = REDACTED_EVENT_VALUE;
+        }
         yield { line: redactor.exportValue(line) };
       }
     } catch (error) {
