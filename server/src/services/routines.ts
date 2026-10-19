@@ -89,6 +89,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
@@ -2510,6 +2511,19 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        // The wake refuses an assignee it cannot invoke (a paused agent is assignable but not
+        // invokable). Apply the wake's own rule first, so no issue is committed only to be deleted;
+        // the throw is recorded below exactly like that wake failure.
+        const assignee = await txDb
+          .select()
+          .from(agents)
+          .where(eq(agents.id, assigneeAgentId))
+          .then((rows) => rows[0] ?? null);
+        const invokability = await evaluateAgentInvokabilityFromDb(txDb, assignee);
+        if (!invokability.invokable) {
+          throw conflict(invokability.message, { reason: invokability.reason, ...invokability.details });
+        }
+
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -2605,6 +2619,9 @@ export function routineService(
         return updated ?? createdRun;
       } catch (error) {
         if (createdIssue) {
+          // The issue is committed outside this transaction because the wake reads and updates it
+          // on its own connections, so it is deleted rather than rolled back. Its recovery actions
+          // cascade, and a recovery sweep that read it earlier skips it once it is gone.
           await txDb.delete(issues).where(eq(issues.id, createdIssue.id));
         }
         const failureReason = error instanceof Error ? error.message : String(error);
