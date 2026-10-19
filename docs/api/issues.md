@@ -93,6 +93,26 @@ Each `changes` entry has `from` and `to` values. Requested no-ops are omitted, s
 
 Receipt values for `description` are limited to the first 200 characters and include `updated: true`. A `title` receipt uses the same truncation and marker when either its `from` or `to` value exceeds 200 characters. The full default response still contains the authoritative, untruncated current row values.
 
+### Blocked issues and unblock owners
+
+An issue enters `blocked` with unresolved `blockedByIssueIds`, a pending interaction or approval, or an
+`unblockDescriptor` that names who must act and what they must do:
+
+```json
+{ "status": "blocked", "unblockDescriptor": { "owner": "board", "action": "Click Update branch on PR #123" } }
+```
+
+- `owner` is `"board"`, `{ "userId": "..." }` (an active company member) or `{ "agentId": "..." }` (a company
+  agent).
+- A board- or user-owned block appears in the board inbox once per blocked transition. An agent owner is woken.
+  When an agent hands an issue that is already blocked to the board or a user, that counts as a new blocked
+  transition, so the inbox item appears then.
+- Agents may name themselves or `"board"`. They may not name a specific user or another agent (`403`).
+- When the board or a user owns the block, an agent may not move the issue out of `blocked` or change or clear
+  its `unblockDescriptor` (`403`). A board user unblocks it. This holds for every route that changes the status,
+  including a comment with `resume` or `reopen` (`POST /api/issues/{id}/comments`): the agent gets `403` and the
+  comment is not posted.
+
 When the request includes `blockedByIssueIds`, the response also includes:
 
 - top-level `blockedByIssueIds`, echoing the normalized committed ID array
@@ -407,6 +427,36 @@ POST /api/issues/{issueId}/recovery-actions/resolve
 `executionReconciliation` is board-only and required when the open action is an
 execution recovery (the server asks for it). `actionOutcome` is `completed`,
 `not_performed`, or `mixed`.
+
+## Issue Tree
+
+```
+GET /api/issues/{issueId}/diagnostics/subtree
+```
+
+Read-only view of an issue and its sub-issues (depth 8, 100 nodes) with the
+blockers, wake requests, and activity that explain a stall. The root and every
+returned node must pass issue-read authorization; hidden nodes are omitted and
+counted in `omittedUnauthorizedNodeCount`.
+
+Each entry of `nodes` has `issue` (status, priority, assignee ids), `parentId`,
+`depth`, `diagnosis`, `blockers`, `wakeEvents`, and `lastRun`:
+
+```json
+"lastRun": {
+  "id": "run-uuid",
+  "status": "failed",
+  "agentId": "agent-uuid",
+  "startedAt": "2026-10-09T10:00:00.000Z",
+  "finishedAt": "2026-10-09T10:04:12.000Z",
+  "createdAt": "2026-10-09T09:59:58.000Z",
+  "errorCode": "process_exit"
+}
+```
+
+`lastRun` is the latest heartbeat run whose context issue is that node, or
+`null` when it never ran. `id` and `agentId` are `null` for actors without
+company-scope read, the same rule as the wake-request run and agent ids.
 
 ## Issue Lifecycle
 

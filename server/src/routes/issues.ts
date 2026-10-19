@@ -1,5 +1,10 @@
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
+import {
+  issueWaitRequestSchema,
+  parseIssueWaitDurationMs,
+  type IssueWaitRequest,
+} from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
 import { createIssueReadTiming } from "../services/issue-read-timing.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
@@ -133,6 +138,7 @@ import {
   type IssueBlockerDiagnosticsResponse,
   type IssueSubtreeDiagnosticEdge,
   type IssueSubtreeDiagnosticNode,
+  type IssueSubtreeDiagnosticLastRun,
   type IssueSubtreeDiagnosticsResponse,
   type IssueWakeDiagnosticActivityRecord,
   type IssueWakeDiagnosticEvent,
@@ -161,6 +167,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
+import { scheduleIssueWaitMonitor } from "../services/issue-waits.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -311,6 +318,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  monitorClearedByReassignment,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -1829,6 +1837,34 @@ type IssueSubtreeDiagnosticActivityRow = {
   createdAt: Date | string;
 };
 
+type IssueSubtreeDiagnosticLastRunRow = {
+  id: string;
+  status: string;
+  agentId: string;
+  startedAt: Date | string | null;
+  finishedAt: Date | string | null;
+  createdAt: Date | string;
+  errorCode: string | null;
+};
+
+// Run and agent ids follow the wake-request rule: only actors with
+// company-scope read see them.
+function projectIssueSubtreeLastRun(
+  row: IssueSubtreeDiagnosticLastRunRow | undefined,
+  options: { includeInternalIds: boolean },
+): IssueSubtreeDiagnosticLastRun | null {
+  if (!row) return null;
+  return {
+    id: options.includeInternalIds ? row.id : null,
+    status: row.status,
+    agentId: options.includeInternalIds ? row.agentId : null,
+    startedAt: dateToIso(row.startedAt),
+    finishedAt: dateToIso(row.finishedAt),
+    createdAt: dateToIso(row.createdAt)!,
+    errorCode: row.errorCode,
+  };
+}
+
 function groupByIssueId<T extends { issueId: string }>(rows: T[]) {
   const map = new Map<string, T[]>();
   for (const row of rows) {
@@ -1902,6 +1938,7 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
   >;
   wakeRequestsByIssueId: Map<string, IssueSubtreeDiagnosticWakeRequestRow[]>;
   activityRecordsByIssueId: Map<string, IssueSubtreeDiagnosticActivityRow[]>;
+  lastRunByIssueId: Map<string, IssueSubtreeDiagnosticLastRunRow>;
   truncatedNodes: boolean;
   truncatedDepth: boolean;
   truncatedBlockerIssueIds: Set<string>;
@@ -1995,6 +2032,9 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
           ? node.parentId
           : null,
       depth: node.depth,
+      lastRun: projectIssueSubtreeLastRun(input.lastRunByIssueId.get(node.id), {
+        includeInternalIds: input.includeInternalIds,
+      }),
       diagnosis: nodeDiagnosis,
       likelyReason: nodeDiagnosis,
       blockers: blockerResponse.blockers,
@@ -2325,7 +2365,12 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   checkoutRunId: string | null | undefined;
   executionRunId: string | null | undefined;
   requestAddsExplicitBlockers?: boolean;
+  reopenRequested?: boolean;
 }) {
+  // An explicit `reopen: false` opts out of the implicit move, so a board
+  // comment on a cancelled issue stays a comment. Omitting `reopen` keeps the
+  // conversational default.
+  if (input.reopenRequested === false) return false;
   // A request that wires a non-empty blockedByIssueIds list is declaring that
   // the issue is waiting on other work. The implicit reopen exists for plain
   // conversational comments ("please continue"), not structured dependency
@@ -8840,6 +8885,7 @@ export function issueRoutes(
       readinessByIssueId: diagnostic.readinessByIssueId,
       wakeRequestsByIssueId: diagnostic.wakeRequestsByIssueId,
       activityRecordsByIssueId: diagnostic.activityRecordsByIssueId,
+      lastRunByIssueId: diagnostic.lastRunByIssueId,
       truncatedNodes: diagnostic.truncatedNodes,
       truncatedDepth: diagnostic.truncatedDepth,
       truncatedBlockerIssueIds: diagnostic.truncatedBlockerIssueIds,
@@ -9385,6 +9431,19 @@ export function issueRoutes(
           activeRecoveryAction,
           { source: "recovery_action_resolution" },
         );
+
+        // backlog and cancelled only clear a stale flag on a task that is
+        // already parked or stopped; they never move the task there.
+        if (
+          (sourceIssueStatus === "backlog" ||
+            sourceIssueStatus === "cancelled") &&
+          sourceIssueStatus !== lockedIssue.status
+        ) {
+          throw conflict(
+            `Clearing a recovery action with sourceIssueStatus ${sourceIssueStatus} requires the task to already be ${sourceIssueStatus}. Move the task with a normal update first.`,
+            { code: "recovery_clear_requires_current_status" },
+          );
+        }
 
         if (outcome === "restored" && activeRecoveryAction.cause === "native_workspace_sync_out_unsafe_archive") {
           throw conflict("Unsafe workspace export recovers automatically without another provider turn.", { code: "workspace_export_automatic_recovery" });
@@ -12764,6 +12823,66 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
+  // An agent ends its turn with a wait instead of a background process: the
+  // issue keeps its status and the assignee is woken by its monitor later.
+  router.post(
+    "/issues/:id/wait",
+    validate(issueWaitRequestSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!issue) return;
+      await assertCanManageIssueMonitor(
+        access,
+        req,
+        issue.companyId,
+        issue.assigneeAgentId,
+        true,
+      );
+      const body = req.body as IssueWaitRequest;
+      const delayMs = parseIssueWaitDurationMs(body.in);
+      if (delayMs === null) throw unprocessable("Invalid wait duration");
+      const row = await db
+        .select()
+        .from(issueRows)
+        .where(eq(issueRows.id, issue.id))
+        .then((rows) => rows[0] ?? null);
+      if (!row) throw notFound("Issue not found");
+
+      const actor = getActorInfo(req);
+      const nextCheckAt = new Date(Date.now() + delayMs);
+      const updated = await scheduleIssueWaitMonitor(db, svc, {
+        issue: row,
+        nextCheckAt,
+        notes: `Waiting: ${body.reason}`,
+        serviceName: null,
+        externalRef: null,
+        activity: {
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId ?? null,
+          runId: actor.runId ?? null,
+          source: "issue.wait",
+          details: { delayMs, reason: body.reason },
+        },
+      });
+      if (!updated) throw notFound("Issue not found");
+
+      res.json({
+        issueId: issue.id,
+        identifier: issue.identifier ?? null,
+        status: updated.status,
+        nextCheckAt: nextCheckAt.toISOString(),
+        reason: body.reason,
+      });
+    },
+  );
+
   router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
@@ -13204,6 +13323,7 @@ export function issueRoutes(
               requestAddsExplicitBlockers:
                 Array.isArray(req.body.blockedByIssueIds) &&
                 req.body.blockedByIssueIds.length > 0,
+              reopenRequested,
             })) ||
           shouldResumeInProgressScheduledRetry);
       const updateReferenceSummaryBefore = titleOrDescriptionChanged
@@ -13406,12 +13526,11 @@ export function issueRoutes(
       const descriptor = updateFields.unblockDescriptor ?? null;
       if (descriptor && typeof descriptor === "object") {
         const owner = descriptor.owner;
-        if (
-          req.actor.type === "agent" &&
-          (owner === "board" || "userId" in owner)
-        ) {
+        // Agents may hand a block to the board (it lands in the board inbox),
+        // but may not page a specific person or wake another agent.
+        if (req.actor.type === "agent" && owner !== "board" && "userId" in owner) {
           throw forbidden(
-            "Agents may only name themselves as an unblock owner",
+            "Agents may name themselves or the board as an unblock owner",
           );
         }
         if (owner !== "board" && "agentId" in owner) {
@@ -13435,7 +13554,7 @@ export function issueRoutes(
             req.actor.agentId !== owner.agentId
           ) {
             throw forbidden(
-              "Agents may only name themselves as an unblock owner",
+              "Agents may name themselves or the board as an unblock owner",
             );
           }
         } else if (owner !== "board" && "userId" in owner) {
@@ -14435,7 +14554,11 @@ export function issueRoutes(
           details: {
             identifier: issue.identifier,
             previousNextCheckAt: previousMonitor.nextCheckAt,
-            reason: nextMonitor.clearReason ?? "manual",
+            reason:
+              nextMonitor.clearReason === "invalid_assignee" &&
+              monitorClearedByReassignment(existing, issue)
+                ? "reassigned"
+                : nextMonitor.clearReason ?? "manual",
             notes: previousMonitor.notes,
           },
         });
@@ -15319,6 +15442,10 @@ export function issueRoutes(
           req.body.agentId,
           req.body.expectedStatuses,
           checkoutRunId,
+          // An agent can only check out as itself (the gate above), so its id is the body's.
+          req.actor.type === "agent"
+            ? { kind: "agent", agentId: req.body.agentId }
+            : { kind: "board", userId: req.actor.userId ?? null },
         );
       } catch (error) {
         if (isUniqueViolation(error, "issues_open_routine_execution_uq")) {
@@ -15347,7 +15474,12 @@ export function issueRoutes(
         action: "issue.checked_out",
         entityType: "issue",
         entityId: issue.id,
-        details: { agentId: req.body.agentId },
+        details: {
+          agentId: req.body.agentId,
+          ...(updated && monitorClearedByReassignment(issue, updated)
+            ? { monitorCleared: "reassigned" }
+            : {}),
+        },
       });
 
       if (
@@ -15415,6 +15547,9 @@ export function issueRoutes(
       action: "issue.released",
       entityType: "issue",
       entityId: released.id,
+      ...(monitorClearedByReassignment(existing, released)
+        ? { details: { monitorCleared: "reassigned" } }
+        : {}),
     });
 
     res.json(released);
@@ -17664,6 +17799,7 @@ export function issueRoutes(
             actorRunId: actor.runId,
             checkoutRunId: issue.checkoutRunId,
             executionRunId: issue.executionRunId,
+            reopenRequested: req.body.reopen,
           }) ||
           shouldResumeInProgressScheduledRetry);
       const hasUnresolvedFirstClassBlockers =
@@ -17758,7 +17894,11 @@ export function issueRoutes(
               actor,
             })
           : null;
-        const reopenedIssue = await svc.update(id, { status: "todo" });
+        const reopenedIssue = await svc.update(id, {
+          status: "todo",
+          ...(actor.agentId ? { actorAgentId: actor.agentId } : {}),
+          ...(actor.actorType === "user" ? { actorUserId: actor.actorId } : {}),
+        });
         if (!reopenedIssue) {
           res.status(404).json({ error: "Issue not found" });
           return;
