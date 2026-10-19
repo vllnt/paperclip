@@ -123,6 +123,16 @@ export interface EnvironmentDriverTraits {
    * `true` changes runtime behavior, so the board owns that decision.
    */
   readonly hasLeaseCapabilityModel: boolean;
+  /**
+   * True when a lease's provider lease id names a resource that only this
+   * lease holds and its cleanup tears down, such as one sandbox. Read by
+   * `sweepOrphanedActiveLeases` (`heartbeat.ts`), which must not tear down a
+   * resource that another live lease still holds. False when every lease on
+   * the environment records the same id (the SSH host workspace) and cleanup
+   * only releases the lease row, so a lease sharing the id never blocks the
+   * recovery of an orphaned one.
+   */
+  readonly leaseOwnsProviderResource: boolean;
 }
 
 /**
@@ -137,6 +147,7 @@ export const ENVIRONMENT_DRIVER_TRAITS: Record<EnvironmentDriver, EnvironmentDri
     runsWorkspaceOffHost: false,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    leaseOwnsProviderResource: false,
   },
   ssh: {
     driver: "ssh",
@@ -144,6 +155,7 @@ export const ENVIRONMENT_DRIVER_TRAITS: Record<EnvironmentDriver, EnvironmentDri
     runsWorkspaceOffHost: true,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    leaseOwnsProviderResource: false,
   },
   sandbox: {
     driver: "sandbox",
@@ -151,6 +163,7 @@ export const ENVIRONMENT_DRIVER_TRAITS: Record<EnvironmentDriver, EnvironmentDri
     runsWorkspaceOffHost: true,
     confinesStagedProjects: true,
     hasLeaseCapabilityModel: true,
+    leaseOwnsProviderResource: true,
   },
   plugin: {
     driver: "plugin",
@@ -158,6 +171,7 @@ export const ENVIRONMENT_DRIVER_TRAITS: Record<EnvironmentDriver, EnvironmentDri
     runsWorkspaceOffHost: true,
     confinesStagedProjects: false,
     hasLeaseCapabilityModel: false,
+    leaseOwnsProviderResource: true,
   },
 };
 

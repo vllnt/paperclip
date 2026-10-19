@@ -1,5 +1,6 @@
 import type { PluginContext, ToolResult, ToolRunContext } from "@paperclipai/plugin-sdk";
-import { RepositoryManager, text } from "./management-repository.js";
+import { RepositoryManager, repoWriteAction, repoWrites, text } from "./management-repository.js";
+import type { PluginWriteRequest } from "./write-identity.js";
 import { nativeGitHubEndpoints, nativeConnectorRequiredError } from "./native-github.js";
 import type { GitHubClient } from "./github.js";
 import type { Catalog, Repository } from "./contracts.js";
@@ -13,6 +14,8 @@ export function registerAgentTools(
   github: GitHubClient,
   credentials: (companyId: string) => Promise<{ id: string; pem: string }>,
   loadCatalog: (companyId: string, refresh?: boolean) => Promise<Catalog>,
+  /** The App user's token for a write when the company writes as its App user; null keeps the App. */
+  writeToken: (companyId: string, repository: string | null, request: PluginWriteRequest) => Promise<string | null> = async () => null,
 ) {
   const schema = (properties: Record<string, unknown>, required: string[] = ["repository"]): Record<string, unknown> => ({
     type: "object", additionalProperties: false, properties: {
@@ -60,9 +63,13 @@ export function registerAgentTools(
       delete input.companyId;
       delete input.reviewerAgentIds;
       delete input.assigneeAgentIds;
-      const manager = new RepositoryManager(github, auth, repo);
+      const userToken = repoWrites.has(op) ? await writeToken(runCtx.companyId, repo.fullName, {
+        ...repoWriteAction(op, input), source: "tool", agentId: runCtx.agentId, runId: runCtx.runId ?? null,
+        ...(typeof input.number === "number" ? { pullRequest: input.number } : {}), ...(typeof input.sha === "string" ? { expectedHeadSha: input.sha } : {}),
+      }) : null;
+      const manager = new RepositoryManager(github, auth, repo, undefined, userToken);
       const data = await manager.run(op, input);
-      await ctx.activity.log({ companyId: runCtx.companyId, message: `GitHub agent action: ${op}`, metadata: { repository: repo.fullName, agentId: runCtx.agentId, runId: runCtx.runId, ...(typeof input.number === "number" ? { number: input.number } : {}) } });
+      await ctx.activity.log({ companyId: runCtx.companyId, message: `GitHub agent action: ${op}`, metadata: { repository: repo.fullName, agentId: runCtx.agentId, runId: runCtx.runId, identity: userToken ? "user" : "bot", ...(typeof input.number === "number" ? { number: input.number } : {}) } });
       return result(data);
     } catch (error) { return fail(error); }
   }

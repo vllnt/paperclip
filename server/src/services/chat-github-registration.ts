@@ -9,6 +9,7 @@ import {
 } from "@paperclipai/db";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { githubBotRequest } from "./chat-github-client.js";
+import { assertNativeGitHubAppAllowed } from "./github-installation-tokens.js";
 import { logActivity } from "./activity-log.js";
 
 const digest = (state: string) =>
@@ -71,6 +72,8 @@ export function githubChatRegistrationService(
       throw conflict(
         "This bot already has a GitHub App. Reconnect its existing credentials.",
       );
+    // A company that writes as its GitHub App user registers no bot App (I-RO).
+    await assertNativeGitHubAppAllowed(db, { companyId: endpoint.companyId });
     const [member] = await db
       .select()
       .from(companyMemberships)
@@ -195,6 +198,7 @@ export function githubChatRegistrationService(
         );
       if (!member || member.membershipRole === "viewer")
         throw forbidden("The configuring member no longer has access");
+      await assertNativeGitHubAppAllowed(db, { companyId: session.companyId });
       const app = await githubBotRequest<{
         id?: number;
         pem?: string;
@@ -217,6 +221,7 @@ export function githubChatRegistrationService(
         throw badRequest(
           "GitHub registration returned incomplete App credentials",
         );
+      await assertNativeGitHubAppAllowed(db, { companyId: session.companyId, appId: String(app.id) });
       await options.storeApp(session.endpointId, session.userId, {
         appId: String(app.id),
         privateKey: app.pem,

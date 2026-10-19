@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
+  activityLog,
   companies,
   companySecretBindings,
   companySecretProviderConfigs,
@@ -88,6 +89,7 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
   });
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(secretAccessEvents);
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
@@ -209,5 +211,44 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
       .from(secretAccessEvents)
       .where(eq(secretAccessEvents.secretId, foreignSecret.id));
     expect(events).toHaveLength(0);
+  });
+
+  it("stores a new version only in the secret bound to the plugin's own config path", async () => {
+    await seedPlugin();
+    const companyId = await seedCompany("Store Co");
+    const otherCompanyId = await seedCompany("Other Co");
+    const svc = secretService(db);
+    const refreshToken = await svc.create(companyId, { name: `refresh-${randomUUID()}`, provider: "local_encrypted", value: "unset" });
+    const unbound = await svc.create(companyId, { name: `unbound-${randomUUID()}`, provider: "local_encrypted", value: "keep" });
+    await svc.syncSecretRefsForTarget(companyId, { targetType: "plugin", targetId: pluginId }, [
+      { secretId: refreshToken.id, configPath: "userRefreshToken" },
+    ], { replaceAll: true });
+    const handler = createPluginSecretsHandler({ db, pluginId });
+
+    await handler.storeOwn({ companyId, configPath: "userRefreshToken", value: "ghr_rotated" });
+    await expect(handler.resolve({ companyId, configPath: "userRefreshToken", secretRef: { type: "secret_ref", secretId: refreshToken.id, version: "latest" } }))
+      .resolves.toBe("ghr_rotated");
+    expect((await svc.getById(refreshToken.id))?.latestVersion).toBe(2);
+
+    // No binding at the path, another company, or an empty value: nothing is written.
+    await expect(handler.storeOwn({ companyId, configPath: "privateKey", value: "x" })).rejects.toThrow(/Bind exactly one/);
+    await expect(handler.storeOwn({ companyId: otherCompanyId, configPath: "userRefreshToken", value: "x" })).rejects.toThrow(/Bind exactly one/);
+    await expect(handler.storeOwn({ companyId, configPath: "userRefreshToken", value: " " })).rejects.toThrow(/value/);
+    expect((await svc.getById(unbound.id))?.latestVersion).toBe(1);
+    expect((await svc.getById(refreshToken.id))?.latestVersion).toBe(2);
+    // A secret also bound at another path (or to another consumer) is never overwritten.
+    const shared = await svc.create(companyId, { name: `shared-${randomUUID()}`, provider: "local_encrypted", value: "pem" });
+    await svc.syncSecretRefsForTarget(companyId, { targetType: "plugin", targetId: pluginId }, [
+      { secretId: refreshToken.id, configPath: "userRefreshToken" },
+      { secretId: shared.id, configPath: "privateKey" },
+      { secretId: shared.id, configPath: "signingKey" },
+    ], { replaceAll: true });
+    await expect(handler.storeOwn({ companyId, configPath: "privateKey", value: "x" })).rejects.toThrow(/also used elsewhere/);
+    expect((await svc.getById(shared.id))?.latestVersion).toBe(1);
+    await handler.storeOwn({ companyId, configPath: "userRefreshToken", value: "ghr_again" });
+    expect((await svc.getById(refreshToken.id))?.latestVersion).toBe(3);
+    const stored = await db.select().from(activityLog).where(eq(activityLog.action, "plugin.secret_stored"));
+    expect(stored.map(row => [row.entityId, (row.details as { configPath: string }).configPath])).toEqual([[refreshToken.id, "userRefreshToken"], [refreshToken.id, "userRefreshToken"]]);
+    expect(JSON.stringify(stored)).not.toContain("ghr_");
   });
 });

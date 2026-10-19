@@ -4737,13 +4737,21 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
-        const child = spawn(target.command, target.args, {
-          cwd: target.cwd ?? opts.cwd,
-          env: childEnv,
-          detached: process.platform !== "win32",
-          shell: false,
-          stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
-        }) as ChildProcessWithEvents;
+        let child: ChildProcessWithEvents;
+        try {
+          child = spawn(target.command, target.args, {
+            cwd: target.cwd ?? opts.cwd,
+            env: childEnv,
+            detached: process.platform !== "win32",
+            shell: false,
+            stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+          }) as ChildProcessWithEvents;
+        } catch (err) {
+          // A synchronous spawn failure emits no "error" or "close" event, so
+          // remove the target's temp files (an SSH key) here.
+          void target.cleanup?.();
+          throw err;
+        }
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
@@ -4907,9 +4915,13 @@ export async function runChildProcess(
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
           const onStdinReady = opts.onStdinReady;
-          // A live writer can outlive the child; a late write must not crash
-          // the server with an unhandled EPIPE.
-          if (onStdinReady) stdin.on("error", () => {});
+          // A child that exits before reading its whole prompt (for example an
+          // `ssh` whose connection drops) makes the pending write fail with
+          // EPIPE. Without a listener that error crashes the server. The exit
+          // status still reports the run's outcome.
+          stdin.on("error", (err) =>
+            onLogError(err, runId, "child process closed stdin before reading all input"),
+          );
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);

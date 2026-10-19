@@ -208,7 +208,7 @@ Browse organization projects, create a project, edit title/summary/README, close
 
 Read and edit **text, number, date, single-select and iteration fields**, including clearing a value. Create, rename and delete custom fields; replace single-select options or an iteration schedule with confirmation because GitHub may clear existing item values. Built-in issue/PR fields are edited on the source item. Projects and items are paginated; restricted content stays restricted. These are GitHub Projects, distinct from native Paperclip Projects.
 
-Personal Projects use **Connection settings → Personal Projects access**. Create a classic user token with `project` scope from the prefilled link, paste it once, and the plugin verifies the account before storing it in encrypted Paperclip Secrets. Add `repo` scope only if private repository content is needed; authorize SSO where required. The token is only used for personal Projects, not repository/PR actions, and is never stored in plugin config. Only the authenticated user’s personal projects are exposed. Organization Projects continue to use your App.
+Personal Projects use **Connection settings → Personal Projects access**. Create a classic user token with `project` scope from the prefilled link, paste it once, and the plugin verifies the account before storing it in encrypted Paperclip Secrets. Add `repo` scope only if private repository content is needed; authorize SSO where required. The token is only used for personal Projects, not repository/PR actions, and is never stored in plugin config. Only the authenticated user’s personal projects are exposed. Organization Projects continue to use your App. While the company writes as its GitHub App user (see App user identity below), personal Projects are read-only: the personal token is outside that identity's fence, kill switch, throttle and audit.
 
 ### Write safety and recovery
 
@@ -216,6 +216,128 @@ All management actions require a Paperclip board user and the selected company�
 
 Mutations use a company-scoped durable request receipt. Double submits with the same request ID execute once. A lost network response stays unconfirmed and is not blindly retried. Refresh the item and check the outcome before starting a new action. Definitive HTTP permission/validation rejections may retry. Validation that fails before a provider mutation does not leave a pending receipt. A successful write whose view cannot refresh is explicitly shown as saved.
 
+### Write identity: who acts on GitHub
+
+One policy per company (instance administrators change it with
+`write-identity.set`; board users read it with `write-identity.get`). Without a
+saved policy, agent `git`/`gh` act as the run's user and this plugin writes as
+the App. Full rules: [`doc/execution-github-identity.md`](../../../doc/execution-github-identity.md#write-identity-who-acts-on-github).
+
+- **`userSource: "run"`** (the **Write identity** panel): per action and
+  `owner/name` override, a write uses the run's user (dedicated account or the
+  responsible person's connection) or the App (`<app-slug>[bot]`). This
+  plugin's tools keep writing as the App.
+- **`userSource: "app"`**: every write is done by one person (`userLogin`)
+  through this company's own App user token; reads and the issue mirror stay on
+  the App installation. This plugin's sync write-back, board actions and agent
+  tools write as that person too, through the same gates.
+
+**The App only reads under `userSource: "app"` (I-RO).** The decision is per
+company and is read on every token mint: for such a company, every App
+installation token (managed reads, issue mirror, sync, catalog listing, board
+reads) is read-only and names one repository by ID or the company's fenced
+repositories by name, never the whole installation. A write scope, a missing
+permission subset, an installation-wide token or a repository outside the
+fence is refused before GitHub is called, so nothing falls back to an App
+write. Saving the policy drops cached tokens and the catalog, so switching a
+company to the App user removes its App writes at once: App write tokens this
+worker minted in the last hour are revoked, and a token GitHub mints during the
+switch is revoked instead of used (tokens from an earlier worker process expire
+within the hour). Companies with `userSource: "run"` or no policy keep their
+App's write tokens (sync write-back, board actions, organization Projects,
+agent tools and `bot` writes). The check is Paperclip's one mint function
+(`@paperclipai/shared/github-installation-token`), which the server's native
+GitHub code uses too; the native GitHub connector is refused for an App-user
+company and for its App.
+
+#### App user setup (anthm)
+
+GitHub side (an Anthm-FR owner):
+
+1. `anthm-agents` App settings: turn on **Device Flow**, keep **Expire user
+   authorization tokens** on, generate a client secret. Permissions: add
+   Actions write and Deployments write; set Checks to read; never add
+   Statuses write or Administration; Workflows write only if agents may edit
+   CI. Approve the change on the Anthm-FR installation.
+2. Narrow the installation to **Only select repositories** with exactly the
+   repositories in `installationRepositories`.
+3. Add the public signing key below to the person's account as an **SSH
+   signing key**.
+
+Paperclip side (instance administrator, continuing the sequence above):
+
+```sh
+# Secrets: the App client secret, a placeholder the plugin overwrites with the
+# rotating refresh token, and the ed25519 signing key (ssh-keygen -t ed25519 -N "").
+CLIENT_SECRET_ID="$(GITHUB_SECRET="$(cat "$ANTHM_CLIENT_SECRET_FILE")" paperclipai secrets create -C "$ANTHM" \
+  --name 'anthm-agents client secret' --provider local_encrypted --value-env GITHUB_SECRET --json | json_id)"
+REFRESH_SECRET_ID="$(GITHUB_SECRET=unset paperclipai secrets create -C "$ANTHM" \
+  --name 'anthm-agents user refresh token' --provider local_encrypted --value-env GITHUB_SECRET --json | json_id)"
+SIGNING_SECRET_ID="$(GITHUB_SECRET="$(cat "$ANTHM_SIGNING_KEY_FILE")" paperclipai secrets create -C "$ANTHM" \
+  --name 'Paperclip anthm agents signing key' --provider local_encrypted --value-env GITHUB_SECRET --json | json_id)"
+# Merge into the company config: userClientId (the App's client ID, not a secret),
+# userClientSecret, userRefreshToken and signingKey as {type:"secret_ref",secretId,version:"latest"}.
+
+# Policy. Writes start on songtrivia and anthm-fr; the other repositories stay
+# readable until the review gate is live (add them to allowedRepositories later).
+paperclipai plugin action "$PLUGIN" write-identity.set -C "$ANTHM" --params-json '{"policy":{
+  "default":{"commit":"user","push":"user","pullRequest":"user","comment":"user"},
+  "userSource":"app","userLogin":"'"$BNT_OWNER"'","enabled":false,
+  "allowedRepositories":["Anthm-FR/songtrivia","Anthm-FR/anthm-fr"],
+  "installationRepositories":["Anthm-FR/songtrivia","Anthm-FR/anthm-fr","Anthm-FR/linkzic","Anthm-FR/wordzic","Anthm-FR/nextdle"],
+  "installationPermissions":{"actions":"write","checks":"read","contents":"write","deployments":"write","issues":"write",
+    "metadata":"read","organization_projects":"write","pull_requests":"write","statuses":"read"},
+  "privileged":{"adminMerge":true,"deploymentApproval":true,"workflowDispatch":true,"wiki":true,
+    "release":false,"tagPush":false,"pushToMain":false,"editWorkflows":false},
+  "throttle":{"perMinute":30,"perHour":300},"bodyFooter":false}}' --json
+
+# Consent: show the code, the person enters it at https://github.com/login/device,
+# then poll every few seconds until "authorized" with "fence": {"ok": true}.
+paperclipai plugin action "$PLUGIN" user-authorization.start -C "$ANTHM" --params-json '{}' --json
+paperclipai plugin action "$PLUGIN" user-authorization.poll -C "$ANTHM" --params-json '{}' --json
+
+# Turn writes on (the same policy with "enabled": true); the save re-checks the fence.
+```
+
+`user-authorization.check` re-runs the fence check; `user-authorization.status`
+shows the person, token expiry and the last check (never a token). Any drift
+turns writes off; fix it, then save the policy with `"enabled": true` again.
+A 401 alone never does: the plugin refreshes the user token with the stored
+refresh token and retries once, and only GitHub refusing that refresh
+(`bad_refresh_token`) confirms a revocation. A network failure, a 401 no refresh
+confirmed or a refused App JWT pauses writes until the next good check. Token
+expiry and App JWTs follow GitHub's clock (the `Date` of its answers): a host
+clock more than a minute off is logged, shown as `fence.clockSkewSeconds` and
+recorded as `github.clock_skew` in the company activity.
+The kill switch is the same save with `"enabled": false`: writes stop at the
+next command, reads continue.
+
+### Releasing protected paths for agent merges
+
+By default an agent never merges a pull request that touches a protected path (`.github/**`, CODEOWNERS and, in a control repository, its control paths); a person merges it in the GitHub web UI. An **instance administrator** can release some of these paths for chosen repositories with the company's plugin config, field `agentMergeablePaths`:
+
+```sh
+# config:set replaces the whole config, so merge the new field into the current one (as in the setup above).
+current="$(paperclipai plugin config "$PLUGIN" -C "$COMPANY" --json)"
+payload="$(CURRENT="$current" node -e '
+  const current = JSON.parse(process.env.CURRENT || "null")?.configJson ?? {};
+  process.stdout.write(JSON.stringify({ configJson: { ...current, agentMergeablePaths: [
+    { repository: "owner/repo", allow: [".github/**"], exclude: [".github/workflows/release.yml", ".github/workflows/deploy-*.yml"] },
+  ] } }));')"
+paperclipai plugin config:set "$PLUGIN" -C "$COMPANY" --payload-json "$payload" --json
+```
+
+- `repository` is `owner/name`. It is matched exactly and without regard to case. The default is no entries, which behaves as before.
+- `allow` lists paths under `.github/`, as globs (`*`, `?`, `**`). `exclude` lists paths or globs that stay refused.
+- A pull request merges when every protected file it touches is covered by `allow` and by no `exclude`. **One file that is not released refuses the whole pull request.** The refusal names only the files that are not released. A rename counts both names.
+- **Never released, whatever the config says:** the CODEOWNERS paths, every path of a control repository (a repository with a `paperclip/tiers.yaml` on its base branch cannot opt in), and the tiers paths. An `allow` entry that names CODEOWNERS or reaches outside `.github/` is refused when the config is saved. An entry that is not valid at the moment of a merge is dropped and releases nothing.
+- The config is read at every merge, from the plugin config only. It is never read from the pull request or from a file of the repository, so a pull request cannot widen its own release. Only an instance administrator can save it.
+- Unchanged: the exact head SHA of the merge, the file list read again after the head, the refusal of auto-merge and the merge queue, the admin-merge rules and every other write-identity gate.
+- The merge evidence records `releasedProtectedFiles` (at most 100, with `releasedProtectedFilesCount`) and `releasedBy: "config:agentMergeablePaths"`.
+
+**An exclusion by file name is a speed bump, not a boundary.** A pull request can add a new workflow file, or a local action that a released workflow calls, and reach production without touching an excluded name. The boundary that holds is GitHub's **environment protection** (required reviewers) on the deployment environment, together with branch protection. Use `exclude` to keep the obvious production and release files out of an agent's reach, and put the real approval on the environment.
+
+## Native tasks and synchronization
 ## Native tasks and synchronization
 
 - Open GitHub issues import as **Todo**. Completed issues import as **Done**; “not planned” issues as **Cancelled**. Pull requests become native tracking tasks when opened from the Tasks PR browser.
@@ -363,6 +485,23 @@ the same PR revision, so their perspectives stay independent. Native Paperclip
 owns bot identity and governed formal reviews; the plugin App remains the
 repository/task management actor.
 
+
+## 0.12.0 — Write identity and the App user
+
+- Per-action write identity (App or the run's user) with repository overrides,
+  stored per company (**Write identity** panel).
+- `userSource: "app"`: one person's App user token for every write, the App
+  installation for reads, device-flow consent, a rotating refresh token kept in
+  a company secret, an hourly fence check that turns writes off on drift, a
+  kill switch, a repository allowlist, privileged-action toggles, a write
+  throttle, an admin-merge guard, a protected-path merge guard (no agent merge
+  touching `.github/**`, CODEOWNERS or, in the control repository, `paperclip/**`,
+  `scripts/**` and the base branch's `paperclip/tiers.yaml` list, except what an instance
+  administrator releases per repository with `agentMergeablePaths`; no auto-merge
+  or merge queue) and server-side commit signing.
+- Declares `writeIdentityAction`, `signCommitAction` and the
+  `secrets.write-own` capability; upgrading asks the operator to approve it.
+  Behaviour is unchanged until a policy is saved.
 
 ## 0.11.0 — Company GitHub Apps and owner allowlists
 

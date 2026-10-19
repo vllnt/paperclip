@@ -56,6 +56,12 @@ export const agentWakeupRequests = pgTable(
       table.agentId,
       table.requestedAt,
     ),
+    // The deferred-wake recovery sweep reads every parked wake across companies,
+    // oldest first. Parked wakes are a few rows in a large table; this narrow
+    // partial index lets that read skip the rest.
+    deferredRequestedIdx: index("agent_wakeup_requests_deferred_requested_idx")
+      .on(table.requestedAt)
+      .where(sql`${table.status} = 'deferred_issue_execution'`),
     reviewPathRecoveryIdempotencyUq: uniqueIndex(
       "agent_wakeup_requests_review_path_recovery_idempotency_uq",
     )
@@ -84,6 +90,11 @@ export const agentWakeupRequests = pgTable(
     chatCompletionIdempotencyUq: uniqueIndex("agent_wakeup_requests_chat_completion_uq")
       .on(table.companyId, table.idempotencyKey)
       .where(sql`${table.idempotencyKey} LIKE 'chat-completion:%'`),
+    // One live receipt per issue, assignee and assignment generation. The
+    // pattern matches only issue-assignment:<issue>:<assignee>:<generation>.
+    issueAssignmentIdempotencyUq: uniqueIndex("agent_wakeup_requests_issue_assignment_idempotency_uq")
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} LIKE 'issue-assignment:%:%:%' AND ${table.status} NOT IN ('skipped', 'failed', 'cancelled')`),
     companyPayloadIssueIdx: index("agent_wakeup_requests_company_payload_issue_idx").on(
       table.companyId,
       sql`(${table.payload} ->> 'issueId')`,

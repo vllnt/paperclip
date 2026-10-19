@@ -14,6 +14,7 @@ import {
   readConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
 import { secretService } from "./secrets.js";
+import { logActivity } from "./activity-log.js";
 import { unprocessable } from "../errors.js";
 
 // ---------------------------------------------------------------------------
@@ -168,8 +169,18 @@ export interface PluginSecretsHandlerOptions {
   pluginId: string;
 }
 
+export interface PluginSecretsStoreOwnParams {
+  /** The new secret value. Never logged. */
+  value: string;
+  companyId: string;
+  /** The plugin's own secret config path the operator bound a company secret to. */
+  configPath: string;
+}
+
 export interface PluginSecretsService {
   resolve(params: PluginSecretsResolveParams): Promise<string>;
+  /** Store a new version of the one company secret bound to this plugin at `configPath`. */
+  storeOwn(params: PluginSecretsStoreOwnParams): Promise<void>;
 }
 
 function createRateLimiter(maxAttempts: number, windowMs: number) {
@@ -193,6 +204,7 @@ export function createPluginSecretsHandler(
 ): PluginSecretsService {
   const { db, pluginId } = options;
   const rateLimiter = createRateLimiter(30, 60_000);
+  const storeRateLimiter = createRateLimiter(10, 60_000);
 
   async function lookupBinding(input: {
     companyId: string;
@@ -279,6 +291,63 @@ export function createPluginSecretsHandler(
           heartbeatRunId: params.heartbeatRunId ?? null,
           pluginId,
         },
+      });
+    },
+
+    async storeOwn(params: PluginSecretsStoreOwnParams): Promise<void> {
+      const companyId = requireCompanyId(params.companyId);
+      if (typeof params.configPath !== "string" || !params.configPath.trim()) {
+        throw unprocessable("Choose the plugin config path whose secret to store", { code: "config_path_required" });
+      }
+      if (typeof params.value !== "string" || !params.value.trim() || params.value.length > 65_536) {
+        throw unprocessable("A stored plugin secret needs a value of at most 64 KiB", { code: "invalid_value" });
+      }
+      if (!storeRateLimiter.check(`${companyId}:${pluginId}`)) {
+        const err = new Error("Rate limit exceeded for plugin secret writes");
+        err.name = "RateLimitExceededError";
+        throw err;
+      }
+      // Only a secret the operator bound to this plugin's own config path, in
+      // this company, can receive a value. Nothing is created.
+      const bindings = await db
+        .select()
+        .from(companySecretBindings)
+        .where(and(
+          eq(companySecretBindings.companyId, companyId),
+          eq(companySecretBindings.targetType, "plugin"),
+          eq(companySecretBindings.targetId, pluginId),
+          eq(companySecretBindings.configPath, params.configPath),
+        ));
+      const secretIds = [...new Set(bindings.map((binding) => binding.secretId))];
+      if (secretIds.length !== 1) {
+        throw unprocessable(
+          `Bind exactly one company secret to plugin:${pluginId} at ${params.configPath} before the plugin can store it`,
+          { code: secretIds.length ? "binding_ambiguous" : "binding_missing" },
+        );
+      }
+      const secrets = secretService(db);
+      const secret = await secrets.getById(secretIds[0]!);
+      if (!secret || secret.companyId !== companyId) {
+        throw unprocessable("The bound secret is not in this company", { code: "binding_missing" });
+      }
+      // The secret must belong to this config path alone, so a plugin can never
+      // replace a value an agent, another plugin or another setting also uses.
+      const shared = await db.select({ id: companySecretBindings.id }).from(companySecretBindings).where(and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.secretId, secret.id),
+      ));
+      if (shared.length !== bindings.length) {
+        throw unprocessable("This secret is also used elsewhere; bind a dedicated secret for the plugin to store", { code: "binding_shared" });
+      }
+      await secrets.rotate(secret.id, { value: params.value });
+      await logActivity(db, {
+        companyId,
+        actorType: "plugin",
+        actorId: pluginId,
+        action: "plugin.secret_stored",
+        entityType: "secret",
+        entityId: secret.id,
+        details: { pluginId, configPath: params.configPath },
       });
     },
   };

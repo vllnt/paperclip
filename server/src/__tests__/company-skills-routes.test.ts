@@ -655,6 +655,8 @@ describe("company skill mutation permissions", () => {
       id: "44444444-4444-4444-8444-444444444444",
       companyId: "company-1",
       status: "in_progress",
+      statusVersion: 0,
+      assigneeAgentId: "55555555-5555-4555-8555-555555555555",
       executionRunId: "run-1",
     });
     mockIssueService.update.mockResolvedValue({});
@@ -2210,6 +2212,8 @@ describe("company skill mutation permissions", () => {
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith("55555555-5555-4555-8555-555555555555", expect.objectContaining({
       reason: "skill_test_run_created",
       payload: expect.objectContaining({ issueId: "44444444-4444-4444-8444-444444444444", skillId: "skill-1" }),
+      // A fresh harness issue with its agent is an assignment event.
+      idempotencyKey: "issue-assignment:44444444-4444-4444-8444-444444444444:55555555-5555-4555-8555-555555555555:0",
     }));
 
     const cancelled = await request(app)

@@ -428,6 +428,26 @@ describe("HTTP logger redaction", () => {
     expect(log.res.statusCode).toBe(status);
   });
 
+  it.each(["/runtime-tools/github/credentials", "/runtime-tools/github/sign"])("keeps managed GitHub request bodies out of failure logs (%s)", async (route) => {
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+    const app = express();
+    app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.post(route, (_req, res) => { res.status(401).json({ error: "no" }); });
+    await request(app).post(route)
+      .send({ operation: { program: "gh", args: ["pr", "comment", "1", "--body", "private-body-canary"] }, payload: "Y29tbWl0LW9iamVjdC1jYW5hcnk=" })
+      .expect(401);
+    const output = chunks.join("");
+    expect(output).not.toContain("private-body-canary");
+    expect(output).not.toContain("Y29tbWl0LW9iamVjdC1jYW5hcnk=");
+  });
+
   it.each([200, 403, 500])("redacts cloud credentials and assertions from HTTP %i logs", async (status) => {
     const headers = {
       "X-Paperclip-Cloud-Tenant-Token": "cloud-tenant-token-canary",

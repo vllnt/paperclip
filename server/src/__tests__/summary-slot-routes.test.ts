@@ -27,6 +27,7 @@ const mockSummarySlotService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockHeartbeatWakeup = vi.hoisted(() => vi.fn());
+const mockIssueService = vi.hoisted(() => ({ getById: vi.fn() }));
 
 function slot(overrides: Record<string, unknown> = {}) {
   return {
@@ -64,6 +65,7 @@ function registerModuleMocks() {
     accessService: () => mockAccessService,
     heartbeatService: () => ({ wakeup: mockHeartbeatWakeup }),
     instanceSettingsService: () => mockInstanceSettingsService,
+    issueService: () => mockIssueService,
     logActivity: mockLogActivity,
   }));
   vi.doMock("../services/summary-slots.js", () => ({
@@ -114,6 +116,8 @@ describe("summary slot routes", () => {
     mockAccessService.canUser.mockResolvedValue(true);
     mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableSummaries: true });
     mockHeartbeatWakeup.mockResolvedValue({ id: "run-1" });
+    // The route reads the assignment generation from the server issue row.
+    mockIssueService.getById.mockResolvedValue({ ...generatingIssue(), companyId, statusVersion: 3 });
     mockSummarySlotService.getSlot.mockResolvedValue({ slot: slot(), document: null, generatingIssue: null });
     mockSummarySlotService.listRevisions.mockResolvedValue({ slot: slot(), revisions: [] });
     mockSummarySlotService.generate.mockResolvedValue({
@@ -190,6 +194,7 @@ describe("summary slot routes", () => {
         agentId,
         expect.objectContaining({
           reason: "summary_slot_generation_requested",
+          idempotencyKey: `issue-assignment:${generatingIssueId}:${agentId}:3`,
           payload: expect.objectContaining({
             issueId: generatingIssueId,
             taskKey: `summary-slot:${companyId}:project:${projectId}:header`,

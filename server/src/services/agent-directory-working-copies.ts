@@ -4,7 +4,7 @@ import { and, eq } from "drizzle-orm";
 import { agents, environmentLeases, environments, agentInstructionWorkingCopies as copies, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
-import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { withDirectoryMergeLock, workspaceRestoreLockWaitMs, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import { instructionGitExcludeProgram } from "./agent-instruction-files.js";
@@ -54,6 +54,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (target.transport === "ssh") {
       // Reuse SSH's plain directory transfer without its task-workspace suffix
       // or Git-history discovery. The registered root is the exact writable root.
+      // The transfer is exact on purpose: every path except .paperclip-runtime
+      // is a valid agent file (agentFilePath), so the execution-workspace
+      // dependency exclusions (sshSyncBackDependencyExcludes) do not apply.
       await syncDirectoryToSsh({ spec: target.spec, localDir: row.localRoot, remoteDir: row.executionRoot, exclude: [".paperclip-runtime"] });
       return { target, workspaceRemoteDir: row.executionRoot, runtimeRootDir: null,
         assetDirs: {}, additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
@@ -391,11 +394,13 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   async function serial<T>(row: Copy, fn: (current: Copy) => Promise<T>, operation: DirectoryMergeLockOperation): Promise<T> {
     // Duplicate stop callbacks and restart recovery must not race while moving
     // the stopped working copy. This lock is outside the writable tree.
+    // Every concurrent run of one agent queues here, behind collections that
+    // read a whole remote workspace, so it waits like a workspace restore.
     return withDirectoryMergeLock(path.resolve(row.localRoot, "../../.."), async () => {
       const current = await get(row.companyId, row.runId);
       if (!current) throw notFound("Agent directory copy not found");
       return fn(current);
-    }, process.env, operation);
+    }, process.env, operation, workspaceRestoreLockWaitMs());
   }
   return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, canReuse, recoverUnavailable,
     checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => serial(row, current => current.receipt?.warm === true ? checkpoint(current, target) : Promise.resolve(current), "agent_directory_checkpoint"),

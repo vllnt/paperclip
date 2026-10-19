@@ -1,4 +1,6 @@
 import { toolActionRequests, toolInvocations } from "@paperclipai/db";
+import { pluginConfig, plugins as pluginRows } from "@paperclipai/db";
+import { pluginStateStore } from "../services/plugin-state-store.js";
 import { GitHubPublicationLeaseLost, withGitHubPublicationLease } from "../services/chat-github-publication-lease.js";
 import { githubChatManagementService } from "../services/chat-github-management.js";
 import { githubChatReviewService } from "../services/chat-github-reviews.js";
@@ -2103,6 +2105,71 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     };
   }
+
+  // Security review round 4, N2: the Chat SDK GitHub adapter mints installation-wide App tokens itself,
+  // so a GitHub chat runtime never runs for an App-user company or with its App (I-RO).
+  describe("N2 (round 4): no GitHub chat runtime for an App-user company or its App", () => {
+    const appPolicy = { default: { commit: "user", push: "user", pullRequest: "user", comment: "user" }, userSource: "app", allowedRepositories: ["Anthm-FR/songtrivia"],
+      userLogin: "agent-owner", installationPermissions: { contents: "write", metadata: "read" } };
+    async function identityPlugin() {
+      const pluginId = randomUUID();
+      await db.insert(pluginRows).values({
+        id: pluginId, pluginKey: `github-${pluginId}`, packageName: "github", version: "1.0.0", status: "ready" as never,
+        manifestJson: { id: `github-${pluginId}`, apiVersion: 1, version: "1.0.0", displayName: "GitHub", description: "", author: "", categories: ["connector"],
+          capabilities: ["ui.action.register"], entrypoints: { worker: "./worker.js" }, projectRepositories: { listAction: "list", writeIdentityAction: "repository-write-identity" } } as never,
+      });
+      return pluginId;
+    }
+    // An addressed issue comment: the webhook path that asks for the endpoint's runtime.
+    async function deliverPing(context: Awaited<ReturnType<typeof configuredGitHubEndpoint>>) {
+      const deliveryId = `github-comment-${randomUUID()}`;
+      const bot = (await context.service.get(context.endpoint.id)).botUsername!.replace(/\[bot\]$/i, "");
+      const commentId = Math.floor(Math.random() * 1_000_000) + 1000;
+      await context.service.handleWebhook(context.endpoint.publicId, "github", signedGitHubWebhookRequest({
+        delivery: deliveryId, event: "issue_comment", webhookSecret: context.webhookSecret,
+        payload: {
+          action: "created", installation: { id: 2468 },
+          repository: { id: 97531, full_name: "paperclipai/paperclip", name: "paperclip", owner: { id: 1357, login: "paperclipai" } },
+          issue: { number: 18 },
+          comment: { id: commentId, body: `@${bot} triage issue 18`, created_at: "2026-09-06T12:00:00Z", updated_at: "2026-09-06T12:00:00Z", user: { id: 42, login: "octocat" } },
+          sender: { id: 42, login: "octocat" },
+        },
+      })).catch(() => undefined);
+      const staged = await db.select({ id: chatActions.id }).from(chatActions)
+        .where(and(eq(chatActions.endpointId, context.endpoint.id), eq(chatActions.providerActionId, `github_webhook_ingress:${deliveryId}`)));
+      for (const row of staged) await context.service.processPendingGitHubWebhookIngress(1, row.id).catch(() => undefined);
+    }
+    for (const mode of ["company", "app"] as const) {
+      it(`stops a running GitHub runtime when ${mode === "company" ? "its company" : "the company using its App"} switches to the App user, and never starts it again`, async () => {
+        const fixture = await seedCompany();
+        const context = await configuredGitHubEndpoint(fixture);
+        const pluginId = await identityPlugin();
+        try {
+          expect(context.runtime.endpoints.has(context.endpoint.id)).toBe(true);
+          let owner = fixture.companyId;
+          if (mode === "app") {
+            const other = await seedCompany();
+            owner = other.companyId;
+            const appId = (await context.service.get(context.endpoint.id)).botExternalId;
+            await db.insert(pluginConfig).values({ pluginId, companyId: owner, configJson: { appId } });
+          }
+          await pluginStateStore(db).set(pluginId, { scopeKind: "company", scopeId: owner, namespace: "identity", stateKey: "write-identity", value: appPolicy });
+          await vi.waitFor(() => expect(context.runtime.endpoints.has(context.endpoint.id)).toBe(false));
+          const replaced = context.runtime.replaceCount;
+          await deliverPing(context);
+          expect(context.runtime.replaceCount).toBe(replaced);
+          expect(context.runtime.endpoints.has(context.endpoint.id)).toBe(false);
+          // Control: once the company no longer writes as its App user, the same delivery starts the runtime again.
+          await pluginStateStore(db).delete(pluginId, "company", "write-identity", { scopeId: owner, namespace: "identity" });
+          await deliverPing(context);
+          expect(context.runtime.replaceCount).toBeGreaterThan(replaced);
+        } finally {
+          await db.delete(pluginRows).where(eq(pluginRows.id, pluginId));
+          await retirePublicationFixture(context.service, context.endpoint.id);
+        }
+      });
+    }
+  });
 
   describe("GitHub agent review workflow", () => {
     async function reviewBotFixture() {
@@ -23717,7 +23784,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           applyGitHubReceiptReaction: (
             input: Parameters<typeof pinned.applyGitHubReceiptReaction>[0],
             check: () => Promise<void>,
-          ) => pinned.applyGitHubReceiptReaction(input, check, requestFetch),
+            appUserFence: Parameters<typeof pinned.applyGitHubReceiptReaction>[2],
+          ) => pinned.applyGitHubReceiptReaction(input, check, appUserFence, requestFetch),
         });
       };
       const originalRuntime = runtime.endpoints.get(endpoint.id)!;

@@ -1,4 +1,5 @@
 import { enrichPromotedWakeContext } from "../domain/context.js";
+import { AUTOMATION_WAKE_REASON_SET } from "../domain/automation-wake-coalesce.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -6,6 +7,12 @@ import {
   decideWakeOutcome,
   deriveImmediateRecoveryContextLabels,
 } from "../domain/policy.js";
+import {
+  decideSelfReblockWakeLimit,
+  isSelfReblockWakeOwner,
+  mergeSelfReblockWakePayload,
+  selfReblockWakeWindowStart,
+} from "../domain/self-reblock-wake.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
@@ -120,6 +127,11 @@ export type ReleaseIssueExecutionInput = {
   runId: string;
   now: Date;
   suppressImmediateRecovery?: boolean;
+  /**
+   * The run only anchors a sweep that re-drives the issue's deferred queue;
+   * it did not just execute on the issue, so its agent gains no ownership.
+   */
+  anchorRunOnly?: boolean;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -144,19 +156,19 @@ async function runReleaseDrain(
     return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
   }
 
-  // Each `continue` path either excludes a pending handoff receipt from
-  // this drain or leaves the wake row off the
-  // `deferred_issue_execution` status, so the next queue read cannot
-  // return that same row again. That invariant is what ends this loop.
+  // Each `continue` path either excludes a still-deferred receipt (a pending
+  // handoff or a parked self-reblock wake) from this drain or leaves the wake
+  // row off the `deferred_issue_execution` status, so the next queue read
+  // cannot return that same row again. That invariant is what ends this loop.
   // The `processedWakeIds` guard below makes a break of the invariant
   // fail loudly, instead of holding this transaction open forever.
   const processedWakeIds = new Set<string>();
-  const handoffWakeIds: string[] = [];
+  const excludedWakeIds: string[] = [];
 
   while (true) {
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
-      ...(handoffWakeIds.length ? { excludedWakeIds: handoffWakeIds } : {}),
+      ...(excludedWakeIds.length ? { excludedWakeIds } : {}),
     });
     if (!candidate) break;
     if (processedWakeIds.has(candidate.id)) {
@@ -167,6 +179,61 @@ async function runReleaseDrain(
       );
     }
     processedWakeIds.add(candidate.id);
+
+    // An automation wake coalesced by the agent's window keeps its place until
+    // the window ends, whoever releases; the deferred-wake sweep delivers it.
+    const coalescedUntil = candidate.automationCoalescedUntil ?? null;
+    if (coalescedUntil && coalescedUntil.getTime() > input.now.getTime()) {
+      excludedWakeIds.push(candidate.id);
+      continue;
+    }
+
+    // Promotion re-applies admission's self-reblock policy. A wake parked
+    // before the owner's run released must not restart the owner on its own
+    // re-block, and a non-owner's own re-block wakes stay within the limit.
+    const selfReblockWake = candidate.selfReblockWake ?? null;
+    if (selfReblockWake) {
+      // A parked wake keeps its place until its window ends, whoever releases.
+      const parkedUntil = candidate.selfReblockParkedUntil ?? null;
+      if (parkedUntil && parkedUntil.getTime() > input.now.getTime()) {
+        excludedWakeIds.push(candidate.id);
+        continue;
+      }
+      if (isSelfReblockWakeOwner({
+        agentId: candidate.agentId,
+        holdingRunAgentId: input.anchorRunOnly ? null : run.agentId,
+      })) {
+        await ports.transaction.suppressSelfReblockDeferredWake({
+          companyId: run.companyId,
+          wakeId: candidate.id,
+          issueId: issue.id,
+          agentId: candidate.agentId,
+          finishingRunId: run.id,
+          reason: selfReblockWake.reason,
+          now: input.now,
+        });
+        continue;
+      }
+      const limit = decideSelfReblockWakeLimit({
+        recentSelfReblockRunCount: await ports.transaction.countRecentSelfReblockWakeRuns({
+          companyId: run.companyId,
+          agentId: candidate.agentId,
+          issueId: issue.id,
+          since: selfReblockWakeWindowStart(input.now),
+        }),
+        now: input.now,
+      });
+      if (limit.kind === "park") {
+        await ports.transaction.parkSelfReblockDeferredWake({
+          companyId: run.companyId,
+          wakeId: candidate.id,
+          notBefore: limit.notBefore,
+          now: input.now,
+        });
+        excludedWakeIds.push(candidate.id);
+        continue;
+      }
+    }
 
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
@@ -204,7 +271,7 @@ async function runReleaseDrain(
         // The old owner can release before assignment admission adopts these
         // exact IDs. Leave its receipt intact, skip it for this drain, and let
         // a current-assignee wake behind it proceed.
-        handoffWakeIds.push(candidate.id);
+        excludedWakeIds.push(candidate.id);
       } else {
         // The current owner has finished. An obsolete assignment cannot
         // launch another former-owner run or reopen its completed task.
@@ -304,7 +371,33 @@ async function runReleaseDrain(
     // Unreachable: decideWakeOutcome only returns "promote" when agentFound and invokable are both true.
     if (!deferredAgent) throw new Error("wake-queue: promoted a deferred wake with no invokable agent");
 
-    const promoted = await promoteDeferredWake(ports, run, issue, workingCandidate, deferredAgent, pauseHold, postCommitEffects, input);
+    // A deferred automation wake starts a run like a fresh one, so it passes the same
+    // per-agent window under the same lock. Another wake may have renewed the window
+    // since this receipt was parked, whatever its own deadline said; a held receipt
+    // stays deferred and the sweep redelivers it through ordinary admission.
+    const automationReason = workingCandidate.wakeReason ?? workingCandidate.reason;
+    let admittedAt: Date | undefined;
+    if (
+      automationReason &&
+      AUTOMATION_WAKE_REASON_SET.has(automationReason) &&
+      workingCandidate.requestedByActorType !== "user"
+    ) {
+      const admission = await ports.transaction.admitAutomationWake({
+        companyId: run.companyId,
+        agentId: workingCandidate.agentId,
+        reason: automationReason,
+        issueId: issue.id,
+        now: input.now,
+        nonblocking: true,
+      });
+      if (admission.hold) {
+        excludedWakeIds.push(workingCandidate.id);
+        continue;
+      }
+      admittedAt = admission.admittedAt;
+    }
+
+    const promoted = await promoteDeferredWake(ports, run, issue, workingCandidate, deferredAgent, pauseHold, postCommitEffects, input, admittedAt);
     if (!promoted) continue;
     return promoted;
   }
@@ -326,6 +419,7 @@ async function promoteDeferredWake(
   pauseHold: PauseHoldFacts,
   postCommitEffects: PostCommitEffect[],
   input: ReleaseIssueExecutionInput,
+  admittedAt: Date | undefined,
 ): Promise<ReleaseTransactionResult | null> {
   let currentIssue = issue;
   let shouldReopen = false;
@@ -477,6 +571,7 @@ async function promoteDeferredWake(
     payload: promotedPayload,
     responsibleUserId,
     sessionBefore,
+    ...(admittedAt ? { admittedAt } : {}),
     authorizedFailedChatRetry: workingCandidate.authorizedFailedChatRetry,
     now: input.now,
   });
@@ -722,6 +817,33 @@ async function runReleaseRecoveryTail(
     );
   }
 
+  // A system recovery run is an automation wake like any other: it passes the agent's
+  // window, and a held one stays parked for the deferred-wake sweep instead of starting now.
+  let admittedAt: Date | undefined;
+  if (AUTOMATION_WAKE_REASON_SET.has(recoveryReason)) {
+    const admission = await transaction.admitAutomationWake({
+      companyId: issue.companyId,
+      agentId: recoveryAgent.id,
+      reason: recoveryReason,
+      issueId: issue.id,
+      now: input.now,
+      nonblocking: true,
+    });
+    if (admission.hold) {
+      await transaction.parkHeldAutomationWake({
+        companyId: issue.companyId,
+        agentId: recoveryAgent.id,
+        issueId: issue.id,
+        reason: recoveryReason,
+        contextSnapshot: recoveryContextSnapshot,
+        notBefore: admission.holdUntil,
+        now: input.now,
+      });
+      return { outcome: { kind: "released" }, postCommitEffects };
+    }
+    admittedAt = admission.admittedAt;
+  }
+
   const queuedRun = await transaction.queueImmediateRecoveryRun({
     companyId: issue.companyId,
     issue,
@@ -731,6 +853,7 @@ async function runReleaseRecoveryTail(
     contextSnapshot: recoveryContextSnapshot,
     responsibleUserId: recoveryResponsibleUserId,
     sessionBefore,
+    ...(admittedAt ? { admittedAt } : {}),
     now: input.now,
   });
   postCommitEffects.push({ kind: "run_queued", run: queuedRun });
@@ -899,12 +1022,17 @@ export function createAdmitWakeBehindIssueExecution(deps: {
           preserveExistingInteractionContinuation: true,
         },
       );
-      const mergedPayload = {
-        ...existingDeferred.payload,
-        ...(input.payload ?? {}),
-        issueId: input.issueId,
-        [DEFERRED_WAKE_CONTEXT_KEY]: mergedDeferredContext,
-      };
+      const mergedPayload = mergeSelfReblockWakePayload({
+        agentId: input.agentId,
+        existingPayload: existingDeferred.payload,
+        incomingPayload: input.payload,
+        mergedPayload: {
+          ...existingDeferred.payload,
+          ...(input.payload ?? {}),
+          issueId: input.issueId,
+          [DEFERRED_WAKE_CONTEXT_KEY]: mergedDeferredContext,
+        },
+      });
       await deps.writer.mergeIntoExistingDeferredWake(scope, {
         companyId: input.companyId,
         existingDeferredWakeId: existingDeferred.id,

@@ -210,7 +210,7 @@ the routine server-verified external-chat handoff described above.
 
 **Bounded write retry.** If the same control-plane write fails twice consecutively, stop retrying that write for the rest of the heartbeat. Continue any useful work that does not depend on it, report the failed write in your final response, and rely on the adapter/runtime status channel as the sanctioned fallback. Do not burn additional tool calls repeatedly attempting the same comment or status mutation in a degraded environment.
 
-**Verify writes — never infer them.** A successful `PATCH /api/issues/{id}` always returns the updated issue JSON. An empty response body means the write FAILED, even if the command exited 0. Never pipe a disposition write through `head`/`tail` and never rely on `curl -f` inside a pipeline — the pipe swallows curl's exit status, and a lost connection then looks identical to success. Use `scripts/paperclip-issue-update.sh` (it checks the HTTP status, retries connection-level failures, and confirms the echoed `status`); if you must hand-roll curl, capture `-w '%{http_code}'` and check the response echoes your update. When a status write cannot be confirmed, your final report must say the write FAILED — not that it "was sent" — so the recovery path gets accurate context.
+**Verify writes — never infer them.** A successful `PATCH /api/issues/{id}` always returns the updated issue JSON. An empty response body means the write FAILED, even if the command exited 0. Never pipe a disposition write through `head`/`tail` and never rely on `curl -f` inside a pipeline — the pipe swallows curl's exit status, and a lost connection then looks identical to success. Use `scripts/paperclip-issue-update.sh` when your workspace has it (it checks the HTTP status, retries connection-level failures, and confirms the echoed `status`); if you must hand-roll curl, capture `-w '%{http_code}'` and check the response echoes your update. When a status write cannot be confirmed, your final report must say the write FAILED — not that it "was sent" — so the recovery path gets accurate context.
 
 Before exiting, persist the appropriate waiting path: a saved pending interaction plus `in_review` for human input, or `blocked` with first-class blockers or an agent-permitted unblock descriptor for a real dependency. A comment naming someone does not create that path.
 
@@ -355,7 +355,7 @@ Key shared semantics:
 - **Resolver audience.** Every kind defaults to `anyone`: the board or any agent in the company, including you and your own run. **Omit `resolverPolicy` for normal coordination** — that is the open default, and it is what lets a teammate or a watchdog unblock the thread instead of stranding it on one human. Ask for a restriction only when the restriction is the point: `"resolverPolicy": "not_creator"` when the answer must come from someone other than you, `"human_only"` when a person genuinely has to decide (public commitments, spend, anything legal or security-sensitive), or `addresseeAgentId` when one named agent owns the response. Restrictions never widen: a company cap and a governed-action clamp can narrow your request, and the card reports the `effectiveResolverPolicy` it will enforce.
 - **Continuation policy.** `request_checkbox_confirmation` and `request_item_verdicts` default to `wake_assignee`, which wakes you after the card is resolved or newly resolved item verdicts are submitted. `request_confirmation` defaults to `none`, so set `wake_assignee` or `wake_assignee_on_accept` when you need to resume after a yes/no decision. `none` never wakes you — only use it when you truly do not need to resume.
 - **Target binding and staleness.** `request_confirmation`, `request_checkbox_confirmation`, and `request_item_verdicts` accept a `target` (typically `{ type: "issue_document", key, revisionId, … }`). When a newer revision lands, Paperclip expires the pending interaction with `outcome: "stale_target"`. Rebuild against the latest revision and create a fresh interaction.
-- **Supersede on user comment.** Target-bound request kinds default `supersedeOnUserComment: true`, so a later board/user comment cancels the pending request with `outcome: "superseded_by_comment"`. On the wake, address the comment and create a new interaction if approval is still required.
+- **Supersede on user comment.** `supersedeOnUserComment` defaults to `false`. Set it to `true` when a later board/user comment should cancel the pending request with `outcome: "superseded_by_comment"`. On that wake, address the comment and create a new interaction if approval is still required.
 - **Withdraw and terminal expiry.** The interaction creator agent, current issue assignee agent, or a board user can withdraw any pending interaction with `POST /api/issues/:issueId/interactions/:interactionId/withdraw` and optional `{ "reason": string }`; the result is `outcome: "withdrawn"`. Closing an issue as `done` or `cancelled` expires all remaining pending interactions with `outcome: "issue_closed"` and never wakes the closed issue.
 - **Idempotency.** Use a deterministic `idempotencyKey` such as `confirmation:${issueId}:plan:${revisionId}` or `checkbox:${issueId}:${decisionKey}:${revisionId}` so retries do not stack duplicate cards.
 - **Source issue posture.** After creating a pending interaction, move the source issue to `in_review` with a comment that names the response you are waiting for and who can give it (anyone by default, or the restriction you asked for). When a `request_confirmation` or `request_checkbox_confirmation` is the issue review request, include its returned id as `reviewInteractionId` in that PATCH. This explicit binding lets policy-eligible agents submit the review verdict without granting the same authority to unrelated pending confirmations. The pending interaction is the explicit waiting path.
@@ -530,7 +530,7 @@ Authorized managers can install company skills independently of hiring, then ass
 - When hiring or creating an agent, include optional `desiredSkills` so the same assignment model is applied on day one.
 
 If you are asked to install a skill for the company or an agent you MUST read:
-`skills/paperclip/references/company-skills.md`
+`references/company-skills.md`
 
 ## Routines
 
@@ -541,21 +541,21 @@ Routines are recurring tasks. Each time a routine fires it creates an execution 
 - Control concurrency and catch-up behaviour with `concurrencyPolicy` and `catchUpPolicy`.
 
 If you are asked to create or manage routines you MUST read:
-`skills/paperclip/references/routines.md`
+`references/routines.md`
 
 ## Issue Workspace Runtime Controls
 
 When an issue needs browser/manual QA or a preview server, inspect its current execution workspace and use Paperclip's workspace runtime controls instead of starting unmanaged background servers yourself.
 
 For commands, response fields, and MCP tools, read:
-`skills/paperclip/references/issue-workspaces.md`
+`references/issue-workspaces.md`
 
 ## Proposing Credentials Safely
 
 **When you receive a credential, propose it as a Paperclip secret immediately with `POST /api/agents/me/secret-proposals`. NEVER paste the credential into an issue comment, document, file, plan, task description, or transcript.** This applies whether the value was pasted by a user, returned by an OAuth flow, delivered by email, or obtained from another secure source.
 
 Before proposing a credential you MUST read the "Agent secret proposals" section in:
-`skills/paperclip/references/api-reference.md`
+`references/api-reference.md`
 
 ## Reading Granted Secrets
 
@@ -581,7 +581,7 @@ curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
 - Every value fetch, including failures, is audited in `secret_access_events` and `activity_log`; never print, persist, or paste fetched values into task comments.
 - These endpoints require the current run-bound agent JWT. Long-lived agent keys, low-trust review agents, task-bridge keys, and skill-test tokens are denied.
 
-Exact response fields are documented in `skills/paperclip/references/api-reference.md`.
+Exact response fields are documented in `references/api-reference.md`.
 
 ## Critical Rules
 
@@ -602,7 +602,7 @@ Exact response fields are documented in `skills/paperclip/references/api-referen
 - **Handle blockers directly.** Identify the exact missing capability or authority. Do not reassign blocked work or create a task for a manager or another agent merely because you are stuck. A title or reporting line does not grant access or authority. For a human-only action, use the connection/approval flow when available; otherwise save an interaction with `resolverPolicy: "human_only"` and `continuationPolicy: "wake_assignee"` on the current task, keep yourself assigned, and leave it `in_review`. Use the complete [human-input payload](#asking-for-human-input). Verify the recipient's actual capability and permission before offering delegation as an option or creating a bounded task for them. Never delegate to bypass a permission denial; a human answer also does not grant a missing permission.
 - **Keep scope decisions on the current task.** Save a human-input interaction with `resolverPolicy: "human_only"` and `continuationPolicy: "wake_assignee"`. Keep the task assigned to yourself and `in_review` while waiting. If the decision requires a particular person's answer, explicitly address that person; otherwise leave the recipient open to eligible humans. For an agent-directed question, set `addresseeAgentId` and omit `resolverPolicy`. Do not substitute a manager or invent an identity.
 - **Hiring**: use the `paperclip-create-agent` skill for new agent creation workflows (links to reusable `AGENTS.md` templates like `Coder` and `QA`).
-- **Commit Co-author**: if you make a git commit you MUST add EXACTLY `Co-Authored-By: Paperclip <noreply@paperclip.ing>` to the end of each commit message. Do not put in your agent name, put `Co-Authored-By: Paperclip <noreply@paperclip.ing>`.
+- **Commit identity and git hooks**: commit with the repository's configured author identity and add no co-author, attribution, or other agent-identifying trailers (no `Co-Authored-By`). Git hooks are the local CI: before the first commit in a clone or worktree, confirm hooks are installed (e.g. `git config core.hooksPath`, or the repo's install step); never skip them (`--no-verify`, `-n`, `HUSKY=0`, hooksPath overrides). A failing hook means fix the cause; a broken hook means stop and report it.
 
 ## Comment Style (Required)
 
@@ -720,7 +720,7 @@ Results are ranked by relevance: title matches first, then identifier, descripti
 
 ## Full Reference
 
-For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `skills/paperclip/references/api-reference.md`
+For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `references/api-reference.md`
 
 ### Conversational confirmation answers
 

@@ -6,14 +6,15 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import { createPaperclipTempDir, removePaperclipTempDir, type PaperclipTempPrefix } from "./paperclip-temp.js";
 import {
   createUnrelatedHistoryGraftCommit,
-  GIT_SYNC_COMMIT_IDENTITY_ARGS,
+  commitTreeWithSyncIdentity,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
-import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
+import { MERGE_STAGING_TAR_EXCLUDE, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
   createRuntimeProgressReporter,
   type RuntimeProgressDirection,
@@ -321,6 +322,11 @@ async function spawnText(
     });
 
     if (options.stdin != null && child.stdin) {
+      // A child that exits before reading all of its input (a refused SSH
+      // connection, or a remote script that exits early on purpose) makes the
+      // pending write fail with EPIPE. Without a listener that error crashes
+      // the server. The exit status above already reports the outcome.
+      child.stdin.on("error", () => undefined);
       child.stdin.end(options.stdin);
     }
   });
@@ -354,27 +360,36 @@ async function resolveCommandPath(command: string): Promise<string | null> {
   }
 }
 
+// The file lives alone in a fresh `0700` directory, created with `mode`.
 async function withTempFile(
-  prefix: string,
+  prefix: PaperclipTempPrefix,
   contents: string,
   mode: number,
 ): Promise<{ path: string; cleanup: () => Promise<void> }> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const dir = await createPaperclipTempDir(prefix);
+  const cleanup = async () => {
+    await removePaperclipTempDir(dir).catch(() => undefined);
+  };
   const filePath = path.join(dir, "payload");
   const normalizedContents = contents.endsWith("\n") ? contents : `${contents}\n`;
-  await fs.writeFile(filePath, normalizedContents, { mode, encoding: "utf8" });
-  return {
-    path: filePath,
-    cleanup: async () => {
-      await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
-    },
-  };
+  try {
+    await fs.writeFile(filePath, normalizedContents, { mode, encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+  return { path: filePath, cleanup };
 }
 
 async function createSshAuthArgs(
   config: Pick<SshConnectionConfig, "privateKey" | "knownHosts" | "strictHostKeyChecking">,
 ): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
+  // Run in order. The private key is created last and placed first, so
+  // cleanup removes it before anything else.
   const tempFiles: Array<() => Promise<void>> = [];
+  const cleanup = async () => {
+    for (const removeTempFile of tempFiles) await removeTempFile();
+  };
   const sshArgs = [
     "-o",
     "BatchMode=yes",
@@ -384,33 +399,70 @@ async function createSshAuthArgs(
     `StrictHostKeyChecking=${config.strictHostKeyChecking ? "yes" : "no"}`,
   ];
 
-  if (config.strictHostKeyChecking) {
-    if (config.knownHosts) {
-      const knownHosts = await withTempFile("paperclip-ssh-known-hosts-", config.knownHosts, 0o600);
-      tempFiles.push(knownHosts.cleanup);
-      sshArgs.push("-o", `UserKnownHostsFile=${knownHosts.path}`);
+  try {
+    if (config.strictHostKeyChecking) {
+      if (config.knownHosts) {
+        const knownHosts = await withTempFile("paperclip-ssh-known-hosts-", config.knownHosts, 0o600);
+        tempFiles.push(knownHosts.cleanup);
+        sshArgs.push("-o", `UserKnownHostsFile=${knownHosts.path}`);
+      }
+    } else {
+      sshArgs.push("-o", "UserKnownHostsFile=/dev/null");
     }
-  } else {
-    sshArgs.push("-o", "UserKnownHostsFile=/dev/null");
+
+    if (config.privateKey) {
+      const privateKey = await withTempFile("paperclip-ssh-key-", config.privateKey, 0o600);
+      tempFiles.unshift(privateKey.cleanup);
+      sshArgs.push("-i", privateKey.path);
+    }
+  } catch (error) {
+    await cleanup();
+    throw error;
   }
 
-  if (config.privateKey) {
-    const privateKey = await withTempFile("paperclip-ssh-key-", config.privateKey, 0o600);
-    tempFiles.push(privateKey.cleanup);
-    sshArgs.push("-i", privateKey.path);
-  }
-
-  return {
-    args: sshArgs,
-    cleanup: async () => {
-      await Promise.all(tempFiles.map((cleanup) => cleanup()));
-    },
-  };
+  return { args: sshArgs, cleanup };
 }
 
 function tarExcludeArgs(exclude: string[] | undefined): string[] {
-  const combined = ["._*", ...(exclude ?? [])];
+  // A concurrent restore's staged file can vanish mid-archive and fail tar.
+  const combined = ["._*", MERGE_STAGING_TAR_EXCLUDE, ...(exclude ?? [])];
   return combined.flatMap((entry) => ["--exclude", entry]);
+}
+
+/**
+ * Dependency and cache trees that SSH sync-back of an execution workspace
+ * leaves on the remote. Runs regenerate them, and copying one pnpm
+ * `node_modules` back to the host costs gigabytes per run. Names that
+ * repositories commonly track, such as `dist` and `vendor`, are not listed.
+ * Agent directories (AGENT_HOME) do not use this list: these names are valid
+ * agent-file paths there, so those transfers stay exact.
+ */
+export const SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES = [
+  "node_modules",
+  ".pnpm-store",
+  ".next",
+  ".turbo",
+  ".cache",
+] as const;
+
+/** Exclude patterns for `names` at any depth. Tar and the restore merge both
+ * match these by whole path component. */
+export function sshSyncBackDependencyExcludes(
+  names: readonly string[] = SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES,
+): string[] {
+  return names.flatMap((name) => [name, `${name}/*`, `*/${name}`, `*/${name}/*`]);
+}
+
+/** The dependency names a Git workspace does not track. The working tree
+ * returns only through the file sync, so a tracked name must keep syncing. If
+ * Git cannot answer, every name keeps syncing. */
+export async function untrackedSshSyncBackDependencyDirNames(localDir: string): Promise<string[]> {
+  const pathspecs = SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES.flatMap((name) => [`:(glob)**/${name}`, `:(glob)**/${name}/**`]);
+  const tracked = await runLocalGit(localDir, ["ls-files", "-z", "--", ...pathspecs], {
+    timeout: 60_000,
+    maxBuffer: 64 * 1024 * 1024,
+  }).then((result) => new Set(result.stdout.split("\0").flatMap((entry) => entry.split("/"))), () => null);
+  return tracked ? SSH_SYNC_BACK_DEPENDENCY_DIR_NAMES.filter((name) => !tracked.has(name)) : [];
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
@@ -604,6 +656,9 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
       recursive: true,
       force: true,
       preserveTimestamps: true,
+      // Without this, fs.cp rewrites relative links to absolute paths inside
+      // `sourceDir`, which is a staging directory deleted right after.
+      verbatimSymlinks: true,
     });
   }));
 }
@@ -684,6 +739,11 @@ async function streamLocalFileToSsh(input: {
     });
     source.on("error", fail);
     ssh.on("error", fail);
+    // `pipe` leaves errors on its destination unhandled. If ssh exits before
+    // reading the whole file (for example when the remote `cat` hits a full
+    // disk), the next write fails with EPIPE, which crashed the server. Stop
+    // reading the file instead; the ssh exit status reports why.
+    ssh.stdin?.on("error", () => source.destroy());
     if (input.progress) {
       input.progress.counter.on("error", fail);
       source.pipe(input.progress.counter).pipe(ssh.stdin ?? null);
@@ -691,6 +751,9 @@ async function streamLocalFileToSsh(input: {
       source.pipe(ssh.stdin ?? null);
     }
     ssh.on("close", (code) => {
+      // Nothing reads the file after ssh exits; release it even when an
+      // early exit stalled the pipe without a write error.
+      source.destroy();
       if (settled) return;
       settled = true;
       if ((code ?? 0) !== 0) {
@@ -766,7 +829,7 @@ async function importGitWorkspaceToSsh(input: {
   snapshot: LocalGitWorkspaceSnapshot;
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
-  const bundleDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-bundle-"));
+  const bundleDir = await createPaperclipTempDir("paperclip-ssh-bundle-");
   const bundlePath = path.join(bundleDir, "workspace.bundle");
   // Per-import unique ref so concurrent imports against the same local repo
   // can't race on `update-ref` between this run's update and bundle create.
@@ -839,7 +902,7 @@ async function importGitWorkspaceToSsh(input: {
       timeout: 10_000,
       maxBuffer: 16 * 1024,
     }).catch(() => undefined);
-    await fs.rm(bundleDir, { recursive: true, force: true }).catch(() => undefined);
+    await removePaperclipTempDir(bundleDir).catch(() => undefined);
   }
 }
 
@@ -851,7 +914,7 @@ async function exportGitWorkspaceFromSsh(input: {
   resetLocalWorkspace?: boolean;
   onProgress?: RuntimeProgressSink;
 }): Promise<string> {
-  const bundleDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-bundle-"));
+  const bundleDir = await createPaperclipTempDir("paperclip-ssh-bundle-");
   const bundlePath = path.join(bundleDir, "workspace.bundle");
   const importedRef = input.importedRef ?? `refs/paperclip/ssh-sync/imported/${randomUUID()}`;
 
@@ -914,8 +977,16 @@ async function exportGitWorkspaceFromSsh(input: {
         maxBuffer: 16 * 1024,
       }).catch(() => undefined);
     }
-    await fs.rm(bundleDir, { recursive: true, force: true }).catch(() => undefined);
+    await removePaperclipTempDir(bundleDir).catch(() => undefined);
   }
+}
+
+// Any git failure answers false, so the caller keeps integrating as before.
+async function localHistoryContains(localDir: string, commit: string): Promise<boolean> {
+  return await runLocalGit(localDir, ["merge-base", "--is-ancestor", commit, "HEAD"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  }).then(() => true, () => false);
 }
 
 async function integrateImportedGitHead(input: {
@@ -1005,11 +1076,9 @@ async function integrateImportedGitHead(input: {
       throw new Error("Failed to compute a merged git tree for SSH workspace restore.");
     }
 
-    const mergeCommit = await runLocalGit(
+    const mergeCommit = await commitTreeWithSyncIdentity(
       input.localDir,
       [
-        ...GIT_SYNC_COMMIT_IDENTITY_ARGS,
-        "commit-tree",
         mergedTreeId,
         "-p",
         currentHead,
@@ -1376,17 +1445,20 @@ export async function syncDirectoryToSsh(input: {
     let sshExited = false;
     let tarExitCode: number | null = null;
     let sshExitCode: number | null = null;
+    let sshStoppedEarly = false;
 
     const maybeFinish = () => {
       if (settled || !tarExited || !sshExited) {
         return;
       }
       settled = true;
-      if ((tarExitCode ?? 0) !== 0) {
+      // When ssh stopped reading first, tar was stopped on purpose below, so
+      // only the ssh exit status says whether the remote got a whole archive.
+      if (!sshStoppedEarly && (tarExitCode ?? 0) !== 0) {
         reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
         return;
       }
-      if ((sshExitCode ?? 0) !== 0) {
+      if (sshStoppedEarly ? sshExitCode !== 0 : (sshExitCode ?? 0) !== 0) {
         reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
         return;
       }
@@ -1403,6 +1475,21 @@ export async function syncDirectoryToSsh(input: {
       reject(error);
     };
 
+    // ssh can stop reading before the archive ends (a dropped connection, or a
+    // remote extract on a full disk). The next write then fails with EPIPE,
+    // and `pipe` leaves that error unhandled, which would crash the server; if
+    // the ssh exit is seen first, the pipe stalls instead. Either way nothing
+    // reads tar's output any more, so stop tar, which would otherwise block on
+    // a full pipe forever. Also close tar's stdout and the counter: with the
+    // pipe stalled they hold unread data, so tar's 'close' would never fire.
+    const stopTarIfSshStoppedEarly = () => {
+      if (tarExited || tar.stdout?.readableEnded) return;
+      sshStoppedEarly = true;
+      tar.kill("SIGTERM");
+      tar.stdout?.destroy();
+      progress?.counter.destroy();
+    };
+    ssh.stdin?.on("error", stopTarIfSshStoppedEarly);
     if (progress) {
       progress.counter.on("error", fail);
       tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
@@ -1426,6 +1513,7 @@ export async function syncDirectoryToSsh(input: {
     ssh.on("close", (code) => {
       sshExited = true;
       sshExitCode = code;
+      stopTarIfSshStoppedEarly();
       maybeFinish();
     });
     }).finally(auth.cleanup);
@@ -1436,17 +1524,18 @@ export async function syncDirectoryToSsh(input: {
   }
 }
 
-export async function syncDirectoryFromSsh(input: {
+// Streams `remoteDir` over SSH as a tar archive and extracts it into
+// `targetDir`. The caller owns `targetDir`; extracting straight into a fresh
+// staging directory keeps a single local copy of the remote tree.
+async function extractDirectoryFromSsh(input: {
   spec: SshRemoteExecutionSpec;
   remoteDir: string;
-  localDir: string;
+  targetDir: string;
   exclude?: string[];
-  preserveLocalEntries?: string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
-  const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
   const remoteTarScript = [
     `cd ${shellQuote(input.remoteDir)}`,
     `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
@@ -1479,7 +1568,7 @@ export async function syncDirectoryFromSsh(input: {
       const ssh = spawn("ssh", sshArgs, {
         stdio: ["ignore", "pipe", "pipe"],
       });
-      const tar = spawn("tar", ["-xf", "-", "-C", stagingDir], {
+      const tar = spawn("tar", ["-xf", "-", "-C", input.targetDir], {
         stdio: ["pipe", "ignore", "pipe"],
         env: tarSpawnEnv(),
       });
@@ -1491,15 +1580,18 @@ export async function syncDirectoryFromSsh(input: {
       let tarExited = false;
       let sshExitCode: number | null = null;
       let tarExitCode: number | null = null;
+      let tarStoppedEarly = false;
 
       const maybeFinish = () => {
         if (settled || !sshExited || !tarExited) return;
         settled = true;
-        if ((sshExitCode ?? 0) !== 0) {
+        // When tar stopped reading first, ssh was stopped on purpose below, so
+        // only tar's exit status says whether it extracted a whole archive.
+        if (!tarStoppedEarly && (sshExitCode ?? 0) !== 0) {
           reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
           return;
         }
-        if ((tarExitCode ?? 0) !== 0) {
+        if (tarStoppedEarly ? tarExitCode !== 0 : (tarExitCode ?? 0) !== 0) {
           reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
           return;
         }
@@ -1514,6 +1606,21 @@ export async function syncDirectoryFromSsh(input: {
         reject(error);
       };
 
+      // tar can stop reading before the archive ends (for example on a full
+      // disk). The next write then fails with EPIPE, and `pipe` leaves that
+      // error unhandled, which would crash the server; if the tar exit is seen
+      // first, the pipe stalls instead. Either way nothing reads ssh's output
+      // any more, so stop ssh, which would otherwise block on a full pipe
+      // forever. Also close ssh's stdout and the counter: with the pipe
+      // stalled they hold unread data, so ssh's 'close' would never fire.
+      const stopSshIfTarStoppedEarly = () => {
+        if (sshExited || ssh.stdout?.readableEnded) return;
+        tarStoppedEarly = true;
+        ssh.kill("SIGTERM");
+        ssh.stdout?.destroy();
+        progress?.counter.destroy();
+      };
+      tar.stdin?.on("error", stopSshIfTarStoppedEarly);
       if (progress) {
         progress.counter.on("error", fail);
         ssh.stdout?.pipe(progress.counter).pipe(tar.stdin ?? null);
@@ -1537,19 +1644,43 @@ export async function syncDirectoryFromSsh(input: {
       tar.on("close", (code) => {
         tarExited = true;
         tarExitCode = code;
+        stopSshIfTarStoppedEarly();
         maybeFinish();
       });
     });
     await progress?.finish();
-
-    await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
-    await copyDirectoryContents(stagingDir, input.localDir);
   } catch (error) {
     await progress?.fail();
     throw error;
   } finally {
-    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
     await auth.cleanup();
+  }
+}
+
+export async function syncDirectoryFromSsh(input: {
+  spec: SshRemoteExecutionSpec;
+  remoteDir: string;
+  localDir: string;
+  exclude?: string[];
+  preserveLocalEntries?: string[];
+  onProgress?: RuntimeProgressSink;
+  progressLabel?: string;
+}): Promise<void> {
+  // Stage first so a failed transfer never clears `localDir`.
+  const stagingDir = await createPaperclipTempDir("paperclip-ssh-sync-back-");
+  try {
+    await extractDirectoryFromSsh({
+      spec: input.spec,
+      remoteDir: input.remoteDir,
+      targetDir: stagingDir,
+      exclude: input.exclude,
+      onProgress: input.onProgress,
+      progressLabel: input.progressLabel,
+    });
+    await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
+    await copyDirectoryContents(stagingDir, input.localDir);
+  } finally {
+    await removePaperclipTempDir(stagingDir).catch(() => undefined);
   }
 }
 
@@ -1614,10 +1745,10 @@ export async function restoreWorkspaceFromSshExecution(input: {
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
   if (input.baselineSnapshot) {
-    const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
     const importedRef = input.restoreGitHistory
       ? `refs/paperclip/ssh-sync/imported/${randomUUID()}`
       : null;
+    const stagingDir = await createPaperclipTempDir("paperclip-ssh-sync-back-");
     try {
       const importedHead = input.restoreGitHistory
         ? await exportGitWorkspaceFromSsh({
@@ -1629,10 +1760,18 @@ export async function restoreWorkspaceFromSshExecution(input: {
           onProgress: input.onProgress,
         })
         : null;
-      await syncDirectoryFromSsh({
+      // A head the local history already contains integrates as a no-op, so a
+      // run without new commits needs no hook and an unchanged tree can skip
+      // the merge lock.
+      const headToIntegrate = importedHead && !(await localHistoryContains(input.localDir, importedHead))
+        ? importedHead
+        : null;
+      // `stagingDir` is fresh and empty, so extract into it directly rather
+      // than through a second staging copy.
+      await extractDirectoryFromSsh({
         spec: input.spec,
         remoteDir,
-        localDir: stagingDir,
+        targetDir: stagingDir,
         exclude: input.baselineSnapshot.exclude,
         onProgress: input.onProgress,
         progressLabel: "workspace",
@@ -1641,13 +1780,14 @@ export async function restoreWorkspaceFromSshExecution(input: {
         baseline: input.baselineSnapshot,
         sourceDir: stagingDir,
         targetDir: input.localDir,
+        onLockWaitProgress: input.onProgress,
         // Git history advances via integrateImportedGitHead; the working tree
         // still comes from the remote file snapshot so dirty remote edits win.
-        beforeApply: importedHead
+        beforeApply: headToIntegrate
           ? async () => {
             await integrateImportedGitHead({
               localDir: input.localDir,
-              importedHead,
+              importedHead: headToIntegrate,
             });
           }
           : undefined,
@@ -1659,7 +1799,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
           maxBuffer: 16 * 1024,
         }).catch(() => undefined);
       }
-      await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+      await removePaperclipTempDir(stagingDir).catch(() => undefined);
     }
     return;
   }

@@ -442,3 +442,25 @@ describe("native chat endpoint bridge", () => {
     expect(listEndpoints).not.toHaveBeenCalled();
   });
 });
+
+describe("plugin-owned secret writes", () => {
+  const context = { invocationScope: { companyId: "company-a" } };
+  const params = { value: "ghr_new", companyId: "company-a", configPath: "userRefreshToken" };
+
+  it("requires secrets.write-own and keeps the invocation's company", async () => {
+    const storeOwn = vi.fn(async () => undefined);
+    const services = { secrets: { storeOwn } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({ pluginId: "paperclip.github", capabilities: ["secrets.write-own"], services });
+    await handlers["secrets.storeOwn"](params, context);
+    expect(storeOwn).toHaveBeenCalledWith(params);
+    await expect(handlers["secrets.storeOwn"]({ ...params, companyId: "company-b" }, context)).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+  });
+
+  it("is not available with only secrets.read-ref", async () => {
+    const storeOwn = vi.fn();
+    const services = { secrets: { storeOwn } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({ pluginId: "paperclip.github", capabilities: ["secrets.read-ref"], services });
+    await expect(handlers["secrets.storeOwn"](params, context)).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(storeOwn).not.toHaveBeenCalled();
+  });
+});

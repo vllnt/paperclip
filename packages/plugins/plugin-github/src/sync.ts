@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Issue, PluginContext } from "@paperclipai/plugin-sdk";
 import { GitHubClient, GitHubError } from "./github.js";
 import { boardScope } from "./setup.js";
+import type { PluginWriteRequest } from "./write-identity.js";
 import { nativeGitHubReady } from "./native-github.js";
 import { PLUGIN_ID, type AutomationRule, type ConnectionState, type GitHubIssue, type Repository, type SyncReport, type SyncSettings, type TaskRepository, type TaskRepositories } from "./contracts.js";
 
@@ -97,7 +98,15 @@ const DISCONNECTED_DURING_SYNC = "The GitHub App was disconnected during sync.";
 export function registerSync(ctx: PluginContext, github: GitHubClient, credentials: Credentials,
   sources: { repositories(companyId: string, projectId?: unknown): Promise<TaskRepositories>; repository(companyId: string, repositoryId: number): Promise<TaskRepository | null> },
   invalidate: (companyId: string) => void,
-  companies: { connected(): Promise<string[]>; state(companyId: string): Promise<ConnectionState> }) {
+  companies: { connected(): Promise<string[]>; state(companyId: string): Promise<ConnectionState> },
+  identity: {
+    /** The token for a write-back (null keeps the App); throws when the write identity refuses it. */
+    writeToken?: (companyId: string, repository: string, request: PluginWriteRequest) => Promise<string | null>;
+    /** Periodic write-identity upkeep (the hourly fence check). */
+    maintain?: (companyId: string) => Promise<void>;
+  } = {}) {
+  const writeToken = async (companyId: string, repo: Repository) =>
+    (await identity.writeToken?.(companyId, repo.fullName, { action: "other", source: "sync" })) ?? undefined;
   // One worker owns the plugin. Serialize its jobs, UI writes and event handlers
   // per company; host idempotency also covers crashes between create and receipt.
   const queues = new Map<string, Promise<unknown>>();
@@ -262,12 +271,13 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       const fields = merged.toRemote;
       // Preserve the creation receipt in the GitHub body when editing it.
       const receipt = (remote.body ?? "").match(/<!-- paperclip:[a-zA-Z0-9-]+:[a-zA-Z0-9-]+ -->/)?.[0];
+      const token = await writeToken(companyId, repo);
       invalidate(companyId);
       try { remote = await github.updateIssue(auth.id, auth.pem, repo, remote.number, {
         ...(fields.title !== undefined ? { title: fields.title } : {}),
         ...(fields.body !== undefined ? { body: fields.body + (receipt ? `\n${receipt}` : "") } : {}),
         ...(fields.state !== undefined ? { state: fields.state === "open" ? "open" : "closed", state_reason: fields.state === "open" ? "reopened" : fields.state === "not_planned" ? "not_planned" : "completed" } : {}),
-      }); } finally { invalidate(companyId); }
+      }, token); } finally { invalidate(companyId); }
       report.updated++;
     }
     link.base = remoteSnapshot(remote);
@@ -293,11 +303,12 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     if (!remote && pending.phase === "posting") throw new Error("GitHub creation is unconfirmed. Sync checks for its receipt before retrying; link the existing GitHub issue if you removed the receipt.");
     if (!remote) {
       if (!repo.issuesWrite) throw new Error("Enable Issues read/write and approve the installation update to publish this task.");
+      const token = await writeToken(companyId, repo);
       pending.phase = "posting";
       const all = await pendingFor(companyId); all[native.id] = pending;
       await ctx.state.set(key(companyId, "pending"), all);
       invalidate(companyId);
-      try { remote = await github.createIssue(auth.id, auth.pem, repo, { title: pending.title, body: pending.body + `\n${marker(companyId, native.id)}` }); }
+      try { remote = await github.createIssue(auth.id, auth.pem, repo, { title: pending.title, body: pending.body + `\n${marker(companyId, native.id)}` }, token); }
       catch (error) {
         if (error instanceof GitHubError && [400, 401, 403, 404, 410, 422, 429].includes(error.status)) {
           pending.phase = "ready"; all[native.id] = pending;
@@ -379,6 +390,8 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     for (const companyId of await companies.connected()) {
       try { await sync(companyId); }
       catch (error) { ctx.logger.error("GitHub scheduled sync failed", { companyId, error: errorText(error) }); }
+      try { await identity.maintain?.(companyId); }
+      catch (error) { ctx.logger.error("GitHub write identity check failed", { companyId, error: errorText(error) }); }
     }
   });
   for (const event of ["issue.updated", "project.created", "project.updated"] as const) {

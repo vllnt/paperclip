@@ -1661,6 +1661,10 @@ export interface WorkerToHostMethods {
     params: { secretRef: string | EnvSecretRefBinding; companyId?: string; configPath?: string },
     result: string,
   ];
+  "secrets.storeOwn": [
+    params: { value: string; companyId: string; configPath: string },
+    result: void,
+  ];
 
   // Activity
   "activity.log": [

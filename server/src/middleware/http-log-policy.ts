@@ -42,6 +42,11 @@ const SECRET_SENSITIVE_HTTP_PATHS = [
 ];
 const SECRET_SENSITIVE_HTTP_METHODS = new Set(["POST", "PUT", "PATCH"]);
 
+/** Managed git/gh reports (command arguments) and git objects sent for signing. */
+export function isRuntimeGitHubHttpRequest(method: string | undefined, url: string | undefined): boolean {
+  return !!method && !!url && method.toUpperCase() === "POST" && /^\/runtime-tools\/github\/(?:credentials|sign)\/?$/.test(normalizePath(url));
+}
+
 /** Provider payloads are private even when a method/signature is rejected. */
 export function isPrivateWebhookHttpRequest(
   method: string | undefined,

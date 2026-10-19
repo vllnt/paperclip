@@ -919,6 +919,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "secrets.read-ref");
         return `resolved:${secretRef}`;
       },
+      async storeOwn(_value, options) {
+        requireCapability(manifest, capabilitySet, "secrets.write-own");
+        requireCompanyId(options.companyId);
+      },
     },
     activity: {
       async log(entry) {

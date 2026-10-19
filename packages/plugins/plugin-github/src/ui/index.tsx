@@ -1,6 +1,7 @@
 import { ConnectionAccess } from "./connection-access.js";
 import { NativeGitHubProjects, PersonalProjectAccess } from "./management.js";
 import { AutomationSettings } from "./automation.js";
+import { WriteIdentitySettings } from "./write-identity.js";
 import { TaskSyncDetail } from "./task-detail.js";
 import { GitHubRecordPanel } from "./task-record.js";
 import { GitHubAgentSettings } from "./agent-settings.js";
@@ -261,6 +262,7 @@ function Setup({ context, companyId }: PluginPageProps & { companyId: string }) 
         </div>
       </section>
       <AutomationSettings companyId={companyId} />
+      <WriteIdentitySettings companyId={companyId} appSlug={status.app?.slug} />
       <details className="panel"><summary>Connection settings</summary>
         <div className="details-content">
           {status.app?.slug && <a href={`https://github.com/apps/${status.app.slug}/installations/new`} target="_blank" rel="noopener noreferrer" onClick={() => { awaitingInstallation.current = true; }}>Manage repository access</a>}

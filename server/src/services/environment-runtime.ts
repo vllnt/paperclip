@@ -38,6 +38,7 @@ import {
   type StartupSpanContext,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { environmentService } from "./environments.js";
+import { assertRunDirectoryNotBeingRemoved, sshRunDirectoryReaperService } from "./ssh-run-directory-reaper.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { verifyNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import {
@@ -79,7 +80,7 @@ import {
   resolvePluginExecuteRpcTimeoutMs,
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
-import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
+import { redactProviderMetadata } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
 import {
   createSandboxOrphanCleanupSpool,
@@ -385,47 +386,7 @@ function stripSecretRefValuesFromPluginLeaseMetadata(input: {
   metadata: Record<string, unknown> | null | undefined;
   schema: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  const sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
-
-  for (const path of collectSecretRefPaths(input.schema)) {
-    const keys = path.split(".");
-    const parents: Array<{ container: Record<string, unknown>; key: string }> = [];
-    let cursor: Record<string, unknown> | null = sanitized;
-
-    for (let index = 0; index < keys.length - 1; index += 1) {
-      const key = keys[index]!;
-      const next = cursor?.[key];
-      if (!next || typeof next !== "object" || Array.isArray(next)) {
-        cursor = null;
-        break;
-      }
-      parents.push({ container: cursor, key });
-      cursor = next as Record<string, unknown>;
-    }
-
-    if (!cursor) continue;
-
-    const leafKey = keys[keys.length - 1]!;
-    if (!Object.prototype.hasOwnProperty.call(cursor, leafKey)) continue;
-    delete cursor[leafKey];
-
-    for (let index = parents.length - 1; index >= 0; index -= 1) {
-      const { container, key } = parents[index]!;
-      const value = container[key];
-      if (
-        value &&
-        typeof value === "object" &&
-        !Array.isArray(value) &&
-        Object.keys(value as Record<string, unknown>).length === 0
-      ) {
-        delete container[key];
-      } else {
-        break;
-      }
-    }
-  }
-
-  return sanitized;
+  return redactProviderMetadata(input.metadata, input.schema);
 }
 
 export interface EnvironmentDriverAcquireInput {
@@ -1178,6 +1139,7 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
 
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
+  const reaper = sshRunDirectoryReaperService(db);
 
   return {
     driver: "ssh",
@@ -1193,7 +1155,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
       }
 
       const { remoteCwd } = await ensureSshWorkspaceReady(parsed.config);
-      return await environmentsSvc.acquireLease({
+      const lease = await environmentsSvc.acquireLease({
         companyId: input.companyId,
         environmentId: input.environment.id,
         executionWorkspaceId: input.executionWorkspaceId,
@@ -1213,10 +1175,34 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           remoteCwd,
         },
       });
+      // The lease is visible now. A reaper that claimed this run directory
+      // before it was must not delete under a run that is about to use it.
+      if (input.heartbeatRunId) {
+        await assertRunDirectoryNotBeingRemoved(db, input.heartbeatRunId, lease.id).catch(async (error) => {
+          await environmentsSvc.releaseLease(lease.id, "failed", { failureReason: "The workspace directory of this run is being removed." }).catch(() => undefined);
+          throw error;
+        });
+      }
+      return lease;
     },
 
     async releaseRunLease(input) {
-      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      const released = await environmentsSvc.releaseLease(input.lease.id, input.status);
+      // Never awaited: it cannot throw, and a large delete must not delay the
+      // run's teardown.
+      if (released) void reaper.reapReleasedLease(input.environment, released).catch(() => undefined);
+      return released;
+    },
+
+    async retryPendingSandboxTeardown({ lease }) {
+      // An SSH lease is bookkeeping on a shared host: like `releaseRunLease`
+      // above, releasing it destroys nothing there. A crash between a run's
+      // end and its lease release leaves the lease to the orphan sweeps, which
+      // release it through this teardown. Never treat another provider's
+      // resource as an SSH no-op cleanup.
+      if (lease.provider !== "ssh") {
+        throw new Error("SSH lease cleanup cannot release a non-SSH provider resource.");
+      }
     },
 
     async realizeWorkspace(input) {
@@ -3601,7 +3587,10 @@ function createPluginEnvironmentDriver(
         expiresAt: providerAttestedLeaseExpiry(input.requestedExpiresAt, parseExpiresAt(providerLease.expiresAt)),
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
-          providerMetadata: providerLease.metadata ?? {},
+          providerMetadata: stripSecretRefValuesFromPluginLeaseMetadata({
+            metadata: providerLease.metadata,
+            schema: driver.configSchema as Record<string, unknown> | null | undefined,
+          }),
           driver: input.environment.driver,
           executionWorkspaceMode: input.executionWorkspaceMode,
           pluginId: plugin.id,

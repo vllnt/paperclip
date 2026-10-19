@@ -1,17 +1,17 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { PLUGIN_ID } from "./contracts.js";
 const manifest: PaperclipPluginManifestV1 = {
-  id: PLUGIN_ID, apiVersion: 1, version: "0.11.0", displayName: "GitHub",
+  id: PLUGIN_ID, apiVersion: 1, version: "0.12.0", displayName: "GitHub",
   description: "Manage GitHub repositories, Projects and synced tasks with Paperclip’s native GitHub channel and review connector.",
   author: "VLLNT", categories: ["connector"],
   capabilities: ["companies.read", "agents.read", "chat.endpoints.read", "issues.create", "issues.update", "issues.wakeup", "jobs.schedule", "events.subscribe", "webhooks.receive", "projects.read", "project.workspaces.read", "issues.read", "plugin.state.read", "plugin.state.write",
-    "secrets.read-ref", "skills.managed", "http.outbound", "activity.log.write", "ui.page.register", "ui.sidebar.register",
+    "secrets.read-ref", "secrets.write-own", "skills.managed", "http.outbound", "activity.log.write", "ui.page.register", "ui.sidebar.register",
     "ui.detailTab.register", "ui.action.register", "instance.settings.register", "agent.tools.register"],
   entrypoints: { worker: "./dist/worker.js", ui: "./dist/ui" },
   jobs: [{ jobKey: "github-sync", displayName: "Sync GitHub tasks", schedule: "* * * * *" }],
   webhooks: [{ endpointKey: "github", displayName: "GitHub events", description: "Receive issue and pull request events from your GitHub App." }],
   taskCreation: { label: "GitHub", listAction: "task-destinations", publishAction: "publish-task", linksAction: "task-links" },
-  projectRepositories: { listAction: "project-repositories", setupPath: "/github-projects" },
+  projectRepositories: { listAction: "project-repositories", setupPath: "/github-projects", writeIdentityAction: "repository-write-identity", signCommitAction: "repository-sign-commit" },
   skills: [{
     skillKey: "github-review-workflow",
     displayName: "GitHub review workflow",
@@ -50,7 +50,37 @@ The operator can edit this skill for each company, repository or organization po
       webhookSecret: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
       privateKey: { type: "object", format: "secret-ref", properties: {
         type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" }
-      }, required: ["type", "secretId"], additionalProperties: false }
+      }, required: ["type", "secretId"], additionalProperties: false },
+      // App user identity: the App's client ID and secret, the rotating refresh
+      // token the plugin stores back (bind a placeholder secret), and the SSH key
+      // agent commits are signed with.
+      userClientId: { type: "string", pattern: "^[A-Za-z0-9.]{8,100}$" },
+      userClientSecret: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
+      userRefreshToken: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
+      signingKey: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
+      // Agents never merge a pull request that touches a protected path. An instance administrator may release some of them for
+      // one repository. The host validates this shape when the config is saved; the worker reads it again (and validates it
+      // again) at every merge. CODEOWNERS paths, control repositories and tiers paths are never released, whatever it says.
+      agentMergeablePaths: {
+        type: "array", maxItems: 50,
+        description: "Lets agents merge pull requests that touch protected paths under .github/ (such as workflows) in the repositories listed here. Each entry names one repository (owner/name), the paths to release (allow, under .github/, for example .github/**) and paths to keep refused (exclude). One refused file refuses the whole pull request. CODEOWNERS files, control repositories and repositories with a paperclip/tiers.yaml are never released. Only an instance administrator can change this. A file-name exclusion is a speed bump, not a boundary: a new workflow file or a local action can still reach production. The real boundary is GitHub's environment protection (required reviewers) on the deployment.",
+        items: {
+          type: "object", additionalProperties: false, required: ["repository", "allow"],
+          properties: {
+            repository: { type: "string", pattern: "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$", description: "owner/name. Matched exactly and without regard to case." },
+            allow: {
+              type: "array", minItems: 1, maxItems: 50,
+              description: "Protected paths to release, all under .github/ (for example .github/** or .github/workflows/**). A CODEOWNERS path cannot be listed.",
+              items: { type: "string", maxLength: 200, pattern: "^\\.github/[A-Za-z0-9._\\-/*?]+$", not: { anyOf: [{ pattern: "\\.\\." }, { pattern: "//" }, { pattern: "[Cc][Oo][Dd][Ee][Oo][Ww][Nn][Ee][Rr][Ss]" }] } }
+            },
+            exclude: {
+              type: "array", maxItems: 100,
+              description: "Paths or globs that stay refused even when allow covers them, for example .github/workflows/release.yml.",
+              items: { type: "string", maxLength: 200, pattern: "^[A-Za-z0-9._\\-/*?]+$", not: { anyOf: [{ pattern: "^/" }, { pattern: "\\.\\." }, { pattern: "//" }] } }
+            }
+          }
+        }
+      }
     }
   },
   tools: [

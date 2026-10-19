@@ -8,6 +8,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { selectInCommentBatches } from "../services/comment-id-batches.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -2874,6 +2875,21 @@ function diffExecutionParticipants(
   };
 }
 
+/**
+ * Server provenance for a wake that an agent's own blocked transition causes
+ * on itself, from its authenticated run. Admission counts (and, while that run
+ * holds the issue, suppresses) only these wakes, which stops the ANT-3260
+ * re-block loop. Any other actor or agent gets no provenance.
+ */
+function selfReblockWakeCause(
+  actor: { actorType: string; agentId?: string | null; runId?: string | null },
+  wakeAgentId: string,
+) {
+  return actor.actorType === "agent" && actor.agentId === wakeAgentId && actor.runId
+    ? { kind: "self_reblock" as const, runId: actor.runId, actorId: actor.agentId }
+    : undefined;
+}
+
 function buildExecutionStageWakeup(input: {
   issueId: string;
   previousState: ParsedExecutionState | null;
@@ -3084,7 +3100,10 @@ const ISSUE_LIST_SERVER_CACHE_STALE_MS = 5_000;
 export const ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES = 256;
 const ISSUE_LIST_STORM_WINDOW_MS = 500;
 const ISSUE_LIST_STORM_THRESHOLD = 4;
-const ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT = 8;
+// One Tasks board load legitimately fans out ~9 distinct list requests (seven
+// status columns, the task list, the inbox badge), which arrive together over
+// HTTP/2. The cap must clear one page with headroom; it only stops runaways.
+export const ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT = 16;
 
 type IssueListPreparedResponse =
   | {
@@ -6961,12 +6980,14 @@ export function issueRoutes(
     }
     const ids = queuedCommentIdsFromWakePayload(wake?.payload);
     if (ids.length === 0) return [];
-    const rows = await executor
-      .select()
-      .from(issueComments)
-      .where(
-        and(eq(issueComments.issueId, issueId), inArray(issueComments.id, ids)),
-      );
+    const rows = await selectInCommentBatches(ids, (batch) =>
+      executor
+        .select()
+        .from(issueComments)
+        .where(
+          and(eq(issueComments.issueId, issueId), inArray(issueComments.id, batch)),
+        ),
+    );
     const byId = new Map(rows.map((row) => [row.id, row]));
     return ids.flatMap((id) => {
       const row = byId.get(id);
@@ -12169,6 +12190,7 @@ export function issueRoutes(
       if (!isOnboardingFirstTask) {
         void queueIssueAssignmentWakeup({
           heartbeat,
+          assignmentEvent: true,
           issue,
           reason: "issue_assigned",
           mutation: "create",
@@ -12412,6 +12434,7 @@ export function issueRoutes(
       if (!serializationContext || !currentSerializedChild) {
         void queueIssueAssignmentWakeup({
           heartbeat,
+          assignmentEvent: true,
           issue,
           reason: "issue_assigned",
           mutation: "create",
@@ -12672,6 +12695,7 @@ export function issueRoutes(
         if (!serializedBlockedChildIds.has(issue.id)) {
           void queueIssueAssignmentWakeup({
             heartbeat,
+            assignmentEvent: true,
             issue,
             reason: "issue_assigned",
             mutation: "accepted_plan_decomposition",
@@ -13940,7 +13964,12 @@ export function issueRoutes(
         let ownerNotifiedAt: Date | null = null;
         await deliverAgentUnblockNotification({
           issue: blockedIssue,
-          wakeup: heartbeat.wakeup,
+          // The unblock owner is woken on behalf of whoever blocked the issue.
+          // Admission uses that cause to stop an agent's own re-block loop.
+          wakeup: (agentId, options) => {
+            const causedBy = selfReblockWakeCause(actor, agentId);
+            return heartbeat.wakeup(agentId, { ...options, ...(causedBy ? { causedBy } : {}) });
+          },
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
           },
@@ -14717,6 +14746,12 @@ export function issueRoutes(
               "failed to check existing dependency wake before issue update wake",
             );
           }
+          // An agent that blocks its own issue on blockers that are already
+          // done caused this wake itself, exactly like its unblock request.
+          const causedBy =
+            input.mutation === "blocked_dependency_restored"
+              ? selfReblockWakeCause(actor, input.agentId)
+              : undefined;
           addWakeup(input.agentId, {
             source: "automation",
             triggerDetail: "system",
@@ -14730,6 +14765,7 @@ export function issueRoutes(
             idempotencyKey,
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
+            ...(causedBy ? { causedBy } : {}),
             contextSnapshot: {
               issueId: input.dependentIssueId,
               taskId: input.dependentIssueId,
@@ -15046,8 +15082,32 @@ export function issueRoutes(
         }
 
         for (const { agentId, wakeup } of wakeups.values()) {
-          heartbeat
-            .wakeup(agentId, wakeup)
+          // An assignment wake names this assignee and assignment generation,
+          // so a transient database failure is retried without admitting it twice.
+          const assignmentWake =
+            wakeup.source === "assignment" &&
+            wakeup.reason === "issue_assigned" &&
+            agentId === issue.assigneeAgentId;
+          const wakePromise = assignmentWake
+            ? queueIssueAssignmentWakeup({
+                heartbeat,
+                assignmentEvent: true,
+                issue: {
+                  id: issue.id,
+                  assigneeAgentId: agentId,
+                  status: issue.status,
+                  statusVersion: issue.statusVersion,
+                },
+                reason: "issue_assigned",
+                mutation: "update",
+                contextSource: "issue.update",
+                requestedByActorType: wakeup.requestedByActorType,
+                requestedByActorId: wakeup.requestedByActorId,
+                rethrowOnError: true,
+                wakeupOptions: wakeup,
+              })
+            : heartbeat.wakeup(agentId, wakeup);
+          wakePromise
             .then((wakeRun) => {
               if (wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) return;
               const payload =
@@ -16490,6 +16550,7 @@ export function issueRoutes(
       for (const createdIssue of createdIssues) {
         void queueIssueAssignmentWakeup({
           heartbeat,
+          assignmentEvent: true,
           issue: createdIssue,
           reason: "issue_assigned",
           mutation: "interaction_accept",
@@ -18241,6 +18302,9 @@ export function issueRoutes(
               "failed to check existing dependency wake before issue comment wake",
             );
           }
+          // No self-reblock provenance here: a comment never moves an issue to
+          // blocked, so this wake only follows a blocker that just became done
+          // (real progress), never a restored blocked dependency.
           addWakeup(input.agentId, {
             source: "automation",
             triggerDetail: "system",

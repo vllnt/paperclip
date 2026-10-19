@@ -82,6 +82,7 @@ function fixture() {
         ...(githubReceipt ? { githubReceipt } : {}),
       },
       current,
+      async () => null,
       fetchImpl,
     );
   return {
@@ -395,4 +396,20 @@ describe("GitHub exact receipt reactions through pinned App auth", () => {
       expect(test.calls.some((call) => call.method === "DELETE")).toBe(false);
     },
   );
+});
+
+describe("I-RO (security review round 3)", () => {
+  it("never mints a reaction token for an App that an App-user company uses; other Apps are unchanged", async () => {
+    const test = fixture();
+    const seen: string[] = [];
+    const refused = await applyGitHubReceiptReaction(test.adapter, appId, 123, {
+      operation: "add", threadId: "github:owner/repo:issue:5", messageId: "5603841952", reaction: "eyes",
+    }, test.current, async (asked) => { seen.push(asked); return ["owner/repo"]; }, test.fetchImpl).catch((error: unknown) => error);
+    // The refusal surfaces as the receipt's usual safe failure; no token request was sent.
+    expect(refused).toBeInstanceOf(Error);
+    expect(seen).toEqual([appId]);
+    expect(test.calls.some((call) => call.path.endsWith("/access_tokens"))).toBe(false);
+    await test.invoke("add");
+    expect(test.calls.filter((call) => call.path.endsWith("/access_tokens"))).toHaveLength(1);
+  });
 });

@@ -627,6 +627,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             configPath: options.configPath,
           });
         },
+        async storeOwn(value, options): Promise<void> {
+          await callHost("secrets.storeOwn", { value, companyId: options.companyId, configPath: options.configPath });
+        },
       },
 
       activity: {

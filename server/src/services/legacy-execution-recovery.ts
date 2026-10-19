@@ -137,6 +137,13 @@ export async function terminalizeLegacyExecution(input: {
           eq(issueRecoveryActions.status, "resolved"),
           or(
             sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+            // A hold for this run that already ended as restored (the issue moved
+            // on, or a live run took over) is decided. Do not open it again.
+            and(
+              eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+              eq(issueRecoveryActions.outcome, "restored"),
+              sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+            ),
             and(
               sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
               sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
@@ -155,6 +162,10 @@ export async function terminalizeLegacyExecution(input: {
         fingerprint: `legacy-execution:${run.id}`,
         evidence: {
           runId: run.id,
+          // The conversation fold retires holds that older releases opened for
+          // chat turns. A hold on an ordinary task is a current board gate, so
+          // the fold must leave it, or this pass opens it again every tick.
+          ...(task.conversationAgentId ? {} : { boardHold: true }),
           ...(isCurrentReviewer ? { reviewParticipantAgentId: run.agentId } : {}),
           originalFailureCode: updated.errorCode,
           ...(hasWorkspaceRestoreFailure(updated.resultJson) ? { workspaceRestoreFailure: updated.resultJson!.workspaceRestoreFailure } : {}),

@@ -34,6 +34,7 @@ export type {
 } from "./sandbox-managed-runtime.js";
 import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
+  formatSandboxCallbackBridgeSlowPickup,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
@@ -1744,7 +1745,8 @@ export async function prepareGitHubOperationLaunchers(input: {
     // Remote launchers live beneath the checkout. Pin their own package scope
     // so an enclosing project's "type": "module" cannot reinterpret require().
     ["package.json", '{"type":"commonjs"}\n'],
-    ...["git", "gh"].map((name) => [name, githubLauncherSource()] as const),
+    // The same launcher also serves as git's commit signing program.
+    ...["git", "gh", "paperclip-ssh-sign"].map((name) => [name, githubLauncherSource()] as const),
     ...[".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"].map((name) => [name, profile] as const),
   ]);
   if (remote) {
@@ -1758,7 +1760,7 @@ export async function prepareGitHubOperationLaunchers(input: {
         timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
       });
     }
-    const permissions = await runner.execute({ command: "sh", args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh && mkdir -p ${shellQuote(configDirectory)}`], cwd: remote.remoteCwd, timeoutMs: 15_000 });
+    const permissions = await runner.execute({ command: "sh", args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh ${shellQuote(directory)}/paperclip-ssh-sign && mkdir -p ${shellQuote(configDirectory)}`], cwd: remote.remoteCwd, timeoutMs: 15_000 });
     if (permissions.exitCode !== 0) throw new Error("Could not prepare managed GitHub launchers");
   } else {
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -4871,6 +4873,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       maxBodyBytes,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
+      // A request the worker picked up late goes to the run log, without
+      // waiting for it: the operator's measure of pickup delay.
+      onSlowPickup: (pickup) => {
+        void Promise.resolve().then(() => onLog("stdout", formatSandboxCallbackBridgeSlowPickup(pickup))).catch(() => undefined);
+      },
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
         reservation: options?.reservation,
@@ -4886,6 +4893,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       timeoutMs: bridgeTimeoutMs,
       maxBodyBytes,
       shellCommand,
+      runId: input.runId,
     });
   } catch (error) {
     await Promise.allSettled([

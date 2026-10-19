@@ -11,6 +11,7 @@ import {
   stopSshEnvLabFixture,
 } from "@paperclipai/adapter-utils/ssh";
 import {
+  activityLog,
   agents,
   builtInManagedResources,
   companies,
@@ -219,6 +220,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }
     await db.delete(environmentLeases);
     await db.delete(issues);
+    // The SSH run directory reaper records activity against a run.
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(environments);
@@ -1289,6 +1292,90 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     } finally {
     }
   });
+
+  // Nothing removed `runs/<runId>` on the SSH host, so 519 finished runs filled
+  // a worker disk on 2026-10-08. The release now removes it, only for a
+  // terminal run whose sync-back left the restored marker.
+  it("removes only the SSH run directories of terminal runs whose sync-back finished", async () => {
+    if (!sshFixtureSupport.supported) {
+      console.warn(`Skipping SSH run directory cleanup test: ${sshFixtureSupport.reason ?? "unsupported environment"}`);
+      return;
+    }
+    const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-environment-runtime-ssh-runs-"));
+    fixtureRoots.push(fixtureRoot);
+    const fixture = await startSshEnvLabFixture({ statePath: path.join(fixtureRoot, "state.json") });
+    const sshConfig = await buildSshEnvLabFixtureConfig(fixture);
+    const { companyId, agentId, environment, runId: restoredRunId } = await seedEnvironment({
+      driver: "ssh",
+      name: "Fixture SSH",
+      config: sshConfig,
+    });
+    const runsDir = path.join(sshConfig.remoteWorkspacePath, ".paperclip-runtime", "runs");
+    const runs = {
+      restored: { id: restoredRunId, status: "succeeded", restored: true },
+      notRestored: { id: randomUUID(), status: "failed", restored: false },
+      live: { id: randomUUID(), status: "running", restored: true },
+    };
+    for (const run of Object.values(runs)) {
+      if (run.id !== restoredRunId) {
+        await db.insert(heartbeatRuns).values({ id: run.id, companyId, agentId, invocationSource: "manual", status: "running" });
+      }
+      await runtime.acquireRunLease({ companyId, environment, issueId: null, heartbeatRunId: run.id, persistedExecutionWorkspace: null });
+      await mkdir(path.join(runsDir, run.id, "workspace"), { recursive: true });
+      await writeFile(path.join(runsDir, run.id, "workspace", "work.txt"), "agent work\n");
+      if (run.restored) await writeFile(path.join(runsDir, run.id, ".paperclip-restored"), "");
+      await db.update(heartbeatRuns).set({ status: run.status }).where(eq(heartbeatRuns.id, run.id));
+    }
+
+    for (const run of Object.values(runs)) {
+      const released = await runtime.releaseRunLeases(run.id);
+      expect(released[0]?.lease.status).toBe("released");
+    }
+
+    // The removal runs in the background after the release.
+    await vi.waitFor(async () => {
+      expect((await readdir(runsDir)).sort()).toEqual([runs.notRestored.id, runs.live.id].sort());
+    }, { timeout: 15_000, interval: 100 });
+  });
+
+  it("still releases an SSH lease when its run directory cleanup fails", async () => {
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "ssh",
+      name: "Unreachable SSH",
+      config: {
+        host: "ssh.invalid",
+        port: 22,
+        username: "ssh-user",
+        remoteWorkspacePath: "/srv/paperclip/workspace",
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: false,
+      },
+    });
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+    const leaseId = randomUUID();
+    await db.insert(environmentLeases).values({
+      id: leaseId, companyId, environmentId: environment.id, heartbeatRunId: runId, status: "active",
+      leasePolicy: "ephemeral", provider: "ssh", providerLeaseId: "ssh://ssh-user@ssh.invalid:22/srv/paperclip/workspace",
+      // The acquire records the configured root next to the one it resolved.
+      metadata: { driver: "ssh", remoteWorkspacePath: "/srv/paperclip/workspace", remoteCwd: "/srv/paperclip/workspace", host: "ssh.invalid", port: 22, username: "ssh-user" },
+    });
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      const released = await runtime.releaseRunLeases(runId);
+
+      expect(released.map((entry) => entry.lease.id)).toEqual([leaseId]);
+      expect(released[0]?.lease).toMatchObject({ status: "released" });
+      await vi.waitFor(() => {
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({ errorKind: "ssh_run_directory_cleanup_failed", leaseId }),
+          expect.any(String),
+        );
+      }, { timeout: 25_000, interval: 100 });
+    } finally {
+      warn.mockRestore();
+    }
+  }, 30_000);
 
   it("acquires and releases a fake sandbox run lease through the runtime seam", async () => {
     const { companyId, environment, runId } = await seedEnvironment({
@@ -7779,6 +7866,137 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         pluginId,
       }),
     });
+  });
+
+  // Acquires a run lease from a generic plugin driver whose `environmentAcquireLease`
+  // returns `providerMetadata`, and returns the lease and its stored row.
+  async function acquireGenericPluginLease(providerMetadata: Record<string, unknown>) {
+    const pluginId = randomUUID();
+    const workerManager = {
+      isRunning: vi.fn(() => true),
+      call: vi.fn(async (_pluginId: string, method: string) => {
+        if (method === "environmentAcquireLease") {
+          return { providerLeaseId: "plugin-lease-secret-echo", metadata: providerMetadata };
+        }
+        return undefined;
+      }),
+      getWorker: vi.fn(() => ({ supportedMethods: [] })),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "plugin",
+      name: "Plugin Secret Echo",
+      config: {
+        pluginKey: "acme.environments",
+        driverKey: "secret-echo-plugin",
+        driverConfig: { template: "base", apiKey: randomUUID() },
+      },
+    });
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: "acme.environments",
+      packageName: "@acme/paperclip-environments",
+      version: "1.0.0",
+      apiVersion: 1,
+      categories: ["automation"],
+      manifestJson: {
+        id: "acme.environments",
+        apiVersion: 1,
+        version: "1.0.0",
+        displayName: "Acme Environments",
+        description: "Plugin environment driver that returns resolved credentials in lease metadata",
+        author: "Acme",
+        categories: ["automation"],
+        capabilities: ["environment.drivers.register"],
+        entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [
+          {
+            driverKey: "secret-echo-plugin",
+            displayName: "Secret echo plugin",
+            configSchema: {
+              type: "object",
+              $defs: {
+                credential: {
+                  type: "object",
+                  properties: { host: { type: "string" }, token: { type: "string", format: "secret-ref" } },
+                },
+              },
+              properties: {
+                template: { type: "string" },
+                apiKey: { type: "string", format: "secret-ref" },
+                connection: {
+                  type: "object",
+                  properties: { token: { type: "string", format: "secret-ref" } },
+                },
+                tokens: { type: "array", items: { type: "string", format: "secret-ref" } },
+                replicas: { type: "array", items: { $ref: "#/$defs/credential" } },
+              },
+            },
+          },
+        ],
+      },
+      status: "ready",
+      installOrder: 1,
+      updatedAt: new Date(),
+    } as any);
+
+    const acquired = await runtimeWithPlugin.acquireRunLease({
+      companyId,
+      environment,
+      issueId: null,
+      heartbeatRunId: runId,
+      persistedExecutionWorkspace: null,
+    });
+
+    const [stored] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, acquired.lease.id));
+    return { acquired, stored };
+  }
+
+  it("does not store a declared secret-ref value that a generic plugin driver returns in its lease metadata", async () => {
+    const resolvedApiKey = "resolved-provider-api-key";
+    const resolvedToken = "resolved-connection-token";
+    const resolvedListToken = "resolved-list-token";
+    const resolvedReplicaToken = "resolved-replica-token";
+    const { acquired, stored } = await acquireGenericPluginLease({
+      remoteCwd: "/workspace",
+      apiKey: resolvedApiKey,
+      connection: { host: "sandbox.example.test", token: resolvedToken },
+      tokens: [resolvedListToken],
+      replicas: [{ host: "replica.example.test", token: resolvedReplicaToken }],
+    });
+
+    expect(stored?.metadata).toMatchObject({
+      pluginKey: "acme.environments",
+      driverKey: "secret-echo-plugin",
+      providerMetadata: {
+        remoteCwd: "/workspace",
+        connection: { host: "sandbox.example.test" },
+        replicas: [{ host: "replica.example.test" }],
+      },
+    });
+    const storedJson = JSON.stringify(stored?.metadata);
+    expect(storedJson).not.toContain(resolvedApiKey);
+    expect(storedJson).not.toContain(resolvedToken);
+    expect(storedJson).not.toContain(resolvedListToken);
+    expect(storedJson).not.toContain(resolvedReplicaToken);
+    expect((stored?.metadata as { providerMetadata: Record<string, unknown> }).providerMetadata).not.toHaveProperty("tokens");
+    expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedApiKey);
+    expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedListToken);
+    expect(JSON.stringify(acquired.lease.metadata)).not.toContain(resolvedReplicaToken);
+  });
+
+  it("stores a withheld marker, and still acquires, when provider lease metadata is nested too deeply to check", async () => {
+    let deep: unknown = "leaf";
+    for (let level = 0; level < 10_000; level += 1) deep = { child: deep };
+
+    const { stored } = await acquireGenericPluginLease({ remoteCwd: "/workspace", deep });
+
+    expect(stored?.metadata).toMatchObject({
+      pluginKey: "acme.environments",
+      driverKey: "secret-echo-plugin",
+      providerMetadata: { withheld: expect.any(String) },
+    });
+    expect(JSON.stringify(stored?.metadata).length).toBeLessThan(2_000);
   });
 
   it("releases with the driver captured on the lease even if the environment driver changes later", async () => {

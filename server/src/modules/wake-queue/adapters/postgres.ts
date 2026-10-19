@@ -3,6 +3,8 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { selectInCommentBatches } from "../../../services/comment-id-batches.js";
+import { ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON } from "../../../services/issue-dependency-wakeups.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
@@ -40,17 +42,33 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import { extractWakeCommentIds } from "../../run-dispatch/index.js";
+import {
+  AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
+  buildAutomationWakeCoalescedState,
+  readAutomationWakeCoalescedUntil,
+} from "../domain/automation-wake-coalesce.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
+  buildSelfReblockWakeParkedState,
+  readSelfReblockWakeMarker,
+  readSelfReblockWakeParkedUntil,
+  SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY,
+  SELF_REBLOCK_WAKE_PAYLOAD_KEY,
+} from "../domain/self-reblock-wake.js";
+import {
+  CONFIGURATION_INCOMPLETE_FAILURE_CODE,
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
   isConfigurationIncompleteFailedRun,
   isWorkspaceValidationFailedRun,
   parseObject,
   readNonEmptyString,
+  WORKSPACE_VALIDATION_FAILURE_CODE,
 } from "../domain/values.js";
 import { requireTransactionScopeTx, TransactionScope } from "../application/ports.js";
 import type {
+  AutomationWakeAdmission,
+  AutomationWakeAdmissionInput,
   DeferredWakeCandidate,
   InvokableAgentSnapshot,
   IssueLockWriter,
@@ -165,6 +183,9 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
     deferredContextSeed,
     deferredCommentIds,
     wakeReason,
+    selfReblockWake: readSelfReblockWakeMarker(payload, row.agentId),
+    selfReblockParkedUntil: readSelfReblockWakeParkedUntil(payload),
+    automationCoalescedUntil: readAutomationWakeCoalescedUntil(payload),
   };
 }
 
@@ -172,6 +193,7 @@ export type WakeQueuePostgresAdapterDeps = {
   resolveResponsibleUserId: WakeQueueHost["resolveResponsibleUserId"];
   getRoutineEnv: WakeQueueHost["getRoutineEnv"];
   resolveSessionBeforeForWakeup: WakeQueueHost["resolveSessionBeforeForWakeup"];
+  admitAutomationWake: (input: AutomationWakeAdmissionInput & { tx: Db }) => Promise<AutomationWakeAdmission>;
 };
 
 function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
@@ -270,13 +292,14 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async getQueuedCommentLiveness({ companyId, issueId, wakeAgentId, finishingRunId, finishingRunAgentId, queuedCommentIds }) {
-      const rows = await tx
+      const rows = await selectInCommentBatches(queuedCommentIds, (batch) => tx
         .select({ id: issueComments.id, deletedAt: issueComments.deletedAt, createdByRunId: issueComments.createdByRunId })
         .from(issueComments)
-        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queuedCommentIds), currentConversationCommentCondition()));
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, batch), currentConversationCommentCondition())));
+      const rowsById = new Map(rows.map((row) => [row.id, row]));
       const targetsFinishingRunAgent = wakeAgentId === finishingRunAgentId;
       const liveNonSelfCommentIds = queuedCommentIds.filter((commentId) => {
-        const row = rows.find((candidate) => candidate.id === commentId);
+        const row = rowsById.get(commentId);
         return Boolean(row && !row.deletedAt && (!targetsFinishingRunAgent || row.createdByRunId !== finishingRunId));
       });
       const containedSelfAuthoredComment = rows.some(
@@ -289,6 +312,63 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const rows = await tx
         .update(agentWakeupRequests)
         .set({ status: "cancelled", finishedAt: now, error: reason, updatedAt: now })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, wakeId),
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      return rows.length > 0;
+    },
+
+    async suppressSelfReblockDeferredWake({ companyId, wakeId, issueId, agentId, finishingRunId, reason, now }) {
+      const rows = await tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          // The marker keeps the original reason; this one lets the
+          // dependency backstop see the suppression in the blocked cycle.
+          reason: ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON,
+          finishedAt: now,
+          error: "Self-caused re-block wake suppressed: the agent owns this issue's execution",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, wakeId),
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      if (rows.length === 0) return false;
+      await tx.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "issue_wake_loop_guard",
+        agentId,
+        runId: finishingRunId,
+        action: "issue.wake_suppressed_self",
+        entityType: "issue",
+        entityId: issueId,
+        details: { reason, wakeupRequestId: wakeId, phase: "promotion", cause: "self_reblock_owner" },
+      });
+      return true;
+    },
+
+    async countRecentSelfReblockWakeRuns(input) {
+      return countRecentSelfReblockWakeRuns(tx, input);
+    },
+
+    async parkSelfReblockDeferredWake({ companyId, wakeId, notBefore, now }) {
+      const rows = await tx
+        .update(agentWakeupRequests)
+        .set({
+          payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), array[${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY}]::text[], ${JSON.stringify(buildSelfReblockWakeParkedState(notBefore))}::jsonb)`,
+          updatedAt: now,
+        })
         .where(
           and(
             eq(agentWakeupRequests.id, wakeId),
@@ -369,10 +449,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async getCommentSelfAuthorship({ companyId, issueId, finishingRunId, commentIds }) {
-      const rows = await tx
+      const rows = await selectInCommentBatches(commentIds, (batch) => tx
         .select({ createdByRunId: issueComments.createdByRunId })
         .from(issueComments)
-        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)));
+        .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, batch))));
       return { allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId) };
     },
 
@@ -388,12 +468,12 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .then((rows) => rows[0]);
       if (parent?.status !== "done" || parent.assigneeAgentId !== run.agentId) return false;
 
-      const comments = await tx.select({ body: issueComments.body, createdByRunId: issueComments.createdByRunId,
+      const comments = await selectInCommentBatches(uniqueCommentIds, (batch) => tx.select({ body: issueComments.body, createdByRunId: issueComments.createdByRunId,
         authorAgentId: issueComments.authorAgentId })
         .from(issueComments).where(and(
           eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-          inArray(issueComments.id, uniqueCommentIds), isNull(issueComments.deletedAt), currentConversationCommentCondition(),
-        ));
+          inArray(issueComments.id, batch), isNull(issueComments.deletedAt), currentConversationCommentCondition(),
+        )));
       if (comments.length !== uniqueCommentIds.length || comments.some((comment) =>
         comment.createdByRunId !== run.id || (comment.authorAgentId !== null && comment.authorAgentId !== run.agentId)
       )) return false;
@@ -421,6 +501,59 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     async reopenIssue({ companyId, issueId }) {
       const updated = await issuesSvc.updateForCompany(issueId, companyId, { status: "todo", executionState: null }, tx);
       return updated ? toIssueSnapshot(updated as unknown as IssueRow) : null;
+    },
+
+    admitAutomationWake(input) {
+      return deps.admitAutomationWake({ ...input, tx });
+    },
+
+    async parkHeldAutomationWake({ companyId, agentId, issueId, reason, contextSnapshot, notBefore, now }) {
+      const [existing] = await tx
+        .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            sql`${agentWakeupRequests.payload} -> ${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY} is not null`,
+          ),
+        )
+        .orderBy(asc(agentWakeupRequests.requestedAt))
+        .limit(1);
+      const state = buildAutomationWakeCoalescedState({
+        notBefore,
+        existing: existing ? parseObject(existing.payload) : null,
+        reason,
+      });
+      if (existing) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY}]::text[], ${JSON.stringify(state)}::jsonb)`,
+            coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, existing.id));
+        return;
+      }
+      await tx.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "automation_wake_coalesced",
+        payload: {
+          issueId,
+          [DEFERRED_WAKE_CONTEXT_KEY]: contextSnapshot,
+          [AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY]: state,
+        },
+        status: DEFERRED_WAKE_STATUS,
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        updatedAt: now,
+      });
     },
 
     async claimDeferredWakeForPromotion({ companyId, wakeId, now }) {
@@ -455,6 +588,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: input.triggerDetail,
           status: "queued",
           wakeupRequestId: input.wakeId,
+          ...(input.admittedAt ? { createdAt: input.admittedAt } : {}),
           retryOfRunId: input.authorizedFailedChatRetry
             ? readNonEmptyString(input.contextSnapshot.retryOfRunId)
             : null,
@@ -660,6 +794,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       contextSnapshot,
       responsibleUserId,
       sessionBefore,
+      admittedAt,
       now,
     }) {
       const wakeupRequest = await tx
@@ -692,6 +827,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
+          ...(admittedAt ? { createdAt: admittedAt } : {}),
           updatedAt: now,
         })
         .returning()
@@ -799,6 +935,86 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
 }
 
 /**
+ * Counts runs started since `since` from this agent's own re-block wakes on
+ * this issue. A coalesced receipt started no run of its own, so it does not
+ * count. Promoted rows keep their marker, so deferral cannot hide a run.
+ */
+async function countRecentSelfReblockWakeRuns(
+  tx: Db,
+  input: { companyId: string; agentId: string; issueId: string; since: Date },
+): Promise<number> {
+  const [row] = await tx
+    .select({ total: sql<number>`count(*)::integer` })
+    .from(agentWakeupRequests)
+    .innerJoin(
+      heartbeatRuns,
+      and(
+        eq(heartbeatRuns.id, agentWakeupRequests.runId),
+        eq(heartbeatRuns.companyId, agentWakeupRequests.companyId),
+      ),
+    )
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        sql`${agentWakeupRequests.status} <> 'coalesced'`,
+        sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PAYLOAD_KEY} ->> 'agentId' = ${input.agentId}`,
+        sql`coalesce(${agentWakeupRequests.payload} ->> 'issueId', ${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY} ->> 'issueId') = ${input.issueId}`,
+        sql`${heartbeatRuns.createdAt} >= ${input.since.toISOString()}::timestamptz`,
+      ),
+    );
+  return Number(row?.total ?? 0);
+}
+
+/**
+ * The run a sweep releases to re-drive an issue's parked queue. Its release
+ * must not replay failure handling, so prefer a succeeded run, and otherwise
+ * take the latest terminal non-native run whose failure does not raise a
+ * pre-drain blocked notice.
+ */
+export async function findParkedWakeAnchorRun(
+  db: Db,
+  input: { companyId: string; issueId: string },
+): Promise<{ id: string; companyId: string } | null> {
+  const [anchor] = await db
+    .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+        or(
+          eq(heartbeatRuns.status, "succeeded"),
+          and(
+            inArray(heartbeatRuns.status, ["failed", "timed_out", "cancelled"]),
+            sql`coalesce(${heartbeatRuns.runtimeMode}, '') <> 'native'`,
+            sql`coalesce(${heartbeatRuns.errorCode}, '') not in (${WORKSPACE_VALIDATION_FAILURE_CODE}, ${CONFIGURATION_INCOMPLETE_FAILURE_CODE}, 'model_not_found')`,
+          ),
+        ),
+      ),
+    )
+    .orderBy(
+      sql`case when ${heartbeatRuns.status} = 'succeeded' then 0 else 1 end`,
+      sql`${heartbeatRuns.createdAt} desc`,
+      sql`${heartbeatRuns.id} desc`,
+    )
+    .limit(1);
+  return anchor ?? null;
+}
+
+/** Admission reads the self-reblock run count inside heartbeat's issue-locked transaction. */
+export function createSelfReblockWakeAdmissionReader() {
+  return {
+    countRecentSelfReblockWakeRuns(
+      scope: TransactionScope,
+      input: { companyId: string; agentId: string; issueId: string; since: Date },
+    ): Promise<number> {
+      return countRecentSelfReblockWakeRuns(requireAdmissionTx(scope, input.companyId), input);
+    },
+  };
+}
+
+/**
  * Builds the temporary transaction-scope handle the admission port needs.
  * `heartbeat.ts` calls this through `createWakeQueue`'s own wrapper; it
  * never builds a `TransactionScope` itself.
@@ -878,6 +1094,11 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            // A wake parked by the self-reblock limit keeps its own provenance;
+            // other wakes queue beside it instead of inheriting its actor.
+            sql`${agentWakeupRequests.payload} -> ${SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY} is null`,
+            // Likewise an automation-coalesced receipt waits out its window alone.
+            sql`${agentWakeupRequests.payload} -> ${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY} is null`,
             ...(durableActor
               ? [
                   durableActor.type === null

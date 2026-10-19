@@ -3,6 +3,7 @@ import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import {
+  isRuntimeGitHubHttpRequest,
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
   shouldSilenceHttpSuccessLog,
@@ -162,6 +163,10 @@ export function createHttpLogger(baseLogger: Logger) {
     customProps(req, res) {
       if (res.statusCode >= 400) {
         const ctx = (res as any).__errorContext;
+        if (isRuntimeGitHubHttpRequest(req.method, requestClassificationUrl(req))) {
+          // Command arguments (message bodies) and git objects stay out of logs.
+          return { reqBody: "[REDACTED]" };
+        }
         if (isPrivateWebhook(req)) {
           // Omit, rather than recursively redact, the entire provider payload.
           // This applies equally before/after parsing and with/without context.

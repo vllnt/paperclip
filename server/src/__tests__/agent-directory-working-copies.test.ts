@@ -20,6 +20,7 @@ import type { EnvironmentRuntimeService } from "../services/environment-runtime.
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService } from "../services/agent-directory-working-copies.js";
 import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { shouldExcludePath } from "@paperclipai/adapter-utils/exclude-patterns";
 import { heartbeatRunEvents } from "@paperclipai/db";
 
 describe("persistent agent directories", () => {
@@ -716,6 +717,40 @@ describe("persistent agent directories", () => {
     } finally { stage.mockRestore(); restore.mockRestore(); exclude.mockRestore(); }
   });
 
+  it("round-trips a managed agent file under .cache over SSH exactly", async () => {
+    // Only .paperclip-runtime is reserved, so dependency-named folders hold
+    // ordinary agent files. The transport mocks honor each exclude list the
+    // way tar and the restore merge do.
+    const remoteCwd = path.join(home, "ssh-cache-task");
+    const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand").mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" });
+    const copyExcluding = (from: string, to: string, exclude: string[]) => fs.cp(from, to, { recursive: true, force: true,
+      filter: source => {
+        const relative = path.relative(from, source).split(path.sep).join("/");
+        return relative === "" || !shouldExcludePath(relative, exclude);
+      } });
+    const stage = vi.spyOn(ssh, "syncDirectoryToSsh").mockImplementation(async input => {
+      await fs.mkdir(path.dirname(input.remoteDir), { recursive: true });
+      await copyExcluding(input.localDir, input.remoteDir, input.exclude ?? []);
+    });
+    const restore = vi.spyOn(ssh, "restoreWorkspaceFromSshExecution").mockImplementation(async input => {
+      await copyExcluding(input.remoteDir!, input.localDir, input.baselineSnapshot?.exclude ?? []);
+    });
+    try {
+      await agentFileStore(db).write({ ...target(), path: ".cache/tool.md", bytes: Buffer.from("v1\n"), baseHash: null }, board());
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+      const sshTarget = { kind: "remote" as const, transport: "ssh" as const, environmentId: randomUUID(), remoteCwd,
+        spec: { host: "unused.invalid", port: 22, username: "test", remoteCwd } };
+      const copy = (await copies.prepare({ companyId, agentId, runId, cwd: home, target: sshTarget }))!;
+      expect(await fs.readFile(path.join(copy.executionRoot, ".cache", "tool.md"), "utf8")).toBe("v1\n");
+      await fs.writeFile(path.join(copy.executionRoot, ".cache", "tool.md"), "v2 from SSH\n");
+      expect((await copies.collectStopped({ companyId, runId, target: sshTarget }))?.state).toBe("saved");
+      expect(await fs.readFile(path.join(root, ".cache", "tool.md"), "utf8")).toBe("v2 from SSH\n");
+      expect(stage).toHaveBeenCalledWith(expect.objectContaining({ exclude: [".paperclip-runtime"] }));
+      expect(restore).toHaveBeenCalledWith(expect.objectContaining({ baselineSnapshot: expect.objectContaining({ exclude: [".paperclip-runtime"] }) }));
+    } finally { stage.mockRestore(); restore.mockRestore(); shell.mockRestore(); }
+  });
+
   it("deduplicates concurrent stopped callbacks and discards completed operational snapshots", async () => {
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, "note.txt"), "one write");
@@ -731,6 +766,30 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(root, "note.txt"), "utf8")).toBe("one write");
   });
 
+  // The agent-wide lifecycle lock is shared by every concurrent run of one
+  // agent, so it waits like a workspace restore (10 minutes without queue
+  // progress by default), not the 30 s a short credential write gets.
+  const RESTORE_WAIT_ENV = "PAPERCLIP_WORKSPACE_RESTORE_LOCK_WAIT_MS";
+  async function withRestoreWait<T>(waitMs: string, fn: () => Promise<T>): Promise<T> {
+    const previous = process.env[RESTORE_WAIT_ENV];
+    process.env[RESTORE_WAIT_ENV] = waitMs;
+    try { return await fn(); } finally {
+      if (previous === undefined) delete process.env[RESTORE_WAIT_ENV]; else process.env[RESTORE_WAIT_ENV] = previous;
+    }
+  }
+
+  it("waits for a held agent directory lock for the configured restore budget, not the 30 s default", async () => {
+    const copy = await run();
+    await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: new Date() })
+      .where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+    await withRestoreWait("1000", () => withDirectoryMergeLock(path.resolve(copy.localRoot, "../../.."), async () => {
+      const started = performance.now();
+      await expect(copies.release(companyId, copy.runId)).rejects.toMatchObject({ code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT" });
+      expect(performance.now() - started).toBeGreaterThanOrEqual(900);
+      expect(performance.now() - started).toBeLessThan(5_000);
+    }));
+  }, 40_000);
+
   it.each(["prepared", "unavailable", "warm_saved", "superseded", "saved", "unchanged", "resolved"])(
     "does not acquire a held directory lock for a no-op %s release", async state => {
       const copy = await run();
@@ -743,7 +802,7 @@ describe("persistent agent directories", () => {
         // Any attempted nested acquisition fails promptly instead of hanging the test.
         let now = Date.now();
         const clock = vi.spyOn(Date, "now").mockImplementation(() => now += 31_000);
-        try { await copies.release(companyId, copy.runId); } finally { clock.mockRestore(); }
+        try { await withRestoreWait("1000", () => copies.release(companyId, copy.runId)); } finally { clock.mockRestore(); }
         expect(await copies.get(companyId, copy.runId)).toEqual(before);
         expect(await fs.readFile(path.join(copy.localRoot, entryFile), "utf8")).toBe(initial);
       });
@@ -873,8 +932,10 @@ describe("persistent agent directories", () => {
       let now = Date.now();
       const clock = vi.spyOn(Date, "now").mockImplementation(() => now += 31_000);
       try {
-        await expect(copies.release(companyId, blocked.runId)).rejects.toMatchObject({ code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT" });
-        await copies.recoverCaptured();
+        await withRestoreWait("1000", async () => {
+          await expect(copies.release(companyId, blocked.runId)).rejects.toMatchObject({ code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT" });
+          await copies.recoverCaptured();
+        });
       } finally { clock.mockRestore(); }
       expect((await copies.get(companyId, blocked.runId))?.nextAttemptAt).toBeInstanceOf(Date);
       expect(await fs.readFile(path.join(blocked.localRoot, entryFile), "utf8")).toBe(initial);

@@ -92,6 +92,10 @@ The vite dev server serves an unbundled module graph. This is fast to reload on 
 
 The preview server binds `0.0.0.0` and accepts any Host, so a tailnet or LAN address (e.g. `http://<host>.ts.net:3101/`) works out of the box. The `/api` proxy sets `x-forwarded-host` and `x-forwarded-proto`, which the server's board mutation guard uses to trust the browser's Origin — mutations from `:3101` succeed against the API on `:3100` without further configuration. An HTTPS tunnel in front of the preview server (ngrok, tailscale funnel) is also supported: the tunnel's `x-forwarded-proto` header is preserved when set.
 
+### Precompressed UI assets
+
+`vite build` writes a `.br` (Brotli) and a `.gz` (gzip) file next to every script, stylesheet, SVG and JSON file in `assets/` that is at least 1 KB and compresses smaller. The server (`server/src/middleware/precompressed-static.ts`) sends the Brotli file to clients that accept it, the gzip file to the rest of the clients that accept gzip, and the plain file otherwise, with `Vary: Accept-Encoding`. The app therefore does not depend on a reverse proxy to compress its own bundle: the 6.4 MB entry chunk is about 1.3 MB on the wire. Range requests and files without a sibling get the plain file. The server reads the list of precompressed files when it starts, so restart it after rebuilding the UI to serve the new copies; until then new files go out uncompressed. `index.html` and the service worker are not precompressed. The compression adds about 9 s to the UI build.
+
 ## Storybook
 
 The board UI Storybook keeps stories and Storybook config under `ui/storybook/` so component review files stay out of the app source routes.
@@ -1483,6 +1487,29 @@ Environment overrides:
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES=<minutes>` sets how long after a run
+  finished the temp sweep keeps its per-run temp entries in the OS temp
+  directory (`paperclip-ssh-key-<runId>-*`, `paperclip-ssh-sync-back-<runId>-*`,
+  `paperclip-workspace-baseline-<runId>-*`, and similar). The default is `15`.
+  Values between `0` and `1` use `1`; zero, negative and non-numeric values use
+  the default. The sweep removes an entry only when the database shows its run
+  terminal, with a `finished_at` at least this long ago, with no `active`,
+  `retained` or `pending_cleanup` lease, and not executing. It keeps an entry
+  without a run id (also every entry from before run ids were added; the
+  operator's temp cleanup removes those), a link, and anything it cannot
+  classify. It does nothing when another user may change the temp directory or
+  a directory above it (unless the directory is sticky, like `/tmp`), and it
+  enters only directories the server's user owns that no other user can write,
+  on the temp directory's device. One pass examines at most 5,000 entry names,
+  removes at most 200 entries and takes at most 30 seconds; the rest waits for
+  the next pass. Only one server process sweeps at a time, and shutdown stops a
+  running pass. Each pass logs `event: "paperclip_tmp_sweep"` with `removed`,
+  `freedBytes`, `deferred`, the kept reasons (`kept`), why it stopped early
+  (`stops`), and the first failure (`firstFailure`).
+- `PAPERCLIP_TMP_SWEEP_INTERVAL_MINUTES=<minutes>` sets how often the temp sweep
+  runs after startup. The default is `60`. A value of `0` sweeps on startup only.
+  Other values are kept between `1` and `1440`; negative and non-numeric values
+  use the default.
 
 Without `PAPERCLIP_DB_BACKUP_ALERT_FILE`, health checks look for
 `db-backup-to-s3.failure` in the backup directory, beside the backup directory,

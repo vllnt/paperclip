@@ -859,6 +859,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `local.folders`
 - `http.outbound`
 - `secrets.read-ref`
+- `secrets.write-own`
 - `environment.drivers.register`
 
 ### Agent Tools

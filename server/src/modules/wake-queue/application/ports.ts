@@ -1,4 +1,5 @@
 import type { ReleaseRecoveryBlockedNoticeKind } from "../domain/policy.js";
+import type { SelfReblockWakeMarker } from "../domain/self-reblock-wake.js";
 import type {
   InvokableAgentSnapshot,
   IssueSnapshot,
@@ -83,7 +84,31 @@ export type DeferredWakeCandidate = {
   wakeReason: string | null;
   /** Exact failed-chat retry authority revalidated by the transaction-bound adapter. */
   authorizedFailedChatRetry?: boolean;
+  /** Present only when every merged contribution was the agent's own unblock/re-block cycle wake. */
+  selfReblockWake?: SelfReblockWakeMarker | null;
+  /** Set while the self-reblock limit holds the wake back; the drain skips it until then. */
+  selfReblockParkedUntil?: Date | null;
+  /** Set while a per-agent automation-wake window holds the wake back; the drain skips it until then. */
+  automationCoalescedUntil?: Date | null;
 };
+
+/** Admission of an automation wake through the agent's serialized window; a hold keeps the wake deferred. */
+export type AutomationWakeAdmissionInput = {
+  companyId: string;
+  agentId: string;
+  reason: string | null;
+  issueId: string | null;
+  now: Date;
+  /**
+   * Hold instead of waiting when another transaction owns the agent's window lock. A release
+   * drain can reach several agents while holding earlier windows; waiting on each would let
+   * two drains lock the same agents in opposite order and deadlock.
+   */
+  nonblocking?: boolean;
+};
+export type AutomationWakeAdmission =
+  | { hold: true; holdUntil: Date }
+  | { hold: false; admittedAt?: Date };
 
 export type PromoteDeferredWakeInput = {
   companyId: string;
@@ -98,6 +123,8 @@ export type PromoteDeferredWakeInput = {
   payload: Record<string, unknown>;
   responsibleUserId: string;
   sessionBefore: string | null;
+  /** The window admission time, stamped as the run's creation time so it opens the agent's next window. */
+  admittedAt?: Date;
   /** Only a proven failed-chat retry may retain its original retry lineage. */
   authorizedFailedChatRetry?: boolean;
   now: Date;
@@ -119,6 +146,24 @@ export interface WakeQueueTransaction {
     finishingRunAgentId: string;
     queuedCommentIds: string[];
   }): Promise<{ liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean }>;
+  /**
+   * Runs the agent's automation-window admission inside this transaction, under the
+   * per-agent window lock, before a deferred wake may start a run.
+   */
+  admitAutomationWake(input: AutomationWakeAdmissionInput): Promise<AutomationWakeAdmission>;
+  /**
+   * Keeps a held automation wake as the issue's coalesced deferred receipt (merging into an
+   * existing one) so the deferred-wake sweep delivers it through ordinary admission.
+   */
+  parkHeldAutomationWake(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    reason: string;
+    contextSnapshot: Record<string, unknown>;
+    notBefore: Date;
+    now: Date;
+  }): Promise<void>;
   /** Cancels the wake with `status = 'deferred_issue_execution'` as an atomic compare-and-set guard. */
   cancelDeferredWake(input: {
     companyId: string;
@@ -136,6 +181,33 @@ export interface WakeQueueTransaction {
   }): Promise<DeferredWakeCandidate | null>;
   /** Sets `status = 'failed'` guarded by the current `deferred_issue_execution` status. */
   failDeferredWake(input: { companyId: string; wakeId: string; now: Date }): Promise<boolean>;
+  /**
+   * Cancels an owner's own re-block wake (guarded on the deferred status) and
+   * records `issue.wake_suppressed_self`, so the suppression stays auditable.
+   */
+  suppressSelfReblockDeferredWake(input: {
+    companyId: string;
+    wakeId: string;
+    issueId: string;
+    agentId: string;
+    finishingRunId: string;
+    reason: string;
+    now: Date;
+  }): Promise<boolean>;
+  /** Runs started since `since` from this agent's own re-block wakes on this issue. */
+  countRecentSelfReblockWakeRuns(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    since: Date;
+  }): Promise<number>;
+  /** Keeps the wake deferred and records when the self-reblock limit allows it again. */
+  parkSelfReblockDeferredWake(input: {
+    companyId: string;
+    wakeId: string;
+    notBefore: Date;
+    now: Date;
+  }): Promise<boolean>;
   getPauseHoldFacts(input: {
     companyId: string;
     issueId: string;
@@ -218,6 +290,8 @@ export interface WakeQueueTransaction {
     contextSnapshot: Record<string, unknown>;
     responsibleUserId: string;
     sessionBefore: string | null;
+    /** The window admission time, stamped as the run's creation time so it opens the agent's next window. */
+    admittedAt?: Date;
     now: Date;
   }): Promise<RunSummary>;
 }

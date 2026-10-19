@@ -32,9 +32,30 @@ export const repoWrites = new Set([
 ]);
 export const repoReads = new Set(["issues", "pulls", "issue", "pull", "pin-status", "subscription", "comments", "reviews", "review-comments", "threads", "files", "commits", "checks", "labels", "milestones", "assignees", "branches", "metadata"]);
 
+const COMMENT_WRITES = new Set(["comment", "edit-comment", "delete-comment", "react-comment", "react-body", "review", "dismiss-review", "inline-comment", "reply-review-comment", "edit-review-comment", "delete-review-comment", "resolve-thread", "unresolve-thread"]);
+const PULL_REQUEST_WRITES = new Set(["create-pr", "edit-pr", "draft-pr", "ready-pr", "merge-pr", "update-branch", "enable-auto-merge", "disable-auto-merge", "request-reviewers", "remove-reviewers"]);
+/**
+ * The write-identity action and privileged actions of a repository write. A
+ * merge through the API can bypass branch rules, so it counts as an admin
+ * merge; rerunning a check reruns its workflow.
+ */
+export function repoWriteAction(op: string, params: Params = {}): { action: "comment" | "pullRequest" | "other"; privileged: ("adminMerge" | "workflowDispatch")[]; merge?: true; autoMerge?: true; retarget?: true } {
+  return {
+    action: COMMENT_WRITES.has(op) ? "comment" : PULL_REQUEST_WRITES.has(op) ? "pullRequest" : "other",
+    privileged: op === "merge-pr" ? ["adminMerge"] : op === "rerequest-check" ? ["workflowDispatch"] : [],
+    // Merges pass the protected-path guard; auto-merge (and with it the merge queue) is refused as the App user.
+    ...(op === "merge-pr" || op === "enable-auto-merge" ? { merge: true as const } : {}),
+    ...(op === "enable-auto-merge" ? { autoMerge: true as const } : {}),
+    ...(op === "edit-pr" && params.base !== undefined ? { retarget: true as const } : {}),
+  };
+}
+
 export class RepositoryManager {
-  constructor(private github: GitHubClient, private auth: { id: string; pem: string }, private repo: Repository, private beforeWrite: () => Promise<void> = async () => {}) {}
+  /** `userToken` makes writes act as the company's App user; reads keep the App. */
+  constructor(private github: GitHubClient, private auth: { id: string; pem: string }, private repo: Repository, private beforeWrite: () => Promise<void> = async () => {}, private userToken: string | null = null) {}
   private async token(key: string, write = false) {
+    // GitHub enforces the person's own access and the App's permissions for a user token.
+    if (write && this.userToken) return this.userToken;
     permission(this.repo, key, write);
     return this.github.scopedToken(this.auth.id, this.auth.pem, this.repo.installationId,
       { metadata: "read", [key]: write ? "write" : "read" }, this.repo.id);
@@ -138,7 +159,7 @@ export class RepositoryManager {
         const destinationRepositoryId = integer(p.destinationRepositoryId, "destination repository");
         if (row.pull_request || typeof p.destinationNodeId !== "string") throw new Error("Select a destination repository.");
         permission(this.repo, "issues", true);
-        const token = await this.github.scopedToken(this.auth.id, this.auth.pem, this.repo.installationId, { metadata: "read", issues: "write" }, [this.repo.id, destinationRepositoryId]);
+        const token = this.userToken ?? await this.github.scopedToken(this.auth.id, this.auth.pem, this.repo.installationId, { metadata: "read", issues: "write" }, [this.repo.id, destinationRepositoryId]);
         await this.beforeWrite();
         return this.github.graphql(token, "mutation($input:TransferIssueInput!){transferIssue(input:$input){clientMutationId}}", { input: { issueId: row.node_id, repositoryId: p.destinationNodeId } });
       }

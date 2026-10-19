@@ -1,4 +1,6 @@
+import { assertReadOnlyInstallationToken, mintGitHubInstallationToken } from "@paperclipai/shared/github-installation-token";
 import { createPrivateKey, sign } from "node:crypto";
+import { GitHubClock } from "./clock.js";
 import type { AllowedOwner, AppIdentity, Catalog, Credentials, GitHubIssue, IssuePage, Repository } from "./contracts.js";
 
 const ownerPattern = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
@@ -81,12 +83,63 @@ function identity(raw: any): AppIdentity {
       ? `https://github.com/${raw.owner.type === "Organization" ? `organizations/${raw.owner.login}/settings` : "settings"}/apps/${raw.slug}/permissions` : undefined,
     ...(typeof raw.owner?.login === "string" && /^[A-Za-z0-9-]+$/.test(raw.owner.login) ? { owner: raw.owner.login } : {}) };
 }
+/** I-RO (an App-user company's App only reads) lives with the one mint function Paperclip has. */
+export { assertReadOnlyInstallationToken, GITHUB_READ_ONLY_INSTALLATION_SCOPES as READ_ONLY_INSTALLATION_SCOPES } from "@paperclipai/shared/github-installation-token";
+
+/** A response's `Date` header, when it has one. */
+const dateOf = (res: Response) => typeof res.headers?.get === "function" ? res.headers.get("date") : null;
+/** A response that moves the learned clock by more than this was answered to a JWT dated by the old clock. */
+const JWT_RESIGN_MS = 30_000;
+
 export class GitHubClient {
+  /** GitHub's clock, learned from every response: App JWTs and token expiry follow it, not this host's clock. */
+  readonly clock = new GitHubClock();
   constructor(private fetchImpl: typeof fetch = fetch) {}
+  /**
+   * A request authenticated as the App (a JWT). A JWT dated by a skewed host
+   * clock is refused with 401; that answer's `Date` header corrects the clock,
+   * so the request is signed again and sent once more.
+   */
+  private async appRequest<T>(path: string, id: string, pem: string, body?: unknown): Promise<{ data: T; next: boolean }> {
+    const skew = this.clock.skewMs();
+    try { return await this.request<T>(path, appJwt(id, pem, this.clock.now()), body); }
+    catch (error) {
+      if (!(error instanceof GitHubError && error.status === 401 && Math.abs(this.clock.skewMs() - skew) > JWT_RESIGN_MS)) throw error;
+      return this.request<T>(path, appJwt(id, pem, this.clock.now()), body);
+    }
+  }
+  /**
+   * The fenced repositories (lowercase `owner/name`) of the company that owns an
+   * App, when that company writes as the App's user; null otherwise. Set by the
+   * worker and read on every mint, so a policy change applies to the next token.
+   * An error counts as such a company with an empty fence (fail closed).
+   */
+  appUserFence: (appId: string) => Promise<string[] | null> = async () => null;
+  private async fenceFor(appId: string): Promise<string[] | null> {
+    try { return await this.appUserFence(appId); } catch { return []; }
+  }
+  /** App installation tokens with a write scope minted in the last hour (installation tokens live one hour), per App. */
+  private writeTokens = new Map<string, Array<{ token: string; expires: number }>>();
+  /** Revokes one installation token at GitHub (DELETE /installation/token, authenticated by the token itself). */
+  async revokeInstallationToken(token: string): Promise<boolean> {
+    try { await this.request("/installation/token", token, undefined, "DELETE"); return true; } catch { return false; }
+  }
+  /**
+   * Revokes every App write token this worker minted for an App in the last
+   * hour, when its company switches to the App user (I-RO). Tokens minted by an
+   * earlier worker process are not known here; they expire within the hour.
+   */
+  async revokeWriteTokens(appId: string): Promise<number> {
+    const tokens = (this.writeTokens.get(appId) ?? []).filter(entry => entry.expires > Date.now());
+    this.writeTokens.delete(appId);
+    const results = await Promise.all(tokens.map(entry => this.revokeInstallationToken(entry.token)));
+    return results.filter(Boolean).length;
+  }
   async request<T>(path: string, token?: string, body?: unknown, method?: "POST" | "PATCH" | "PUT" | "DELETE"): Promise<{ data: T; next: boolean }> {
     if (!path.startsWith("/") || path.startsWith("//")) throw new Error("Invalid GitHub path.");
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), 20_000);
+    const startedAt = this.clock.started();
     try {
       const res = await this.fetchImpl(`https://api.github.com${path}`, {
         method: method ?? (body === undefined ? "GET" : "POST"), redirect: "error", signal: abort.signal,
@@ -94,6 +147,7 @@ export class GitHubClient {
           ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
         ...(body === undefined ? {} : { body: JSON.stringify(body) })
       });
+      this.clock.observe(dateOf(res), startedAt);
       if (!res.ok) { await res.body?.cancel(); throw new GitHubError(res.status); }
       if (res.status === 204) return { data: undefined as T, next: false };
       const reader = res.body?.getReader();
@@ -121,22 +175,40 @@ export class GitHubClient {
     return { ...app, privateKey: data.pem };
   }
   async verify(id: string, pem: string): Promise<AppIdentity> {
-    const { data } = await this.request<any>("/app", appJwt(id, pem));
+    const { data } = await this.appRequest<any>("/app", id, pem);
     const app = identity(data);
     if (app.id !== id) throw new Error("The GitHub App ID does not match this private key.");
     return app;
   }
-  async token(jwt: string, installationId: number, repositoryId?: number, write = false): Promise<string> {
-    const { data } = await this.request<{ token: string }>(`/app/installations/${installationId}/access_tokens`, jwt,
-      { permissions: { metadata: "read", issues: write ? "write" : "read" }, ...(repositoryId ? { repository_ids: [repositoryId] } : {}) });
-    if (typeof data.token !== "string" || !data.token) throw new Error("GitHub did not return an installation token.");
-    return data.token;
+  /** An issues token for one repository (the mirror and sync). */
+  async token(id: string, pem: string, installationId: number, repositoryId: number, write = false): Promise<string> {
+    return this.scopedToken(id, pem, installationId, { metadata: "read", issues: write ? "write" : "read" }, repositoryId);
   }
-  async scopedToken(id: string, pem: string, installationId: number, permissions: Record<string, string>, repositoryId?: number | number[]) {
-    const { data } = await this.request<{ token: string }>(`/app/installations/${installationId}/access_tokens`, appJwt(id, pem),
-      { permissions, ...(repositoryId ? { repository_ids: Array.isArray(repositoryId) ? repositoryId : [repositoryId] } : {}) });
-    if (!data.token) throw new Error("GitHub did not return an installation token.");
-    return data.token;
+  /**
+   * The only way this plugin mints installation tokens. `repositories` are IDs,
+   * or `owner/name` names of one installation owner. For an App-user company's
+   * App every token is checked against I-RO here.
+   */
+  async scopedToken(id: string, pem: string, installationId: number, permissions: Record<string, string>, repositories?: number | ReadonlyArray<number> | ReadonlyArray<string>) {
+    const list: Array<number | string> = repositories === undefined ? [] : typeof repositories === "number" ? [repositories] : [...repositories];
+    const fence = await this.fenceFor(id);
+    const token = await mintGitHubInstallationToken({ installationId, permissions, repositories: list as number[] | string[] }, fence,
+      async call => (await this.appRequest<{ token?: unknown }>(call.path, id, pem, call.body)).data?.token);
+    // The company may have switched to its App user while GitHub minted the token: check again, and
+    // revoke a token that I-RO no longer allows instead of handing it out.
+    const after = fence ?? await this.fenceFor(id);
+    if (after && !fence) {
+      try { assertReadOnlyInstallationToken(permissions, list, after); } catch (error) {
+        await this.revokeInstallationToken(token);
+        throw error;
+      }
+    }
+    if (!after && Object.values(permissions).some(level => level !== "read")) {
+      const recent = (this.writeTokens.get(id) ?? []).filter(entry => entry.expires > Date.now());
+      recent.push({ token: token, expires: Date.now() + 60 * 60_000 });
+      this.writeTokens.set(id, recent);
+    }
+    return token;
   }
   async graphql<T>(token: string, query: string, variables: Record<string, unknown> = {}): Promise<T> {
     const { data } = await this.request<{ data?: T; errors?: { type?: string }[] }>("/graphql", token, { query, variables });
@@ -150,9 +222,8 @@ export class GitHubClient {
     const wanted = validateAllowedOwners(requested);
     if (!wanted.length) return [];
     const byLogin = new Map<string, AllowedOwner>();
-    const jwt = appJwt(id, pem);
     for (let page = 1; page <= 10; page++) {
-      const response = await this.request<any[]>(`/app/installations?per_page=100&page=${page}`, jwt);
+      const response = await this.appRequest<any[]>(`/app/installations?per_page=100&page=${page}`, id, pem);
       for (const row of response.data) {
         const login = typeof row.account?.login === "string" ? row.account.login : "";
         const accountId = row.account?.id;
@@ -172,9 +243,8 @@ export class GitHubClient {
   /** Identify a webhook installation without applying the repository owner allowlist. */
   async hasInstallation(id: string, pem: string, installationId: number): Promise<boolean> {
     if (!Number.isSafeInteger(installationId) || installationId < 1) return false;
-    const jwt = appJwt(id, pem);
     for (let page = 1; page <= 10; page++) {
-      const response = await this.request<any[]>(`/app/installations?per_page=100&page=${page}`, jwt);
+      const response = await this.appRequest<any[]>(`/app/installations?per_page=100&page=${page}`, id, pem);
       if (response.data.some(row => Number.isSafeInteger(row?.id) && row.id === installationId)) return true;
       if (!response.next) return false;
     }
@@ -185,17 +255,18 @@ export class GitHubClient {
     const owners = normalizeAllowedOwnerRecords(allowedOwners);
     const ownerIds = new Set(owners.filter(owner => owner.id > 0).map(owner => owner.id));
     const ownerLogins = new Set(owners.map(owner => owner.login.toLowerCase()));
-    const jwt = appJwt(id, pem);
-    const { data } = await this.request<any>("/app", jwt);
+    const { data } = await this.appRequest<any>("/app", id, pem);
     const app = identity(data);
     if (app.id !== id) throw new Error("The GitHub App identity changed. Reconnect the App.");
+    // An App-user company's App lists only its fenced repositories (I-RO).
+    const fence = await this.fenceFor(id);
     const result: Catalog = { app, installations: [], repositories: [], warnings: [], truncated: false };
     if (!owners.length) {
       result.warnings.push("No GitHub owners are allowlisted for this company. Add at least one owner in GitHub connection settings.");
       return result;
     }
     for (let page = 1; page <= 10; page++) {
-      const response = await this.request<any[]>(`/app/installations?per_page=100&page=${page}`, jwt);
+      const response = await this.appRequest<any[]>(`/app/installations?per_page=100&page=${page}`, id, pem);
       for (const row of response.data) {
         if (!Number.isSafeInteger(row.id) || !row.account?.login) continue;
         const login = String(row.account.login);
@@ -211,7 +282,10 @@ export class GitHubClient {
     for (const installation of result.installations) {
       if (installation.suspended) { result.warnings.push(`${installation.login}: installation is suspended.`); continue; }
       try {
-        const token = await this.token(jwt, installation.id);
+        // Listing the installation's repositories needs metadata alone.
+        const fenced = fence?.filter(name => name.split("/")[0] === installation.login.toLowerCase());
+        if (fenced && !fenced.length) continue;
+        const token = await this.scopedToken(id, pem, installation.id, { metadata: "read" }, fenced);
         for (let page = 1; page <= 10; page++) {
           const response = await this.request<{ repositories: any[] }>(`/installation/repositories?per_page=100&page=${page}`, token);
           for (const row of response.data.repositories) {
@@ -231,7 +305,7 @@ export class GitHubClient {
     return result;
   }
   async issues(id: string, pem: string, repository: Repository, page: number, state: "open" | "closed" | "all"): Promise<IssuePage> {
-    const token = await this.token(appJwt(id, pem), repository.installationId, repository.id);
+    const token = await this.token(id, pem, repository.installationId, repository.id);
     const { data, next } = await this.request<any[]>(`/repos/${repository.fullName}/issues?state=${state}&sort=updated&direction=desc&per_page=50&page=${page}`, token);
     const issues = data.filter(row => !row.pull_request).map(row => this.issue(row, repository));
     return { issues, repository: repository.fullName, nextPage: next ? page + 1 : null };
@@ -245,20 +319,47 @@ export class GitHubClient {
       updatedAt: String(row.updated_at), assignees: (row.assignees ?? []).map((a: any) => String(a.login)) };
   }
   async getIssue(id: string, pem: string, repository: Repository, number: number): Promise<GitHubIssue> {
-    const token = await this.token(appJwt(id, pem), repository.installationId, repository.id);
+    const token = await this.token(id, pem, repository.installationId, repository.id);
     const { data } = await this.request<any>(`/repos/${repository.fullName}/issues/${number}`, token);
     return this.issue(data, repository);
   }
-  async createIssue(id: string, pem: string, repository: Repository, input: { title: string; body: string }): Promise<GitHubIssue> {
-    const token = await this.token(appJwt(id, pem), repository.installationId, repository.id, true);
+  /** `token` writes as that identity (the company's App user) instead of the App. */
+  async createIssue(id: string, pem: string, repository: Repository, input: { title: string; body: string }, token?: string): Promise<GitHubIssue> {
+    token ??= await this.token(id, pem, repository.installationId, repository.id, true);
     const { data } = await this.request<any>(`/repos/${repository.fullName}/issues`, token, input);
     return this.issue(data, repository);
   }
   async updateIssue(id: string, pem: string, repository: Repository, number: number,
-    input: { title?: string; body?: string; state?: "open" | "closed"; state_reason?: "completed" | "not_planned" | "reopened" }): Promise<GitHubIssue> {
-    const token = await this.token(appJwt(id, pem), repository.installationId, repository.id, true);
+    input: { title?: string; body?: string; state?: "open" | "closed"; state_reason?: "completed" | "not_planned" | "reopened" }, token?: string): Promise<GitHubIssue> {
+    token ??= await this.token(id, pem, repository.installationId, repository.id, true);
     const { data } = await this.request<any>(`/repos/${repository.fullName}/issues/${number}`, token, input, "PATCH");
     return this.issue(data, repository);
+  }
+
+  /**
+   * POST to GitHub's OAuth endpoints (device flow and user token refresh).
+   * GitHub reports OAuth errors in a 200 body (`{ error }`), which is returned
+   * as data. Bodies and errors are never logged; they carry tokens.
+   */
+  async oauth(path: "/login/device/code" | "/login/oauth/access_token", body: Record<string, string>): Promise<Record<string, unknown>> {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 20_000);
+    const startedAt = this.clock.started();
+    try {
+      const res = await this.fetchImpl(`https://github.com${path}`, {
+        method: "POST", redirect: "error", signal: abort.signal,
+        headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "paperclip-github-plugin" },
+        body: JSON.stringify(body),
+      });
+      this.clock.observe(dateOf(res), startedAt);
+      if (!res.ok) { await res.body?.cancel(); throw new GitHubError(res.status); }
+      const data = await res.json() as unknown;
+      if (!data || typeof data !== "object") throw new Error();
+      return data as Record<string, unknown>;
+    } catch (error) {
+      if (error instanceof GitHubError) throw error;
+      throw new Error("GitHub did not return a valid response. Please try again.");
+    } finally { clearTimeout(timer); }
   }
 
 }

@@ -1,6 +1,7 @@
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
+import { selectInCommentBatches } from "../comment-id-batches.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import {
@@ -89,6 +90,7 @@ import { budgetService } from "../budgets.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import {
+  LEGACY_RECOVERY_CAUSE,
   legacyExecutionNeedsReconciliationWithEvidence,
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
@@ -114,9 +116,12 @@ import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
   findExistingIssueBlockersResolvedWakeForReadyState,
+  isIssueBlockedCycleSelfSuppressed,
 } from "../issue-dependency-wakeups.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
+import { queueIssueAssignmentWakeup } from "../issue-assignment-wakeup.js";
+import type { IssueExecutionState } from "@paperclipai/shared";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
@@ -487,6 +492,9 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "claude_transient_upstream",
   "provider_quota",
   "timeout",
+  // A restore or agent directory lock timeout is contention that clears itself,
+  // so it keeps the continuation recovery `adapter_failed` already received.
+  "workspace_restore_lock_timeout",
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
@@ -924,6 +932,12 @@ export function recoveryService(
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /**
+     * The heartbeat policy reason (`wakeOnDemand` disabled, daily run/cost
+     * cap) that would make an on-demand wake for this agent a skipped
+     * receipt, or null when the agent can be woken now.
+     */
+    getOnDemandWakePolicyBlock?: (agentId: string) => Promise<string | null>;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -1282,20 +1296,22 @@ export function recoveryService(
     )
       return false;
     const commentIds = ids as string[];
-    const sources = await db
-      .select({ id: issueComments.id })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.companyId, binding.companyId),
-          eq(issueComments.issueId, binding.issueId),
-          inArray(issueComments.id, commentIds),
-          isNull(issueComments.createdByRunId),
-          isNull(issueComments.deletedAt),
-          sql`${issueComments.updatedAt} = ${issueComments.createdAt}`,
-          sql`${issueComments.createdAt} <= (select started_at from heartbeat_runs where id = ${binding.runId})`,
+    const sources = await selectInCommentBatches(commentIds, (batch) =>
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, binding.companyId),
+            eq(issueComments.issueId, binding.issueId),
+            inArray(issueComments.id, batch),
+            isNull(issueComments.createdByRunId),
+            isNull(issueComments.deletedAt),
+            sql`${issueComments.updatedAt} = ${issueComments.createdAt}`,
+            sql`${issueComments.createdAt} <= (select started_at from heartbeat_runs where id = ${binding.runId})`,
+          ),
         ),
-      );
+    );
     if (sources.length !== commentIds.length) return false;
     const [newer, pendingInteraction, pendingApproval] = await Promise.all([
       db
@@ -1603,30 +1619,32 @@ export function recoveryService(
           ].filter((id): id is string => id !== null),
         ),
       ];
-      const comments = await tx
+      // The named ids and the "changed since finalization" window are separate
+      // lookups so the id list can be batched.
+      const inIssue = and(
+        eq(issueComments.companyId, current.companyId),
+        eq(issueComments.issueId, current.id),
+      );
+      const named = await selectInCommentBatches(commentIds, (batch) =>
+        tx.select().from(issueComments).where(and(inIssue, inArray(issueComments.id, batch))),
+      );
+      const changedSince = await tx
         .select()
         .from(issueComments)
         .where(
           and(
-            eq(issueComments.companyId, current.companyId),
-            eq(issueComments.issueId, current.id),
+            inIssue,
             or(
-              commentIds.length
-                ? inArray(issueComments.id, commentIds)
-                : sql`false`,
-              and(
-                or(
-                  isNull(issueComments.createdByRunId),
-                  not(eq(issueComments.createdByRunId, source.id)),
-                ),
-                or(
-                  gt(issueComments.createdAt, proof.finalizedAt),
-                  gt(issueComments.updatedAt, proof.finalizedAt),
-                ),
-              ),
+              isNull(issueComments.createdByRunId),
+              not(eq(issueComments.createdByRunId, source.id)),
+            ),
+            or(
+              gt(issueComments.createdAt, proof.finalizedAt),
+              gt(issueComments.updatedAt, proof.finalizedAt),
             ),
           ),
         );
+      const comments = [...new Map([...named, ...changedSince].map((comment) => [comment.id, comment])).values()];
       if (
         comments.some(
           (comment) =>
@@ -1724,6 +1742,7 @@ export function recoveryService(
     companyId: string,
     issueId: string,
     agentId?: string | null,
+    options: { includeClaimedOrDeferred?: boolean } = {},
   ) {
     return db
       .select({ id: agentWakeupRequests.id })
@@ -1731,7 +1750,9 @@ export function recoveryService(
       .where(
         and(
           eq(agentWakeupRequests.companyId, companyId),
-          eq(agentWakeupRequests.status, "queued"),
+          options.includeClaimedOrDeferred
+            ? inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"])
+            : eq(agentWakeupRequests.status, "queued"),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
         ),
@@ -2030,28 +2051,82 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     agentId: string,
   ) {
-    return deps.enqueueWakeup(agentId, {
-      source: "assignment",
-      triggerDetail: "system",
+    return queueIssueAssignmentWakeup({
+      heartbeat: { wakeup: deps.enqueueWakeup },
+      // Recovery redelivers a missed assignment wake as that assignment event:
+      // if the route's wake for the same generation committed meanwhile,
+      // admission returns its receipt instead of starting a second run.
+      assignmentEvent: true,
+      issue: { ...issue, assigneeAgentId: agentId },
       reason: "issue_assigned",
-      payload: withRecoveryContext(
-        {
-          issueId: issue.id,
-          mutation: "assigned_todo_liveness_dispatch",
-        },
-        "normal_model",
-      ),
+      mutation: "assigned_todo_liveness_dispatch",
+      contextSource: "issue.assigned_todo_liveness_dispatch",
       requestedByActorType: "system",
       requestedByActorId: null,
-      contextSnapshot: withRecoveryContext(
-        {
-          issueId: issue.id,
-          taskId: issue.id,
-          wakeReason: "issue_assigned",
-          source: "issue.assigned_todo_liveness_dispatch",
-        },
-        "normal_model",
-      ),
+      wakeupOptions: {
+        payload: withRecoveryContext(
+          {
+            issueId: issue.id,
+            mutation: "assigned_todo_liveness_dispatch",
+          },
+          "normal_model",
+        ),
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: issue.id,
+            taskId: issue.id,
+            wakeReason: "issue_assigned",
+            source: "issue.assigned_todo_liveness_dispatch",
+          },
+          "normal_model",
+        ),
+      },
+      rethrowOnError: true,
+    });
+  }
+
+  /**
+   * Only for a reviewer who is the issue's agent assignee: the dispatch is
+   * that assignment's missed wake, under the assignee's assignment key.
+   */
+  async function enqueueInitialAssignedReviewDispatch(
+    issue: typeof issues.$inferSelect,
+    pendingExecutionState: Pick<IssueExecutionState, "currentStageId" | "currentStageType">,
+  ) {
+    return queueIssueAssignmentWakeup({
+      heartbeat: { wakeup: deps.enqueueWakeup },
+      assignmentEvent: true,
+      issue,
+      reason: "issue_assigned",
+      mutation: "review_assignment_recovery",
+      contextSource: "issue.review_assignment_recovery",
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      wakeupOptions: {
+        payload: withRecoveryContext(
+          {
+            issueId: issue.id,
+            mutation: "review_assignment_recovery",
+            currentStageId: pendingExecutionState.currentStageId ?? null,
+            currentStageType: pendingExecutionState.currentStageType ?? null,
+          },
+          "normal_model",
+        ),
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: issue.id,
+            taskId: issue.id,
+            wakeReason: "issue_assigned",
+            source: "issue.review_assignment_recovery",
+            reviewRecoveryInstruction:
+              "This reviewer was assigned without a prior run. Review the pending execution stage now, or mark the issue blocked with the exact unblock action.",
+            currentStageId: pendingExecutionState.currentStageId ?? null,
+            currentStageType: pendingExecutionState.currentStageType ?? null,
+          },
+          "normal_model",
+        ),
+      },
+      rethrowOnError: true,
     });
   }
 
@@ -2624,6 +2699,14 @@ export function recoveryService(
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
     return db.transaction(async (tx) => {
+      // A run has no foreign key to its issue. The share lock serializes this
+      // insert with the deferred-wake sweep, which locks the issue row before it
+      // finalizes the issue's parked wakes.
+      await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id)))
+        .for("share");
       const wakeup = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -3210,6 +3293,13 @@ export function recoveryService(
           created = Boolean(enqueuedRun);
         } else {
           scheduledRun = await db.transaction(async (tx) => {
+            // Serializes with the deferred-wake sweep's issue-row lock; see
+            // ensureProviderQuotaWaitRecoveryMonitor.
+            await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(and(eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id)))
+              .for("share");
             const wakeup = await tx
               .insert(agentWakeupRequests)
               .values({
@@ -3391,6 +3481,36 @@ export function recoveryService(
     return Boolean(run || wake);
   }
 
+  /**
+   * Why a legacy reconciliation hold no longer applies, or null while it does.
+   * It applies while the issue is in progress (or in review for the reviewer
+   * whose run was lost) and no run other than the lost one is live. Reuses the
+   * resolution notes that the done and live-path exits already write.
+   */
+  async function legacyHoldExitNote(
+    action: typeof issueRecoveryActions.$inferSelect,
+    issue: typeof issues.$inferSelect,
+  ): Promise<string | null> {
+    const reviewerHold =
+      issue.status === "in_review" &&
+      typeof action.evidence.reviewParticipantAgentId === "string";
+    if (issue.status !== "in_progress" && !reviewerHold) return "source_terminal";
+    const lostRunId = typeof action.evidence.runId === "string" ? action.evidence.runId : null;
+    const [liveRun] = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, action.companyId),
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${action.sourceIssueId}`,
+          lostRunId ? not(eq(heartbeatRuns.id, lostRunId)) : sql`true`,
+        ),
+      )
+      .limit(1);
+    return liveRun ? "new_source_execution_path" : null;
+  }
+
   async function reconcileActiveRecoveryActions() {
     const rows = await db
       .select({ action: issueRecoveryActions, issue: issues })
@@ -3436,6 +3556,29 @@ export function recoveryService(
           result.issueIds.push(issue.id);
         }
         continue;
+      }
+
+      // A legacy hold stays only while its premise holds: the lost run is the
+      // issue's last word, the issue is still in the state that run held, and no
+      // live run has taken over. Otherwise it ends through the same resolution
+      // as a done or cancelled issue, so it cannot outlive its cause.
+      if (action.cause === LEGACY_RECOVERY_CAUSE) {
+        const exitNote = await legacyHoldExitNote(action, issue);
+        if (exitNote) {
+          const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            actionId: action.id,
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote: exitNote,
+          });
+          if (resolved) {
+            result.resolved += 1;
+            result.issueIds.push(issue.id);
+          }
+          continue;
+        }
       }
 
       // A queued comment or healthy child cannot establish what the stopped
@@ -4355,6 +4498,7 @@ export function recoveryService(
       successfulRunHandoffEscalated: 0,
       successfulRunHandoffRetried: 0,
       reviewParticipantRequeued: 0,
+      reviewParticipantDispatchDeferred: 0,
       escalated: 0,
       waitingOnReviewResolved: 0,
       providerQuotaMonitored: 0,
@@ -4917,10 +5061,55 @@ export function recoveryService(
         }
         const participantLatestRun = participantLatestRunForRecovery;
 
-        if (
-          !participantLatestRun ||
-          !isTerminalIssueRun(participantLatestRun)
-        ) {
+        if (!participantLatestRun) {
+          if (!agentInvokable) {
+            const updated = await escalateStrandedAssignedIssue({
+              issue,
+              previousStatus: "in_review",
+              latestRun: participantLatestRun,
+              notice: buildExecutionReviewParticipantUnavailableNoticeSeed(),
+              recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
+            });
+            if (updated) {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+          } else if (issue.assigneeAgentId !== participantAgentId) {
+            // The reviewer is not the issue's agent assignee, so there is no
+            // assignment for this dispatch to deliver. Leave it as base did.
+            result.skipped += 1;
+          } else if (
+            // A claimed or deferred wake for this reviewer will still run.
+            await hasQueuedIssueWake(issue.companyId, issue.id, participantAgentId, {
+              includeClaimedOrDeferred: true,
+            })
+          ) {
+            result.skipped += 1;
+          } else if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
+            result.skipped += 1;
+          } else if (await deps.getOnDemandWakePolicyBlock?.(participantAgentId)) {
+            // The reviewer's own policy (wakeOnDemand off, daily cap reached)
+            // would turn this wake into a skipped receipt on every sweep.
+            // Leave the dispatch pending, with no receipt, until it changes.
+            result.reviewParticipantDispatchDeferred += 1;
+          } else {
+            const queued = await enqueueInitialAssignedReviewDispatch(
+              issue,
+              pendingExecutionState,
+            );
+            if (queued) {
+              result.reviewParticipantRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+          }
+          continue;
+        }
+
+        if (!isTerminalIssueRun(participantLatestRun)) {
           if (!agentInvokable) {
             const updated = await escalateStrandedAssignedIssue({
               issue,
@@ -5537,6 +5726,7 @@ export function recoveryService(
       checked: 0,
       healed: 0,
       existingWakeSkipped: 0,
+      selfReblockSkipped: 0,
       livePathSkipped: 0,
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
@@ -5701,6 +5891,21 @@ export function recoveryService(
           });
         if (existingWake) {
           result.existingWakeSkipped += 1;
+          continue;
+        }
+        // The assignee re-blocked this issue from its own run on it in this
+        // blocked cycle, so the ready state is its own decision, not news.
+        // Re-delivering it every tick restarted the ANT-3260 loop.
+        if (
+          await isIssueBlockedCycleSelfSuppressed(db, {
+            companyId,
+            agentId,
+            dependentIssueId: candidate.id,
+            blockerIssueIds: readiness.blockerIssueIds,
+            blockedTransitionAt: candidate.blockedTransitionAt,
+          })
+        ) {
+          result.selfReblockSkipped += 1;
           continue;
         }
 

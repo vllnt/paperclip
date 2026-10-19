@@ -344,6 +344,35 @@ describe("native task sync controls", () => {
     await screen.findByText("Saved");
     expect(action("save-sync-settings")).toHaveBeenCalledWith({ companyId: "c1", settings: { enabled: true, rules: [expect.objectContaining({ if: { assignee: "alex", state: "open" }, then: { agentId: "a1", status: "todo", wake: false } })] } });
   });
+  it("saves a per-action write identity with a repository override and previews it", async () => {
+    action("status").mockResolvedValue({ configured: true, app });
+    action("catalog").mockResolvedValue({ app, installations: [], repositories: [repository], warnings: [], truncated: false });
+    action("write-identity.get").mockResolvedValue({ companyId: "c1", policy: null });
+    action("write-identity.set").mockImplementation(({ policy }: any) => Promise.resolve({ companyId: "c1", policy }));
+    render(<GitHubPage context={context} />);
+    fireEvent.click(await screen.findByText("Write identity · Default"));
+    expect(screen.getByText(/writes as my-app\[bot\]/)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText("Choose the identity per action"));
+    fireEvent.change(screen.getByLabelText("Comments and reviews"), { target: { value: "bot" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add override" }));
+    fireEvent.change(screen.getByLabelText("Repositories"), { target: { value: "vllnt/*" } });
+    fireEvent.change(screen.getAllByLabelText("Pushes")[1]!, { target: { value: "bot" } });
+    fireEvent.change(screen.getByLabelText("Preview a repository"), { target: { value: "vllnt/site" } });
+    const preview = screen.getByRole("list", { name: "Write identity preview" });
+    expect(preview.textContent).toContain("Pushes: As the App");
+    expect(preview.textContent).toContain("Commits: As the user");
+    expect(action("write-identity.set")).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Save write identity" }));
+    await screen.findByText("Saved");
+    // Fields the panel does not edit (kill switch, allowlist, privileged toggles…) keep their values.
+    expect(action("write-identity.set")).toHaveBeenCalledWith({ companyId: "c1", policy: expect.objectContaining({
+      default: { commit: "user", push: "user", pullRequest: "user", comment: "bot" },
+      overrides: [{ match: "vllnt/*", push: "bot" }],
+      missingUserConnection: "fail",
+      enabled: true,
+      privileged: expect.objectContaining({ release: false, tagPush: false }),
+    }) });
+  });
   it("opens the managed workflow skill for policy edits", async () => {
     action("status").mockResolvedValue({ configured: true, app });
     action("catalog").mockResolvedValue({ app, installations: [], repositories: [repository], warnings: [], truncated: false });
