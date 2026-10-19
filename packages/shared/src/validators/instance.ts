@@ -37,6 +37,9 @@ export const instanceGeneralSettingsSchema = z.object({
   routineGateRepos: z.array(z.string().trim().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/)).max(20).optional(),
   /** Named run tiers and the agent allowlist, keyed by company ID. */
   companyRunTiers: z.record(z.string().guid(), companyRunTiersSchema).optional(),
+  // Pull requests always link to tasks. This switch lets that link also move a task's
+  // status (open → in_review, merged → done). Absent = off.
+  gitStatusAutomation: z.boolean().optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

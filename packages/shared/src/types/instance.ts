@@ -43,6 +43,11 @@ export interface InstanceGeneralSettings {
   routineGateRepos?: string[];
   /** Named run tiers and the agent allowlist, keyed by company ID. */
   companyRunTiers?: Record<string, import("../run-profile.js").CompanyRunTiers>;
+  /**
+   * Lets a linked pull request move a task's status (open → in_review, merged → done).
+   * Linking itself is always on. Absent = off.
+   */
+  gitStatusAutomation?: boolean;
 }
 
 export interface InstanceExperimentalSettings {
