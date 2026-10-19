@@ -1,1 +1,2 @@
 patches/*.patch whitespace=-space-before-tab
+scripts/ci/image-build-vitest-files.txt merge=union

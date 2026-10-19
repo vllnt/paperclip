@@ -22,7 +22,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "PATCH /api/agents/{}": {
     "section": "Agents",
-    "description": "Update agent config or budget"
+    "description": "Update agent config or budget. An agent cannot change its own run limits, budget, model, working directory, environment or env vars, sandbox or approval-bypass settings, role, or permissions, or un-pause itself or roll back its own config, without `agents:configure` for itself."
   },
   "POST /api/agents/{}/pause": {
     "section": "Agents",
@@ -600,7 +600,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "GET /api/companies/{}/routines": {
     "section": "Routines",
-    "description": "List all routines in company"
+    "description": "List routines in company; optional filters `q`, `assigneeAgentId`, `projectId`, `folderId` (`none`), `status`, `trigger` (`schedule`, `webhook`, `api`, `event`, `manual`)"
   },
   "GET /api/routines/{}": {
     "section": "Routines",
@@ -616,7 +616,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "POST /api/routines/{}/triggers": {
     "section": "Routines",
-    "description": "Add trigger (`schedule`, `webhook`, or `api` kind)"
+    "description": "Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`)"
   },
   "PATCH /api/routine-triggers/{}": {
     "section": "Routines",
@@ -641,6 +641,46 @@ export const runnerApiReference: Record<string, { section: string; description?:
   "GET /api/routines/{}/runs": {
     "section": "Routines",
     "description": "Run history (default 50)"
+  },
+  "GET /api/routines/{}/event-groups": {
+    "section": "Routines",
+    "description": "Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`)"
+  },
+  "GET /api/companies/{}/event-sources": {
+    "section": "Event Sources",
+    "description": "List sources (`?includeArchived=true`); no secrets"
+  },
+  "POST /api/companies/{}/event-sources": {
+    "section": "Event Sources",
+    "description": "Create source (board only); secret returned once in `secretMaterial`"
+  },
+  "GET /api/event-sources/{}": {
+    "section": "Event Sources",
+    "description": "Source details; no secret"
+  },
+  "PATCH /api/event-sources/{}": {
+    "section": "Event Sources",
+    "description": "Update source (board only)"
+  },
+  "DELETE /api/event-sources/{}": {
+    "section": "Event Sources",
+    "description": "Archive source (board only, soft delete)"
+  },
+  "POST /api/event-sources/{}/rotate-secret": {
+    "section": "Event Sources",
+    "description": "Rotate secret (board only); new secret returned once, old one invalid immediately"
+  },
+  "POST /api/event-sources/{}/test": {
+    "section": "Event Sources",
+    "description": "Dry run `{ \"payload\": {...} }`: normalized event, matched routines, would-be action; writes nothing"
+  },
+  "GET /api/event-sources/{}/deliveries": {
+    "section": "Event Sources",
+    "description": "Delivery log (`?status=&limit=&cursor=`)"
+  },
+  "POST /api/event-sources/public/{}/events": {
+    "section": "Event Sources",
+    "description": "Sender ingress (no Paperclip login): `paperclip.event.v1` body, HMAC (`X-Paperclip-Timestamp` + `X-Paperclip-Signature`) or bearer auth, max 64 KB"
   },
   "GET /api/companies/{}/approvals": {
     "section": "Approvals, Costs, Activity, Dashboard",

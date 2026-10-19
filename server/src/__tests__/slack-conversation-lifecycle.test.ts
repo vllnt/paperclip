@@ -2,7 +2,7 @@ import express from "express";
 import request from "supertest";
 import { issueRoutes } from "../routes/issues.js";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agents, agentWakeupRequests, approvals, chatConversations, chatEndpoints,
@@ -136,7 +136,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await state(f))?.externalConversationState).toBe("active");
     expect(await settle(f)).toBe(false);
     expect((await state(f))?.status).toBe("todo");
-    await issueService(db).checkout(f.issueId, f.agentId, ["todo", "backlog", "blocked"], null);
+    await issueService(db).checkout(f.issueId, f.agentId, ["todo", "backlog", "blocked"], null, { kind: "agent", agentId: f.agentId });
     expect((await state(f))?.status).toBe("in_progress");
     const nextRun = randomUUID();
     await db.insert(chatMessageLinks).values({ companyId: f.companyId, endpointId: f.endpointId, conversationId: f.conversationId, commentId: followup.id, providerMessageId: followup.id, direction: "inbound" });
@@ -188,6 +188,26 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(chatMessageLinks).values({ companyId: f.companyId, endpointId: f.endpointId, conversationId: f.conversationId, commentId: message.id, providerMessageId: message.id, direction: "inbound" });
     expect(await settle(f)).toBe(false);
   });
+
+  it.each([500, 501])("picks the newest of %i reordered wake comments at microsecond precision", async (count) => {
+    const f = await fixture();
+    const suffix = String(count).padStart(12, "0");
+    const older = `ffffffff-ffff-4fff-8fff-${suffix}`;
+    const newer = `00000000-0000-4000-8000-${suffix}`;
+    const filler = Array.from({ length: count - 2 }, () => randomUUID());
+    // Last id is neither newest nor highest: only SQL ordering sees the .000900 row as newest.
+    const wakeIds = [older, ...filler.slice(0, count - 3), newer, ...filler.slice(count - 3)];
+    await db.update(issueComments).set({ createdAt: new Date("2026-09-10T00:00:00Z") }).where(eq(issueComments.id, f.wakeId));
+    await db.insert(issueComments).values(wakeIds.map((id) => ({ id, companyId: f.companyId, issueId: f.issueId, authorType: "user" as const,
+      authorUserId: "local-board", body: "message", createdAt: new Date("2026-09-10T00:00:00Z") })));
+    await db.update(issueComments).set({ createdAt: sql`'2026-09-11T00:00:00.000100Z'::timestamptz` }).where(eq(issueComments.id, older));
+    await db.update(issueComments).set({ createdAt: sql`'2026-09-11T00:00:00.000900Z'::timestamptz` }).where(eq(issueComments.id, newer));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, source: "chat:slack", wakeCommentId: wakeIds.at(-1), wakeCommentIds: wakeIds } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    expect(wakeIds).toHaveLength(count);
+    expect(await settle(f)).toBe(true);
+    expect((await state(f))?.externalConversationState).toBe("waiting");
+  }, 30000);
 
   it("requires committed native response-wait evidence", async () => {
     const f = await fixture(true);

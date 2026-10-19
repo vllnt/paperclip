@@ -1,7 +1,8 @@
 import { and, desc, eq, inArray, isNull, isNotNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issueRecoveryActions, workspaceOperations } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions, issues, workspaceOperations } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
+import { isUniqueViolation } from "../db-errors.js";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -109,20 +110,19 @@ function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   };
 }
 
-function isUniqueRecoveryActionConflict(error: unknown) {
-  const maybe = error as { code?: string; constraint?: string; message?: string } | null;
-  return Boolean(
-    maybe &&
-      maybe.code === "23505" &&
-      (
-        maybe.constraint === "issue_recovery_actions_active_source_uq" ||
-        maybe.constraint === "issue_recovery_actions_active_fingerprint_uq" ||
-        typeof maybe.message === "string" && (
-          maybe.message.includes("issue_recovery_actions_active_source_uq") ||
-          maybe.message.includes("issue_recovery_actions_active_fingerprint_uq")
-        )
-      ),
-  );
+const ACTIVE_RECOVERY_ACTION_UNIQUE_INDEXES = [
+  "issue_recovery_actions_active_source_uq",
+  "issue_recovery_actions_active_fingerprint_uq",
+] as const;
+
+/**
+ * True when a writer lost a race on one of the active-action unique indexes, so
+ * the caller should re-read and retry. Drizzle wraps the driver error and
+ * postgres.js nests the index name under `cause.constraint_name`; the shared
+ * helper walks that chain. Any other constraint or error code is rethrown.
+ */
+export function isUniqueRecoveryActionConflict(error: unknown): boolean {
+  return ACTIVE_RECOVERY_ACTION_UNIQUE_INDEXES.some((index) => isUniqueViolation(error, index));
 }
 
 export function issueRecoveryActionService(db: Db) {
@@ -257,6 +257,49 @@ export function issueRecoveryActionService(db: Db) {
     }
     await projectNativeRunActivity(companyId, [...result.values()], db);
     return result;
+  }
+
+  /**
+   * Company-wide read of recovery actions with their source issue, newest
+   * first. Read-only: unlike the per-issue read, it does not revalidate (and so
+   * never cancels) stale actions. The issue authorization fields are returned
+   * so the route can apply the same per-issue visibility filter.
+   */
+  async function listForCompany(
+    companyId: string,
+    input: { statuses: readonly IssueRecoveryActionStatus[]; limit: number },
+  ) {
+    const rows = await db
+      .select({
+        action: issueRecoveryActions,
+        issue: {
+          id: issues.id,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          title: issues.title,
+          status: issues.status,
+          projectId: issues.projectId,
+          parentId: issues.parentId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+        },
+      })
+      .from(issueRecoveryActions)
+      .innerJoin(
+        issues,
+        and(eq(issues.id, issueRecoveryActions.sourceIssueId), eq(issues.companyId, issueRecoveryActions.companyId)),
+      )
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          inArray(issueRecoveryActions.status, [...input.statuses]),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.createdAt), desc(issueRecoveryActions.id))
+      .limit(input.limit);
+    const actions = rows.map((row) => toReadModel(row.action));
+    await projectNativeRunActivity(companyId, actions, db);
+    return rows.map((row, index) => ({ action: actions[index]!, issue: row.issue }));
   }
 
   async function retryUpsertSourceScoped(
@@ -570,6 +613,7 @@ export function issueRecoveryActionService(db: Db) {
   return {
     getActiveForIssue,
     listActiveForIssues,
+    listForCompany,
     resolveActiveForIssue,
     upsertSourceScoped,
   };

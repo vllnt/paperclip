@@ -22,6 +22,7 @@ export { budgetIncidents } from "./budget_incidents.js";
 export { agentConfigRevisions } from "./agent_config_revisions.js";
 export { agentApiKeys } from "./agent_api_keys.js";
 export { agentRuntimeState } from "./agent_runtime_state.js";
+export { agentHarnessCooldowns } from "./agent_harness_cooldowns.js";
 export { agentTaskSessions, agentSessionGoalActions } from "./agent_task_sessions.js";
 export { agentWakeupRequests } from "./agent_wakeup_requests.js";
 export { projects } from "./projects.js";
@@ -32,6 +33,8 @@ export { executionWorkspaces } from "./execution_workspaces.js";
 export { executionWorkspaceRuntimeLeases } from "./execution_workspace_runtime_leases.js";
 export { environments } from "./environments.js";
 export { environmentLeases } from "./environment_leases.js";
+export { resourceCapacityTargets } from "./resource_capacity_targets.js";
+export { resourceCapacitySamples } from "./resource_capacity_samples.js";
 export { environmentCustomImageTemplates } from "./environment_custom_image_templates.js";
 export { environmentCustomImageSetupSessions } from "./environment_custom_image_setup_sessions.js";
 export { adapterAuthSessions, ADAPTER_AUTH_SESSION_ACTIVE_STATES } from "./adapter_auth_sessions.js";
@@ -63,7 +66,8 @@ export {
   chatSdkState,
 } from "./chat_channels.js";
 export { issueRelations } from "./issue_relations.js";
-export { routines, routineRevisions, routineTriggers, routineWebhookTestReceipts, routineRuns } from "./routines.js";
+export { routines, routineRevisions, routineTriggers, routineWebhookTestReceipts, routineRuns, routineEventGroups } from "./routines.js";
+export { eventSources, eventDeliveries } from "./event_sources.js";
 export { pipelines, pipelineStages, pipelineTransitions } from "./pipelines.js";
 export {
   cases,
@@ -138,6 +142,8 @@ export { statusDecisionEffects } from "./status_decision_effects.js";
 export { heartbeatRunWatchdogDecisions } from "./heartbeat_run_watchdog_decisions.js";
 export { smokeRuns, smokeRunSteps } from "./smoke_lab.js";
 export { costEvents } from "./cost_events.js";
+export { runUsageRecords } from "./run_usage_records.js";
+export type { RunUsageFootprintSource } from "./run_usage_records.js";
 export { financeEvents } from "./finance_events.js";
 export { approvals } from "./approvals.js";
 export { approvalComments } from "./approval_comments.js";
@@ -219,3 +225,6 @@ export { companyBrowserSettings, browserProfiles, browserProfileAgents } from ".
 
 
 export * from "./company_skill_sources.js";
+
+export { issueDuplicatePairs } from "./issue_duplicate_pairs.js";
+export { judgeUsageDaily } from "./judge_usage_daily.js";

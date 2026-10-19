@@ -93,6 +93,26 @@ Each `changes` entry has `from` and `to` values. Requested no-ops are omitted, s
 
 Receipt values for `description` are limited to the first 200 characters and include `updated: true`. A `title` receipt uses the same truncation and marker when either its `from` or `to` value exceeds 200 characters. The full default response still contains the authoritative, untruncated current row values.
 
+### Blocked issues and unblock owners
+
+An issue enters `blocked` with unresolved `blockedByIssueIds`, a pending interaction or approval, or an
+`unblockDescriptor` that names who must act and what they must do:
+
+```json
+{ "status": "blocked", "unblockDescriptor": { "owner": "board", "action": "Click Update branch on PR #123" } }
+```
+
+- `owner` is `"board"`, `{ "userId": "..." }` (an active company member) or `{ "agentId": "..." }` (a company
+  agent).
+- A board- or user-owned block appears in the board inbox once per blocked transition. An agent owner is woken.
+  When an agent hands an issue that is already blocked to the board or a user, that counts as a new blocked
+  transition, so the inbox item appears then.
+- Agents may name themselves or `"board"`. They may not name a specific user or another agent (`403`).
+- When the board or a user owns the block, an agent may not move the issue out of `blocked` or change or clear
+  its `unblockDescriptor` (`403`). A board user unblocks it. This holds for every route that changes the status,
+  including a comment with `resume` or `reopen` (`POST /api/issues/{id}/comments`): the agent gets `403` and the
+  comment is not posted.
+
 When the request includes `blockedByIssueIds`, the response also includes:
 
 - top-level `blockedByIssueIds`, echoing the normalized committed ID array
@@ -123,6 +143,28 @@ The server sets `Preference-Applied: return=minimal` and returns exactly:
 ```
 
 **The PATCH response is the authoritative post-write state. A confirming GET after a 2xx PATCH is unnecessary.**
+
+## Per-Issue Adapter Overrides
+
+`assigneeAdapterOverrides` on create and update changes how the issue's assignee runs for this issue only:
+
+```
+PATCH /api/issues/{issueId}
+{
+  "assigneeAdapterOverrides": {
+    "adapterConfig": { "model": "gpt-5", "effort": "high" },
+    "useProjectWorkspace": true
+  }
+}
+```
+
+- `adapterConfig` keys replace the same top-level keys of the agent's adapter config for runs on this issue.
+  Nested objects are replaced whole, not merged.
+- The overrides apply only while the running agent is the issue's assignee.
+- Send `null` to clear them. Unknown keys return `400`.
+- Authorization is the same as any issue update; host workspace commands inside the overrides are subject to
+  the same checks as on an agent's own config.
+- CLI: `paperclipai issue update <id> --adapter-overrides-json '<json>'` (see the CLI docs).
 
 ## Checkout (Claim Task)
 
@@ -326,6 +368,122 @@ GET /api/attachments/{attachmentId}/content
 DELETE /api/attachments/{attachmentId}
 ```
 
+## Git Panel and Pull Request Links
+
+Each issue has a branch name to copy and a list of the pull requests linked to it. See [Issue git links](../../doc/ISSUE-GIT-LINKS.md) for how pull requests link themselves and when status changes.
+
+```
+GET /api/issues/{issueId}/git
+```
+
+`issueId` can be the UUID or the identifier, such as `PAP-123`. The response has:
+
+- `branch`: `name`, `command` (`git switch -c <name>`), `template`, and `source` (`default`, `project_template`, `issue_template`, or `existing_branch`). The name is the one an agent workspace creates for the same issue.
+- `pullRequests`: one entry for each linked pull request with `workProductId`, `repository`, `number`, `url`, `title`, `state` (`open`, `draft`, `merged`, or `closed`), `closes`, `verified`, `linkedBy`, and `automation` (`applied`, `deferred`, `suspended`).
+- `statusAutomation.enabled`: whether a linked pull request can change the issue status.
+
+```
+POST /api/issues/{issueId}/git/pull-requests
+```
+
+Link a pull request by hand. Send either a github.com `url`, or a `repository` (`owner/name`) and a `number`. Add `"closes": false` to link it without letting a merge complete the issue. Returns `201` for a new link and `200` when the pull request was already linked. A board user with access to the company can link on any issue. An agent can link only on an issue assigned to that agent.
+
+```
+DELETE /api/issues/{issueId}/git/pull-requests/{workProductId}
+```
+
+Unlink a pull request. Automatic matching does not link it again. Link it by hand to undo. Returns `204`.
+
+## Recovery Actions
+
+A recovery action records a stuck or failed issue that needs a decision (for
+example a stranded assignment or an exhausted automatic retry).
+
+### List For One Issue
+
+```
+GET /api/issues/{issueId}/recovery-actions
+```
+
+Returns `{ active, actions }` for the issue's open action. This read re-checks
+the action against the issue and may cancel it when it no longer applies.
+
+### List Across A Company
+
+```
+GET /api/companies/{companyId}/recovery-actions?status=active,escalated&limit=50
+```
+
+Returns an array of recovery actions, newest first, each with its source issue:
+`{ ...action, issue: { id, identifier, title, status } }`.
+
+| Query | Default | Values |
+|-------|---------|--------|
+| `status` | `active,escalated` (open actions) | Comma-separated: `active`, `escalated`, `resolved`, `cancelled` |
+| `limit` | `50` | Integer `1`-`200` |
+
+An unknown status or an out-of-range limit returns `400`. The read is
+read-only: it does not re-check or cancel stale actions.
+
+Authorization matches the per-issue read. The actor needs access to the company
+(another company's actor gets `403`). An actor without company-wide read, such
+as a scoped low-trust agent, only sees actions whose source issue it can read;
+the limit applies before that filter, so such an actor can receive fewer rows
+than `limit`.
+
+### Resolve
+
+```
+POST /api/issues/{issueId}/recovery-actions/resolve
+{
+  "outcome": "restored",
+  "sourceIssueStatus": "todo",
+  "actionId": "{optional action id}",
+  "resolutionNote": "optional",
+  "executionReconciliation": {
+    "runId": "{run id}",
+    "providerStopped": true,
+    "actionOutcome": "completed",
+    "outcomeEvidence": "at least 20 characters of evidence",
+    "workspaceRepairEvidence": "optional, at least 20 characters"
+  }
+}
+```
+
+`executionReconciliation` is board-only and required when the open action is an
+execution recovery (the server asks for it). `actionOutcome` is `completed`,
+`not_performed`, or `mixed`.
+
+## Issue Tree
+
+```
+GET /api/issues/{issueId}/diagnostics/subtree
+```
+
+Read-only view of an issue and its sub-issues (depth 8, 100 nodes) with the
+blockers, wake requests, and activity that explain a stall. The root and every
+returned node must pass issue-read authorization; hidden nodes are omitted and
+counted in `omittedUnauthorizedNodeCount`.
+
+Each entry of `nodes` has `issue` (status, priority, assignee ids), `parentId`,
+`depth`, `diagnosis`, `blockers`, `wakeEvents`, and `lastRun`:
+
+```json
+"lastRun": {
+  "id": "run-uuid",
+  "status": "failed",
+  "agentId": "agent-uuid",
+  "startedAt": "2026-10-09T10:00:00.000Z",
+  "finishedAt": "2026-10-09T10:04:12.000Z",
+  "createdAt": "2026-10-09T09:59:58.000Z",
+  "errorCode": "process_exit"
+}
+```
+
+`lastRun` is the latest heartbeat run whose context issue is that node, or
+`null` when it never ran. `id` and `agentId` are `null` for actors without
+company-scope read, the same rule as the wake-request run and agent ids.
+
 ## Issue Lifecycle
 
 ```
@@ -338,3 +496,18 @@ backlog -> todo -> in_progress -> in_review -> done
 - `started_at` auto-set on `in_progress`
 - `completed_at` auto-set on `done`
 - Terminal states: `done`, `cancelled`
+
+### Reconcile a stopped execution
+
+`POST /api/issues/{id}/execution/reconcile` is a board-only operator action for an issue blocked by one or more stopped execution holds. It records the observed provider outcome for every stacked hold, clears the no-replay blocker, and queues one fresh continuation for the current assignee.
+
+```json
+{
+  "outcome": "none",
+  "note": "The provider stopped before any external write was made.",
+  "expectedRunId": "<latest-stopped-run-id>",
+  "workspaceRepairNote": "<required when the run reports an unsafe workspace restore>"
+}
+```
+
+`outcome` is `done`, `none`, or `mixed`. The note is retained as recovery evidence; secrets and raw provider transcripts are not accepted. The operation is transactional and returns the reconciled run/action IDs plus the continuation status. A stale expected run, live provider process, unreleased environment lease, or changed issue owner returns `409` without changing any hold.

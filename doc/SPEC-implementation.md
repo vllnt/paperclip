@@ -161,6 +161,7 @@ Invariant: every business record belongs to exactly one company.
 - `adapter_type` text; built-ins include `process`, `http`, `claude_local`, `codex_local`, `gemini_local`, `opencode_local`, `pi_local`, `cursor`, `hermes_local`, `hermes_gateway`, and `openclaw_gateway`
 - `adapter_config` jsonb not null
 - `runtime_config` jsonb not null default `{}`; contains Paperclip runtime policy such as heartbeat scheduling and debug settings
+- `fallbacks` jsonb not null default `[]`; ordered harness/model fallback targets (`adapterType`, `model`, `effort`, `adapterConfig`, `env`), at most 3; see §11.8
 - `default_environment_id` uuid fk `environments.id` null
 - `context_mode` enum: `thin | fat` default `thin`
 - `budget_monthly_cents` int not null default 0
@@ -310,6 +311,8 @@ Invariants:
 - `error` text null
 - `external_run_id` text null
 - `context_snapshot` jsonb null
+- `executed_adapter_type`, `executed_model` text null: the harness and model the run executed
+- `fallback_reason` text null: why a run executed on a fallback target (for example `provider_usage_limit`)
 
 ## 7.9 `cost_events`
 
@@ -1359,6 +1362,19 @@ Per-agent schedule fields in `adapter_config`:
 - `intervalSec` integer (minimum 30)
 - `maxConcurrentRuns` integer; new agents default to `20`; scheduler clamps configured values to `1..50`
 
+Per-agent run limits in `runtime_config.heartbeat`:
+
+- `maxDailyRuns` integer, optional: started runs per agent per UTC day. A legacy run that failed with a provider quota or capacity error (`provider_quota`, classified only from the provider's structured error: Codex's JSONL error event, Claude's result marked `is_error` or its `errors` entries, or an ACP limit failure; never from raw stdout or stderr) before any useful action is not counted, up to `providerQuotaRetry.maxDailyUncountedRuns` (default `48`, clamped `0..1000`) per day. "Before any useful action" means the model returned no output tokens and the run created no issue comment, document revision, work product, non-bookkeeping activity, or run event other than lifecycle, adapter invocation, and error records (any tool or action event counts as useful action). Failures beyond the allowance count again, so the cap still bounds a permanent outage. The day's first failure beyond the allowance writes a `heartbeat.provider_quota_cap_exemption_exhausted` activity entry on the agent.
+- `providerQuotaRetry.maxAttempts` (default `8`, clamped `0..50`) and `providerQuotaRetry.windowMinutes` (default `120`, clamped `0..1440`): such a failure is retried with exponential backoff (1, 2, 4 … minutes, capped at 30, ±20% jitter) while both bounds hold, measured from the chain's first failure. After that the chain keeps one retry per hour until a run succeeds, a retry gate refuses it (for example the issue was reassigned or closed), the daily run cap cancels it, or the chain reaches its ceiling. Adapters without conversation continuation keep the existing reconciliation hold after two failure retries.
+- `providerQuotaRetry.maxTotalAttempts` (default `24`, clamped `0..500`) and `providerQuotaRetry.maxRetryHours` (default `24`, clamped `0..168`): the hard ceiling of one chain, whichever comes first, independent of `maxDailyRuns`. `maxTotalAttempts` counts retries, so the chain makes at most `maxTotalAttempts + 1` runs. At the ceiling the lane stops and, in one transaction, the issue gets one `heartbeat.provider_quota_exhausted` activity entry and a `todo`, `in_progress` or `in_review` issue moves to `blocked` with an unblock reason (owner `board`); a system comment follows.
+- Per company and provider (the agent's adapter type and configured model), at most one such retry probes at a time: the retry of the oldest chain. Other due retries wait until one base delay (1 minute) after the probe's next attempt (re-checked at least hourly), or after a probe that is still queued or running. When a probe succeeds, every waiting retry is released. A waiting retry that would pass its chain's ceiling is cancelled (`provider_quota_exhausted`, with no immediate recovery run) and its issue is stopped as above. An operator "retry now" is not held back; it exempts only the retry it was requested for, not later retries of the chain.
+- Lane quota state: a provider lane (company, adapter type and configured model) is in quota state while its latest provider outcome (a succeeded, failed or timed-out legacy run of any agent on the lane) is a `provider_quota` failure; any other outcome ends it. While a lane is in quota state, one run probes at a time, checked when a run is claimed: a lane chain's retry when nothing else is in flight, or any other run (a new assignment, a comment, a retry without a lane key) only when no lane retry is waiting and the lane backoff has passed (1, 2, 4 … minutes after the latest quota failure, counted over failed probes, up to 30, then hourly). Every other run of the lane stays `queued`, spends no retry, and gets one "Waiting on provider capacity" run event. When a probe succeeds, the queued runs start through each agent's `maxConcurrentRuns`; there is no other stagger. Every retry of a `provider_quota` failure carries the lane key, including retries on the default budget after useful action. An operator "retry now" is not held back.
+- A provider reset time (`retryNotBefore`) later than the ceiling still schedules that one retry at the reset time; the chain ends at its next failure.
+- The recovery service's hourly `provider_quota_recovery` wait monitor (for quota failures after useful action, or with the lane disabled) is not part of this lane: it is neither coalesced nor bounded by these ceilings.
+- `providerQuotaRetry.enabled` (default `true`): `false` restores the default transient retry budget and counts every quota failure toward `maxDailyRuns`.
+
+Other failure classes keep the default bounded transient retry budget and count toward `maxDailyRuns`.
+
 Scheduler must skip invocation when:
 
 - agent is paused/terminated
@@ -1369,6 +1385,38 @@ Legacy execution records a renewable controller lease when claiming a queued run
 before provisioning. A live lease protects the run during overlapping service
 deployments. An expired controller loses dispatch authority; a recovery worker
 must establish that the previous execution stopped before starting a successor.
+
+## 11.8 Provider quota cooldowns and harness fallbacks
+
+A legacy run that fails with a provider usage limit before useful work (no
+comment, document, work product, non-bookkeeping activity or output tokens)
+cools down the harness/model that ran (`agent_harness_cooldowns`, keyed by
+`<adapterType>:<model>`). A capacity failure does the same once its bounded
+retries are spent. Auth failures, task failures and refusals never do. The
+server treats quota wording (for example a credential proxy's
+`All credentials for model … are cooling down`) as `provider_quota` even when
+an adapter reports it as transient.
+
+The cooldown ends at the provider reset when the error or adapter names one,
+otherwise after a backoff that starts at 5 minutes and doubles while failures
+repeat, up to `runtime_config.heartbeat.quotaBackoffMaxMinutes` (default 60).
+
+- With a healthy entry in `agents.fallbacks`, the failed wake is re-dispatched
+  once on it (`harness_fallback` scheduled retry). The failed run and its
+  re-dispatch count as one run toward `maxDailyRuns`. A fallback run that
+  fails is not re-dispatched again.
+- Later runs claim the first healthy target in order. When every target is
+  cooling down, queued runs stay queued and every scheduled retry is due no
+  earlier than the first recovery. No run executes the same harness and model
+  again before its cooldown ends.
+- A run on a different harness than the agent's previous run on the issue
+  starts a fresh session with the continuation summary.
+- Harness/model compatibility: `claude_local` runs Anthropic models only,
+  `codex_local` OpenAI and xAI models, `grok_local` xAI models. No non-Claude
+  harness runs an Anthropic model id, including through `extraArgs`. Config
+  writes and run start both enforce this (`harness_model_incompatible`).
+- An agent changing its own `fallbacks` or `quotaBackoffMaxMinutes` needs
+  `agents:configure` for itself.
 
 ## 11.7 Durable agent session goals
 
@@ -1723,6 +1771,9 @@ turns keep the Steer label. Steer and Interrupt immediately move the submitted
 messages from the composer queue into the conversation while delivery proceeds.
 Provider acknowledgement remains authoritative; failed delivery restores the
 latest queue with an inline error. Neither action produces a toast.
+A legacy `claude_local` CLI run whose process takes live input also offers Steer.
+That steer stays queued as "Steer pending" until Claude Code reports that the
+message started, and returns to the queue if the run ends first.
 
 ### Managed AI authentication
 

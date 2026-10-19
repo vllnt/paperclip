@@ -1,11 +1,14 @@
 import { Command } from "commander";
+import { planCodexToGrokSwitch } from "@paperclipai/adapter-grok-local";
 import {
+  agentFallbacksSchema,
   agentSkillSyncSchema,
   createAgentSchema,
   resetAgentSessionSchema,
   updateAgentInstructionsBundleSchema,
   updateAgentInstructionsPathSchema,
   updateAgentPermissionsSchema,
+  updateAgentMergePatchSchema,
   updateAgentSchema,
   upsertAgentInstructionsFileSchema,
   wakeAgentSchema,
@@ -17,6 +20,7 @@ import {
   removeMaintainerOnlySkillSymlinks,
   resolvePaperclipSkillsDir,
 } from "@paperclipai/adapter-utils/server-utils";
+import { buildAgentConfigMergePatch, readConfigPath } from "./agent-config.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -30,6 +34,7 @@ import {
   resolveCommandContext,
   type BaseClientOptions,
 } from "./common.js";
+import { diffConfigRevision, formatConfigRevisionDiff } from "./config-diff.js";
 
 interface AgentListOptions extends BaseClientOptions {
   companyId?: string;
@@ -54,6 +59,15 @@ interface AgentWakeOptions extends BaseClientOptions {
   payload?: string;
   idempotencyKey?: string;
   forceFreshSession?: boolean;
+}
+
+interface AgentFallbacksSetOptions extends BaseClientOptions {
+  fallbacksJson: string;
+}
+
+interface AgentSetAdapterOptions extends BaseClientOptions {
+  dryRun?: boolean;
+  xaiBaseUrl?: string;
 }
 
 interface AgentJsonPayloadOptions extends BaseClientOptions {
@@ -382,15 +396,162 @@ export function registerAgentCommands(program: Command): void {
   addCommonClientOptions(
     agent
       .command("update")
-      .description("Update an agent from a JSON payload")
+      .description("Update an agent from a JSON payload (runtimeConfig.runContext sets the run-context policy)")
       .argument("<agentId>", "Agent ID")
       .requiredOption("--payload-json <json>", "UpdateAgent JSON payload")
       .action(async (agentId: string, opts: AgentJsonPayloadOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
-          const payload = updateAgentSchema.parse(parseJson(opts.payloadJson));
+          const body = parseJson(opts.payloadJson);
+          const mergeMode = typeof body === "object" && body !== null && "mergeConfig" in body && body.mergeConfig === true;
+          const payload = (mergeMode ? updateAgentMergePatchSchema : updateAgentSchema).parse(body);
           const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, payload);
           printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  const config = agent
+    .command("config")
+    .description("Read or change one agent config value without resending the rest (secrets stay untouched)");
+
+  addCommonClientOptions(
+    config
+      .command("get")
+      .description("Print adapterConfig and runtimeConfig, or one dotted path (secrets stay redacted)")
+      .argument("<agentId>", "Agent ID")
+      .argument("[path]", "Dotted path, e.g. runtimeConfig.heartbeat")
+      .action(async (agentId: string, configPath: string | undefined, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const row = await ctx.api.get<Agent>(apiPath`/api/agents/${agentId}`);
+          const value = readConfigPath({ ...row }, configPath);
+          printOutput(value === undefined ? null : value, { json: true });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    config
+      .command("set")
+      .description(
+        "Merge config changes into an agent: path=value pairs (values parse as JSON, otherwise as text). " +
+          "Only the named keys change.",
+      )
+      .argument("<agentId>", "Agent ID")
+      .argument("[assignments...]", "e.g. runtimeConfig.heartbeat.maxDailyRuns=64 adapterConfig.model=gpt-5")
+      .option("--unset <path...>", "Remove these dotted paths, e.g. adapterConfig.env.DEBUG")
+      .option("--dry-run", "Print the merge patch without sending it")
+      .action(
+        async (
+          agentId: string,
+          assignments: string[],
+          opts: BaseClientOptions & { unset?: string[]; dryRun?: boolean },
+        ) => {
+          try {
+            const body = { mergeConfig: true as const, ...buildAgentConfigMergePatch(assignments, opts.unset ?? []) };
+            if (opts.dryRun) {
+              printOutput(body, { json: true });
+              return;
+            }
+            const ctx = resolveCommandContext(opts);
+            const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, body);
+            printOutput(updated, { json: ctx.json });
+          } catch (err) {
+            handleCommandError(err);
+          }
+        },
+      ),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("fallbacks:set")
+      .description(
+        "Set an agent's ordered harness/model fallback chain. Env values that hold credentials must be secret references.",
+      )
+      .argument("<agentId>", "Agent ID")
+      .requiredOption(
+        "--fallbacks-json <json>",
+        'Fallback entries, for example [{"adapterType":"codex_local","model":"gpt-5.5","effort":"high","env":{"OPENAI_API_KEY":{"type":"secret_ref","secretId":"<id>"}}}]',
+      )
+      .action(async (agentId: string, opts: AgentFallbacksSetOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const fallbacks = agentFallbacksSchema.parse(parseJson(opts.fallbacksJson));
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, { fallbacks });
+          printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("fallbacks:clear")
+      .description("Remove an agent's fallback chain; runs use only the primary harness and model")
+      .argument("<agentId>", "Agent ID")
+      .action(async (agentId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, { fallbacks: [] });
+          printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("cooldowns:clear")
+      .description("Clear an agent's provider quota cooldowns so its next run may use any harness and model")
+      .argument("<agentId>", "Agent ID")
+      .action(async (agentId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const result = await ctx.api.post(apiPath`/api/agents/${agentId}/harness-cooldowns/clear`, {});
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("set-adapter")
+      .description(
+        "Move a codex_local agent that runs a Grok model onto grok_local, keeping its model, instructions, working directory and skills",
+      )
+      .argument("<agentId>", "Agent ID")
+      .argument("<adapterType>", "Target adapter; only grok_local is supported")
+      .option("--dry-run", "Print the planned change without applying it")
+      .option(
+        "--xai-base-url <url>",
+        "Gateway URL for GROK_XAI_API_BASE_URL. The API hides the agent's OPENAI_BASE_URL, so pass it here",
+      )
+      .action(async (agentId: string, adapterType: string, opts: AgentSetAdapterOptions) => {
+        try {
+          if (adapterType !== "grok_local") {
+            throw new Error(`set-adapter supports only grok_local; got "${adapterType}". Use the agent update API for other changes.`);
+          }
+          const ctx = resolveCommandContext(opts);
+          const row = await ctx.api.get<Agent>(apiPath`/api/agents/${agentId}`);
+          if (!row) throw new Error(`Agent ${agentId} not found`);
+          const plan = planCodexToGrokSwitch(row, { xaiBaseUrl: opts.xaiBaseUrl });
+          if (!plan.ok) throw new Error(plan.message);
+          if (opts.dryRun) {
+            printOutput({ dryRun: true, patch: plan.patch, changes: plan.changes, warnings: plan.warnings }, { json: ctx.json });
+            return;
+          }
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, plan.patch);
+          printOutput({ agent: updated, changes: plan.changes, warnings: plan.warnings }, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }
@@ -420,7 +581,6 @@ export function registerAgentCommands(program: Command): void {
     ["resume", "resume", "Resume an agent"],
     ["approve", "approve", "Approve a pending agent"],
     ["terminate", "terminate", "Terminate an agent"],
-    ["heartbeat:invoke", "heartbeat/invoke", "Invoke an agent heartbeat"],
     ["claude-login", "claude-login", "Trigger Claude login for an agent"],
   ] as const) {
     addCommonClientOptions(
@@ -439,6 +599,24 @@ export function registerAgentCommands(program: Command): void {
         }),
     );
   }
+
+  addCommonClientOptions(
+    agent
+      .command("heartbeat:invoke")
+      .description("Invoke an agent heartbeat, optionally for one assigned issue")
+      .argument("<agentId>", "Agent ID")
+      .option("--issue <issueId>", "Wake the agent for this issue (sends payload.issueId)")
+      .action(async (agentId: string, opts: BaseClientOptions & { issue?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const body = opts.issue ? { payload: { issueId: opts.issue } } : {};
+          const result = await ctx.api.post(`${apiPath`/api/agents/${agentId}`}/heartbeat/invoke`, body);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
 
   addCommonClientOptions(
     agent
@@ -501,6 +679,30 @@ export function registerAgentCommands(program: Command): void {
           const ctx = resolveCommandContext(opts);
           const result = await ctx.api.get(apiPath`/api/agents/${agentId}/config-revisions/${revisionId}`);
           printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("config-revision:diff")
+      .description("Show what one agent config revision changed (redacted values stay redacted)")
+      .argument("<agentId>", "Agent ID")
+      .argument("<revisionId>", "Revision ID")
+      .action(async (agentId: string, revisionId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const revision = await ctx.api.get<Record<string, unknown>>(
+            apiPath`/api/agents/${agentId}/config-revisions/${revisionId}`,
+          );
+          const diff = diffConfigRevision(revision ?? {});
+          if (ctx.json) {
+            printOutput(diff, { json: true });
+            return;
+          }
+          for (const line of formatConfigRevisionDiff(diff)) console.log(line);
         } catch (err) {
           handleCommandError(err);
         }

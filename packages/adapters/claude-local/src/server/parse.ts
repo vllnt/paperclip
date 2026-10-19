@@ -6,6 +6,7 @@ import {
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
+import { isProviderQuotaMessage, parseProviderQuotaResetAt } from "@paperclipai/adapter-utils/provider-quota";
 
 // The legacy login-prompt markers. The Claude CLI prints these words when it
 // asks the user to log in. The detector matches them against the parsed result
@@ -58,6 +59,12 @@ export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
+  // A run that takes a mid-run message as a follow-up turn emits one result
+  // per turn. `total_cost_usd` and `modelUsage` are cumulative for the
+  // process, so the last result carries the totals; top-level `usage` is
+  // per turn and must be summed.
+  const turnUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+  const resultTexts: string[] = [];
   const assistantTexts: string[] = [];
 
   for (const rawLine of stdout.split(/\r?\n/)) {
@@ -91,6 +98,12 @@ export function parseClaudeStreamJson(stdout: string) {
     if (type === "result") {
       finalResult = event;
       sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
+      const usageObj = parseObject(event.usage);
+      turnUsage.inputTokens += asNumber(usageObj.input_tokens, 0);
+      turnUsage.cachedInputTokens += asNumber(usageObj.cache_read_input_tokens, 0);
+      turnUsage.outputTokens += asNumber(usageObj.output_tokens, 0);
+      const resultText = asString(event.result, "").trim();
+      if (resultText) resultTexts.push(resultText);
     }
   }
 
@@ -106,16 +119,12 @@ export function parseClaudeStreamJson(stdout: string) {
     };
   }
 
-  const modelUsageTotals = claudeModelUsageTotals(finalResult.modelUsage);
-  const usageObj = parseObject(finalResult.usage);
-  const usage: UsageSummary = modelUsageTotals ?? {
-    inputTokens: asNumber(usageObj.input_tokens, 0),
-    cachedInputTokens: asNumber(usageObj.cache_read_input_tokens, 0),
-    outputTokens: asNumber(usageObj.output_tokens, 0),
-  };
+  const usage: UsageSummary = claudeModelUsageTotals(finalResult.modelUsage) ?? turnUsage;
   const costRaw = finalResult.total_cost_usd;
   const costUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
-  const summary = asString(finalResult.result, assistantTexts.join("\n\n")).trim();
+  const summary = typeof finalResult.result === "string"
+    ? resultTexts.join("\n\n")
+    : assistantTexts.join("\n\n").trim();
 
   return {
     sessionId,
@@ -520,8 +529,9 @@ export function extractClaudeRetryNotBefore(
 ): Date | null {
   const haystack = buildClaudeTransientHaystack(input);
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
-  if (!match) return null;
-  return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
+  const clockReset = match ? parseClaudeResetClockTime(match[1] ?? "", now, match[2]) : null;
+  if (clockReset) return clockReset;
+  return isProviderQuotaMessage(haystack) ? parseProviderQuotaResetAt(haystack, now) : null;
 }
 
 export function isClaudeTransientUpstreamError(input: {
@@ -548,24 +558,29 @@ export function isClaudeTransientUpstreamError(input: {
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
 
+/**
+ * Classifies a provider quota failure from structured provider errors only:
+ * the `result` text of a terminal result event that Claude marked
+ * `is_error`, its `errors` entries, and a caller-supplied structured message
+ * such as an ACP failure title. Raw stdout and stderr are not read, because a
+ * task's tools can print any text there.
+ *
+ * @param input.parsed Claude's terminal result event.
+ * @param input.errorMessage A structured provider message, never process output.
+ * @returns True when Claude reported a usage or session limit.
+ */
 export function isClaudeProviderQuotaError(input: {
   parsed?: Record<string, unknown> | null;
-  stdout?: string | null;
-  stderr?: string | null;
   errorMessage?: string | null;
 }): boolean {
   const parsed = input.parsed ?? null;
   if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
     return false;
   }
-  const loginMeta = detectClaudeLoginRequired({
-    parsed,
-    stdout: input.stdout ?? "",
-    stderr: input.stderr ?? "",
-  });
-  if (loginMeta.requiresLogin) return false;
+  if (detectClaudeLoginRequired({ parsed, stdout: "", stderr: "" }).requiresLogin) return false;
 
-  const haystack = buildClaudeTransientHaystack(input);
+  const errorFields = parsed && parsed.is_error !== true ? { errors: parsed.errors } : parsed;
+  const haystack = buildClaudeTransientHaystack({ errorMessage: input.errorMessage, parsed: errorFields });
   if (!haystack) return false;
-  return CLAUDE_PROVIDER_QUOTA_RE.test(haystack);
+  return CLAUDE_PROVIDER_QUOTA_RE.test(haystack) || isProviderQuotaMessage(haystack);
 }

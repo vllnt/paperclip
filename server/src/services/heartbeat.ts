@@ -1,6 +1,27 @@
-import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
+import { RUN_CONTEXT_DEFAULTS, resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
+import { issueIdEqualsText } from "./issue-id-match.js";
+import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
+import {
+  agentEnvBindingPrefix,
+  COOLDOWN_READ_FAILURE_BASE_MS,
+  HARNESS_FALLBACK_RETRY_REASON,
+  HARNESS_FALLBACK_WAKE_REASON,
+  applyClaimedHarnessDispatch,
+  checkRunHarnessCompatibility,
+  classifyQuotaFailure,
+  harnessFallbackService,
+  isLlmHarnessAdapterType,
+  overridesForHarnessTarget,
+  primaryHarnessDispatch,
+  readAgentFallbacks,
+  readClaimedHarnessDispatch,
+  reclassifyProviderQuotaResult,
+  profileUnavailableReason,
+  type HarnessDispatch,
+  type ProfileTargetInput,
+} from "./harness-fallback.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
 
@@ -16,7 +37,8 @@ import {
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
+import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
@@ -26,9 +48,10 @@ import { isBrowserUseConnection } from "./browser-use-client.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { AGENT_CHAT_DIRECTIVE, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
+import { runWithPaperclipTempRun } from "@paperclipai/adapter-utils/paperclip-temp";
 import { getConversationConfirmationContext, type ConversationConfirmationContext } from "./conversation-confirmation-context.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
-import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
+import { hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
 import { legacyControllerBootId, legacyControllerClaim, renewLegacyControllerLease, hasLiveLegacyController, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
 import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "./remote-execution-termination.js";
@@ -37,8 +60,16 @@ import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import {
+  HARNESS_FALLBACK_ADAPTER_TYPES,
+  aiConnectionBindingSchema,
+  issueRunProfileFromOverrides,
+  resolveRunProfile,
+  runProfileSchema,
+  type RunProfile,
+} from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { selectInCommentBatches } from "./comment-id-batches.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -56,6 +87,11 @@ import {
   registerAdapterExecutionControl,
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
+import {
+  acknowledgeAdapterSteering,
+  clearAdapterSteering,
+  setAdapterSteeringHandle,
+} from "./adapter-steering.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
@@ -63,7 +99,7 @@ import { buildExecutionContinuation, StaleExecutionContinuationError } from "./e
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
-import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { captureDirectorySnapshot, classifyWorkspaceRestoreFailure, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
 import {
   assertDurableChatWakeupReceipt,
@@ -75,8 +111,15 @@ import {
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
 import {
+  cleanupHeartbeatRemoteRunTemp,
+  prepareHeartbeatRemoteRunTemp,
+  type HeartbeatRemoteRunTemp,
+} from "./heartbeat-remote-run-temp.js";
+import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
+  REMOTE_PREFLIGHT_UNAVAILABLE_CODE,
+  RemotePreflightUnavailableError,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { agentService } from "./agents.js";
@@ -106,6 +149,7 @@ import {
   notInArray,
   or,
   sql,
+  type SQL,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -116,6 +160,7 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  ISSUE_WAIT_MONITOR_MAX_ATTEMPTS,
   envBindingSchema,
   isEnvironmentDriverSupportedForAdapter,
   isToolConnectionAttentionHealth,
@@ -171,6 +216,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  issueTreeHolds,
   issues,
   issueWorkProducts,
   nativeRunFinalizations,
@@ -188,7 +234,7 @@ import {
   toolProfiles,
   workspaceOperations,
 } from "@paperclipai/db";
-import { conflict, HttpError, notFound } from "../errors.js";
+import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isUniqueViolation } from "../db-errors.js";
 import {
   decideIssueAssignmentWakeRefusal,
@@ -267,6 +313,7 @@ import {
   readNativeWorkspaceSyncReference,
   recordNativeFinalizationFailure,
   type NativeRestartRecoveryClaim,
+  type NativeRuntimeResolution,
   rebindNativeSessionCheckpoint,
   reconcileNativeFinalizations,
   reconcileRetainedNativeSessionCleanup,
@@ -376,6 +423,7 @@ import {
 } from "./heartbeat-run-summary.js";
 import {
   buildHeartbeatRunStopMetadata,
+  isSuccessfulRunWithStoppedBackgroundTask,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
@@ -390,6 +438,7 @@ import {
 } from "./chat-control-recovery-stop.js";
 import {
   classifyRunLiveness,
+  hasConcreteActionEvidence,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import {
@@ -402,7 +451,9 @@ import {
 } from "./issue-rewake-throttle.js";
 import {
   logActivity,
+  publishActivity,
   publishPluginDomainEvent,
+  type ActivityPublication,
   type LogActivityInput,
 } from "./activity-log.js";
 import {
@@ -429,7 +480,12 @@ import {
   readManagedWorktreeInstanceOwnership,
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
-import { issueService } from "./issues.js";
+import {
+  executeIssuePostCommitActions,
+  issueService,
+  type IssuePostCommitAction,
+} from "./issues.js";
+import { HEARTBEAT_CHECKOUT_ACTOR } from "./routable-blocked.js";
 import {
   blockRunnerGoalRecovery,
   failRunnerGoalAction,
@@ -445,6 +501,9 @@ import {
 } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
+import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
+import { isRetryableMonitorWakeBlock, monitorWakeRetryDelayMs } from "./issue-monitor-wake-block.js";
+import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
@@ -452,6 +511,7 @@ import {
 } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorRescheduledPatch,
   buildIssueMonitorTriggeredPatch,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -544,10 +604,14 @@ import {
   type StrandedRecoveryNoticeSeed,
 } from "./recovery/stranded-notice.js";
 import { withRecoveryContext } from "./recovery/status-only-context.js";
-import { recoveryService } from "./recovery/service.js";
+import {
+  PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
+  recoveryService,
+} from "./recovery/service.js";
 import {
   createRunDispatch,
   type PostCommitEffect,
+  type RetryAdmissionPolicy,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON,
   AI_CONNECTION_BUSY_RETRY_REASON,
@@ -561,18 +625,27 @@ import {
   isResolvedInteractionContinuationWakeContext,
 } from "../modules/run-dispatch/index.js";
 import {
+  AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
+  AUTOMATION_WAKE_REASON_SET,
+  buildAutomationWakeCoalescedState,
   buildSelfReblockWakeParkedState,
   createWakeQueue,
+  DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+  DEFERRED_WAKE_SWEEP_RECHECK_MS,
   decideSelfReblockWakeLimit,
+  resolveMinSecondsBetweenAutomationWakes,
   deriveSelfReblockWakeMarker,
   isSelfReblockWakeOwner,
   readSelfReblockWakeMarker,
   SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY,
   SELF_REBLOCK_WAKE_PAYLOAD_KEY,
   SELF_REBLOCK_WAKE_WINDOW_MS,
+  selectDeferredWakesToPromote,
   selfReblockWakeWindowStart,
+  sweepPromotionBudget,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
+  type OrphanedDeferredWakeRow,
   type PostCommitEffect as WakeQueuePostCommitEffect,
   type ReleaseRecoveryBlockedNoticeKind,
   type RunSnapshot as WakeQueueRunSnapshot,
@@ -595,7 +668,10 @@ import {
   DIRECT_NON_INVOKABLE_STATUSES,
   type AgentOrgRow,
 } from "./agent-invokability.js";
-import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
+import {
+  isHeartbeatWakeOnDemandEnabled,
+  readAgentAutomationWakeSettings,
+} from "./heartbeat-policy.js";
 import {
   isLowTrustQuarantined,
   redactQuarantinedBodyForHigherTrust,
@@ -607,6 +683,7 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { createRunLogChunkCompactor } from "./run-log-chunk-compactor.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
 import {
   hasSessionCompactionThresholds,
@@ -623,6 +700,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
+import type { DeferredWakeSweepCounters } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { getEnvironmentDriverTraits } from "./environment-driver-traits.js";
@@ -670,9 +748,14 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
+import {
+  drainRunsInParallel,
+  shutdownTerminationGraceMs,
+  stopRunProcessForShutdown,
+  type ShutdownRunOutcome,
+} from "../shutdown.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
-const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
 
@@ -705,6 +788,8 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
+  "agent.harness_fallback_activated",
+  "agent.harness_fallback_returned",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
@@ -802,10 +887,7 @@ function pendingCleanupCapWarnedSql() {
 }
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
-const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_ATTACHMENTS = 20;
-const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
-const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS = 12_000;
 const MAX_AGENT_SESSION_MESSAGE_CHARS = 12_000;
 /** Backs one live receipt per `issue-assignment:<issue>:<assignee>:<generation>` key. */
@@ -856,6 +938,12 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 function isTransientWorkspaceGitScanCode(code: string | null | undefined): boolean {
   return code === WORKSPACE_GIT_SCAN_ERROR_CODES.timeout || code === WORKSPACE_GIT_SCAN_ERROR_CODES.saturated;
 }
+// Pre-dispatch failures that a bounded retry can clear. The issue keeps its
+// status while the scheduled retry is pending; after the budget it is handled
+// like any other non-retryable setup failure.
+export function isTransientSetupFailureCode(code: string | null | undefined): boolean {
+  return isTransientWorkspaceGitScanCode(code) || code === REMOTE_PREFLIGHT_UNAVAILABLE_CODE;
+}
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 export {
@@ -864,6 +952,24 @@ export {
 };
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
+const DEFERRED_WAKE_HELD_ACTION = "heartbeat.deferred_wake_held";
+/** A wake the sweep keeps parked this long after it was requested gets one held activity entry. */
+const DEFERRED_WAKE_HELD_NOTICE_MS = 10 * 60 * 1000;
+type DeferredWakeHeldReason =
+  /** The agent has no free run slot. */
+  | "no_free_run_slot"
+  /** The pass budget ran out, or an older wake of the same issue went first. */
+  | "waiting_for_turn"
+  | "agent_not_invokable"
+  | "budget_stop"
+  | "pause_hold"
+  | "execution_blocker"
+  | "operator_stop"
+  | "admission_deferred";
+// A workspace restore or agent directory lock that no queue progress released
+// in time. Contention clears on its own, so the run is retried under the
+// bounded transient budget instead of ending as a plain `adapter_failed`.
+const WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE = "workspace_restore_lock_timeout";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
@@ -876,6 +982,7 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE =
 const GITHUB_PR_WORKFLOW_SKILL_KEY =
   "paperclipai/bundled/software-development/github-pr-workflow";
 const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
+  "harness_model_incompatible",
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
   "low_trust_boundary_mismatch",
@@ -889,6 +996,7 @@ const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
 // of these codes when a failure happens before `adapter.execute`.
 const PRE_ADAPTER_SETUP_FAILURE_CODES = new Set<string>([
   "setup_failed",
+  REMOTE_PREFLIGHT_UNAVAILABLE_CODE,
   CONFIGURATION_INCOMPLETE_FAILURE_CODE,
   WORKSPACE_VALIDATION_FAILURE_CODE,
   ...NON_RETRYABLE_PREFLIGHT_FAILURE_CODES,
@@ -1116,24 +1224,29 @@ function resolveCodexTransientFallbackMode(
   return "fresh_session_safer_invocation";
 }
 
+/**
+ * The persisted, adapter-set errorCode wins over a family carried in the run
+ * result. Only that errorCode can claim provider_quota, because the family
+ * unlocks the provider-quota retry lane and its cap exemption.
+ */
 function readHeartbeatRunErrorFamily(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
-  const resultJson = parseObject(run.resultJson);
-  const persistedFamily = readNonEmptyString(resultJson.errorFamily);
-  if (persistedFamily) return persistedFamily;
-
   if (run.errorCode === "provider_quota") {
     return "provider_quota";
   }
   if (
     run.errorCode === "codex_transient_upstream" ||
     run.errorCode === "claude_transient_upstream" ||
+    run.errorCode === "grok_transient_upstream" ||
     run.errorCode === "codex_harness_crash"
   ) {
     return "transient_upstream";
   }
-  return null;
+  const persistedFamily = readNonEmptyString(
+    parseObject(run.resultJson).errorFamily,
+  );
+  return persistedFamily === "provider_quota" ? null : persistedFamily;
 }
 
 function isMaxTurnExhaustionRun(
@@ -1316,6 +1429,11 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+
+/** Whether this server process is executing the run now. */
+export function isHeartbeatRunExecuting(runId: string): boolean {
+  return activeRunExecutions.has(runId);
+}
 // A legacy process adapter's signal exit can race the operator cancellation CAS while
 // its owned process group is still being joined. Keep that exit from becoming
 // a successful result (or a competing failure) before Stop settles. This is an
@@ -1439,8 +1557,6 @@ export function getTaskDrainStatus(): {
   };
 }
 
-const INLINE_BASE64_IMAGE_DATA_RE =
-  /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
 type RuntimeConfigSecretResolver = Pick<
   ReturnType<typeof secretService>,
   | "resolveAdapterConfigForRuntime"
@@ -1596,6 +1712,8 @@ export async function resolveExecutionRunAdapterConfig(input: {
   projectId?: string | null;
   routineId?: string | null;
   executionRunConfig: Record<string, unknown>;
+  /** Binding path prefix of the agent's own env; set for a fallback target. */
+  agentEnvPathPrefix?: string;
   projectEnv: unknown;
   routineEnv?: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
@@ -1700,6 +1818,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
             consumerId: input.agentId,
             responsibleUserId: input.responsibleUserId ?? null,
           },
+          { envPathPrefix: input.agentEnvPathPrefix },
         )),
       );
       if (
@@ -1837,7 +1956,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
             : {}),
         }
       : undefined,
-    { adapterType: input.adapterType ?? null },
+    { adapterType: input.adapterType ?? null, envPathPrefix: input.agentEnvPathPrefix },
   );
   if (Object.keys(environmentEnvResolution.env).length > 0) {
     resolvedConfig.env = {
@@ -2026,6 +2145,209 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
     dueAt: new Date(now.getTime() + delayMs),
     maxAttempts: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
   };
+}
+
+// A provider that rejects a turn for capacity (for example Codex "Selected
+// model is at capacity") stays unavailable for minutes to hours. Two 30-second
+// retries land inside the same burst, so a failure before any useful action
+// gets its own backoff and does not spend heartbeat.maxDailyRuns.
+const PROVIDER_QUOTA_RETRY_BASE_DELAY_MS = 60 * 1000;
+const PROVIDER_QUOTA_RETRY_MAX_BACKOFF_DELAY_MS = 30 * 60 * 1000;
+const PROVIDER_QUOTA_RETRY_JITTER_RATIO = 0.2;
+const PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION =
+  "heartbeat.provider_quota_cap_exemption_exhausted";
+const PROVIDER_QUOTA_EXHAUSTED_ACTION = "heartbeat.provider_quota_exhausted";
+
+export interface ProviderQuotaRetryPolicy {
+  /** False restores the default transient retry budget and charges every quota failure. */
+  enabled: boolean;
+  /** Backoff attempts before the chain drops to the hourly recovery cadence. */
+  maxAttempts: number;
+  /** Backoff window measured from the chain's first quota failure. */
+  windowMs: number;
+  /** Hard ceiling: retries in the chain, backoff and hourly phases together. */
+  maxTotalAttempts: number;
+  /** Hard ceiling: no retry is scheduled later than this after the chain's first failure. */
+  maxRetryMs: number;
+  /** Per agent and UTC day: quota failures exempt from maxDailyRuns. Later ones count. */
+  maxDailyUncountedRuns: number;
+}
+
+/**
+ * An agent with a harness fallback chain is gated by its per-target harness
+ * cooldowns, which end at the provider's reset and let one run probe the
+ * primary. The shared provider-quota lane would hold that probe a second time
+ * on its own backoff, and would stretch a capacity failure's retries to its
+ * hours-long ceiling before the chain could take over. The lane applies to
+ * agents without a chain.
+ */
+function usesHarnessFallbackChain(agent: Pick<typeof agents.$inferSelect, "fallbacks">) {
+  return readAgentFallbacks(agent.fallbacks).length > 0;
+}
+
+/**
+ * Groups provider-quota probes: the adapter and its configured model, so a
+ * model at capacity does not hold back agents on another model.
+ */
+function providerQuotaKeyForAgent(
+  agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
+) {
+  const model = readNonEmptyString(parseObject(agent.adapterConfig).model);
+  return model ? `${agent.adapterType}:${model}` : agent.adapterType;
+}
+
+/** One agent's runs in a UTC day, as `computeDailyRunUsage` reads them. */
+interface DailyRunUsage {
+  /** Started runs that are not queued or waiting to retry. */
+  total: number;
+  /** The failed ones among them that hit a provider quota before any useful action. */
+  providerQuotaBeforeUsefulAction: number;
+}
+
+const NO_DAILY_RUNS: DailyRunUsage = { total: 0, providerQuotaBeforeUsefulAction: 0 };
+
+/**
+ * The runs that count toward `maxDailyRuns`. Up to the daily allowance, a
+ * provider quota failure before any useful action is not a run the cap guards
+ * against. Failures beyond the allowance count again, so a permanent outage
+ * still meets the cap. The cap and the run stats both call this, so it is the
+ * one place that applies the allowance.
+ *
+ * @param usage - the agent's raw usage for the day.
+ * @param policy - the agent's heartbeat policy.
+ * @returns the number that the cap compares with `maxDailyRuns`.
+ */
+function countedDailyRuns(
+  usage: DailyRunUsage,
+  policy: { providerQuotaRetry: Pick<ProviderQuotaRetryPolicy, "enabled" | "maxDailyUncountedRuns"> },
+): number {
+  const forgiven = policy.providerQuotaRetry.enabled
+    ? Math.min(usage.providerQuotaBeforeUsefulAction, policy.providerQuotaRetry.maxDailyUncountedRuns)
+    : 0;
+  return usage.total - forgiven;
+}
+
+/** Reads `runtimeConfig.heartbeat.providerQuotaRetry`. */
+function parseProviderQuotaRetryPolicy(value: unknown): ProviderQuotaRetryPolicy {
+  const configured = parseObject(value);
+  const bounded = (raw: unknown, fallback: number, max: number) =>
+    Math.max(0, Math.min(max, Math.floor(asNumber(raw, fallback))));
+  return {
+    enabled: asBoolean(configured.enabled, true),
+    maxAttempts: bounded(configured.maxAttempts, 8, 50),
+    windowMs: bounded(configured.windowMinutes, 120, 24 * 60) * 60 * 1000,
+    maxTotalAttempts: bounded(configured.maxTotalAttempts, 24, 500),
+    maxRetryMs: bounded(configured.maxRetryHours, 24, 7 * 24) * 60 * 60 * 1000,
+    maxDailyUncountedRuns: bounded(configured.maxDailyUncountedRuns, 48, 1000),
+  };
+}
+
+/**
+ * Schedules the next retry after a provider-quota failure that happened
+ * before any useful action. Delays double from one minute up to thirty, with
+ * ±20% jitter, while both the attempt budget and the window that started with
+ * the chain's first failure hold. After that the chain probes at the hourly
+ * quota-recovery cadence until a hard ceiling: `maxTotalAttempts` retries or
+ * `maxRetryMs` after the first failure, whichever comes first.
+ *
+ * @returns The schedule, or null for an invalid attempt number or once the
+ *   next retry would pass either ceiling.
+ */
+export function computeProviderQuotaRetrySchedule(input: {
+  attempt: number;
+  now: Date;
+  chainStartedAt: Date;
+  policy: ProviderQuotaRetryPolicy;
+  random?: () => number;
+}) {
+  const { attempt, now, policy } = input;
+  if (!Number.isInteger(attempt) || attempt <= 0) return null;
+  const backoffDelayMs = Math.min(
+    PROVIDER_QUOTA_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1),
+    PROVIDER_QUOTA_RETRY_MAX_BACKOFF_DELAY_MS,
+  );
+  const phase: "backoff" | "slow" =
+    attempt <= policy.maxAttempts &&
+    now.getTime() + backoffDelayMs <=
+      input.chainStartedAt.getTime() + policy.windowMs
+      ? "backoff"
+      : "slow";
+  const baseDelayMs =
+    phase === "backoff" ? backoffDelayMs : PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS;
+  const sample = Math.min(1, Math.max(0, (input.random ?? Math.random)()));
+  const delayMs = Math.round(
+    baseDelayMs * (1 + (sample * 2 - 1) * PROVIDER_QUOTA_RETRY_JITTER_RATIO),
+  );
+  const dueAt = new Date(now.getTime() + delayMs);
+  if (
+    attempt > policy.maxTotalAttempts ||
+    dueAt.getTime() > input.chainStartedAt.getTime() + policy.maxRetryMs
+  ) {
+    return null;
+  }
+  return {
+    attempt,
+    baseDelayMs,
+    delayMs,
+    dueAt,
+    maxAttempts: policy.maxTotalAttempts,
+    phase,
+  };
+}
+
+/**
+ * How long a provider lane in quota state waits after its latest quota failure
+ * before the next probe: the chain backoff (1, 2, 4 … minutes up to 30, then
+ * the hourly cadence past the backoff window) for probe number
+ * `failedProbes + 1`, without jitter. The per-chain ceilings do not apply: the
+ * lane keeps probing, one run at a time, until the provider answers.
+ *
+ * @returns The delay in milliseconds.
+ */
+export function computeProviderQuotaLaneProbeDelayMs(input: {
+  failedProbes: number;
+  lastFailureAt: Date;
+  stateStartedAt: Date;
+  policy: ProviderQuotaRetryPolicy;
+}) {
+  return (
+    computeProviderQuotaRetrySchedule({
+      attempt: Math.max(0, Math.floor(input.failedProbes)) + 1,
+      now: input.lastFailureAt,
+      chainStartedAt: input.stateStartedAt,
+      policy: {
+        ...input.policy,
+        maxTotalAttempts: Number.MAX_SAFE_INTEGER,
+        maxRetryMs: Number.MAX_SAFE_INTEGER,
+      },
+      random: () => 0.5,
+    })?.baseDelayMs ?? PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS
+  );
+}
+
+/**
+ * The checks that need no database: a failed legacy run in the
+ * provider_quota family whose model returned no output. Native runs are
+ * excluded because native recovery owns their retries.
+ *
+ * @returns True when the run still needs the durable-evidence check.
+ */
+export function isProviderQuotaUsefulActionCandidate(input: {
+  outcome: string;
+  runtimeKind: NativeRuntimeResolution["kind"];
+  outputTokens: number;
+  errorCode: string | null;
+  resultJson: Record<string, unknown> | null;
+}) {
+  return (
+    input.outcome === "failed" &&
+    input.runtimeKind !== "native" &&
+    input.outputTokens === 0 &&
+    readHeartbeatRunErrorFamily({
+      errorCode: input.errorCode,
+      resultJson: input.resultJson,
+    }) === "provider_quota"
+  );
 }
 
 async function resolveRunScopedMentionedSkillKeys(input: {
@@ -3375,6 +3697,10 @@ const heartbeatRunListColumns = {
   stdoutExcerpt: sql<string | null>`NULL`.as("stdoutExcerpt"),
   stderrExcerpt: sql<string | null>`NULL`.as("stderrExcerpt"),
   errorCode: heartbeatRuns.errorCode,
+  executedAdapterType: heartbeatRuns.executedAdapterType,
+  executedModel: heartbeatRuns.executedModel,
+  fallbackReason: heartbeatRuns.fallbackReason,
+  targetSource: sql<string | null>`${heartbeatRuns.runnerProfileJson} -> 'adapterDispatch' ->> 'source'`,
   externalRunId: heartbeatRuns.externalRunId,
   processPid: heartbeatRuns.processPid,
   processGroupId: heartbeatRunProcessGroupIdColumn,
@@ -3754,28 +4080,6 @@ export function boundHeartbeatRunEventPayloadForStorage(
   return parseObject(bounded) ?? { _truncated: true };
 }
 
-function redactInlineBase64ImageData(chunk: string) {
-  return chunk.replace(
-    INLINE_BASE64_IMAGE_DATA_RE,
-    (_match, prefix: string, data: string, suffix: string) =>
-      `${prefix}[omitted base64 image data: ${data.length} chars]${suffix}`,
-  );
-}
-
-export function compactRunLogChunk(
-  chunk: string,
-  maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
-) {
-  const normalized = redactSensitiveText(redactInlineBase64ImageData(chunk));
-  if (normalized.length <= maxChars) return normalized;
-
-  const headChars = Math.max(0, Math.floor(maxChars * 0.6));
-  const tailChars = Math.max(0, Math.floor(maxChars * 0.25));
-  const omittedChars = Math.max(0, normalized.length - headChars - tailChars);
-  const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
-  return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
-}
-
 function normalizeMaxConcurrentRuns(value: unknown) {
   const parsed = Math.floor(
     asNumber(value, HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT),
@@ -3820,6 +4124,14 @@ interface WakeupOptions {
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
+  /**
+   * Internal. With `executionWaitRequestId`, this call re-drives that parked
+   * `deferred_issue_execution` receipt because no run is left to promote it.
+   * Admission runs every gate again under the issue lock and consumes the
+   * receipt together with its successor run, or leaves it parked untouched.
+   * Only the deferred-wake sweep sets it; no route or payload can.
+   */
+  redeliverDeferredWake?: boolean;
 }
 
 type UsageTotals = {
@@ -3838,6 +4150,7 @@ type SessionCompactionDecision = {
 interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
   useProjectWorkspace: boolean | null;
+  runProfile: RunProfile | null;
 }
 
 /**
@@ -5717,10 +6030,13 @@ function parseIssueAssigneeAdapterOverrides(
     typeof parsed.useProjectWorkspace === "boolean"
       ? parsed.useProjectWorkspace
       : null;
-  if (!adapterConfig && useProjectWorkspace === null) return null;
+  const parsedProfile = runProfileSchema.safeParse(parsed.runProfile);
+  const runProfile = parsedProfile.success ? parsedProfile.data : null;
+  if (!adapterConfig && useProjectWorkspace === null && !runProfile) return null;
   return {
     adapterConfig,
     useProjectWorkspace,
+    runProfile,
   };
 }
 
@@ -7863,35 +8179,49 @@ export async function buildPaperclipWakePayload(input: {
   )
     return null;
 
+  const runContext =
+    commentIds.length === 0 && !annotationCommentId
+      ? RUN_CONTEXT_DEFAULTS
+      : await loadRunContextSettings({
+          db: input.db,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          issueId,
+          wakeReason: readNonEmptyString(input.contextSnapshot.wakeReason),
+        });
+  const windowCommentIds =
+    runContext.window === "newest" ? commentIds.slice(-runContext.maxComments) : commentIds;
   const commentRows =
-    commentIds.length === 0
+    windowCommentIds.length === 0
       ? []
-      : await input.db
-          .select({
-            id: issueComments.id,
-            issueId: issueComments.issueId,
-            body: issueComments.body,
-            authorType: issueComments.authorType,
-            authorAgentId: issueComments.authorAgentId,
-            authorUserId: issueComments.authorUserId,
-            presentation: issueComments.presentation,
-            metadata: issueComments.metadata,
-            deletedAt: issueComments.deletedAt,
-            deletedByType: issueComments.deletedByType,
-            deletedByAgentId: issueComments.deletedByAgentId,
-            deletedByUserId: issueComments.deletedByUserId,
-            deletedByRunId: issueComments.deletedByRunId,
-            sourceTrust: issueComments.sourceTrust,
-            createdAt: issueComments.createdAt,
-          })
-          .from(issueComments)
-          .where(
-            and(
-              eq(issueComments.companyId, input.companyId),
-              issueId ? eq(issueComments.issueId, issueId) : undefined,
-              inArray(issueComments.id, commentIds),
+      : await selectInCommentBatches(windowCommentIds, (batch) =>
+          input.db
+            .select({
+              id: issueComments.id,
+              issueId: issueComments.issueId,
+              body: issueComments.body,
+              authorType: issueComments.authorType,
+              authorAgentId: issueComments.authorAgentId,
+              authorUserId: issueComments.authorUserId,
+              presentation: issueComments.presentation,
+              metadata: issueComments.metadata,
+              deletedAt: issueComments.deletedAt,
+              deletedByType: issueComments.deletedByType,
+              deletedByAgentId: issueComments.deletedByAgentId,
+              deletedByUserId: issueComments.deletedByUserId,
+              deletedByRunId: issueComments.deletedByRunId,
+              sourceTrust: issueComments.sourceTrust,
+              createdAt: issueComments.createdAt,
+            })
+            .from(issueComments)
+            .where(
+              and(
+                eq(issueComments.companyId, input.companyId),
+                issueId ? eq(issueComments.issueId, issueId) : undefined,
+                inArray(issueComments.id, batch),
+              ),
             ),
-          );
+        );
 
   const commentsById = new Map(
     commentRows.map((comment) => [comment.id, comment]),
@@ -7904,22 +8234,22 @@ export async function buildPaperclipWakePayload(input: {
     ? issueDescription.slice(0, MAX_INLINE_WAKE_ISSUE_DESCRIPTION_CHARS)
     : issueDescription;
   const comments: Array<Record<string, unknown>> = [];
-  let remainingBodyChars = MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS;
-  let truncated = false;
+  let remainingBodyChars = runContext.maxTotalCommentChars;
+  let truncated = windowCommentIds.length < commentIds.length;
   let missingCommentCount = 0;
   const safeContinuationSummary =
     continuationSummary && !input.exposeLowTrustRaw
       ? redactQuarantinedBodyForHigherTrust(continuationSummary)
       : continuationSummary;
 
-  for (const commentId of commentIds) {
+  for (const commentId of windowCommentIds) {
     const row = commentsById.get(commentId);
     if (!row) {
       truncated = true;
       missingCommentCount += 1;
       continue;
     }
-    if (comments.length >= MAX_INLINE_WAKE_COMMENTS) {
+    if (comments.length >= runContext.maxComments) {
       truncated = true;
       break;
     }
@@ -7931,7 +8261,7 @@ export async function buildPaperclipWakePayload(input: {
         : sanitizeQuarantinedCommentForHigherTrust(row);
     const fullBody = deletedAt ? "" : safeRow.body;
     const allowedBodyChars = Math.min(
-      MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+      runContext.maxCommentChars,
       remainingBodyChars,
     );
     if (allowedBodyChars <= 0) {
@@ -7939,13 +8269,17 @@ export async function buildPaperclipWakePayload(input: {
       break;
     }
 
-    const body =
+    const cutBody =
       fullBody.length > allowedBodyChars
         ? fullBody.slice(0, allowedBodyChars)
         : fullBody;
-    const bodyTruncated = body.length < fullBody.length;
+    const bodyTruncated = cutBody.length < fullBody.length;
+    const body =
+      bodyTruncated && runContext.truncationMarker
+        ? `${cutBody}\n[truncated: ${fullBody.length - cutBody.length} more characters]`
+        : cutBody;
     if (bodyTruncated) truncated = true;
-    remainingBodyChars -= body.length;
+    remainingBodyChars -= cutBody.length;
 
     comments.push({
       id: row.id,
@@ -8094,11 +8428,11 @@ export async function buildPaperclipWakePayload(input: {
               anchorState: row.anchorState,
               anchorConfidence: row.anchorConfidence,
               body:
-                row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS
-                  ? row.body.slice(0, MAX_INLINE_WAKE_COMMENT_BODY_CHARS)
+                row.body.length > runContext.maxCommentChars
+                  ? row.body.slice(0, runContext.maxCommentChars)
                   : row.body,
               bodyTruncated:
-                row.body.length > MAX_INLINE_WAKE_COMMENT_BODY_CHARS,
+                row.body.length > runContext.maxCommentChars,
               createdAt: row.createdAt.toISOString(),
               author: row.authorAgentId
                 ? { type: "agent", id: row.authorAgentId }
@@ -8210,8 +8544,21 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const monitorNotes =
+    input.contextSnapshot.source === "issue.monitor"
+      ? readNonEmptyString(input.contextSnapshot.monitorNotes)
+      : null;
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    wait: monitorNotes
+      ? {
+          note: monitorNotes,
+          attempt:
+            typeof input.contextSnapshot.monitorAttemptCount === "number"
+              ? input.contextSnapshot.monitorAttemptCount
+              : null,
+        }
+      : null,
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,
@@ -9080,6 +9427,12 @@ export async function persistHeartbeatRunProcessMetadata(
   });
 }
 
+/**
+ * `resultJson` key written with a run's `interrupted` status by the shutdown
+ * drain: `pending` until its follow-up writes finish, then `complete`.
+ */
+const SHUTDOWN_DRAIN_MARKER_KEY = "shutdownDrain";
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -9590,6 +9943,37 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+// Counters for deferred-wake redelivery, one set per company so a reader of one
+// company never sees another company's activity. They live at module scope on
+// purpose: the scheduler and each route module build their own
+// `heartbeatService`, and a counter kept inside one instance is invisible to the
+// others (the endpoint read an idle copy). They reset on restart;
+// `getDeferredWakeStats` pairs them with durable counts read from the queue.
+const deferredWakeSweepCounters = new Map<string, DeferredWakeSweepCounters>();
+function deferredWakeCountersForCompany(companyId: string): DeferredWakeSweepCounters {
+  let counters = deferredWakeSweepCounters.get(companyId);
+  if (!counters) {
+    counters = {
+      examined: 0,
+      promoted: 0,
+      retired: 0,
+      stillDeferred: 0,
+      skippedHeld: 0,
+      skippedPauseHold: 0,
+      skippedExecutionBlocker: 0,
+      skippedOperatorStop: 0,
+      skippedBudget: 0,
+      skippedNotInvokable: 0,
+      skippedCapacity: 0,
+      executionBlockerCauses: {},
+      failed: 0,
+      lastExaminedAt: null,
+    };
+    deferredWakeSweepCounters.set(companyId, counters);
+  }
+  return counters;
+}
+
 export function heartbeatService(
   db: Db,
   options: HeartbeatServiceOptions = {},
@@ -9686,6 +10070,7 @@ export function heartbeatService(
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
+  const harnessFallback = harnessFallbackService(db);
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
@@ -9700,9 +10085,11 @@ export function heartbeatService(
       const result = await scheduleBoundedRetryForRun(run, agent);
       return result.outcome === "scheduled" ? result.run : null;
     },
-    // Mirrors scheduleBoundedRetryForRun's transient budget check: a failed
-    // or interrupted run that has already consumed every bounded transient
-    // attempt cannot be retried again through this lane.
+    // Mirrors scheduleBoundedRetryForRun's default transient budget check: a
+    // failed or interrupted run that has already consumed every bounded
+    // transient attempt cannot be retried again through this lane. A
+    // provider-quota failure before useful action has its own ceiling there;
+    // recovery routes it to the quota branch before it can reach this check.
     transientRetryBudgetSpent: (run) =>
       executionFailureRetryCount(run) >=
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
@@ -9715,6 +10102,18 @@ export function heartbeatService(
       const policy = parseHeartbeatPolicy(agent);
       if (!policy.wakeOnDemand) return "heartbeat.wakeOnDemand.disabled";
       return (await getHeartbeatDailyCapBlock(agent, policy))?.reason ?? null;
+    },
+    // The same slot count as the deferred-wake sweep: running runs against
+    // the agent's limit. Queued work waits its turn and does not starve
+    // stranded issues behind a standing queue.
+    getAgentFreeRunSlots: async (agentId) => {
+      const agent = await getAgent(agentId);
+      if (!agent) return null;
+      const [row] = await db
+        .select({ running: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
+      return Math.max(0, parseHeartbeatPolicy(agent).maxConcurrentRuns - Number(row?.running ?? 0));
     },
   });
   const runDispatch = createRunDispatch(db);
@@ -9867,6 +10266,7 @@ export function heartbeatService(
       if (!agent) return null;
       return resolveSessionBeforeForWakeup(agent, input.taskKey);
     },
+    admitAutomationWake: ({ tx, ...input }) => admitThroughAutomationWindow(tx as Db, input),
     // These four helpers stay in this file today; the wake-queue module
     // receives them here so it never imports this file, the service it is
     // extracted from.
@@ -10670,7 +11070,7 @@ export function heartbeatService(
     const waits = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        issueIdEqualsText(sql`${agentWakeupRequests.payload}->>'issueId'`),
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
@@ -11141,19 +11541,22 @@ export function heartbeatService(
       messageIds.length &&
       !input.contextSnapshot.retryOfRunId
     ) {
-      const messages = await db
-        .select({
-          id: issueComments.id,
-          authorUserId: issueComments.authorUserId,
-        })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.companyId, input.companyId),
-            eq(issueComments.issueId, input.issueContext.id),
-            inArray(issueComments.id, messageIds),
+      const issueContextId = input.issueContext.id;
+      const messages = await selectInCommentBatches(messageIds, (batch) =>
+        db
+          .select({
+            id: issueComments.id,
+            authorUserId: issueComments.authorUserId,
+          })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, input.companyId),
+              eq(issueComments.issueId, issueContextId),
+              inArray(issueComments.id, batch),
+            ),
           ),
-        );
+      );
       for (const id of [...messageIds].reverse()) {
         const author = messages.find(
           (message) => message.id === id,
@@ -11491,6 +11894,7 @@ export function heartbeatService(
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
+    manualUserWake?: boolean;
   }) {
     const reviewPathLost =
       input.claimed.status === "in_review" &&
@@ -11552,6 +11956,7 @@ export function heartbeatService(
             { issueId: recoveryIssue.id, sourceIssueId: input.claimed.id },
             "status_only",
           ),
+          ...(input.manualUserWake ? { manualUserWake: true } : {}),
           requestedByActorType: input.actorType,
           requestedByActorId: input.actorId,
           contextSnapshot: withRecoveryContext(
@@ -11628,6 +12033,7 @@ export function heartbeatService(
         },
         "status_only",
       ),
+      ...(input.manualUserWake ? { manualUserWake: true } : {}),
       requestedByActorType: input.actorType,
       requestedByActorId: input.actorId,
       contextSnapshot: withRecoveryContext(
@@ -11674,6 +12080,8 @@ export function heartbeatService(
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
+    /** Trusted provenance of a user's check-now: the recovery wake stays exempt from the automation window. */
+    manualUserWake?: boolean;
   }) {
     await db
       .update(issues)
@@ -11720,6 +12128,7 @@ export function heartbeatService(
       agentId: input.agentId,
       runId: input.runId,
       activitySource: input.activitySource,
+      manualUserWake: input.manualUserWake,
     });
 
     return { outcome: "skipped" as const, reason: input.clearReason };
@@ -11738,6 +12147,8 @@ export function heartbeatService(
       runId: string | null;
       clearOnClientError: boolean;
       activitySource: "manual" | "scheduled";
+      /** An authenticated user's check-now: exempt from the automation window like any human wake. */
+      manualUserWake?: boolean;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -11809,9 +12220,70 @@ export function heartbeatService(
         agentId: input.agentId,
         runId: input.runId,
         activitySource: input.activitySource,
+        manualUserWake: input.manualUserWake,
       });
     }
 
+    const monitorWakeKey = `issue-monitor:${claimed.id}:${scheduledAtIso}`;
+    // The queue dropped or refused the wake. Keep the monitor armed: count the
+    // attempt, back off, and hand the issue to owner recovery once the attempts
+    // run out, so a permanently blocked agent cannot retry without end.
+    const holdMonitorForRetry = async (message: string, skipReason: string) => {
+      if (nextAttemptCount >= ISSUE_WAIT_MONITOR_MAX_ATTEMPTS) {
+        return clearIssueMonitorAndRecover({
+          claimed,
+          policy,
+          scheduledAtIso,
+          nextAttemptCount,
+          clearReason: "max_attempts_exhausted",
+          recoveryPolicy,
+          monitor,
+          now: input.now,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          activitySource: input.activitySource,
+        });
+      }
+      const retryAt = new Date(
+        input.now.getTime() + monitorWakeRetryDelayMs(claimed.monitorAttemptCount ?? 0),
+      );
+      const rescheduled = buildIssueMonitorRescheduledPatch({
+        issue: { ...claimed, monitorAttemptCount: nextAttemptCount },
+        policy,
+        nextCheckAt: retryAt,
+      });
+      await db
+        .update(issues)
+        .set(
+          rescheduled
+            ? { ...rescheduled, monitorAttemptCount: nextAttemptCount, updatedAt: new Date() }
+            : { monitorWakeRequestedAt: null, updatedAt: new Date() },
+        )
+        .where(eq(issues.id, claimed.id));
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_wake_skipped",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: scheduledAtIso,
+          retryAt: retryAt.toISOString(),
+          attemptCount: nextAttemptCount,
+          skipReason,
+          source: input.activitySource,
+        },
+      });
+      return { outcome: "skipped" as const, reason: message };
+    };
+    let monitorWake: Awaited<ReturnType<typeof enqueueWakeup>> | undefined;
+    let monitorWakeStartedAt = input.now;
     try {
       if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
         // Normalized monitor projections redact externalRef. Read the claimed
@@ -11869,12 +12341,21 @@ export function heartbeatService(
           if (scheduled.outcome === "not_scheduled")
             throw conflict(scheduled.reason);
         }
-      } else
-        await enqueueWakeup(targetAgentId, {
+      } else {
+        // The receipt lookup below compares database timestamps, so the start
+        // mark comes from the database clock too.
+        monitorWakeStartedAt = await db
+          .select({ now: sql<string>`clock_timestamp()` })
+          .from(agents)
+          .where(eq(agents.id, targetAgentId))
+          .limit(1)
+          .then((rows) => (rows[0] ? new Date(rows[0].now) : input.now));
+        monitorWake = await enqueueWakeup(targetAgentId, {
           source: input.source,
           triggerDetail: input.triggerDetail,
           reason: wakeReason,
-          idempotencyKey: `issue-monitor:${claimed.id}:${scheduledAtIso}`,
+          idempotencyKey: monitorWakeKey,
+          ...(input.manualUserWake ? { manualUserWake: true } : {}),
           payload: {
             issueId: claimed.id,
             nextCheckAt: scheduledAtIso,
@@ -11900,6 +12381,34 @@ export function heartbeatService(
             manualTrigger: input.activitySource === "manual",
           },
         });
+      }
+
+      // enqueueWakeup returns null for a wake it admitted behind a live run, and
+      // also for one it dropped (wake on demand off, tree hold, pause). Only a
+      // skipped receipt written or touched by this dispatch means the agent
+      // will not run, so the monitor stays armed.
+      if (monitorWake === null) {
+        const skipped = await db
+          .select({ reason: agentWakeupRequests.reason })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, claimed.companyId),
+              eq(agentWakeupRequests.agentId, targetAgentId),
+              eq(agentWakeupRequests.status, "skipped"),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${claimed.id}`,
+              gte(agentWakeupRequests.updatedAt, monitorWakeStartedAt),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (skipped) {
+          return holdMonitorForRetry(
+            `Monitor wake skipped (${skipped.reason ?? "skipped"})`,
+            skipped.reason ?? "skipped",
+          );
+        }
+      }
 
       await db
         .update(issues)
@@ -11935,6 +12444,9 @@ export function heartbeatService(
 
       return { outcome: "triggered" as const };
     } catch (err) {
+      if (input.clearOnClientError && isRetryableMonitorWakeBlock(err)) {
+        return holdMonitorForRetry((err as HttpError).message, (err as HttpError).message);
+      }
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
           await db
@@ -12073,11 +12585,60 @@ export function heartbeatService(
       runId: input?.runId ?? null,
       clearOnClientError: false,
       activitySource: "manual",
+      manualUserWake: actorType === "user",
     });
   }
 
   async function tickDueIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
+    const parkedMonitors = await db
+      .select(issueMonitorDispatchColumns)
+      .from(issues)
+      .where(
+        and(
+          sql`${issues.monitorNextCheckAt} is not null`,
+          lte(issues.monitorNextCheckAt, now),
+          inArray(issues.status, ["blocked", "done", "cancelled"]),
+        ),
+      )
+      .limit(50);
+    for (const candidate of parkedMonitors) {
+      // Lock and re-read so the cleanup never overwrites a concurrent edit with a stale snapshot.
+      await db.transaction(async (tx) => {
+        const [parked] = await tx
+          .select(issueMonitorDispatchColumns)
+          .from(issues)
+          .where(
+            and(
+              eq(issues.id, candidate.id),
+              sql`${issues.monitorNextCheckAt} is not null`,
+              inArray(issues.status, ["blocked", "done", "cancelled"]),
+            ),
+          )
+          .for("update");
+        if (!parked) return;
+        const { monitor: _monitor, ...policyWithoutMonitor } = (parked.executionPolicy ?? {}) as Record<string, unknown>;
+        const clearedPatch = buildIssueMonitorClearedPatch({
+          issue: parked,
+          policy: normalizeIssueExecutionPolicy(parked.executionPolicy ?? null),
+          clearReason:
+            parked.status === "done" || parked.status === "cancelled"
+              ? parked.status
+              : "invalid_status",
+          clearedAt: now,
+        });
+        await tx
+          .update(issues)
+          .set({
+            ...clearedPatch,
+            // Keep every non-monitor policy field; the normalized policy would drop some.
+            executionPolicy: parked.executionPolicy ? policyWithoutMonitor : null,
+            updatedAt: now,
+          })
+          .where(eq(issues.id, parked.id));
+      });
+    }
+
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
       .from(issues)
@@ -12094,6 +12655,8 @@ export function heartbeatService(
             isNull(issues.monitorWakeRequestedAt),
             lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
           ),
+          // A paused agent keeps its waits; they fire once after it resumes.
+          sql`not exists (select 1 from ${agents} where ${agents.id} = ${issues.assigneeAgentId} and ${agents.status} = 'paused')`,
         ),
       )
       .orderBy(asc(issues.monitorNextCheckAt), asc(issues.updatedAt))
@@ -12122,6 +12685,7 @@ export function heartbeatService(
                 isNull(issues.monitorWakeRequestedAt),
                 lt(issues.monitorWakeRequestedAt, staleClaimThreshold),
               ),
+              sql`not exists (select 1 from ${agents} where ${agents.id} = ${issues.assigneeAgentId} and ${agents.status} = 'paused')`,
             ),
           )
           .returning();
@@ -12809,7 +13373,7 @@ export function heartbeatService(
     lastError: string | null;
   }) {
     return db.transaction(async (tx) => {
-      const [issue] = await tx.select().from(issues).where(and(sql`${issues.id}::text = ${input.taskKey}`, eq(issues.companyId, input.companyId))).for("update");
+      const [issue] = await tx.select().from(issues).where(and(issueIdEqualsText(sql`${input.taskKey}`), eq(issues.companyId, input.companyId))).for("update");
       if (isConversation(issue)) {
         const [run] = input.lastRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.lastRunId)) : [];
         if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
@@ -12893,7 +13457,7 @@ export function heartbeatService(
 
     return db.transaction(async (tx) => {
       if (opts?.taskKey && opts.expectedRunId) {
-        const [issue] = await tx.select().from(issues).where(sql`${issues.id}::text = ${opts.taskKey}`).for("update");
+        const [issue] = await tx.select().from(issues).where(issueIdEqualsText(sql`${opts.taskKey}`)).for("update");
         if (isConversation(issue)) {
           const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, opts.expectedRunId));
           if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return 0;
@@ -13345,6 +13909,7 @@ export function heartbeatService(
           assigneeAgentId: issues.assigneeAgentId,
           executionState: issues.executionState,
           projectId: issues.projectId,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
         })
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
@@ -14440,6 +15005,24 @@ export function heartbeatService(
       return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
+    // A legitimately waiting issue is not re-run to force a comment: the
+    // wait's wake runs the agent again later, and that run can comment.
+    const waitingIssue = await db
+      .select({ monitorNextCheckAt: issues.monitorNextCheckAt })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (waitingIssue && hasActiveIssueWait(waitingIssue)) {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
     // A settled run may legitimately have no user-facing prose. The response
     // resolver owns that decision; do not wake the agent again merely to force
     // an artificial comment into the issue thread.
@@ -14649,8 +15232,16 @@ export function heartbeatService(
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
+    opts: { abortSignal?: AbortSignal } = {},
   ) {
     shutdownInProgress = true;
+    // Aborted by the shutdown budget: write nothing, and let the drain run.
+    const aborted = () => ({
+      mode: "aborted" as const,
+      skipDrain: false as const,
+      activeRunIds: [] as string[],
+    });
+    if (opts.abortSignal?.aborted) return aborted();
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
       logger.warn({ idleSessions }, "idle native sessions could not checkpoint before controller shutdown");
@@ -14703,6 +15294,9 @@ export function heartbeatService(
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
+    // The last point to give up: from the first snapshot write on, the
+    // preparation finishes, and the shutdown waits for it before the drain.
+    if (opts.abortSignal?.aborted) return aborted();
     const snapshotRuns = activeRuns.map(toHotRestartIntentRun);
     const intentWithVersion = {
       ...intent,
@@ -15243,10 +15837,19 @@ export function heartbeatService(
     };
   }
 
+  /**
+   * Ends this boot's running runs for a graceful shutdown. The runs are ended
+   * in parallel, and with `deadlineAt` (epoch ms) each run's grace is capped so
+   * that its termination, SIGKILL and verify end by the deadline. A run that
+   * cannot be stopped does not stop the drain of the others: it is reported as
+   * `terminate_failed` and left `running` for the reaper, because its process
+   * may still be alive. Every run gets one reported outcome.
+   */
   async function drainRunningRunsForShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    opts: { deadlineAt?: number; abortSignal?: AbortSignal } = {},
   ) {
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
@@ -15255,6 +15858,7 @@ export function heartbeatService(
         interruptedRunIds: [],
         retryRunIds: [],
         restartSuspendedRunIds: [],
+        outcomes: [],
       };
     }
     const activeRuns = await db
@@ -15276,13 +15880,14 @@ export function heartbeatService(
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
     const restartSuspendedRunIds: string[] = [];
+    const outcomes: ShutdownRunOutcome[] = [];
 
-    for (const { run, agent } of activeRuns) {
+    const drainOne = async ({ run, agent }: (typeof activeRuns)[number]): Promise<ShutdownRunOutcome> => {
       // Shutdown owns only this boot's legacy executions. Expired foreign
       // owners belong to the reaper, not another container's drain.
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
-          run.controllerBootId !== legacyControllerBootId) continue;
-      if (isNativeRunnerOwnershipHeld(run)) continue;
+          run.controllerBootId !== legacyControllerBootId) return { runId: run.id, outcome: "foreign_owner" };
+      if (isNativeRunnerOwnershipHeld(run)) return { runId: run.id, outcome: "native_runner_owned" };
       if (
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
@@ -15343,29 +15948,42 @@ export function heartbeatService(
           },
         });
         restartSuspendedRunIds.push(run.id);
-        continue;
+        return { runId: run.id, outcome: "restart_suspended" };
       }
       const message = `Interrupted by graceful server shutdown (${signal})`;
       const running = runningProcesses.get(run.id);
+      let stopFailure: ShutdownRunOutcome | null;
       try {
-        if (run.runtimeMode === "native") {
-          await cancelHeartbeatNativeRun({
-            db,
-            runId: run.id,
-            reason: message,
-            runtimeMode: run.runtimeMode,
-          });
-        }
-        if (running) {
-          await terminateHeartbeatRunProcess({
-            pid: running.child.pid,
-            processGroupId: running.processGroupId,
-            graceMs: Math.max(1, running.graceSec) * 1000,
-          });
-        }
+        stopFailure = await stopRunProcessForShutdown({
+          runId: run.id,
+          signal,
+          log: logger,
+          stop: async () => {
+            if (run.runtimeMode === "native") {
+              await cancelHeartbeatNativeRun({
+                db,
+                runId: run.id,
+                reason: message,
+                runtimeMode: run.runtimeMode,
+              });
+            }
+            if (running) {
+              await terminateHeartbeatRunProcess({
+                pid: running.child.pid,
+                processGroupId: running.processGroupId,
+                graceMs: shutdownTerminationGraceMs(running.graceSec, opts.deadlineAt),
+              });
+            }
+          },
+        });
       } finally {
         runningProcesses.delete(run.id);
       }
+      // A run whose process may still be alive is left for the reaper.
+      if (stopFailure) return stopFailure;
+      // After the drain deadline nothing new is written: the run stays
+      // `running`, its process is gone, and the next start reaps it.
+      if (opts.abortSignal?.aborted) return { runId: run.id, outcome: "deadline_skipped" };
 
       const persistedCancellationResult =
         run.runtimeMode === "native"
@@ -15382,59 +16000,37 @@ export function heartbeatService(
           error: message,
           errorCode: "server_shutdown_interrupted",
           signal,
-          resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
-            conversationContinuationEligible: await runUsedConversationAdapter(db, run),
-            resultJson: persistedCancellationResult,
-            errorCode: "server_shutdown_interrupted",
-            errorMessage: message,
-          }),
+          resultJson: {
+            ...mergeRunStopMetadataForAgent(agent, "interrupted", {
+              conversationContinuationEligible: await runUsedConversationAdapter(db, run),
+              resultJson: persistedCancellationResult,
+              errorCode: "server_shutdown_interrupted",
+              errorMessage: message,
+            }),
+            // Written with the status: until the follow-ups below mark it
+            // complete, the next start finishes them (repairIncompleteShutdownDrains).
+            [SHUTDOWN_DRAIN_MARKER_KEY]: { phase: "pending", signal, at: now.toISOString() },
+          },
         },
       );
-      if (!interruptedStatus.updated || !interruptedStatus.run) continue;
-      let interrupted = interruptedStatus.run;
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: now,
-        error: null,
-      });
-      interrupted =
-        (await classifyAndPersistRunLiveness(
-          interrupted,
-          parseObject(interrupted.resultJson),
-        )) ?? interrupted;
+      if (!interruptedStatus.updated || !interruptedStatus.run) return { runId: run.id, outcome: "not_running" };
+      const retry = await completeShutdownDrainFollowups(interruptedStatus.run, agent, signal, now);
+      if (retry) retryRunIds.push(retry.id);
+      interruptedRunIds.push(interruptedStatus.run.id);
+      return { runId: run.id, outcome: "interrupted" };
+    };
 
-      await releaseEnvironmentLeasesForRun({
-        runId: interrupted.id,
-        companyId: interrupted.companyId,
-        agentId: interrupted.agentId,
-        status: interrupted.status,
-        failureReason: interrupted.error ?? undefined,
-      });
-
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
-      if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
-      } else {
-        retryRunIds.push(retry.id);
-      }
-
-      await appendRunEvent(interrupted, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
-        message,
-        payload: {
-          signal,
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(retry ? { retryRunId: retry.id } : {}),
-        },
-      });
-
-      await finalizeAgentStatus(run.agentId, "interrupted", message, {
-        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-      });
-      interruptedRunIds.push(interrupted.id);
-    }
+    outcomes.push(...await drainRunsInParallel({
+      rows: activeRuns,
+      runIdOf: (row) => row.run.id,
+      drainOne: async (row) => {
+        // After the drain deadline no new per-run drain starts.
+        if (opts.abortSignal?.aborted) return { runId: row.run.id, outcome: "deadline_skipped" };
+        return drainOne(row);
+      },
+      signal,
+      log: logger,
+    }));
 
     if (interruptedRunIds.length > 0) {
       logger.warn(
@@ -15453,7 +16049,526 @@ export function heartbeatService(
       interruptedRunIds,
       retryRunIds,
       restartSuspendedRunIds,
+      outcomes,
     };
+  }
+
+  /**
+   * Everything a graceful shutdown does for a run after its status became
+   * `interrupted`: the wakeup, the liveness class, the leases, the retry or the
+   * issue release, the run event and the agent status. Each step is idempotent,
+   * so a later start can run them again for a run whose drain was cut (see
+   * `repairIncompleteShutdownDrains`). The last write marks the drain complete.
+   */
+  async function completeShutdownDrainFollowups(
+    interruptedRun: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    signal: "SIGINT" | "SIGTERM",
+    now: Date,
+  ) {
+    const message = `Interrupted by graceful server shutdown (${signal})`;
+    let interrupted = interruptedRun;
+    await setWakeupStatus(interrupted.wakeupRequestId, "cancelled", {
+        finishedAt: now,
+        error: null,
+      });
+    interrupted =
+      (await classifyAndPersistRunLiveness(
+        interrupted,
+        parseObject(interrupted.resultJson),
+      )) ?? interrupted;
+
+    await releaseEnvironmentLeasesForRun({
+      runId: interrupted.id,
+      companyId: interrupted.companyId,
+      agentId: interrupted.agentId,
+      status: interrupted.status,
+      failureReason: interrupted.error ?? undefined,
+    });
+
+    const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+    if (!retry) {
+      await releaseIssueExecutionAndPromote(interrupted);
+    }
+
+    await appendRunEvent(interrupted, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message,
+      payload: {
+        signal,
+        ...(interrupted.processPid ? { processPid: interrupted.processPid } : {}),
+        ...(interrupted.processGroupId ? { processGroupId: interrupted.processGroupId } : {}),
+        ...(retry ? { retryRunId: retry.id } : {}),
+      },
+    });
+
+    await finalizeAgentStatus(interrupted.agentId, "interrupted", message, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(interrupted),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb), ${`{${SHUTDOWN_DRAIN_MARKER_KEY},phase}`}::text[], '"complete"'::jsonb, true)`,
+      })
+      .where(eq(heartbeatRuns.id, interrupted.id));
+    return retry;
+  }
+
+  /**
+   * At startup: finishes the shutdown drain of every run whose status became
+   * `interrupted` but whose follow-ups never completed (the process was killed
+   * mid-drain). Without this, such a run has no retry and may keep its issue
+   * lock, and neither the orphan reap (it selects `running`) nor the stale-lock
+   * sweep recreates them.
+   */
+  async function repairIncompleteShutdownDrains(now = new Date()) {
+    const rows = await db
+      .select({ run: heartbeatRuns, agent: agents })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "server_shutdown_interrupted"),
+        sql`${heartbeatRuns.resultJson} -> ${SHUTDOWN_DRAIN_MARKER_KEY} ->> 'phase' = 'pending'`,
+      ));
+    const repairedRunIds: string[] = [];
+    for (const { run, agent } of rows) {
+      const marker = parseObject(parseObject(run.resultJson)[SHUTDOWN_DRAIN_MARKER_KEY]);
+      const signal = marker.signal === "SIGINT" ? "SIGINT" : "SIGTERM";
+      try {
+        await completeShutdownDrainFollowups(run, agent, signal, now);
+        repairedRunIds.push(run.id);
+      } catch (err) {
+        logger.error({ err, runId: run.id }, "failed to finish an interrupted shutdown drain");
+      }
+    }
+    if (rows.length > 0) {
+      logger.warn({ found: rows.length, repairedRunIds }, "finished shutdown drains that a restart cut");
+    }
+    return { found: rows.length, repairedRunIds };
+  }
+
+  /**
+   * The provider-quota retry lane applies to a run that failed before any
+   * useful action. Past the backoff window it keeps one retry per hour until
+   * the chain's hard ceiling (`maxTotalAttempts` or `maxRetryMs`), then stops
+   * and blocks the issue. It does not depend on maxDailyRuns being set.
+   */
+  function resolveProviderQuotaRetry(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
+    if (
+      !policy.enabled ||
+      usesHarnessFallbackChain(agent) ||
+      run.status !== "failed" ||
+      readHeartbeatRunErrorFamily(run) !== "provider_quota" ||
+      parseObject(run.resultJson).providerQuotaBeforeUsefulAction !== true
+    ) {
+      return null;
+    }
+    const chainStartedAt =
+      dateValue(parseObject(run.contextSnapshot).providerQuotaRetryStartedAt) ??
+      run.startedAt ??
+      run.createdAt;
+    return { policy, chainStartedAt };
+  }
+
+  /**
+   * Quota state of the agent's provider lane (company, adapter and model). The
+   * lane is in quota state while its latest provider outcome (a succeeded,
+   * failed or timed-out legacy run of any agent on the lane) is a
+   * provider_quota failure. Any other outcome means the provider answered and
+   * ends the state. `nextProbeAt` follows the lane backoff over the failed
+   * probes since the state began; `probeInFlight` is a running lane run or a
+   * queued run already chosen as the probe; `laneRetryWaiting` is a scheduled
+   * retry of a lane chain, whose promotion the coalescing sweep paces.
+   */
+  async function readProviderQuotaLaneState(
+    agent: typeof agents.$inferSelect,
+    excludeRunId: string,
+    client: Db = db,
+  ) {
+    const laneKey = providerQuotaKeyForAgent(agent);
+    const laneAgentIds = (
+      await client
+        .select({ id: agents.id, adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
+        .from(agents)
+        .where(eq(agents.companyId, agent.companyId))
+    )
+      .filter((candidate) => providerQuotaKeyForAgent(candidate) === laneKey)
+      .map((candidate) => candidate.id);
+    const laneRuns = and(
+      eq(heartbeatRuns.companyId, agent.companyId),
+      inArray(heartbeatRuns.agentId, laneAgentIds),
+      eq(heartbeatRuns.runtimeMode, "legacy"),
+      // The lane is the agent's primary harness and model. A run that a
+      // harness fallback sent elsewhere says nothing about this provider.
+      isNull(heartbeatRuns.fallbackReason),
+    );
+    const providerOutcome = and(
+      inArray(heartbeatRuns.status, ["succeeded", "failed", "timed_out"]),
+      isNotNull(heartbeatRuns.finishedAt),
+    );
+    const [latest] = await client
+      .select({ errorCode: heartbeatRuns.errorCode, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(and(laneRuns, providerOutcome))
+      .orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id))
+      .limit(1);
+    if (!latest?.finishedAt || latest.errorCode !== "provider_quota") {
+      return { laneKey, inQuotaState: false as const };
+    }
+    const [boundary] = await client
+      .select({ finishedAt: sql<Date | null>`max(${heartbeatRuns.finishedAt})` })
+      .from(heartbeatRuns)
+      .where(and(
+        laneRuns,
+        providerOutcome,
+        sql`${heartbeatRuns.errorCode} is distinct from 'provider_quota'`,
+      ));
+    const boundaryAt = boundary?.finishedAt ? new Date(boundary.finishedAt) : null;
+    const [stats] = await client
+      .select({
+        failedProbes: sql<number>`count(*) filter (where ${heartbeatRuns.contextSnapshot} ->> 'providerQuotaProbe' = 'true')::integer`,
+        stateStartedAt: sql<Date | null>`min(${heartbeatRuns.finishedAt})`,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        laneRuns,
+        eq(heartbeatRuns.status, "failed"),
+        eq(heartbeatRuns.errorCode, "provider_quota"),
+        boundaryAt ? gt(heartbeatRuns.finishedAt, boundaryAt) : undefined,
+      ));
+    const lastFailureAt = new Date(latest.finishedAt);
+    const delayMs = computeProviderQuotaLaneProbeDelayMs({
+      failedProbes: Number(stats?.failedProbes ?? 0),
+      lastFailureAt,
+      stateStartedAt: stats?.stateStartedAt ? new Date(stats.stateStartedAt) : lastFailureAt,
+      policy: parseHeartbeatPolicy(agent).providerQuotaRetry,
+    });
+    const [inFlight] = await client
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        laneRuns,
+        sql`${heartbeatRuns.id} <> ${excludeRunId}`,
+        or(
+          eq(heartbeatRuns.status, "running"),
+          and(
+            eq(heartbeatRuns.status, "queued"),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaProbe' = 'true'`,
+          ),
+        ),
+      ))
+      .limit(1);
+    const [laneRetry] = await client
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, agent.companyId),
+        eq(heartbeatRuns.status, "scheduled_retry"),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaKey' = ${laneKey}`,
+      ))
+      .limit(1);
+    return {
+      laneKey,
+      inQuotaState: true as const,
+      nextProbeAt: new Date(lastFailureAt.getTime() + delayMs),
+      probeInFlight: Boolean(inFlight),
+      laneRetryWaiting: Boolean(laneRetry),
+    };
+  }
+
+  /**
+   * Coalesces every run of a provider lane in quota state behind one probe per
+   * backoff interval: new assignments, comments and first retries alike. Only
+   * one run probes at a time. A lane chain's retry may probe when nothing else
+   * is in flight, because the coalescing sweep already promotes one retry per
+   * interval. Any other run may probe only when no lane retry is waiting and
+   * the lane backoff has passed. The probe is marked `providerQuotaProbe`
+   * under a lane advisory lock and proceeds; any other run stays queued without
+   * spending a retry and gets one "Waiting on provider capacity" run event.
+   * When a probe succeeds the lane leaves quota state and the queued runs start
+   * through the normal per-agent concurrency limit. An operator "retry now" is
+   * not held back.
+   *
+   * @returns True when the run must stay queued.
+   */
+  async function waitForProviderQuotaLane(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    if (agent.adapterType === "paperclip_runner") return false;
+    if (!parseHeartbeatPolicy(agent).providerQuotaRetry.enabled) return false;
+    if (usesHarnessFallbackChain(agent)) return false;
+    if (operatorRequestedRetryNow(run)) return false;
+    if (!(await readProviderQuotaLaneState(agent, run.id)).inQuotaState) return false;
+    const now = new Date();
+    const waiting = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`provider-quota-lane:${agent.companyId}:${providerQuotaKeyForAgent(agent)}`}, 0))`,
+      );
+      const locked = await readProviderQuotaLaneState(agent, run.id, txDb);
+      if (!locked.inQuotaState) return null;
+      const laneRetry =
+        run.retryOfRunId !== null &&
+        parseObject(run.contextSnapshot).providerQuotaKey === locked.laneKey;
+      const mayProbe =
+        !locked.probeInFlight &&
+        (laneRetry ||
+          (!locked.laneRetryWaiting && now.getTime() >= locked.nextProbeAt.getTime()));
+      if (mayProbe) {
+        await txDb
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({
+              providerQuotaProbe: true,
+              providerQuotaKey: locked.laneKey,
+            })}::jsonb`,
+          })
+          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")));
+        return null;
+      }
+      const [flagged] = await txDb
+        .update(heartbeatRuns)
+        .set({
+          // No provider key here: the coalescing sweep reads a keyed queued
+          // run as a probe in flight.
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({
+            providerQuotaWaitingSince: now.toISOString(),
+          })}::jsonb`,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(heartbeatRuns.id, run.id),
+          eq(heartbeatRuns.status, "queued"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaWaitingSince' is null`,
+        ))
+        .returning();
+      return { locked, newlyWaiting: flagged ?? null };
+    });
+    if (!waiting) return false;
+    if (waiting.newlyWaiting) {
+      await appendRunEvent(waiting.newlyWaiting, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message:
+          "Waiting on provider capacity: the provider is at capacity, so one run of it probes at a time; " +
+          "this run starts when a probe succeeds",
+        payload: {
+          providerQuotaKey: waiting.locked.laneKey,
+          nextProbeAt: waiting.locked.nextProbeAt.toISOString(),
+          probeInFlight: waiting.locked.probeInFlight,
+          laneRetryWaiting: waiting.locked.laneRetryWaiting,
+        },
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Records, once per agent and UTC day, that quota failures before useful
+   * action passed the uncounted allowance and now count toward maxDailyRuns.
+   * Best effort: finalization continues if the alarm cannot be written.
+   */
+  async function recordProviderQuotaCapExemptionExhausted(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    const policy = parseHeartbeatPolicy(agent).providerQuotaRetry;
+    if (!policy.enabled) return;
+    try {
+      const usage = (await computeDailyRunUsage(agent.companyId, { agentId: agent.id })).get(agent.id) ?? NO_DAILY_RUNS;
+      if (usage.providerQuotaBeforeUsefulAction <= policy.maxDailyUncountedRuns) {
+        return;
+      }
+      const { start } = currentUtcDayWindow();
+      await logActivityOnce({
+        lockKey: `provider-quota-cap-alarm:${agent.id}:${start.toISOString()}`,
+        alreadyRecorded: and(
+          eq(activityLog.entityType, "agent"),
+          eq(activityLog.entityId, agent.id),
+          gte(activityLog.createdAt, start),
+        ),
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: agent.id,
+        action: PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION,
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          observed: usage.providerQuotaBeforeUsefulAction,
+          limit: policy.maxDailyUncountedRuns,
+          runId: run.id,
+          issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+        },
+      });
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, agentId: agent.id },
+        "failed to record the provider quota cap exemption alarm",
+      );
+    }
+  }
+
+  /**
+   * Writes an activity entry unless one with the same action and
+   * `alreadyRecorded` condition exists. The advisory lock on `lockKey`
+   * serializes writers, so the check and the insert cannot race. `andThen`
+   * runs in the same transaction, after the insert; its issue updates publish
+   * only after the commit.
+   *
+   * @returns True when this call wrote the entry.
+   */
+  async function logActivityOnce(
+    input: LogActivityInput & {
+      lockKey: string;
+      alreadyRecorded: SQL | undefined;
+    },
+    andThen?: (
+      tx: Db,
+      postCommit: {
+        publications: ActivityPublication[];
+        actions: IssuePostCommitAction[];
+      },
+    ) => Promise<void>,
+  ) {
+    const { lockKey, alreadyRecorded, ...entry } = input;
+    const postCommit = {
+      publications: [] as ActivityPublication[],
+      actions: [] as IssuePostCommitAction[],
+    };
+    const recorded = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`,
+      );
+      const [existing] = await txDb
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, entry.companyId),
+            eq(activityLog.action, entry.action),
+            alreadyRecorded,
+          ),
+        )
+        .limit(1);
+      if (existing) return false;
+      await logActivity(txDb, entry, postCommit.publications);
+      await andThen?.(txDb, postCommit);
+      return true;
+    });
+    for (const publication of postCommit.publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommit.actions);
+    return recorded;
+  }
+
+  /**
+   * Stops a provider-quota retry chain at its ceiling. In one transaction it
+   * writes one `heartbeat.provider_quota_exhausted` activity per chain and
+   * blocks an open issue with an unblock reason, so the stop is visible and a
+   * failed block is retried on the next call instead of being skipped. Best
+   * effort: the caller continues if this fails.
+   *
+   * @returns False when the stop could not be recorded.
+   */
+  async function recordProviderQuotaExhausted(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    chainStartedAt: Date;
+    attempts: number;
+  }) {
+    const { run, agent } = input;
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (!issueId) return true;
+    const chainStartedAt = input.chainStartedAt.toISOString();
+    const hours = Math.round(
+      (Date.now() - input.chainStartedAt.getTime()) / (60 * 60 * 1000),
+    );
+    const reason =
+      `The provider (${agent.adapterType}) stayed at capacity for about ${hours} h ` +
+      `across ${input.attempts} automatic retries, so automatic retries stopped. ` +
+      "Unblock the issue once the provider is available.";
+    let blocked = false;
+    try {
+      await logActivityOnce(
+        {
+          lockKey: `provider-quota-exhausted:${run.companyId}:${issueId}:${chainStartedAt}`,
+          alreadyRecorded: and(
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, issueId),
+            sql`${activityLog.details} ->> 'chainStartedAt' = ${chainStartedAt}`,
+          ),
+          companyId: run.companyId,
+          actorType: "system",
+          actorId: "heartbeat",
+          agentId: agent.id,
+          runId: run.id,
+          action: PROVIDER_QUOTA_EXHAUSTED_ACTION,
+          entityType: "issue",
+          entityId: issueId,
+          details: {
+            chainStartedAt,
+            attempts: input.attempts,
+            provider: agent.adapterType,
+            runId: run.id,
+          },
+        },
+        async (tx, postCommit) => {
+          const [issue] = await tx
+            .select({ status: issues.status })
+            .from(issues)
+            .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+            .for("update");
+          if (
+            issue?.status !== "todo" &&
+            issue?.status !== "in_progress" &&
+            issue?.status !== "in_review"
+          ) {
+            return;
+          }
+          await issuesSvc.update(
+            issueId,
+            {
+              status: "blocked",
+              unblockDescriptor: { owner: "board", action: reason },
+              companyGuard: run.companyId,
+            },
+            tx,
+            postCommit.publications,
+            postCommit.actions,
+          );
+          blocked = true;
+        },
+      );
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, issueId },
+        "failed to record provider quota retry exhaustion",
+      );
+      return false;
+    }
+    if (blocked) {
+      await issuesSvc
+        .addComment(
+          issueId,
+          `Provider capacity retries stopped. ${reason}`,
+          { runId: run.id },
+          { authorType: "system" },
+        )
+        .catch((err) => {
+          logger.warn({ err, runId: run.id, issueId }, "failed to comment on provider quota retry exhaustion");
+        });
+    }
+    return true;
   }
 
   async function scheduleBoundedRetryForRun(
@@ -15466,6 +16581,9 @@ export function heartbeatService(
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      contextPatch?: Record<string, unknown>;
+      /** The retry is due no earlier than this time. */
+      notBefore?: Date;
     },
   ) {
     if (run.errorCode === "provider_tool_definition_invalid") {
@@ -15483,16 +16601,34 @@ export function heartbeatService(
       opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason =
       opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+    const providerQuotaRetry =
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+      opts?.maxAttempts == null &&
+      opts?.delayMs == null
+        ? resolveProviderQuotaRetry(run, agent)
+        : null;
     const maxAttempts = Math.max(
       0,
       Math.floor(
-        opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+        opts?.maxAttempts ??
+          providerQuotaRetry?.policy.maxTotalAttempts ??
+          BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       ),
     );
     const consumedAttempts = executionRetryAttemptCount(run, retryReason);
     const nextAttempt = consumedAttempts + 1;
-    const computedBaseSchedule =
-      opts?.delayMs != null
+    const providerQuotaSchedule = providerQuotaRetry
+      ? computeProviderQuotaRetrySchedule({
+          attempt: nextAttempt,
+          now,
+          chainStartedAt: providerQuotaRetry.chainStartedAt,
+          policy: providerQuotaRetry.policy,
+          random: opts?.random,
+        })
+      : null;
+    const computedBaseSchedule = providerQuotaRetry
+      ? providerQuotaSchedule
+      : (opts?.delayMs != null
         ? nextAttempt <= maxAttempts
           ? {
               attempt: nextAttempt,
@@ -15510,7 +16646,7 @@ export function heartbeatService(
               now,
               opts?.random,
             )
-          : null;
+          : null);
     const baseSchedule = computedBaseSchedule
       ? { ...computedBaseSchedule, maxAttempts }
       : null;
@@ -15541,6 +16677,14 @@ export function heartbeatService(
         payload: exhaustion,
         retryExhaustion: exhaustion,
       });
+      if (providerQuotaRetry) {
+        await recordProviderQuotaExhausted({
+          run,
+          agent,
+          chainStartedAt: providerQuotaRetry.chainStartedAt,
+          attempts: consumedAttempts,
+        });
+      }
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         await escalatePlanApprovalResumeFailureNeedsAttention({
           run,
@@ -15601,21 +16745,27 @@ export function heartbeatService(
       }
     }
 
+    // A retry never lands before the provider reset, nor while every
+    // harness/model of the agent is cooling down from a quota failure.
+    const storedAgentForQuota = run.runtimeMode === "native" ? null : await getAgent(run.agentId).catch(() => null);
+    const quotaHeldUntil = storedAgentForQuota
+      ? await harnessFallback.heldUntil(storedAgentForQuota, now, await resolveRunProfileForRun(run, storedAgentForQuota))
+      : null;
+    const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
+      .filter((value): value is Date => value !== null)
+      .reduce<Date | null>((latest, value) => (!latest || value > latest ? value : latest), null);
     const schedule =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      notBefore && notBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(
-              0,
-              transientRetryNotBefore.getTime() - now.getTime(),
-            ),
+            dueAt: notBefore,
+            delayMs: Math.max(0, notBefore.getTime() - now.getTime()),
           }
         : baseSchedule;
 
     const requiresIssueGate =
-      isTransientWorkspaceGitScanCode(run.errorCode) ||
+      isTransientSetupFailureCode(run.errorCode) ||
+      run.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE ||
       hasConversationContinuationPolicy(run.resultJson) ||
       retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
@@ -15723,6 +16873,20 @@ export function heartbeatService(
             }
           : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+        // Only a quota-lane retry carries the chain start; any other retry
+        // drops it so a later quota failure starts a fresh chain. Every retry
+        // of a provider_quota failure carries the provider key, so the
+        // coalescing sweep paces it with the other chains of the lane.
+        providerQuotaRetryStartedAt:
+          providerQuotaRetry?.chainStartedAt.toISOString(),
+        providerQuotaKey:
+          providerQuotaRetry ||
+          (transientRecovery?.errorFamily === "provider_quota" &&
+            parseHeartbeatPolicy(agent).providerQuotaRetry.enabled &&
+            !usesHarnessFallbackChain(agent))
+            ? providerQuotaKeyForAgent(agent)
+            : undefined,
+        ...(opts?.contextPatch ?? {}),
       },
       "normal_model",
     );
@@ -16294,10 +17458,16 @@ export function heartbeatService(
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
+      message:
+        providerQuotaSchedule?.phase === "slow"
+          ? `Scheduled provider quota retry ${schedule.attempt} at the hourly recovery cadence for ${schedule.dueAt.toISOString()}`
+          : `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
       payload: {
         retryRunId: retryRun.id,
         retryReason,
+        ...(providerQuotaSchedule
+          ? { providerQuotaRetryPhase: providerQuotaSchedule.phase }
+          : {}),
         ...(transientRecovery
           ? { errorFamily: transientRecovery.errorFamily }
           : {}),
@@ -16378,7 +17548,7 @@ export function heartbeatService(
         issues,
         and(
           eq(issues.companyId, heartbeatRuns.companyId),
-          sql`${issues.id}::text = ${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+          issueIdEqualsText(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`),
         ),
       )
       .where(
@@ -16604,11 +17774,316 @@ export function heartbeatService(
     });
   }
 
+  /**
+   * Coalesces provider-quota retries per company and provider (the agent's
+   * adapter type and model). While the provider is in quota state, one retry probes at
+   * a time: the retry of the oldest chain. Other due retries wait one base
+   * delay past the probe's next attempt, or past a probe that is running, so
+   * at most one probe runs per backoff interval. Once a probe succeeds, every
+   * waiting retry is released. A waiting retry that would pass its chain's
+   * ceiling is cancelled and its issue blocked. An operator "retry now" is
+   * not held back; it exempts only the retry it was requested for.
+   */
+  async function coalesceProviderQuotaRetries(now: Date) {
+    const providerKey = sql<string>`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaKey'`;
+    const groups = await db
+      .selectDistinct({ companyId: heartbeatRuns.companyId, key: providerKey })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          sql`${providerKey} is not null`,
+        ),
+      );
+    for (const group of groups) {
+      try {
+        await coalesceProviderQuotaGroup(group.companyId, group.key, now);
+      } catch (err) {
+        logger.warn(
+          { err, companyId: group.companyId, provider: group.key },
+          "failed to coalesce provider quota retries",
+        );
+      }
+    }
+  }
+
+  /**
+   * True when an operator asked to retry this scheduled row now. Successor
+   * retries copy the context, so a request older than the row belongs to an
+   * earlier retry in the chain and does not exempt this one.
+   */
+  function operatorRequestedRetryNow(run: typeof heartbeatRuns.$inferSelect) {
+    const requestedAt = dateValue(parseObject(run.contextSnapshot).retryNowRequestedAt);
+    return requestedAt !== null && requestedAt.getTime() >= run.createdAt.getTime();
+  }
+
+  async function coalesceProviderQuotaGroup(
+    companyId: string,
+    key: string,
+    now: Date,
+  ) {
+    const inGroup = and(
+      eq(heartbeatRuns.companyId, companyId),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'providerQuotaKey' = ${key}`,
+    );
+    const chainStartOf = (run: typeof heartbeatRuns.$inferSelect) =>
+      dateValue(parseObject(run.contextSnapshot).providerQuotaRetryStartedAt) ??
+      run.createdAt;
+    const expired = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`provider-quota-probe:${companyId}:${key}`}, 0))`,
+      );
+      const waiting = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(inGroup, eq(heartbeatRuns.status, "scheduled_retry")))
+        .for("update");
+      if (waiting.length === 0) return [];
+
+      const newestWaitingAt = new Date(
+        Math.max(...waiting.map((run) => run.createdAt.getTime())),
+      );
+      const [recovered] = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            inGroup,
+            eq(heartbeatRuns.status, "succeeded"),
+            gt(heartbeatRuns.finishedAt, newestWaitingAt),
+          ),
+        )
+        .limit(1);
+      if (recovered) {
+        await tx
+          .update(heartbeatRuns)
+          .set({ scheduledRetryAt: now, updatedAt: now })
+          .where(
+            and(
+              inGroup,
+              eq(heartbeatRuns.status, "scheduled_retry"),
+              gt(heartbeatRuns.scheduledRetryAt, now),
+            ),
+          );
+        return [];
+      }
+
+      const [inFlight] = await tx
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(and(inGroup, inArray(heartbeatRuns.status, ["queued", "running"])))
+        .limit(1);
+      const leader = inFlight
+        ? null
+        : [...waiting].sort(
+            (a, b) =>
+              chainStartOf(a).getTime() - chainStartOf(b).getTime() ||
+              (a.scheduledRetryAt?.getTime() ?? 0) -
+                (b.scheduledRetryAt?.getTime() ?? 0) ||
+              a.id.localeCompare(b.id),
+          )[0];
+      // Hold until just after the probe's next attempt, but re-check at
+      // least at the hourly cadence: a probe that waits for a provider reset
+      // days away must not push followers past their ceilings at once.
+      const holdUntil = new Date(
+        Math.min(
+          Math.max(now.getTime(), leader?.scheduledRetryAt?.getTime() ?? 0),
+          now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
+        ) + PROVIDER_QUOTA_RETRY_BASE_DELAY_MS,
+      );
+      const held = waiting.filter(
+        (run) =>
+          run.id !== leader?.id &&
+          run.scheduledRetryAt !== null &&
+          run.scheduledRetryAt.getTime() <= now.getTime() &&
+          !operatorRequestedRetryNow(run),
+      );
+      if (held.length === 0) return [];
+      await tx
+        .update(heartbeatRuns)
+        .set({ scheduledRetryAt: holdUntil, updatedAt: now })
+        .where(
+          and(
+            inArray(heartbeatRuns.id, held.map((run) => run.id)),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            lte(heartbeatRuns.scheduledRetryAt, now),
+          ),
+        );
+      const heldAgents = await tx
+        .select()
+        .from(agents)
+        .where(inArray(agents.id, [...new Set(held.map((run) => run.agentId))]));
+      return held.flatMap((run) => {
+        const agent = heldAgents.find((row) => row.id === run.agentId);
+        if (!agent) return [];
+        const { maxRetryMs } = parseHeartbeatPolicy(agent).providerQuotaRetry;
+        return holdUntil.getTime() > chainStartOf(run).getTime() + maxRetryMs
+          ? [{ run, agent }]
+          : [];
+      });
+    });
+
+    for (const { run, agent } of expired) {
+      try {
+        // Stop and block first: if that fails, the row is still a scheduled
+        // retry and the next sweep tries again. Recording is idempotent.
+        const source = run.retryOfRunId ? await getRun(run.retryOfRunId) : null;
+        const stopped = await recordProviderQuotaExhausted({
+          run: source ?? run,
+          agent,
+          chainStartedAt: chainStartOf(run),
+          attempts: Math.max(0, (run.scheduledRetryAttempt ?? 1) - 1),
+        });
+        if (!stopped) continue;
+        // No immediate recovery: a continuation run would be another probe.
+        await cancelRunInternal(
+          run.id,
+          "Provider capacity retries stopped: the chain reached its retry ceiling while waiting for the provider.",
+          { errorCode: "provider_quota_exhausted", suppressImmediateRecovery: true },
+        );
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id },
+          "failed to stop a provider quota retry past its ceiling",
+        );
+      }
+    }
+  }
+
+  async function resolveAutomationWakeWindowSec(
+    dbOrTx: Db,
+    input: {
+      agent: { companyId: string; runtimeConfig: unknown };
+      reason: string;
+      issue: { originKind: string | null; originId: string | null } | null;
+    },
+  ): Promise<number> {
+    if (!AUTOMATION_WAKE_REASON_SET.has(input.reason)) return 0;
+    const { agent, issue } = input;
+    return resolveMinSecondsBetweenAutomationWakes({
+      reason: input.reason,
+      agent: parseHeartbeatPolicy(agent as typeof agents.$inferSelect).automationWakeSettings,
+      company: await dbOrTx
+        .select({ settings: companies.automationWakeSettings })
+        .from(companies)
+        .where(eq(companies.id, agent.companyId))
+        .then((rows) => rows[0]?.settings ?? null),
+      routine:
+        issue?.originKind === "routine_execution" && issue.originId
+          ? await dbOrTx
+              .select({ settings: routines.automationWakeSettings })
+              .from(routines)
+              .where(and(eq(routines.id, issue.originId), eq(routines.companyId, agent.companyId)))
+              .then((rows) => rows[0]?.settings ?? null)
+          : null,
+    });
+  }
+
+  async function lockAutomationWakeWindow(tx: Db, companyId: string, agentId: string) {
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`automation-wake-window:${companyId}:${agentId}`}, 0))`,
+    );
+  }
+
+  async function tryLockAutomationWakeWindow(tx: Db, companyId: string, agentId: string): Promise<boolean> {
+    const rows = await tx.execute<{ acquired: boolean }>(
+      sql`select pg_try_advisory_xact_lock(hashtextextended(${`automation-wake-window:${companyId}:${agentId}`}, 0)) as acquired`,
+    );
+    return Boolean(rows[0]?.acquired);
+  }
+
+  async function findLastAutomationRun(
+    dbOrTx: Db,
+    input: { companyId: string; agentId: string; since: Date; excludeRunId?: string },
+  ) {
+    const [row] = await dbOrTx
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          gte(heartbeatRuns.createdAt, input.since),
+          inArray(sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`, [...AUTOMATION_WAKE_REASON_SET]),
+          input.excludeRunId ? ne(heartbeatRuns.id, input.excludeRunId) : undefined,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  /**
+   * Admits an automation wake that is about to start a run outside the fresh-wake path: a
+   * scheduled retry or a deferred wake promoted on release. Inside the caller's transaction,
+   * under the same per-agent lock as fresh wakes, it is held while the agent's window is open;
+   * otherwise its admission time opens a new window.
+   */
+  async function admitThroughAutomationWindow(
+    txDb: Db,
+    input: {
+      companyId: string;
+      agentId: string;
+      reason: string | null;
+      issueId: string | null;
+      now: Date;
+      excludeRunId?: string;
+      /** Hold, rather than wait, when another transaction owns the window lock. */
+      nonblocking?: boolean;
+    },
+  ): Promise<{ hold: true; holdUntil: Date } | { hold: false; admittedAt?: Date }> {
+    const proceed = { hold: false as const };
+    if (!input.reason) return proceed;
+    const [agent] = await txDb.select().from(agents).where(eq(agents.id, input.agentId));
+    if (!agent) return proceed;
+    const issue = input.issueId
+      ? await txDb
+          .select({ originKind: issues.originKind, originId: issues.originId })
+          .from(issues)
+          .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const windowSec = await resolveAutomationWakeWindowSec(txDb, { agent, reason: input.reason, issue });
+    if (windowSec <= 0) return proceed;
+    if (input.nonblocking) {
+      if (!(await tryLockAutomationWakeWindow(txDb, input.companyId, input.agentId))) {
+        return { hold: true as const, holdUntil: input.now };
+      }
+    } else {
+      await lockAutomationWakeWindow(txDb, input.companyId, input.agentId);
+    }
+    // The caller's clock predates any wait for the issue and window locks; admit on a fresh one.
+    const admittedAt = new Date(Math.max(input.now.getTime(), Date.now()));
+    const last = await findLastAutomationRun(txDb, {
+      companyId: input.companyId,
+      agentId: input.agentId,
+      since: new Date(admittedAt.getTime() - windowSec * 1000),
+      excludeRunId: input.excludeRunId,
+    });
+    return last
+      ? { hold: true as const, holdUntil: new Date(last.createdAt.getTime() + windowSec * 1000 + 1) }
+      : { hold: false as const, admittedAt };
+  }
+
+  const admitScheduledRetryThroughAutomationWindow: RetryAdmissionPolicy = ({ tx, run, now }) =>
+    admitThroughAutomationWindow(tx as Db, {
+      companyId: run.companyId,
+      agentId: run.agentId,
+      reason: readNonEmptyString(run.contextSnapshot.wakeReason),
+      issueId: readNonEmptyString(run.contextSnapshot.issueId),
+      now,
+      excludeRunId: run.id,
+    });
+
   async function promoteDueScheduledRetries(now = new Date()) {
+    await coalesceProviderQuotaRetries(now).catch((err) => {
+      logger.warn({ err }, "failed to coalesce provider quota retries");
+    });
     const cutoff = await getWorktreeExecutionCutoff();
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
       cutoff,
+      admission: admitScheduledRetryThroughAutomationWindow,
     });
     applyRunDispatchPostCommitEffects(result.postCommitEffects);
     return { promoted: result.promoted, runIds: result.runIds };
@@ -16841,6 +18316,7 @@ export function heartbeatService(
       maxConcurrentRuns: normalizeMaxConcurrentRuns(
         heartbeat.maxConcurrentRuns,
       ),
+      automationWakeSettings: readAgentAutomationWakeSettings(heartbeat),
       skipTimerWhenNoActionableWork: asBoolean(
         heartbeat.skipTimerWhenNoActionableWork ??
           heartbeat.requireActionableTimerWork ??
@@ -16858,6 +18334,9 @@ export function heartbeatService(
           heartbeat.dailyCostCentsLimit ??
           heartbeat.dailySpendCentsLimit ??
           heartbeat.dailyBudgetCents,
+      ),
+      providerQuotaRetry: parseProviderQuotaRetryPolicy(
+        heartbeat.providerQuotaRetry,
       ),
     };
   }
@@ -16894,6 +18373,228 @@ export function heartbeatService(
     return { start, end };
   }
 
+  /**
+   * The run profile an issue gives its assignee's run: the issue's own profile
+   * (or the model and effort of its legacy adapter override) resolved against
+   * the company's tiers. Only legacy runs of the local Claude, Codex and Grok
+   * harnesses take a profile. An unknown tier runs on the agent's default and
+   * is noted on the run.
+   */
+  async function resolveRunProfileForRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType">,
+  ): Promise<ProfileTargetInput | null> {
+    if (run.runtimeMode === "native") return null;
+    if (!(HARNESS_FALLBACK_ADAPTER_TYPES as readonly string[]).includes(agent.adapterType)) return null;
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (!issueId) return null;
+    const issue = await getIssueExecutionContext(agent.companyId, issueId);
+    if (!issue || issue.assigneeAgentId !== agent.id) return null;
+    const overrides = parseIssueAssigneeAdapterOverrides(issue.assigneeAdapterOverrides);
+    const issueProfile = issueRunProfileFromOverrides(overrides);
+    if (!issueProfile) return null;
+    const tiers = (await instanceSettings.getGeneral()).companyRunTiers?.[agent.companyId] ?? null;
+    const resolved = resolveRunProfile(issueProfile.profile, tiers);
+    if (!resolved.ok) {
+      logger.warn({ runId: run.id, tier: resolved.tier }, "run profile names an unknown tier; running on the agent default");
+      return null;
+    }
+    if (!resolved.target) return null;
+    return { ...resolved.target, source: "issue_profile" };
+  }
+
+  /** Notes on a held queued run when it can start; written once per cooldown end. */
+  async function recordProviderQuotaWait(run: typeof heartbeatRuns.$inferSelect, heldUntil: Date) {
+    const waitUntil = heldUntil.toISOString();
+    // A merge in SQL: a comment wake can coalesce into this queued run while
+    // we hold it, and a read-modify-write of the snapshot would drop it.
+    const [held] = await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ providerQuotaWaitUntil: waitUntil })}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.status, "queued"),
+        sql`coalesce(${heartbeatRuns.contextSnapshot}->>'providerQuotaWaitUntil', '') <> ${waitUntil}`,
+      ))
+      .returning();
+    if (!held) return;
+    await appendRunEvent(held, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: `Waiting for the provider quota to reset; this run starts at or after ${waitUntil}`,
+      payload: { providerQuotaWaitUntil: waitUntil },
+    }).catch(() => undefined);
+  }
+
+  /**
+   * After a failed legacy run that hit a provider usage limit before useful
+   * work (or a capacity limit whose bounded retries are spent), cools the
+   * harness/model that ran down until the provider's reset, or a bounded
+   * backoff when none is known. With a healthy fallback the same wake is
+   * re-dispatched there once; otherwise every retry and new wake waits for
+   * the cooldown (see scheduleBoundedRetryForRun and claimQueuedRun).
+   */
+  async function handleProviderQuotaFailure(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    executedAgent: typeof agents.$inferSelect;
+    storedAgent: typeof agents.$inferSelect;
+    phase: "failure" | "retry_exhausted";
+  }): Promise<{ redispatched: boolean; awaitingRetryExhaustion: boolean; deferUntil: Date | null }> {
+    const none = { redispatched: false, awaitingRetryExhaustion: false, deferUntil: null };
+    const { run, executedAgent, storedAgent } = input;
+    if (run.runtimeMode === "native") return none;
+    const dispatch = readClaimedHarnessDispatch(run.runnerProfileJson) ?? primaryHarnessDispatch(storedAgent);
+    if (!isLlmHarnessAdapterType(dispatch.adapterType)) return none;
+    const outputTokens = asNumber(parseObject(run.usageJson).outputTokens, 0);
+    let usefulWork = outputTokens > 0;
+    if (!usefulWork) {
+      const evidence = await buildRunLivenessInput(run, parseObject(run.resultJson))
+        .then((liveness) => liveness.evidence)
+        .catch(() => null);
+      // An unreadable evidence lookup fails closed: the failure still has to
+      // read as a provider quota error, and cooling down is the safe side.
+      usefulWork = !!evidence && (
+        (evidence.issueCommentsCreated ?? 0) > 0 ||
+        (evidence.documentRevisionsCreated ?? 0) > 0 ||
+        (evidence.workProductsCreated ?? 0) > 0 ||
+        (evidence.activityEventsCreated ?? 0) > 0);
+    }
+    const decision = classifyQuotaFailure({
+      status: run.status,
+      errorCode: run.errorCode,
+      errorFamily: readHeartbeatRunErrorFamily(run),
+      errorMessage: run.error,
+      retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+      usefulWork,
+    });
+    if (!decision.trigger) return none;
+    if (decision.requiresRetryExhaustion && input.phase !== "retry_exhausted") {
+      return { ...none, awaitingRetryExhaustion: true };
+    }
+    const reason = `provider_${decision.kind}`;
+    const cooled = await harnessFallback.coolDown({
+      agent: storedAgent,
+      targetKey: dispatch.targetKey,
+      reason,
+      resetAt: decision.resetAt,
+      sourceRunId: run.id,
+      profile: dispatch.profile ?? null,
+    }).catch((err) => {
+      // Fail closed: without a recorded cooldown the normal 30 second retry
+      // would send this wake straight back at the exhausted target.
+      logger.warn({ err, runId: run.id, target: dispatch.targetKey }, "quota cooldown could not be recorded; deferring this wake");
+      return null;
+    });
+    if (!cooled) {
+      return { ...none, deferUntil: new Date(Date.now() + COOLDOWN_READ_FAILURE_BASE_MS) };
+    }
+    const { until, nextTarget } = cooled;
+    if (!until) return none;
+    const context = parseObject(run.contextSnapshot);
+    const alreadyRedispatched = readNonEmptyString(parseObject(context.harnessFallbackRedispatch).fromRunId) !== null;
+    await appendRunEvent(run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: `Harness ${dispatch.targetKey} cooled down until ${until.toISOString()} (${reason})`,
+      payload: {
+        harnessTarget: dispatch.targetKey,
+        reason,
+        cooldownUntil: until.toISOString(),
+        resetKnown: decision.resetAt !== null,
+        nextTarget: nextTarget?.key ?? null,
+        alreadyRedispatched,
+      },
+    });
+    // A wake gets one re-dispatch. A failed fallback run defers the wake to its
+    // own cooldown end instead of hopping to the next target a moment later.
+    if (alreadyRedispatched) return { ...none, deferUntil: until };
+    if (!nextTarget) return none;
+    const scheduled = await scheduleBoundedRetryForRun(run, executedAgent, {
+      retryReason: HARNESS_FALLBACK_RETRY_REASON,
+      wakeReason: HARNESS_FALLBACK_WAKE_REASON,
+      maxAttempts: executionRetryAttemptCount(run, HARNESS_FALLBACK_RETRY_REASON) + 1,
+      delayMs: 0,
+      contextPatch: {
+        harnessFallbackRedispatch: {
+          fromRunId: run.id,
+          fromTarget: dispatch.targetKey,
+          toTarget: nextTarget.key,
+          reason,
+        },
+      },
+    });
+    return { ...none, redispatched: scheduled.outcome === "scheduled" };
+  }
+
+  /**
+   * The single definition of how many runs `maxDailyRuns` counts, per agent,
+   * in one UTC day. The cap check (`getHeartbeatDailyCapBlock`), the run
+   * stats (`runStats`) and the provider quota alarm all read it, so what
+   * automation reads from the stats is exactly what the cap enforces. A run
+   * that the cap should not charge is taken out of the count here and in
+   * `countedDailyRuns`, and nowhere else.
+   *
+   * Counted: runs started in the day that are not queued or waiting to retry.
+   * `providerQuotaBeforeUsefulAction` is the part of them that failed on a
+   * provider quota before any useful action; `countedDailyRuns` decides how
+   * many of those the cap forgives.
+   *
+   * @param companyId - the company whose runs are counted.
+   * @param options.agentId - count one agent; omit to count every agent that has runs.
+   * @param options.excludeRunId - a run to leave out (the run being admitted).
+   * @param options.window - the UTC day; defaults to the current one.
+   * @returns the usage per agent ID; an agent with none is absent.
+   */
+  async function computeDailyRunUsage(
+    companyId: string,
+    options: {
+      agentId?: string;
+      excludeRunId?: string | null;
+      window?: { start: Date; end: Date };
+    } = {},
+    client: Pick<Db, "select"> = db,
+  ): Promise<Map<string, DailyRunUsage>> {
+    const window = options.window ?? currentUtcDayWindow();
+    const conditions = [
+      eq(heartbeatRuns.companyId, companyId),
+      gte(heartbeatRuns.startedAt, window.start),
+      lt(heartbeatRuns.startedAt, window.end),
+      notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
+      // A run that a harness fallback re-dispatched is charged once, on the successor.
+      sql`not exists (
+        select 1 from heartbeat_runs fallback_successor
+        where fallback_successor.company_id = ${heartbeatRuns.companyId}
+          and fallback_successor.retry_of_run_id = ${heartbeatRuns.id}
+          and fallback_successor.scheduled_retry_reason = ${HARNESS_FALLBACK_RETRY_REASON}
+      )`,
+      ...(options.agentId ? [eq(heartbeatRuns.agentId, options.agentId)] : []),
+      ...(options.excludeRunId ? [sql`${heartbeatRuns.id} <> ${options.excludeRunId}`] : []),
+    ];
+    const rows = await client
+      .select({
+        agentId: heartbeatRuns.agentId,
+        total: sql<number>`count(*)::integer`,
+        providerQuotaBeforeUsefulAction: sql<number>`count(*) filter (where ${heartbeatRuns.status} = 'failed' and ${heartbeatRuns.resultJson} ->> 'providerQuotaBeforeUsefulAction' = 'true')::integer`,
+      })
+      .from(heartbeatRuns)
+      .where(and(...conditions))
+      .groupBy(heartbeatRuns.agentId);
+    return new Map(
+      rows.map((row) => [
+        row.agentId,
+        {
+          total: Number(row.total),
+          providerQuotaBeforeUsefulAction: Number(row.providerQuotaBeforeUsefulAction),
+        },
+      ]),
+    );
+  }
+
   async function getHeartbeatDailyCapBlock(
     agent: typeof agents.$inferSelect,
     policy: ReturnType<typeof parseHeartbeatPolicy>,
@@ -16908,21 +18609,12 @@ export function heartbeatService(
     const checkCostCap = options.checkCostCap ?? true;
     const { start, end } = currentUtcDayWindow();
     if (checkRunCap && policy.maxDailyRuns !== null) {
-      const conditions = [
-        eq(heartbeatRuns.companyId, agent.companyId),
-        eq(heartbeatRuns.agentId, agent.id),
-        gte(heartbeatRuns.startedAt, start),
-        lt(heartbeatRuns.startedAt, end),
-        notInArray(heartbeatRuns.status, ["queued", "scheduled_retry"]),
-      ];
-      if (options.excludeRunId) {
-        conditions.push(sql`${heartbeatRuns.id} <> ${options.excludeRunId}`);
-      }
-      const [row] = await client
-        .select({ total: sql<number>`count(*)::integer` })
-        .from(heartbeatRuns)
-        .where(and(...conditions));
-      const observed = Number(row?.total ?? 0);
+      const usage = await computeDailyRunUsage(
+        agent.companyId,
+        { agentId: agent.id, excludeRunId: options.excludeRunId, window: { start, end } },
+        client,
+      );
+      const observed = countedDailyRuns(usage.get(agent.id) ?? NO_DAILY_RUNS, policy);
       if (observed >= policy.maxDailyRuns) {
         return {
           reason: "heartbeat.daily_run_limit",
@@ -17461,6 +19153,30 @@ export function heartbeatService(
       await cancelQueuedRunForHeartbeatDailyCap(run, dailyCapBlock);
       return null;
     }
+    if (await waitForProviderQuotaLane(run, agent)) return null;
+
+    const runProfile = await resolveRunProfileForRun(run, agent);
+    const harnessDecision = await harnessFallback.resolveDispatch(agent, new Date(), runProfile);
+    if (runProfile && profileUnavailableReason(agent, runProfile)) {
+      logger.warn(
+        { runId: run.id, agentId: agent.id, profile: runProfile },
+        "run profile needs credentials this agent does not have for that harness; running on the agent default",
+      );
+    }
+    if (harnessDecision.heldUntil && run.runtimeMode !== "native") {
+      // Every harness/model of this agent is out of provider quota. Leave the
+      // run queued: the scheduler tick claims it once a target recovers, and
+      // the daily run cap is not charged for the wait.
+      await recordProviderQuotaWait(run, harnessDecision.heldUntil);
+      return null;
+    }
+    const harnessDispatch: HarnessDispatch = harnessDecision.dispatch;
+    const adapterDispatchPatch = JSON.stringify({ adapterDispatch: harnessDispatch });
+    const harnessDispatchColumns = {
+      executedAdapterType: harnessDispatch.adapterType,
+      executedModel: harnessDispatch.model,
+      fallbackReason: harnessDispatch.fallbackReason,
+    };
 
     const issueId = readNonEmptyString(context.issueId);
     if (issueId && activeRunExecutions.size > 0) {
@@ -17800,7 +19516,8 @@ export function heartbeatService(
                   .update(heartbeatRuns)
                   .set({
                     status: "running",
-                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${adapterDispatchPatch}::jsonb`,
+                    ...harnessDispatchColumns,
                     ...legacyControllerClaim(run.runtimeMode),
                     responsibleUserId,
                     startedAt: lockedRun.startedAt ?? claimedAt,
@@ -17818,21 +19535,24 @@ export function heartbeatService(
                   ? { kind: "claimed" as const, run: claimedRun }
                   : { kind: "stale" as const, run: null };
               }
-              const commentRows = await tx
-                .select({
-                  id: issueComments.id,
-                  deletedAt: issueComments.deletedAt,
-                })
-                .from(issueComments)
-                .where(
-                  and(
-                    eq(issueComments.companyId, run.companyId),
-                    eq(issueComments.issueId, issueId),
-                    inArray(issueComments.id, authoritativeIds),
+              const commentRows = await selectInCommentBatches(authoritativeIds, (batch) =>
+                tx
+                  .select({
+                    id: issueComments.id,
+                    deletedAt: issueComments.deletedAt,
+                  })
+                  .from(issueComments)
+                  .where(
+                    and(
+                      eq(issueComments.companyId, run.companyId),
+                      eq(issueComments.issueId, issueId),
+                      inArray(issueComments.id, batch),
+                    ),
                   ),
-                );
+              );
+              const commentsById = new Map(commentRows.map((row) => [row.id, row]));
               const liveIds = authoritativeIds.filter((commentId) => {
-                const comment = commentRows.find((row) => row.id === commentId);
+                const comment = commentsById.get(commentId);
                 return Boolean(comment && !comment.deletedAt);
               });
               if (liveIds.length === 0) {
@@ -17899,7 +19619,8 @@ export function heartbeatService(
                 .update(heartbeatRuns)
                 .set({
                   status: "running",
-                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${adapterDispatchPatch}::jsonb`,
+                  ...harnessDispatchColumns,
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
@@ -17966,7 +19687,8 @@ export function heartbeatService(
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
           const claimValues = {
             status: "running",
-            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${adapterDispatchPatch}::jsonb`,
+            ...harnessDispatchColumns,
             ...legacyControllerClaim(run.runtimeMode),
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
@@ -17989,6 +19711,11 @@ export function heartbeatService(
           });
         });
     if (!claimed) return null;
+    if (harnessDispatch.target === "primary") {
+      await harnessFallback.notePrimaryDispatched(agent, claimed.id).catch((err) => {
+        logger.warn({ err, runId: claimed.id }, "failed to record the return to the primary harness");
+      });
+    }
 
     publishLiveEvent({
       companyId: claimed.companyId,
@@ -18488,6 +20215,51 @@ export function heartbeatService(
         ),
       },
     };
+  }
+
+  /**
+   * Marks a provider-quota failure that happened before any useful action:
+   * the model produced no output and the run left no comment, document,
+   * work product, activity or run event beyond lifecycle, invocation and
+   * error records. Any tool or action event counts as useful action, so a run
+   * that may have caused an external side effect is never replayed for free.
+   * The server owns the marker, so an adapter-supplied value is dropped.
+   */
+  async function withProviderQuotaUsefulActionMarker(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    // Typed from the resolution so the stale string run.runtimeMode cannot be passed.
+    runtimeKind: NativeRuntimeResolution["kind"];
+    outcome: string;
+    errorCode: string | null;
+    outputTokens: number;
+    resultJson: Record<string, unknown> | null;
+  }) {
+    const { resultJson } = input;
+    const marked =
+      isProviderQuotaUsefulActionCandidate(input) &&
+      !(await runLeftDurableActionEvidence(input.run));
+    if (!marked && !(resultJson && "providerQuotaBeforeUsefulAction" in resultJson)) {
+      return resultJson;
+    }
+    const result = { ...resultJson };
+    delete result.providerQuotaBeforeUsefulAction;
+    return marked ? { ...result, providerQuotaBeforeUsefulAction: true } : result;
+  }
+
+  /** An unreadable evidence check counts as useful work: the run is charged as before. */
+  async function runLeftDurableActionEvidence(
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    try {
+      const { evidence } = await buildRunLivenessInput(run, run.resultJson);
+      return hasConcreteActionEvidence(evidence);
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id },
+        "could not read run action evidence; treating the provider quota failure as charged",
+      );
+      return true;
+    }
   }
 
   async function classifyAndPersistRunLiveness(
@@ -19476,10 +21248,14 @@ export function heartbeatService(
           const detachedMessage = processPidAlive
             ? `Lost in-memory process handle, but child pid ${run.processPid} is still alive`
             : `Lost in-memory process handle, but persisted process group ${run.processGroupId} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
+          // Compare-and-set: the run may have finished after it was listed
+          // above. Writing by id alone would reopen a terminal run with its
+          // old finished_at.
+          const detached = await setRunStatusIfRunning(run.id, "running", {
             error: detachedMessage,
             errorCode: DETACHED_PROCESS_ERROR_CODE,
           });
+          const detachedRun = detached.updated ? detached.run : null;
           if (detachedRun) {
             await appendRunEvent(detachedRun, {
               eventType: "lifecycle",
@@ -19603,6 +21379,7 @@ export function heartbeatService(
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
       await startNextQueuedRunForAgent(run.agentId);
+      await redeliverDeferredWakesForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
     }
@@ -19733,6 +21510,461 @@ export function heartbeatService(
     });
   }
 
+  const countersForCompany = deferredWakeCountersForCompany;
+  // The completion trigger runs after a run frees a slot. Promotion queues a run
+  // whose start calls `startNextQueuedRunForAgent` again, so one pass per agent.
+  const deferredWakeCompletionPassesInFlight = new Set<string>();
+
+  /**
+   * The holds that mean "do not wake this issue" and need more than a column to
+   * prove: an active subtree pause hold, an execution blocker that awaits an
+   * operator, and an operator Stop. An operator Stop never promotes old queued
+   * work by itself; the next explicit wake adopts it. Read once for a whole
+   * batch: one pause-hold probe per company, one latest-run read for all issues,
+   * and the per-issue blocker read only for the wakes about to be promoted.
+   */
+  async function readDeferredWakeHolds(candidates: readonly OrphanedDeferredWakeRow[]) {
+    // An execution blocker carries its cause, so a reader sees which recovery holds the wake.
+    const holds = new Map<
+      string,
+      { reason: "pause_hold" | "execution_blocker" | "operator_stop"; cause: string | null }
+    >();
+    const blockers = new Map<string, ExecutionBlocker>();
+    if (candidates.length === 0) return { holds, blockers };
+
+    const companyIds = [...new Set(candidates.map((candidate) => candidate.companyId))];
+    const companiesWithPauseHold = new Set(
+      (await db
+        .selectDistinct({ companyId: issueTreeHolds.companyId })
+        .from(issueTreeHolds)
+        .where(and(
+          inArray(issueTreeHolds.companyId, companyIds),
+          eq(issueTreeHolds.status, "active"),
+          eq(issueTreeHolds.mode, "pause"),
+        ))).map((row) => row.companyId),
+    );
+
+    const issueKey = sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
+    const latestRuns = await db
+      .selectDistinctOn([issueKey])
+      .from(heartbeatRuns)
+      .where(and(
+        inArray(heartbeatRuns.companyId, companyIds),
+        sql`${issueKey} in (${sql.join(
+          [...new Set(candidates.map((candidate) => candidate.issueId))].map((issueId) => sql`${issueId}`),
+          sql`, `,
+        )})`,
+      ))
+      .orderBy(issueKey, desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
+    const latestRunByIssueId = new Map(
+      latestRuns.map((run) => [String(parseObject(run.contextSnapshot).issueId), run]),
+    );
+
+    for (const candidate of candidates) {
+      if (
+        companiesWithPauseHold.has(candidate.companyId) &&
+        (await treeControlSvc.getActivePauseHoldGate(candidate.companyId, candidate.issueId))
+      ) {
+        holds.set(candidate.wakeId, { reason: "pause_hold", cause: null });
+        continue;
+      }
+      const executionBlocker = await getExecutionBlocker(db, candidate.companyId, candidate.issueId);
+      if (executionBlocker) {
+        holds.set(candidate.wakeId, { reason: "execution_blocker", cause: executionBlocker.cause });
+        blockers.set(candidate.wakeId, executionBlocker);
+        continue;
+      }
+      const latest = latestRunByIssueId.get(candidate.issueId);
+      if (
+        latest &&
+        (isAcknowledgedNativeReassignmentStop(latest) ||
+          (latest.status === "cancelled" &&
+            (parseObject(latest.resultJson?.executionCancellation).state === "acknowledged" ||
+              isAcknowledgedNativeStop(latest))))
+      ) {
+        holds.set(candidate.wakeId, { reason: "operator_stop", cause: null });
+      }
+    }
+    return { holds, blockers };
+  }
+
+  /**
+   * Records, once per wake, that the sweep keeps a wake parked longer than
+   * `DEFERRED_WAKE_HELD_NOTICE_MS`, whatever holds it: no free run slot, an agent
+   * that cannot run, a budget stop, a pause hold, an operator Stop, an execution
+   * blocker (with its cause, run and recovery action) or admission deferring it
+   * again. The advisory lock makes the check and the insert atomic.
+   */
+  async function recordDeferredWakeHeld(
+    candidate: OrphanedDeferredWakeRow,
+    reason: DeferredWakeHeldReason,
+    blocker: ExecutionBlocker | null,
+  ) {
+    const publications: ActivityPublication[] = [];
+    await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await txDb.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`deferred-wake-held:${candidate.wakeId}`}, 0))`,
+      );
+      const [existing] = await txDb
+        .select({ id: activityLog.id })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, candidate.companyId),
+          eq(activityLog.action, DEFERRED_WAKE_HELD_ACTION),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, candidate.issueId),
+          sql`${activityLog.details} ->> 'wakeId' = ${candidate.wakeId}`,
+        ))
+        .limit(1);
+      if (existing) return;
+      await logActivity(txDb, {
+        companyId: candidate.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: candidate.agentId,
+        action: DEFERRED_WAKE_HELD_ACTION,
+        entityType: "issue",
+        entityId: candidate.issueId,
+        details: {
+          wakeId: candidate.wakeId,
+          reason,
+          parkedSince: candidate.requestedAt.toISOString(),
+          ...(blocker
+            ? {
+                cause: blocker.cause,
+                runId: blocker.runId,
+                recoveryActionId: blocker.recoveryActionId,
+                nextAction: blocker.nextAction,
+              }
+            : {}),
+        },
+      }, publications);
+    });
+    for (const publication of publications) publishActivity(publication);
+  }
+
+  /**
+   * Re-drives one orphaned wake through ordinary admission. Admission takes the
+   * issue-row lock, compare-and-swaps the parked receipt, applies every gate
+   * (budget, pause hold, execution blocker, dependencies, a closed task, a former
+   * assignee), creates the successor run and consumes the receipt in ONE
+   * transaction. A concurrent release drain, adoption or cancellation that got
+   * the lock first leaves nothing to deliver, so a wake starts at most one run
+   * and never leaves a second parked receipt behind.
+   */
+  async function redeliverDeferredWake(candidate: OrphanedDeferredWakeRow) {
+    const [wake] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.id, candidate.wakeId),
+      eq(agentWakeupRequests.companyId, candidate.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ));
+    if (!wake) return "retired" as const;
+    // The context rides inside the receipt's payload; hand it back as the
+    // wake's context so the successor run is built as the original would be.
+    const { [DEFERRED_WAKE_CONTEXT_KEY]: deferredContext, ...payload } = parseObject(wake.payload);
+    const context = parseObject(deferredContext);
+    await enqueueWakeup(wake.agentId, {
+      source: (wake.source ?? "automation") as WakeupOptions["source"],
+      triggerDetail: (wake.triggerDetail ?? "system") as WakeupOptions["triggerDetail"],
+      // A parked receipt's own reason is the deferral; the wake's reason is in its context.
+      reason: readNonEmptyString(context.wakeReason) ?? wake.reason,
+      payload,
+      contextSnapshot: context,
+      requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
+      requestedByActorId: wake.requestedByActorId,
+      redeliverDeferredWake: true,
+    }, wake.id);
+    const [after] = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, candidate.wakeId));
+    if (!after || after.status === "deferred_issue_execution") return "stillDeferred" as const;
+    return after.runId ? ("promoted" as const) : ("retired" as const);
+  }
+
+  /**
+   * Safety net for deferred wakes nothing will promote. A wake is parked behind
+   * its issue's execution lock and promoted when the holder releases; several
+   * paths clear that lock without the drain (the stale-lock sweeper, the
+   * claim-time stale-run cancel, a reaped holder), and the older recovery only
+   * saw comment-shaped wakes of an agent that had already run the issue. This
+   * finds every wake whose open issue has no lock and no live run, skips held
+   * work, and re-delivers in priority then FIFO order, at most one per issue
+   * and one per free agent slot, and at most `DEFERRED_WAKE_SWEEP_MAX_PER_PASS`
+   * per pass so a backlog drains over several passes instead of one burst.
+   * Idempotent: an optimistic claim on the wake and the issue-locked admission
+   * mean concurrent passes can start at most one run per wake.
+   */
+  async function sweepDeferredWakes(opts: {
+    agentId?: string;
+    /** `0` for the run-completion trigger; the periodic sweep waits `DEFERRED_WAKE_SWEEP_MIN_AGE_MS`. */
+    minAgeMs?: number;
+    recheckMs?: number;
+    maxPromotions?: number;
+    now?: Date;
+  } = {}) {
+    const result = {
+      scanned: 0,
+      promoted: 0,
+      retired: 0,
+      stillDeferred: 0,
+      skippedHeld: 0,
+      skippedPauseHold: 0,
+      skippedExecutionBlocker: 0,
+      skippedOperatorStop: 0,
+      skippedBudget: 0,
+      skippedNotInvokable: 0,
+      skippedCapacity: 0,
+      executionBlockerCauses: {} as Record<string, number>,
+      failed: 0,
+    };
+    if ((await getSchedulingSuppression()).suppressed) return result;
+    const now = opts.now ?? new Date();
+    if (!opts.agentId) {
+      // A wake parked on a closed task will never run; finalize it instead of
+      // keeping it parked.
+      const retiredClosed = await wakeQueue.retireClosedIssueDeferredWakes({
+        now,
+        minAgeMs: DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+      });
+      result.retired += retiredClosed.length;
+      for (const wake of retiredClosed) countersForCompany(wake.companyId).retired += 1;
+    }
+
+    const orphans = await wakeQueue.listOrphanedDeferredWakes({
+      now,
+      minAgeMs: opts.minAgeMs ?? DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
+      recheckMs: opts.recheckMs ?? DEFERRED_WAKE_SWEEP_RECHECK_MS,
+      ...(opts.agentId ? { agentId: opts.agentId } : {}),
+      requestedAtGte: await getWorktreeExecutionCutoff(),
+    });
+    result.scanned = orphans.length;
+    if (orphans.length === 0) return result;
+    for (const orphan of orphans) {
+      const counters = countersForCompany(orphan.companyId);
+      counters.examined += 1;
+      counters.lastExaminedAt = now;
+    }
+
+    // Agent facts for the whole batch: the agents, each company's org rows for
+    // the invokability chain, and each agent's running count, in three reads.
+    const agentIds = [...new Set(orphans.map((orphan) => orphan.agentId))];
+    const agentRows = await db.select().from(agents).where(inArray(agents.id, agentIds));
+    const agentById = new Map(agentRows.map((row) => [row.id, row]));
+    const orgRowsByCompany = new Map<string, AgentOrgRow[]>();
+    for (const companyId of new Set(agentRows.map((row) => row.companyId))) {
+      orgRowsByCompany.set(companyId, await listCompanyAgentOrgRows(companyId));
+    }
+    const runningRows = await db
+      .select({ agentId: heartbeatRuns.agentId, running: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(and(inArray(heartbeatRuns.agentId, agentIds), eq(heartbeatRuns.status, "running")))
+      .groupBy(heartbeatRuns.agentId);
+    const runningByAgent = new Map(runningRows.map((row) => [row.agentId, Number(row.running)]));
+
+    const freeSlotsByAgent = new Map<string, number>();
+    const notInvokableAgentIds = new Set<string>();
+    for (const agentId of agentIds) {
+      const agent = agentById.get(agentId);
+      if (!agent) continue;
+      const invokable = evaluateAgentInvokability(toAgentOrgRow(agent), orgRowsByCompany.get(agent.companyId) ?? [])
+        .invokable;
+      if (!invokable) {
+        notInvokableAgentIds.add(agentId);
+        continue;
+      }
+      freeSlotsByAgent.set(
+        agentId,
+        Math.max(0, parseHeartbeatPolicy(agent).maxConcurrentRuns - (runningByAgent.get(agentId) ?? 0)),
+      );
+    }
+    // A wake of an agent that cannot run waits for it. Move those wakes to the
+    // back of the recheck window in one write, so they cannot crowd out others.
+    const notInvokableWakes = orphans.filter((orphan) => notInvokableAgentIds.has(orphan.agentId));
+    if (notInvokableWakes.length > 0) {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        inArray(agentWakeupRequests.id, notInvokableWakes.map((orphan) => orphan.wakeId)),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      for (const orphan of notInvokableWakes) countersForCompany(orphan.companyId).skippedNotInvokable += 1;
+      result.skippedNotInvokable = notInvokableWakes.length;
+    }
+    // Why each examined wake stays parked this pass; promoted wakes are removed.
+    const heldReasons = new Map<string, { reason: DeferredWakeHeldReason; blocker: ExecutionBlocker | null }>(
+      orphans.map((orphan) => [
+        orphan.wakeId,
+        {
+          reason: notInvokableAgentIds.has(orphan.agentId)
+            ? "agent_not_invokable"
+            : (freeSlotsByAgent.get(orphan.agentId) ?? 0) === 0
+              ? "no_free_run_slot"
+              : "waiting_for_turn",
+          blocker: null,
+        },
+      ]),
+    );
+
+    // Without them, an issue is served through its oldest wake that can run now.
+    const invokableOrphans = orphans.filter((orphan) => !notInvokableAgentIds.has(orphan.agentId));
+    const selected = selectDeferredWakesToPromote(invokableOrphans, freeSlotsByAgent, {
+      maxTotal: sweepPromotionBudget(opts.maxPromotions),
+    });
+    // An eligible issue the pass did not select waits for a free slot or the next pass.
+    const eligibleIssuesByCompany = new Map<string, Set<string>>();
+    for (const orphan of invokableOrphans) {
+      const issuesOfCompany = eligibleIssuesByCompany.get(orphan.companyId) ?? new Set<string>();
+      issuesOfCompany.add(orphan.issueId);
+      eligibleIssuesByCompany.set(orphan.companyId, issuesOfCompany);
+    }
+    for (const [companyId, eligibleIssues] of eligibleIssuesByCompany) {
+      const left = Math.max(
+        0,
+        eligibleIssues.size - selected.filter((candidate) => candidate.companyId === companyId).length,
+      );
+      countersForCompany(companyId).skippedCapacity += left;
+      result.skippedCapacity += left;
+    }
+    const { holds, blockers } = await readDeferredWakeHolds(selected);
+    // Company, agent and project decide a budget block, so one read serves every
+    // wake that shares them.
+    const budgetBlockByScope = new Map<string, boolean>();
+
+    for (const candidate of selected) {
+      const counters = countersForCompany(candidate.companyId);
+      try {
+        const claimed = await wakeQueue.claimDeferredWakeExamination({
+          companyId: candidate.companyId,
+          wakeId: candidate.wakeId,
+          observedUpdatedAt: candidate.observedUpdatedAt,
+          now: new Date(),
+        });
+        if (!claimed) {
+          // Another pass owns this wake now.
+          heldReasons.delete(candidate.wakeId);
+          continue;
+        }
+        const hold = holds.get(candidate.wakeId);
+        if (hold) {
+          // The wake stays parked and moves to the back of the recheck window.
+          // Count it by what holds it, so the endpoint says why it was not woken.
+          const reasonKey = {
+            pause_hold: "skippedPauseHold",
+            execution_blocker: "skippedExecutionBlocker",
+            operator_stop: "skippedOperatorStop",
+          }[hold.reason] as "skippedPauseHold" | "skippedExecutionBlocker" | "skippedOperatorStop";
+          for (const tally of [result, counters]) {
+            tally.skippedHeld += 1;
+            tally[reasonKey] += 1;
+            if (hold.cause) tally.executionBlockerCauses[hold.cause] = (tally.executionBlockerCauses[hold.cause] ?? 0) + 1;
+          }
+          heldReasons.set(candidate.wakeId, { reason: hold.reason, blocker: blockers.get(candidate.wakeId) ?? null });
+          continue;
+        }
+        const budgetScope = `${candidate.companyId}:${candidate.agentId}:${candidate.projectId ?? ""}`;
+        if (!budgetBlockByScope.has(budgetScope)) {
+          budgetBlockByScope.set(
+            budgetScope,
+            Boolean(await budgets.getInvocationBlock(candidate.companyId, candidate.agentId, {
+              issueId: candidate.issueId,
+              projectId: candidate.projectId,
+            })),
+          );
+        }
+        if (budgetBlockByScope.get(budgetScope)) {
+          // A hard stop leaves the receipt parked and untouched: no run row is
+          // created and none is cancelled later. It resumes when the budget does.
+          result.skippedBudget += 1;
+          counters.skippedBudget += 1;
+          heldReasons.set(candidate.wakeId, { reason: "budget_stop", blocker: null });
+          continue;
+        }
+        const outcome = await redeliverDeferredWake(candidate);
+        result[outcome] += 1;
+        counters[outcome] += 1;
+        if (outcome === "stillDeferred") {
+          heldReasons.set(candidate.wakeId, { reason: "admission_deferred", blocker: null });
+        } else {
+          heldReasons.delete(candidate.wakeId);
+        }
+      } catch (err) {
+        result.failed += 1;
+        counters.failed += 1;
+        heldReasons.delete(candidate.wakeId);
+        logger.warn({ err, queueId: candidate.wakeId }, "failed to re-deliver an orphaned deferred wake");
+      }
+    }
+
+    for (const orphan of orphans) {
+      const held = heldReasons.get(orphan.wakeId);
+      if (!held || now.getTime() - orphan.requestedAt.getTime() < DEFERRED_WAKE_HELD_NOTICE_MS) continue;
+      await recordDeferredWakeHeld(orphan, held.reason, held.blocker).catch((err) => {
+        logger.warn({ err, wakeId: orphan.wakeId }, "failed to record a held deferred wake");
+      });
+    }
+
+    // One line per pass that read any wake, so a stall can be read from the log:
+    // what was seen, what started, and what held the rest.
+    const summary = { trigger: opts.agentId ? "run_completed" : "periodic", ...result };
+    if (result.failed > 0) logger.warn(summary, "deferred wake sweep pass");
+    else logger.info(summary, "deferred wake sweep pass");
+    return result;
+  }
+
+  /**
+   * Run-completion trigger: a run just freed one of this agent's slots, so
+   * promote its oldest (priority-aware) orphaned deferred wake now instead of
+   * waiting for the periodic sweep. Best effort; the periodic sweep is the net.
+   */
+  async function redeliverDeferredWakesForAgent(agentId: string) {
+    if (deferredWakeCompletionPassesInFlight.has(agentId)) return;
+    deferredWakeCompletionPassesInFlight.add(agentId);
+    try {
+      await sweepDeferredWakes({ agentId, minAgeMs: 0, recheckMs: 0 });
+    } catch (err) {
+      logger.warn({ err, agentId }, "failed to re-deliver deferred wakes after a run completed");
+    } finally {
+      deferredWakeCompletionPassesInFlight.delete(agentId);
+    }
+  }
+
+  /**
+   * Per-agent deferred-queue health for the API: how many wakes are parked, how
+   * long the oldest has waited, and how many were promoted recently. The sweep
+   * counters are this company's own, since the last server restart.
+   */
+  async function getDeferredWakeStats(companyId: string, now = new Date()) {
+    const perAgent = await wakeQueue.getDeferredWakeAgentStats({ companyId, now });
+    const parked = await wakeQueue.getDeferredWakeParkedBreakdown({ companyId });
+    const agentStats = perAgent.map((row) => ({
+      agentId: row.agentId,
+      agentName: row.agentName,
+      deferredCount: row.deferredCount,
+      oldestDeferredAt: row.oldestDeferredAt,
+      oldestDeferredAgeSeconds: row.oldestDeferredAt
+        ? Math.max(0, Math.round((now.getTime() - row.oldestDeferredAt.getTime()) / 1000))
+        : null,
+      promotedLast24h: row.promotedLast24h,
+    }));
+    const oldest = agentStats
+      .map((row) => row.oldestDeferredAt)
+      .filter((at): at is Date => at !== null)
+      .sort((left, right) => left.getTime() - right.getTime())[0] ?? null;
+    return {
+      generatedAt: now,
+      deferredTotal: agentStats.reduce((sum, row) => sum + row.deferredCount, 0),
+      promotedLast24h: agentStats.reduce((sum, row) => sum + row.promotedLast24h, 0),
+      oldestDeferredAt: oldest,
+      oldestDeferredAgeSeconds: oldest ? Math.max(0, Math.round((now.getTime() - oldest.getTime()) / 1000)) : null,
+      agents: agentStats,
+      parked,
+      sweep: {
+        ...countersForCompany(companyId),
+        executionBlockerCauses: { ...countersForCompany(companyId).executionBlockerCauses },
+      },
+    };
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
@@ -19759,7 +21991,7 @@ export function heartbeatService(
     const strandedQueues = await db.select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        issueIdEqualsText(sql`${agentWakeupRequests.payload}->>'issueId'`),
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -19803,7 +22035,7 @@ export function heartbeatService(
       .select({ wake: agentWakeupRequests })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
-        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`))
+        issueIdEqualsText(sql`${agentWakeupRequests.payload}->>'issueId'`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
@@ -19866,6 +22098,13 @@ export function heartbeatService(
       });
     }
 
+    // Every deferred wake above waits for a specific trigger. Any other wake
+    // whose issue lock is already free has no run left to promote it, so
+    // re-deliver it here instead of leaving it parked indefinitely.
+    await sweepDeferredWakes().catch((err) => {
+      logger.error({ err }, "failed to sweep orphaned deferred wakes");
+    });
+
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
@@ -19900,7 +22139,7 @@ export function heartbeatService(
       .innerJoin(
         issues,
         and(
-          sql`${issues.id}::text = ${agentTaskSessions.taskKey}`,
+          issueIdEqualsText(sql`${agentTaskSessions.taskKey}`),
           eq(issues.companyId, agentTaskSessions.companyId),
           eq(issues.assigneeAgentId, agentTaskSessions.agentId),
         ),
@@ -19955,7 +22194,7 @@ export function heartbeatService(
       .innerJoin(
         issues,
         and(
-          sql`${issues.id}::text = ${agentTaskSessions.taskKey}`,
+          issueIdEqualsText(sql`${agentTaskSessions.taskKey}`),
           eq(issues.companyId, agentTaskSessions.companyId),
           eq(issues.assigneeAgentId, agentTaskSessions.agentId),
         ),
@@ -20475,12 +22714,24 @@ export function heartbeatService(
     return promise;
   }
 
-  async function executeRun(
+  function executeRun(
     runId: string,
     runOptions: {
       nativeLeaseOwner?: string;
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
     } = {},
+  ) {
+    // Temp entries the run creates carry its id, so the temp sweep can prove
+    // the run ended before it removes them.
+    return runWithPaperclipTempRun(runId, () => executeRunAttempt(runId, runOptions));
+  }
+
+  async function executeRunAttempt(
+    runId: string,
+    runOptions: {
+      nativeLeaseOwner?: string;
+      nativeRestartRecovery?: NativeRestartRecoveryClaim;
+    },
   ) {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
@@ -20631,6 +22882,10 @@ export function heartbeatService(
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
+    let remoteRunTempLocation: HeartbeatRemoteRunTemp["cleanupLocation"] | null = null;
+    // Set when the adapter proves its last remote process exited, which a
+    // timeout or a dropped SSH channel does not.
+    let remoteProviderStopped = false;
     let nativeSessionResumeScheduled = false;
     let nativeOwnershipHeld = false;
     let nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
@@ -20658,8 +22913,8 @@ export function heartbeatService(
     let readFailureReportSecrets: () => string[] = () => [];
 
     try {
-      const agent = await getAgent(run.agentId);
-      if (!agent) {
+      const storedAgent = await getAgent(run.agentId);
+      if (!storedAgent) {
         await setRunStatus(runId, "failed", {
           error: "Agent not found",
           errorCode: "agent_not_found",
@@ -20674,6 +22929,11 @@ export function heartbeatService(
         return;
       }
 
+      const claimedHarnessDispatch = readClaimedHarnessDispatch(run.runnerProfileJson);
+      const agent = applyClaimedHarnessDispatch(storedAgent, claimedHarnessDispatch);
+      if (!agent) {
+        throw new Error("Agent fallback target changed during startup; start a new turn with the updated agent.");
+      }
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
       const selectedAdapter = claimedAdapterType(run);
@@ -20797,6 +23057,7 @@ export function heartbeatService(
             agent.id,
             [...resolvedInteractionCheckoutExpectedStatuses()],
             run.id,
+            HEARTBEAT_CHECKOUT_ACTOR,
           );
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
         } catch (error) {
@@ -20834,6 +23095,7 @@ export function heartbeatService(
             agent.id,
             ["todo", "backlog", "blocked"],
             run.id,
+            HEARTBEAT_CHECKOUT_ACTOR,
           );
           context[PAPERCLIP_HARNESS_CHECKOUT_KEY] = true;
         } catch (error) {
@@ -21788,7 +24050,7 @@ export function heartbeatService(
       });
       const mergedConfig = {
         ...workspaceManagedConfig,
-        ...(issueAssigneeOverrides?.adapterConfig ?? {}),
+        ...overridesForHarnessTarget(issueAssigneeOverrides?.adapterConfig, claimedHarnessDispatch),
         // The base below is already task-owned. Keep directory transport while
         // preserving isolated mode and the mandatory sandbox preflight.
         ...(useIsolatedTaskDirectory ? { workspaceStrategy: { type: "project_primary" } } : {}),
@@ -21848,6 +24110,7 @@ export function heartbeatService(
           routineId: routineEnvContext.routineId,
           responsibleUserId,
           executionRunConfig: aiBinding ? { ...executionRunConfig, env: stripAiAuthBindings(executionRunConfig.env) } : executionRunConfig,
+          agentEnvPathPrefix: agentEnvBindingPrefix(storedAgent, claimedHarnessDispatch),
           projectEnv: aiBinding ? stripAiAuthBindings(projectContext?.env) : projectContext?.env ?? null,
           routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
           secretsSvc,
@@ -21888,6 +24151,13 @@ export function heartbeatService(
         for (const key of AI_AUTH_ENV_KEYS) secretKeys.add(key);
         context.aiConnection = { ...managedAiRuntime.attribution, identity: managedAiRuntime.identity };
         await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
+      } else if (persistedNativeExecutionInput && parseObject(run.contextSnapshot?.aiConnection).identity) {
+        // The suspended run was started on a managed account and the agent has since been unbound.
+        throw new ConfigurationIncompleteFailure("The AI account changed while this native run was suspended. Start a new execution.", { configurationIncomplete: { reason: "ai_connection_changed", actionUrl: `/agents/${agent.id}/runtime` } });
+      } else if (context.aiConnection) {
+        // A retry copies its predecessor's snapshot; an unbound run carries no managed identity or attribution.
+        delete context.aiConnection;
+        await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) - 'aiConnection'` }).where(eq(heartbeatRuns.id, run.id));
       }
       if (secretManifest.length > 0) {
         context.paperclipSecrets = {
@@ -22021,6 +24291,14 @@ export function heartbeatService(
         });
       const configuredModel =
         readConfiguredModelFromAdapterConfig(runtimeConfig);
+      const harnessCompatibility = checkRunHarnessCompatibility({
+        adapterType: agent.adapterType,
+        config: runtimeConfig,
+        fallback: claimedHarnessDispatch?.target === "fallback" || claimedHarnessDispatch?.crossHarness === true,
+      });
+      if (!harnessCompatibility.ok) {
+        throw unprocessable(harnessCompatibility.message, { code: harnessCompatibility.code });
+      }
       if (context.refreshTools === true && agent.adapterType !== "paperclip_runner") {
         const capability = getServerAdapter(agent.adapterType).supportsToolRefreshOnResume;
         const canRefresh = typeof capability === "function" ? capability(runtimeConfig) : capability === true;
@@ -22037,10 +24315,20 @@ export function heartbeatService(
         preserveLegacySessionWithoutConfigMetadata:
           acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
       });
+      const previousIssueHarness = issueId
+        ? await harnessFallback.previousIssueHarness(agent, issueId, run.id)
+        : null;
+      const harnessSwitched =
+        previousIssueHarness !== null && previousIssueHarness !== agent.adapterType;
       const resetTaskSession =
-        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
+        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset || harnessSwitched;
       const sessionResetReason =
-        sessionConfigFreshness.reasons.join("; ") || null;
+        [
+          ...sessionConfigFreshness.reasons,
+          ...(harnessSwitched
+            ? [`the harness changed from ${previousIssueHarness} to ${agent.adapterType}`]
+            : []),
+        ].join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
       const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
         db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
@@ -23036,6 +25324,30 @@ export function heartbeatService(
         }
       } else {
         delete context.paperclipScratch;
+        // A remote run gets its own temp directory on the target, so agents
+        // do not fill the worker's shared /tmp.
+        try {
+          const existingRuntimeEnv = parseObject(runtimeConfig.env);
+          const remoteTemp = await prepareHeartbeatRemoteRunTemp({
+            native: agent.adapterType === "paperclip_runner",
+            runId: run.id,
+            target: executionTarget,
+            env: existingRuntimeEnv,
+          });
+          if (remoteTemp) {
+            remoteRunTempLocation = remoteTemp.cleanupLocation;
+            runtimeConfig = {
+              ...runtimeConfig,
+              env: { ...existingRuntimeEnv, ...remoteTemp.env },
+            };
+            context.paperclipScratch = remoteTemp.scratchContext;
+          }
+        } catch (remoteTempError) {
+          logger.warn(
+            { err: remoteTempError, runId: run.id, agentId: agent.id },
+            "failed to prepare the remote run temp directory; continuing without it",
+          );
+        }
       }
       const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
         target: executionTarget,
@@ -23358,6 +25670,9 @@ export function heartbeatService(
       } = { current: null };
       let stdoutExcerpt = "";
       let stderrExcerpt = "";
+      // Set once the run log is open. Both the success and the error path call it before they
+      // finalize the log, so the text that a stream held back is written, redacted.
+      let flushLogTails: () => Promise<void> = async () => {};
       let outputSeq = Number(run.lastOutputSeq ?? 0);
       let lastOutputFlushAt: Date | null = run.lastOutputAt ?? null;
       let lastLogRuntimeStatusTouchMs = 0;
@@ -23486,10 +25801,12 @@ export function heartbeatService(
 
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
-        const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-          const sanitizedChunk = compactRunLogChunk(
-            redactCurrentUserText(chunk, currentUserRedactionOptions),
-          );
+        const compactLogChunk = createRunLogChunkCompactor();
+        const emitLogChunk = async (
+          stream: "stdout" | "stderr",
+          sanitizedChunk: string,
+        ) => {
+          if (sanitizedChunk === "") return;
           if (stream === "stdout")
             stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
           if (stream === "stderr")
@@ -23560,6 +25877,30 @@ export function heartbeatService(
               truncated: payloadChunk.length !== sanitizedChunk.length,
             },
           });
+        };
+        const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+          await emitLogChunk(
+            stream,
+            compactLogChunk.compact(
+              stream,
+              redactCurrentUserText(chunk, currentUserRedactionOptions),
+            ),
+          );
+        };
+        // Each stream holds back the end of its last chunk until the token is whole. Call this
+        // before the run log is finalized, so that text is redacted and written, never lost.
+        flushLogTails = async () => {
+          const streams: Array<"stdout" | "stderr"> = ["stdout", "stderr"];
+          for (const stream of streams) {
+            try {
+              await emitLogChunk(stream, compactLogChunk.flush(stream));
+            } catch (err) {
+              logger.warn(
+                { err, runId, stream },
+                "failed to write the held tail of the run log",
+              );
+            }
+          }
         };
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
@@ -23674,6 +26015,13 @@ export function heartbeatService(
             message: event.message,
             payload: event.payload,
           });
+          try {
+            await acknowledgeAdapterSteering(run.id, event);
+          } catch (err) {
+            // The message reached the agent; its comment stays queued, so the
+            // worst case is a duplicate delivery on the next wake.
+            logger.warn({ err, runId: run.id }, "failed to settle steered comment");
+          }
         };
 
         const adapter = getServerAdapter(agent.adapterType);
@@ -25119,6 +27467,7 @@ export function heartbeatService(
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
+                  remoteProviderStopped = false;
                   return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
                     getFreshSessionHandoff,
                     runId: run.id,
@@ -25152,7 +27501,10 @@ export function heartbeatService(
                         issueId,
                       );
                     },
-                    onProviderStopped: collectStoppedInstructions,
+                    onProviderStopped: async () => {
+                      remoteProviderStopped = true;
+                      await collectStoppedInstructions();
+                    },
                     onDispatch: markDispatchStarted,
                     signal: executionControl.controller.signal,
                     ...(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? {
@@ -25175,6 +27527,7 @@ export function heartbeatService(
                         }
                       },
                     } : {}),
+                    onSteeringReady: (handle) => setAdapterSteeringHandle(run.id, handle),
                     onCancellationReady: async () => {
                       await registerAdapterExecutionControl(run.id, executionControl);
                       const current = await getRun(run.id);
@@ -25203,6 +27556,7 @@ export function heartbeatService(
           }
           if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
           adapterResult = applyWorkspaceRestoreFailure(adapterResult);
+          if (run.runtimeMode !== "native") adapterResult = reclassifyProviderQuotaResult(adapterResult, new Date(), agent.adapterType);
           // A returned result can include a failed restore. Keep the workspace
           // barrier closed until required files have been restored.
           // If recording the barrier itself fails, propagate as a run failure
@@ -25531,6 +27885,11 @@ export function heartbeatService(
           failedProcessRunCancellations.get(run.id);
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
+        const backgroundTaskStopped = isSuccessfulRunWithStoppedBackgroundTask({
+          errorCode: adapterResult.errorCode ?? null,
+          timedOut: adapterResult.timedOut,
+          resultJson: parseObject(adapterResult.resultJson),
+        });
         const latestRun = await getRun(run.id);
         if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
           outcome = latestRun.status;
@@ -25555,6 +27914,9 @@ export function heartbeatService(
           !adapterResult.signal &&
           !processCancellation?.failed
         ) {
+          outcome = "succeeded";
+        } else if (backgroundTaskStopped && !processCancellation?.failed) {
+          // The turn succeeded; only the lingering background task was stopped.
           outcome = "succeeded";
         } else {
           outcome = "failed";
@@ -25607,6 +27969,7 @@ export function heartbeatService(
           sha256?: string | null;
           compressed: boolean;
         } | null = null;
+        await flushLogTails();
         if (handle) {
           logSummary = await runLogStore.finalize(handle);
         }
@@ -25696,7 +28059,14 @@ export function heartbeatService(
               } as Record<string, unknown>)
             : null;
 
-        const persistedResultJson = cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
+        const persistedResultJson = await withProviderQuotaUsefulActionMarker({
+          run,
+          // The in-memory run predates native selection; use the resolution.
+          runtimeKind: nativeRuntimeResolution.kind,
+          outcome,
+          errorCode: runErrorCode,
+          outputTokens: normalizedUsage?.outputTokens ?? 0,
+          resultJson: cancellationResultJson(latestRun ?? run, outcome, mergeHeartbeatRunResultJson(
           mergeRunStopMetadataForAgent(agent, outcome, {
             resultJson: mergeAdapterRecoveryMetadata({
               resultJson: {
@@ -25707,6 +28077,14 @@ export function heartbeatService(
                 ...(adapterResult.executionRecovery
                   ? { executionRecovery: adapterResult.executionRecovery }
                   : {}),
+                ...(outcome === "succeeded" && backgroundTaskStopped
+                  ? {
+                      backgroundTaskStopped: true,
+                      backgroundTaskStopWarning: adapterResult.errorMessage
+                        ? redactCurrentUserText(adapterResult.errorMessage, currentUserRedactionOptions)
+                        : null,
+                    }
+                  : {}),
                 configFreshness: configFreshnessResultMetadata,
               },
               errorFamily: adapterResult.errorFamily ?? null,
@@ -25716,7 +28094,8 @@ export function heartbeatService(
             errorMessage: runErrorMessage,
           }),
           adapterResult.summary ?? null,
-        ), runErrorCode, runErrorMessage);
+          ), runErrorCode, runErrorMessage),
+        });
 
         const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
           finishedAt: new Date(),
@@ -25793,6 +28172,9 @@ export function heartbeatService(
               persistedRun,
               persistedResultJson,
             )) ?? persistedRun;
+          if (persistedResultJson?.providerQuotaBeforeUsefulAction === true) {
+            await recordProviderQuotaCapExemptionExhausted(persistedRun, agent);
+          }
         }
 
         await setWakeupStatus(
@@ -25814,6 +28196,9 @@ export function heartbeatService(
             payload: {
               status,
               exitCode: adapterResult.exitCode,
+              ...(outcome === "succeeded" && backgroundTaskStopped
+                ? { backgroundTaskStopped: true, signal: adapterResult.signal ?? null }
+                : {}),
               ...(readRunCancellation(finalizedRun.resultJson) ? { cancellation: readRunCancellation(finalizedRun.resultJson) } : {}),
             },
           });
@@ -25837,6 +28222,19 @@ export function heartbeatService(
           }
           const livenessRun = finalizedRun;
           await refreshContinuationSummaryForRun(livenessRun, agent);
+          // Schedule the re-check before release, continuation and handoff run,
+          // so they see the wait and leave the issue alone until it is due.
+          try {
+            await scheduleBackgroundTaskRecheck(db, issuesSvc, {
+              run: livenessRun,
+              agentRuntimeConfig: agent.runtimeConfig,
+            });
+          } catch (err) {
+            logger.warn(
+              { err, runId: livenessRun.id, issueId },
+              "failed to schedule background task re-check",
+            );
+          }
           const skipRunIssueComment =
             parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
           let resolvedPresentationDecision: RunPresentationDecision | null =
@@ -25981,7 +28379,28 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+          const harnessFallbackOutcome = outcome === "failed" && !isMaxTurnExhaustionRun(livenessRun)
+            ? await handleProviderQuotaFailure({
+                run: livenessRun,
+                executedAgent: agent,
+                storedAgent,
+                phase: "failure",
+              }).catch((err) => {
+                logger.warn({ err, runId: livenessRun.id }, "harness fallback scheduling failed; using the normal retry path");
+                return { redispatched: false, awaitingRetryExhaustion: false, deferUntil: null };
+              })
+            : null;
+          if (harnessFallbackOutcome?.redispatched) {
+            await appendRunEvent(livenessRun, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "warn",
+              message: "Re-dispatched this wake once on a fallback harness",
+              payload: { retryReason: HARNESS_FALLBACK_RETRY_REASON },
+            });
+          } else if (harnessFallbackOutcome?.deferUntil) {
+            await scheduleBoundedRetryForRun(livenessRun, agent, { notBefore: harnessFallbackOutcome.deferUntil });
+          } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
               await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -26007,7 +28426,20 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            await scheduleBoundedRetryForRun(livenessRun, agent);
+            const transientRetry = await scheduleBoundedRetryForRun(livenessRun, agent);
+            if (
+              transientRetry.outcome === "retry_exhausted" &&
+              harnessFallbackOutcome?.awaitingRetryExhaustion
+            ) {
+              await handleProviderQuotaFailure({
+                run: livenessRun,
+                executedAgent: agent,
+                storedAgent,
+                phase: "retry_exhausted",
+              }).catch((err) => {
+                logger.warn({ err, runId: livenessRun.id }, "harness fallback after exhausted retries failed");
+              });
+            }
           } else if (
             outcome === "failed" &&
             !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
@@ -26315,12 +28747,15 @@ export function heartbeatService(
               : null;
           })
           .catch(() => null);
+        const restoreLockTimeoutFailure =
+          classifyWorkspaceRestoreFailure(err) === "restore_lock_timeout";
         const failureErrorCode =
           workspaceValidationFailure?.code ??
           configurationIncompleteFailure?.code ??
           nonRetryablePreflightFailureCode(err) ??
           recordedResponsibleUserDenialCode ??
           nativeTerminalFailureCode ??
+          (restoreLockTimeoutFailure ? WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE : null) ??
           "adapter_failed";
         logger.error({ err, runId }, "heartbeat execution failed");
 
@@ -26329,6 +28764,7 @@ export function heartbeatService(
           sha256?: string | null;
           compressed: boolean;
         } | null = null;
+        await flushLogTails();
         if (handle) {
           try {
             logSummary = await runLogStore.finalize(handle);
@@ -26365,6 +28801,9 @@ export function heartbeatService(
               ...(workspaceValidationFailure?.resultJson ??
                 configurationIncompleteFailure?.resultJson ??
                 {}),
+              ...(failureErrorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE
+                ? { workspaceRestoreFailure: "restore_lock_timeout" }
+                : {}),
               ...(!legacyAdapterEntered && run.runtimeMode !== "native"
                 ? {
                     executionRecovery: {
@@ -26434,10 +28873,21 @@ export function heartbeatService(
           ) {
             await finalizeIssueCommentPolicy(livenessRun, agent);
           }
-          await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-            livenessRun,
-            agent,
-          );
+          if (livenessRun.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE) {
+            // Only this branch tolerates a scheduling error; the other keeps
+            // propagating it as it always did.
+            await scheduleBoundedRetryForRun(livenessRun, agent).catch((retryError) => {
+              logger.warn(
+                { err: retryError, runId: livenessRun.id },
+                "failed to schedule a retry after a workspace restore lock timeout",
+              );
+            });
+          } else {
+            await scheduleInteractionContinuationInfrastructureRetryIfEligible(
+              livenessRun,
+              agent,
+            );
+          }
           await releaseIssueExecutionAndPromote(livenessRun, {
             // Native recovery owns the original heartbeat run through
             // exhaustion. Once its durable coordinator has classified a
@@ -26580,6 +29030,9 @@ export function heartbeatService(
             : null) ??
           recordedResponsibleUserDenialCode ??
           nonRetryablePreflightCode ??
+          (outerErr instanceof RemotePreflightUnavailableError
+            ? REMOTE_PREFLIGHT_UNAVAILABLE_CODE
+            : null) ??
           "setup_failed";
         logger.error(
           { err: outerErr, runId },
@@ -26702,7 +29155,7 @@ export function heartbeatService(
             // No provider work began. Retry temporary host scan failures with
             // the existing durable failure budget, before releasing execution.
             // Generic recovery must not grant a second budget on exhaustion.
-            await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)
+            await (isTransientSetupFailureCode(livenessRun.errorCode)
               ? scheduleBoundedRetryForRun(livenessRun, failedAgent)
               : scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent)
             ).catch((retryError) => {
@@ -26714,6 +29167,7 @@ export function heartbeatService(
           }
           await releaseIssueExecutionAndPromote(livenessRun, {
             suppressImmediateRecovery:
+              livenessRun.errorCode === "harness_model_incompatible" ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
               ) !== null ||
@@ -26836,6 +29290,35 @@ export function heartbeatService(
               },
             );
           }
+          if (
+            remoteRunTempLocation &&
+            latestRun &&
+            isHeartbeatRunTerminalStatus(latestRun.status)
+          ) {
+            // Without proof that the remote process stopped, the directory
+            // stays for the SSH run directory reaper; a sandbox keeps it until
+            // the sandbox goes away. No dispatched adapter means no process.
+            const remoteTempCleanup = await cleanupHeartbeatRemoteRunTemp({
+              location: remoteRunTempLocation,
+              stopProven:
+                remoteProviderStopped ||
+                !(legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld),
+            }).catch((err) => {
+              logger.warn(
+                { err, runId: run.id },
+                "failed to remove the remote run temp directory",
+              );
+              return null;
+            });
+            if (remoteTempCleanup === "stop_unproven" || remoteTempCleanup === "symlink") {
+              logger.warn(
+                { runId: run.id, reason: remoteTempCleanup },
+                remoteTempCleanup === "symlink"
+                  ? "kept the remote run temp directory: a link or a file replaced a directory in its path"
+                  : "kept the remote run temp directory: nothing proves the remote process stopped",
+              );
+            }
+          }
           // A retained or unverified process stays above this release boundary.
           // If no stopped-copy capture occurred, preserve an explicit loss report.
           const uncapturedInstructions = await instructionCopies.reportUnavailable(run.companyId, run.id);
@@ -26942,6 +29425,7 @@ export function heartbeatService(
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
         }
+        clearAdapterSteering(run.id);
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
@@ -26973,6 +29457,7 @@ export function heartbeatService(
             });
         }
         await startNextQueuedRunForAgent(run.agentId);
+        await redeliverDeferredWakesForAgent(run.agentId);
       }
     }
   }
@@ -27030,6 +29515,7 @@ export function heartbeatService(
       // Loop-guard provenance is derived below from server facts only.
       delete payload[SELF_REBLOCK_WAKE_PAYLOAD_KEY];
       delete payload[SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY];
+      delete payload[AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY];
     }
     if (opts.manualUserWake) {
       if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || opts.failedRunId) {
@@ -27703,24 +30189,59 @@ export function heartbeatService(
           }
 
           if (executionWaitRequestId) {
+            const redelivery = opts.redeliverDeferredWake === true;
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
               eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
               // A user message can join a queue originally created by a
               // system wake. Admission validates the saved user comment or board click.
-              (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
+              // A redelivered receipt keeps its own actor; the lock below revalidates it.
+              redelivery || (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
                 ? undefined : eq(agentWakeupRequests.requestedByActorType, "user"),
-              opts.queuedCommentInterruptId === executionWaitRequestId
+              redelivery ? undefined
+                : opts.queuedCommentInterruptId === executionWaitRequestId
                 ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
                 : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
                   : eq(agentWakeupRequests.requestedByActorId, opts.requestedByActorId ?? ""),
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
             ));
-            // The issue lock serializes cleanup callbacks and periodic workers.
-            // An adopted, discarded, or edited receipt is no longer authority.
-            if (!pending || (!(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
+            if (redelivery) {
+              // Another writer under this lock may already have promoted, adopted
+              // or cancelled the receipt. Then there is nothing left to deliver.
+              if (!pending) return { kind: "deferred" as const };
+              const [lockedIssue] = await tx
+                .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+                .from(issues)
+                .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)));
+              // A closed task is not revived by an old parked wake. The receipt
+              // stays parked; the release of the task's next run retires it.
+              if (!lockedIssue || lockedIssue.status === "done" || lockedIssue.status === "cancelled") {
+                return { kind: "deferred" as const };
+              }
+              // Task messages parked for a former assignee now belong to the
+              // current one, as on a normal release. Retire the receipt.
+              if (
+                ["issue_commented", "issue_reopened_via_comment"].includes(reason ?? "") &&
+                queuedCommentIdsFromWakePayload(pending.payload).length > 0 &&
+                lockedIssue.assigneeAgentId !== agentId
+              ) {
+                const retiredAt = new Date();
+                await tx.update(agentWakeupRequests).set({
+                  status: "cancelled",
+                  error: "Deferred task messages now belong to the current assignee",
+                  finishedAt: retiredAt,
+                  updatedAt: retiredAt,
+                }).where(and(
+                  eq(agentWakeupRequests.id, pending.id),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                ));
+                return { kind: "skipped" as const };
+              }
+            } else if (!pending || (!(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
                 !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
                   agent.companyId, issueId, pending.payload)))) {
+              // The issue lock serializes cleanup callbacks and periodic workers.
+              // An adopted, discarded, or edited receipt is no longer authority.
               return { kind: "deferred" as const };
             }
             if (opts.queuedCommentRequestId) {
@@ -27943,6 +30464,8 @@ export function heartbeatService(
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
+              originKind: issues.originKind,
+              originId: issues.originId,
             })
             .from(issues)
             .where(
@@ -28758,11 +31281,103 @@ export function heartbeatService(
             }
           }
 
+          // Automation window: a recovery, retry or monitor wake that lands within
+          // the resolved `minSecondsBetweenAutomationWakes` (company < agent <
+          // routine < wake type) of the agent's last such run is parked, and later
+          // ones merge into the same receipt. The deferred-wake sweep delivers it
+          // once the window ends; nothing is dropped. Assignment and human-driven
+          // wakes never pass through here. Unset everywhere means off.
+          let automationAdmittedAt: Date | undefined;
+          const automationWakeReason = reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason);
+          const automationWakeWindowSec =
+            automationWakeReason &&
+            !reconciledSourceRunId &&
+            !opts.manualUserWake
+              ? await resolveAutomationWakeWindowSec(tx as unknown as Db, {
+                  agent,
+                  reason: automationWakeReason,
+                  issue,
+                })
+              : 0;
+          if (automationWakeReason && automationWakeWindowSec > 0) {
+            const windowMs = automationWakeWindowSec * 1000;
+            // Wakes for different issues of one agent share the window; the lock
+            // makes the check and the run insert below atomic per agent.
+            await lockAutomationWakeWindow(tx as unknown as Db, agent.companyId, agentId);
+            // Read the clock after the lock wait: the transaction-start default would
+            // age a run by that wait and let the next wake into a window it still owns.
+            const gateNow = new Date();
+            automationAdmittedAt = gateNow;
+            const lastAutomationRun = await findLastAutomationRun(tx as unknown as Db, {
+              companyId: agent.companyId,
+              agentId,
+              since: new Date(gateNow.getTime() - windowMs),
+            });
+            if (lastAutomationRun) {
+              // A redelivered receipt already exists; it simply waits longer.
+              if (executionWaitRequestId) return { kind: "deferred" as const };
+              const notBefore = new Date(lastAutomationRun.createdAt.getTime() + windowMs);
+              const [coalesced] = await tx
+                .select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload })
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.companyId, agent.companyId),
+                    eq(agentWakeupRequests.agentId, agentId),
+                    eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                    sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+                    sql`${agentWakeupRequests.payload} -> ${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY} is not null`,
+                  ),
+                )
+                .orderBy(asc(agentWakeupRequests.requestedAt))
+                .limit(1);
+              const coalescedState = buildAutomationWakeCoalescedState({
+                notBefore,
+                existing: coalesced ? parseObject(coalesced.payload) : null,
+                reason: automationWakeReason,
+              });
+              if (coalesced) {
+                await tx
+                  .update(agentWakeupRequests)
+                  .set({
+                    payload: sql`jsonb_set(${agentWakeupRequests.payload}, array[${AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY}]::text[], ${JSON.stringify(coalescedState)}::jsonb)`,
+                    coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                    updatedAt: gateNow,
+                  })
+                  .where(eq(agentWakeupRequests.id, coalesced.id));
+              } else {
+                await tx.insert(agentWakeupRequests).values({
+                  ...durableReceiptFields,
+                  companyId: agent.companyId,
+                  agentId,
+                  source,
+                  triggerDetail,
+                  reason: "automation_wake_coalesced",
+                  payload: {
+                    ...(payload ?? {}),
+                    issueId: issue.id,
+                    [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
+                    [AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY]: coalescedState,
+                  },
+                  status: "deferred_issue_execution",
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                });
+              }
+              return { kind: "deferred" as const };
+            }
+          }
+
           if (activeExecutionRun) {
             // The resolved action is already a durable retry outbox. Do not merge
             // its fresh-session contract into unrelated work or create a second
             // deferred wake that could later replay the same reconciliation.
             if (reconciledSourceRunId) return { kind: "deferred" as const };
+            // A run took the issue after the sweep read it. The receipt being
+            // redelivered is already parked behind that run and its release
+            // promotes it. Parking or merging a second receipt would duplicate it.
+            if (opts.redeliverDeferredWake) return { kind: "deferred" as const };
 
             const admissionScope = wakeQueue.createAdmissionTransactionScope(
               agent.companyId,
@@ -29181,6 +31796,7 @@ export function heartbeatService(
           const newRun = await tx
             .insert(heartbeatRuns)
             .values({
+                            ...(automationAdmittedAt ? { createdAt: automationAdmittedAt } : {}),
               ...(explicitContinuation ? { id: explicitContinuationRunId } : {}),
               companyId: agent.companyId,
               agentId,
@@ -29240,6 +31856,13 @@ export function heartbeatService(
                 payload: withQueuedCommentIdsInWakePayload(payload, adoptedCommentIds),
               })
               .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+            if (opts.redeliverDeferredWake && executionWaitRequestId) {
+              // The same marker a release promotion leaves, so the queue stats count it.
+              await tx
+                .update(agentWakeupRequests)
+                .set({ reason: "issue_execution_promoted" })
+                .where(eq(agentWakeupRequests.id, executionWaitRequestId));
+            }
           }
 
           // executionRunId is NOT stamped here (enqueueWakeup queues the run but
@@ -29273,6 +31896,22 @@ export function heartbeatService(
 
       if (outcome.kind === "durable") {
         return outcome.receipt.runId ? getRun(outcome.receipt.runId) : null;
+      }
+      if (outcome.kind === "skipped" && opts.redeliverDeferredWake && executionWaitRequestId) {
+        // Admission judged this redelivered wake final and recorded why in its
+        // own receipt. Retire the parked receipt, or the sweep would re-evaluate
+        // it on every recheck. A transient wait is "deferred", not "skipped".
+        const retiredAt = new Date();
+        await db.update(agentWakeupRequests).set({
+          status: "skipped",
+          error: "Redelivery of this deferred wake was skipped by admission",
+          finishedAt: retiredAt,
+          updatedAt: retiredAt,
+        }).where(and(
+          eq(agentWakeupRequests.id, executionWaitRequestId),
+          eq(agentWakeupRequests.companyId, agent.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ));
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") {
         return null;
@@ -29823,7 +32462,7 @@ export function heartbeatService(
         issues,
         and(
           eq(issues.companyId, companyId),
-          sql`${issues.id}::text = ${runIssueId}`,
+          issueIdEqualsText(sql`${runIssueId}`),
         ),
       )
       .where(
@@ -29859,7 +32498,7 @@ export function heartbeatService(
         issues,
         and(
           eq(issues.companyId, companyId),
-          sql`${issues.id}::text = ${wakeIssueId}`,
+          issueIdEqualsText(sql`${wakeIssueId}`),
         ),
       )
       .where(
@@ -30252,6 +32891,7 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
         await startNextQueuedRunForAgent(run.agentId);
+        await redeliverDeferredWakesForAgent(run.agentId);
       }
       return cancelled;
     } finally {
@@ -30451,12 +33091,128 @@ export function heartbeatService(
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
       }
     },
+    /**
+     * Run counts for a company over a creation-time window, the most common
+     * error codes, and each agent's runs today against its daily run cap.
+     */
+    runStats: async (
+      companyId: string,
+      input: { since: Date; until: Date; agentId?: string },
+    ): Promise<HeartbeatRunStats> => {
+      const windowFilters = [
+        eq(heartbeatRuns.companyId, companyId),
+        gte(heartbeatRuns.createdAt, input.since),
+        lt(heartbeatRuns.createdAt, input.until),
+        ...(input.agentId ? [eq(heartbeatRuns.agentId, input.agentId)] : []),
+      ];
+      const capWindow = currentUtcDayWindow();
+      const [statusRows, errorRows, runsToday, agentRows] = await Promise.all([
+        db
+          .select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters))
+          .groupBy(heartbeatRuns.agentId, heartbeatRuns.status),
+        db
+          .select({ errorCode: heartbeatRuns.errorCode, count: sql<number>`count(*)::integer` })
+          .from(heartbeatRuns)
+          .where(and(...windowFilters, isNotNull(heartbeatRuns.errorCode)))
+          .groupBy(heartbeatRuns.errorCode)
+          .orderBy(desc(sql`count(*)`), asc(heartbeatRuns.errorCode))
+          .limit(20),
+        computeDailyRunUsage(companyId, { agentId: input.agentId, window: capWindow }),
+        db
+          .select()
+          .from(agents)
+          .where(and(eq(agents.companyId, companyId), ...(input.agentId ? [eq(agents.id, input.agentId)] : []))),
+      ]);
+
+      const isRunStatus = (status: string): status is HeartbeatRunStatus =>
+        HEARTBEAT_RUN_STATUSES.some((known) => known === status);
+      const emptyCounts = () => {
+        const byStatus: Record<HeartbeatRunStatus, number> = {
+          queued: 0,
+          scheduled_retry: 0,
+          running: 0,
+          succeeded: 0,
+          interrupted: 0,
+          failed: 0,
+          cancelled: 0,
+          timed_out: 0,
+        };
+        return { runs: 0, terminal: 0, succeeded: 0, unsuccessful: 0, byStatus };
+      };
+      const addCounts = (counts: ReturnType<typeof emptyCounts>, status: string, count: number) => {
+        counts.runs += count;
+        if (!isRunStatus(status)) return;
+        counts.byStatus[status] += count;
+        if (HEARTBEAT_RUN_TERMINAL_STATUSES.some((terminal) => terminal === status)) counts.terminal += count;
+        if (status === "succeeded") counts.succeeded += count;
+        if (UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.some((unsuccessful) => unsuccessful === status)) {
+          counts.unsuccessful += count;
+        }
+      };
+
+      const totals = emptyCounts();
+      const perAgent = new Map<string, ReturnType<typeof emptyCounts>>();
+      for (const row of statusRows) {
+        const count = Number(row.count);
+        addCounts(totals, row.status, count);
+        const agentCounts = perAgent.get(row.agentId) ?? emptyCounts();
+        addCounts(agentCounts, row.status, count);
+        perAgent.set(row.agentId, agentCounts);
+      }
+
+      const agentStats = agentRows
+        .filter((agent) => agent.status !== "terminated" || perAgent.has(agent.id))
+        .map((agent) => {
+          const policy = parseHeartbeatPolicy(agent);
+          const maxDailyRuns = policy.maxDailyRuns;
+          const today = countedDailyRuns(runsToday.get(agent.id) ?? NO_DAILY_RUNS, policy);
+          return {
+            agentId: agent.id,
+            name: agent.name,
+            status: agent.status,
+            ...(perAgent.get(agent.id) ?? emptyCounts()),
+            runsToday: today,
+            maxDailyRuns,
+            remainingToday: maxDailyRuns === null ? null : Math.max(0, maxDailyRuns - today),
+            capReached: maxDailyRuns !== null && today >= maxDailyRuns,
+          };
+        })
+        .sort((a, b) => b.runs - a.runs || b.runsToday - a.runsToday || a.name.localeCompare(b.name));
+
+      return {
+        companyId,
+        window: { since: input.since.toISOString(), until: input.until.toISOString() },
+        dailyCapWindow: { start: capWindow.start.toISOString(), end: capWindow.end.toISOString() },
+        totals,
+        topErrorCodes: errorRows
+          .filter((row): row is { errorCode: string; count: number } => row.errorCode !== null)
+          .map((row) => ({ errorCode: row.errorCode, count: Number(row.count) })),
+        agents: agentStats,
+      };
+    },
+
     list: async (
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: {
+        summary?: boolean;
+        statuses?: string[];
+        errorCodes?: string[];
+        since?: Date;
+        until?: Date;
+      } = {},
     ) => {
+      const filters = [
+        eq(heartbeatRuns.companyId, companyId),
+        ...(agentId ? [eq(heartbeatRuns.agentId, agentId)] : []),
+        ...(options.statuses?.length ? [inArray(heartbeatRuns.status, options.statuses)] : []),
+        ...(options.errorCodes?.length ? [inArray(heartbeatRuns.errorCode, options.errorCodes)] : []),
+        ...(options.since ? [gte(heartbeatRuns.createdAt, options.since)] : []),
+        ...(options.until ? [lt(heartbeatRuns.createdAt, options.until)] : []),
+      ];
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
       const query = db
@@ -30479,14 +33235,7 @@ export function heartbeatService(
                 },
         )
         .from(heartbeatRuns)
-        .where(
-          agentId
-            ? and(
-                eq(heartbeatRuns.companyId, companyId),
-                eq(heartbeatRuns.agentId, agentId),
-              )
-            : eq(heartbeatRuns.companyId, companyId),
-        )
+        .where(and(...filters))
         .orderBy(desc(heartbeatRuns.createdAt));
 
       const rows = limit ? await query.limit(limit) : await query;
@@ -30748,6 +33497,7 @@ export function heartbeatService(
     // gate on suppression should prefer this over the env-only resolver.
     resolveSchedulingSuppression: getSchedulingSuppression,
     drainRunningRunsForShutdown,
+    repairIncompleteShutdownDrains,
     drainActiveRunExecutions,
     startTaskDrain,
     stopTaskDrain,
@@ -30759,6 +33509,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    sweepDeferredWakes,
+    getDeferredWakeStats,
 
     scheduleBoundedRetry: async (
       runId: string,

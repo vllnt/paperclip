@@ -1,17 +1,26 @@
-import type { EnvSecretRefBinding, PluginContext } from "@paperclipai/plugin-sdk";
+import type { EnvSecretRefBinding, PluginContext, PluginPerformActionContext } from "@paperclipai/plugin-sdk";
 import {
   GITHUB_PRIVILEGED_ACTIONS,
   GITHUB_WRITE_ACTIONS,
   GITHUB_WRITE_IDENTITY_STATE,
+  describeGitHubPrivilegedScope,
   gitHubInstallationRepositories,
+  isGitHubPrivilegedAllowed,
   isGitHubRepositoryAllowed,
+  isGitHubScopablePrivilegedAction,
+  normalizeGitHubAgentId,
   normalizeGitHubRepository,
+  parseGitHubPrivilegedScope,
   parseGitHubWriteIdentityPolicy,
   resolveGitHubWriteIdentity,
   resolveGitHubWriteIdentityForOther,
   type GitHubOperationAction,
   type GitHubPrivilegedAction,
+  type GitHubPrivilegedToggles,
   type GitHubSignDecision,
+  type GitHubWorkflowChange,
+  type GitHubWorkflowCommit,
+  type GitHubWorkflowPush,
   type GitHubWriteAction,
   type GitHubWriteIdentityDecision,
   type GitHubWriteIdentityPolicy,
@@ -20,10 +29,12 @@ import {
 } from "@paperclipai/shared/github-write-identity";
 import { boardScope, requireInstanceAdmin } from "./setup.js";
 import { GitHubError, type GitHubClient } from "./github.js";
-import { SKILLS_LOCK_FILE, TIERS_FILE, parseProtectedPaths, protectedFiles, protectedPatterns, skillsLockException, type ChangedFile } from "./protected-paths.js";
+import { SKILLS_LOCK_FILE, TIERS_FILE, parseAgentMergeablePaths, parseProtectedPaths, protectedFiles, protectedPatterns, skillsLockException, splitReleased, type AgentMergeableRule, type ChangedFile } from "./protected-paths.js";
 import type { Catalog, Repository } from "./contracts.js";
 import { UserAuthorization, UserAuthorizationError, type FenceStatus } from "./user-authorization.js";
+import { CLOCK_SKEW_ALERT_MS } from "./clock.js";
 import { checkGitObjectForSigning, parseSshSigningKey, sshSign, type SshSigningKey } from "./ssh-signature.js";
+import { createWriteAlerts } from "./write-alerts.js";
 
 const policyKey = (companyId: string) => ({ scopeKind: "company" as const, scopeId: companyId, ...GITHUB_WRITE_IDENTITY_STATE });
 const BOT_PERMISSIONS = ["contents", "pull_requests", "issues"] as const;
@@ -34,13 +45,110 @@ const SIGNING_KEY_TTL_MS = 5 * 60_000;
 /** Writes stop when the last successful fence check is older than this. */
 const FENCE_MAX_AGE_MS = 3 * 60 * 60_000;
 const FENCE_CHECK_INTERVAL_MS = 60 * 60_000;
+/** While writes pause on a transient fence failure, the check is retried this often during the pause's first hour. */
+const FENCE_RETRY_INTERVAL_MS = 5 * 60_000;
 const MAX_SIGN_PAYLOAD_BYTES = 1024 * 1024;
 /** A full commit SHA (SHA-1 or SHA-256 repositories), lowercase as GitHub reports it. */
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 /** GitHub lists at most 3,000 files of a pull request, 100 per page: a longer list is cut, and the merge is refused. */
 const MAX_PULL_REQUEST_FILE_PAGES = 30;
+/** Released files named in a merge's evidence; the count says how many there were. */
+const MAX_RELEASED_LISTED = 100;
 /** Pages read for a fence or merge check; a list that still has a next page after this fails closed. */
 const MAX_PAGES = 10;
+/** The conclusions of a finished check run that pass a required check, as GitHub counts them. */
+const PASSING_CONCLUSIONS = ["success", "skipped"];
+
+const WORKFLOWS = ".github/workflows";
+/** The most the launcher reports of a push's workflow history (it reports none of it beyond these). */
+const MAX_WORKFLOW_FILES = 100, MAX_WORKFLOW_COMMITS = 100, MAX_WORKFLOW_ENTRIES = 8, MAX_WORKFLOW_CHANGES = 400, MAX_WORKFLOW_PARENTS = 16, MAX_WORKFLOW_PATH = 300;
+/** A git object ID (SHA-1 or SHA-256 repositories). */
+const GIT_OID = /^[0-9a-f]{40,64}$/;
+/** The modes of regular files in git. Symlinks (120000) and submodules (160000) are never accepted as the base branch's own. */
+const REGULAR_FILE_MODES = ["100644", "100755"];
+const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 1)}…` : text;
+const short = (sha: string) => sha.slice(0, 8);
+/** The paths for a refusal message: a few, shortened, and how many more there are. */
+const listPaths = (paths: string[]) => paths.slice(0, 3).map(path => clip(path, 70)).join(", ") + (paths.length > 3 ? `, and ${paths.length - 3} more` : "");
+const workflowPath = (value: unknown): value is string => typeof value === "string" && value.length <= MAX_WORKFLOW_PATH && (value === WORKFLOWS || value.startsWith(`${WORKFLOWS}/`));
+const gitOid = (value: unknown): value is string => typeof value === "string" && GIT_OID.test(value);
+
+/**
+ * A push's workflow history in exactly the shape the server forwards from the
+ * launcher; anything else is undefined, so the `editWorkflows` toggle decides.
+ */
+function parseWorkflowPush(value: unknown): GitHubWorkflowPush | undefined {
+  if (!value || typeof value !== "object" || !("branch" in value) || !("tip" in value) || !("files" in value) || !("commits" in value) || !("entries" in value)) return undefined;
+  const { branch, tip, files, commits, entries } = value;
+  if (typeof branch !== "string" || !branch || branch.length > 250 || /[\x00-\x20\x7f]/.test(branch) || !gitOid(tip)) return undefined;
+  if (!Array.isArray(files) || files.length > MAX_WORKFLOW_FILES || !Array.isArray(commits) || commits.length > MAX_WORKFLOW_COMMITS) return undefined;
+  if (!Array.isArray(entries) || !entries.length || entries.length > MAX_WORKFLOW_ENTRIES || !entries.every(gitOid)) return undefined;
+  const parsedFiles: GitHubWorkflowPush["files"] = [];
+  for (const file of files) {
+    if (!file || typeof file !== "object" || !("path" in file) || !("mode" in file) || !("oid" in file)) return undefined;
+    const { path, mode, oid } = file;
+    if (!workflowPath(path) || typeof mode !== "string" || !/^\d{6}$/.test(mode) || !gitOid(oid)) return undefined;
+    parsedFiles.push({ path, mode, oid });
+  }
+  const parsedCommits: GitHubWorkflowCommit[] = [];
+  let total = 0;
+  for (const commit of commits) {
+    if (!commit || typeof commit !== "object" || !("sha" in commit) || !("parents" in commit) || !("changes" in commit)) return undefined;
+    const { sha, parents, changes } = commit;
+    if (!gitOid(sha) || !Array.isArray(parents) || parents.length > MAX_WORKFLOW_PARENTS || !parents.every(gitOid)) return undefined;
+    if (!Array.isArray(changes) || !changes.length || changes.length > MAX_WORKFLOW_FILES) return undefined;
+    total += changes.length;
+    if (total > MAX_WORKFLOW_CHANGES) return undefined;
+    const parsedChanges: GitHubWorkflowChange[] = [];
+    for (const change of changes) {
+      if (!change || typeof change !== "object" || !("path" in change) || !("mode" in change) || !("oid" in change)) return undefined;
+      const { path, mode, oid } = change;
+      if (!workflowPath(path)) return undefined;
+      if (mode === null && oid === null) parsedChanges.push({ path, mode, oid });
+      else if (typeof mode === "string" && /^\d{6}$/.test(mode) && gitOid(oid)) parsedChanges.push({ path, mode, oid });
+      else return undefined;
+    }
+    parsedCommits.push({ sha, parents, changes: parsedChanges });
+  }
+  return { branch, tip, files: parsedFiles, commits: parsedCommits, entries };
+}
+
+/**
+ * Why privileged actions were refused to this caller. An action that is off for the company says so; a scopable
+ * action that is granted to other agents says this agent has no board grant. For those two, the message names the
+ * board action that changes it, with this agent's ID when the host named it.
+ */
+function privilegedRefusal(toggles: GitHubPrivilegedToggles, actions: GitHubPrivilegedAction[], agentId?: string | null): string {
+  const notGranted = actions.filter(action => typeof toggles[action] === "object");
+  const off = actions.filter(action => !notGranted.includes(action));
+  const parts: string[] = [];
+  if (off.length) parts.push(`This is a privileged GitHub action (${off.join(", ")}) and it is turned off for this company.`);
+  for (const action of notGranted) parts.push(`This agent has no board grant for ${action} (${describeGitHubPrivilegedScope(toggles[action])}).`);
+  const first = actions.find(isGitHubScopablePrivilegedAction);
+  return first ? withHint(parts.join(" "), grantHint(toggles, first, agentId)) : clip(parts.join(" "), 500);
+}
+
+/** How a scopable action is unavailable to this caller, to read inside a sentence. */
+function privilegedReason(toggles: GitHubPrivilegedToggles, action: GitHubPrivilegedAction): string {
+  const scope = toggles[action];
+  return typeof scope === "object" ? `this agent has no board grant for ${action} (${describeGitHubPrivilegedScope(scope)})` : `${action} is turned off for this company`;
+}
+
+/**
+ * What the board can do about it: grant this agent (when the host named it), or change the company-wide value.
+ * A grant replaces the list, so the hint says to keep the agents already in it.
+ */
+function grantHint(toggles: GitHubPrivilegedToggles, action: GitHubPrivilegedAction, agentId?: string | null): string {
+  return typeof toggles[action] === "object" && agentId
+    ? `A board administrator can grant it with write-identity.grant, which replaces the whole list (keep the agents already granted): {"action":"${action}","scope":{"agentIds":[…,"${agentId}"]}}.`
+    : `A board administrator can turn it on for every agent, or grant it to chosen agents, with write-identity.grant (scope true, or {"agentIds":[...]}).`;
+}
+
+/** The server accepts a refusal of at most 500 characters: the hint stays whole and the message before it gives way. */
+function withHint(message: string, hint: string): string {
+  const room = 500 - hint.length - 1;
+  return `${message.length > room ? `${message.slice(0, room - 1)}…` : message} ${hint}`;
+}
 
 /** Reads every page of a paginated GitHub list, or throws when it has more than {@link MAX_PAGES} pages. */
 async function allPages<T>(read: (page: number) => Promise<{ items: T[]; next: boolean }>, what: string): Promise<T[]> {
@@ -122,7 +230,14 @@ export function registerWriteIdentity(
   const readTokens = new Map<string, { token: string; expires: number }>();
   const signingKeys = new Map<string, { secretId: string; key: SshSigningKey; expires: number }>();
   const throttle = new WriteThrottle();
-  const users = new UserAuthorization(ctx, github, now);
+  /**
+   * GitHub's clock, for what GitHub times: token expiry, the fence check's age.
+   * This host's clock (`now`) stays for what the host times: the throttle, the
+   * signing check of a commit written here, local caches.
+   */
+  const githubNow = () => now() + github.clock.skewMs();
+  const users = new UserAuthorization(ctx, github, githubNow);
+  const alerts = createWriteAlerts(ctx, now, githubNow);
 
   async function stored(companyId: string): Promise<StoredPolicy> {
     const value = await ctx.state.get(policyKey(companyId));
@@ -216,7 +331,7 @@ export function registerWriteIdentity(
     const version = policyVersion(companyId);
     const key = `${version}:${companyId}:${installationId}:${repository ? ids[0] : "*"}`;
     const cached = readTokens.get(key);
-    if (cached && cached.expires > now()) return cached.token;
+    if (cached && cached.expires > githubNow()) return cached.token;
     const granted = catalog.installations.find(installation => installation.id === installationId)?.permissions ?? targets[0]!.permissions ?? {};
     const permissions: Record<string, string> = { metadata: "read" };
     for (const name of READ_PERMISSIONS) if (granted[name]) permissions[name] = "read";
@@ -229,7 +344,7 @@ export function registerWriteIdentity(
       await github.revokeInstallationToken(token);
       throw new Denied("The company's GitHub write identity changed while this command was checked; run it again.");
     }
-    readTokens.set(key, { token, expires: now() + READ_TOKEN_TTL_MS });
+    readTokens.set(key, { token, expires: githubNow() + READ_TOKEN_TTL_MS });
     return token;
   }
 
@@ -250,7 +365,9 @@ export function registerWriteIdentity(
     if (state.needsReauthorization) throw new Denied(state.needsReauthorization);
     const fence = state.fence;
     if (!fence?.ok) throw new Denied(`The GitHub fence check has not passed${fence?.reason ? `: ${fence.reason}` : ""}.`);
-    if (now() - Date.parse(fence.checkedAt) > FENCE_MAX_AGE_MS) throw new Denied("The GitHub fence check is out of date; writes resume after the next successful check.");
+    // A check dated in the future was stamped under another clock offset: it proves no recent check either.
+    const age = githubNow() - Date.parse(fence.checkedAt);
+    if (!(age <= FENCE_MAX_AGE_MS && age >= -CLOCK_SKEW_ALERT_MS)) throw new Denied("The GitHub fence check is out of date; writes resume after the next successful check.");
     return { login: state.login, userId: state.userId };
   }
 
@@ -262,21 +379,23 @@ export function registerWriteIdentity(
   /**
    * Compares what the user token can reach at GitHub with the policy:
    * the user, the one installation, its repository selection, repositories and
-   * permissions. Any difference turns writes off (fail closed).
+   * permissions. Any difference turns writes off (fail closed). So does a
+   * revocation GitHub confirmed; a 401 alone is not one (VLL-1192).
    */
   async function checkFence(companyId: string): Promise<FenceStatus> {
     const current = await policy(companyId);
     if (!current || current.userSource !== "app") throw new Error("Choose the App user identity (userSource app) first.");
     const state = await users.state(companyId);
     if (!state) throw new Error("Authorize the GitHub user for this company first.");
-    const checkedAt = new Date(now()).toISOString();
+    const checkedAt = new Date(githubNow()).toISOString();
     let status: FenceStatus;
     try {
-      const token = await users.accessToken(companyId);
-      const { data: user } = await github.request<{ login?: unknown; id?: unknown }>("/user", token);
+      // A 401 to the user token refreshes it and retries once; App calls (the catalog) stay outside, so their 401 is never the user's.
+      const asUser = <T>(path: string) => users.withToken(companyId, token => github.request<T>(path, token));
+      const { data: user } = await asUser<{ login?: unknown; id?: unknown }>("/user");
       const login = typeof user.login === "string" ? user.login : "";
       const installations = await allPages(async page => {
-        const response = await github.request<{ installations?: Array<Record<string, any>> }>(`/user/installations?per_page=100&page=${page}`, token);
+        const response = await asUser<{ installations?: Array<Record<string, any>> }>(`/user/installations?per_page=100&page=${page}`);
         return { items: response.data.installations ?? [], next: response.next };
       }, "App installations");
       const catalog = await loadCatalog(companyId);
@@ -300,7 +419,7 @@ export function registerWriteIdentity(
           .filter(name => appPermissions[name] !== approved[name]).map(name => `${name}: ${appPermissions[name] ?? "none"} (approved ${approved[name] ?? "none"})`);
         if (appDifferences.length) problems.push(`App permissions differ: ${appDifferences.join(", ")}`);
         const listed = await allPages(async page => {
-          const response = await github.request<{ repositories?: Array<{ full_name?: unknown; id?: unknown }> }>(`/user/installations/${installation.id}/repositories?per_page=100&page=${page}`, token);
+          const response = await asUser<{ repositories?: Array<{ full_name?: unknown; id?: unknown }> }>(`/user/installations/${installation.id}/repositories?per_page=100&page=${page}`);
           return { items: (response.data.repositories ?? []).map(repo => ({ name: typeof repo.full_name === "string" ? repo.full_name.toLowerCase() : "(unnamed)", id: Number.isSafeInteger(repo.id) ? Number(repo.id) : null })), next: response.next };
         }, "installation repositories");
         const repositories = listed.map(repo => repo.name);
@@ -322,14 +441,25 @@ export function registerWriteIdentity(
       }
       status ??= { ok: false, checkedAt, reason: problems.join("; ") };
     } catch (error) {
-      if (UserAuthorization.rejected(error)) await users.revoked(companyId, "GitHub rejected the user token (authorization revoked). Authorize the GitHub user again.");
+      // A list too long to read whole is drift, and a revocation GitHub confirmed (it refused the refresh) ends
+      // the authorization: writes stop until an administrator re-enables them. Anything else is not drift:
+      // a network failure, a 401 no refresh confirmed, an App JWT dated by a skewed clock. Writes pause
+      // (the check is not ok) and resume after the next good check.
+      const definitive = error instanceof PagesExceeded || (error instanceof UserAuthorizationError && !error.transient);
       const reason = error instanceof UserAuthorizationError || error instanceof PagesExceeded ? error.message
-        : UserAuthorization.rejected(error) ? "GitHub rejected the user token (authorization revoked)."
+        : error instanceof GitHubError && error.status === 401 ? "GitHub rejected the App's credentials during the fence check: this host's clock may be off, or the App's private key was revoked or rotated."
+        : error instanceof GitHubError ? `GitHub answered HTTP ${error.status} to a fence check request: ${error.message}`
         : "GitHub could not be reached to check the fence.";
-      // A network failure is not drift: writes pause (the check is not ok) and resume after the next good check.
-      // A list too long to read whole is drift: writes stop until an administrator re-enables them.
-      status = { ok: false, checkedAt, reason, ...(error instanceof UserAuthorizationError || error instanceof PagesExceeded || UserAuthorization.rejected(error) ? {} : { transient: true }) };
+      status = { ok: false, checkedAt, reason, ...(definitive ? {} : { transient: true }) };
     }
+    // Stamped by GitHub's clock once GitHub has answered: the check's own answers may just have corrected it.
+    const stamped = new Date(githubNow()).toISOString();
+    const skew = github.clock.skewMs();
+    const skewSeconds = Math.abs(skew) > CLOCK_SKEW_ALERT_MS ? Math.round(skew / 1000) : undefined;
+    const previous = state.fence;
+    status = { ...status, checkedAt: stamped, ...(skewSeconds === undefined ? {} : { clockSkewSeconds: skewSeconds }),
+      // A pause is dated from its first transient failure, so its retries back off.
+      ...(status.transient ? { pausedSince: previous?.transient && previous.pausedSince ? previous.pausedSince : stamped } : {}) };
     // A failed check keeps the pinned repository IDs: only an administrator saving the policy re-pins them.
     await users.updateState(companyId, latest => ({ ...latest, fence: { ...status, repositoryIds: status.repositoryIds ?? latest.fence?.repositoryIds } }));
     if (!status.ok && !status.transient) {
@@ -338,8 +468,17 @@ export function registerWriteIdentity(
       if (latest?.enabled) {
         await savePolicy(companyId, { ...latest, enabled: false });
         await ctx.activity.log({ companyId, message: "github.fence_violation", metadata: { reason: status.reason ?? "unknown", writesDisabled: true } });
+        // Tell the board at once: an activity entry alone can go unnoticed for hours.
+        await alerts.writesOff(companyId, { reason: status.reason ?? "unknown", reauthorize: Boolean((await users.state(companyId))?.needsReauthorization) });
       }
     }
+    // Reported after the result is saved, so a failing log never holds back the kill switch; again only when the skew moves.
+    if (skewSeconds !== undefined && (previous?.clockSkewSeconds === undefined || Math.abs(previous.clockSkewSeconds - skewSeconds) * 1000 > CLOCK_SKEW_ALERT_MS)) {
+      try { await ctx.activity.log({ companyId, message: "github.clock_skew", metadata: { skewSeconds, fenceOk: status.ok } }); }
+      catch { ctx.logger.warn("Could not record the GitHub clock skew in the activity log", { companyId, skewSeconds }); }
+    }
+    const after = await stored(companyId);
+    await alerts.observe(companyId, status, !!after && "policy" in after && after.policy.enabled);
     return status;
   }
 
@@ -401,15 +540,30 @@ export function registerWriteIdentity(
     const again = await readPullRequest();
     if (again?.head?.sha !== headSha || again?.base?.sha !== baseSha) throw new Denied(`Pull request #${pullRequest} changed while Paperclip checked it; run the merge again.`, evidence);
     const touched = protectedFiles(files, patterns);
-    if (!touched.length) return { ...evidence, files: files.length, protectedPaths: patterns.length };
-    if (touched.length === 1 && touched[0] === SKILLS_LOCK_FILE) {
+    // An instance admin may release some protected files for this repository (the plugin config, read now, never from the head).
+    // A file the opt-in does not release keeps the refusal for the whole pull request.
+    const optIn = touched.length ? await agentMergeableRule(companyId, repository) : { rule: null, problems: [] as string[] };
+    const { released, kept } = splitReleased(touched, optIn.rule, tiers);
+    const releaseEvidence = released.length ? { releasedProtectedFiles: released.slice(0, MAX_RELEASED_LISTED), releasedProtectedFilesCount: released.length, releasedBy: "config:agentMergeablePaths" } : {};
+    if (!kept.length) return { ...evidence, files: files.length, protectedPaths: patterns.length, ...releaseEvidence };
+    if (kept.length === 1 && kept[0] === SKILLS_LOCK_FILE) {
       const [baseLock, headLock] = await Promise.all([file(SKILLS_LOCK_FILE, baseSha), file(SKILLS_LOCK_FILE, headSha)]).catch(() => [null, null]);
       const reason = baseLock === null || headLock === null ? `${SKILLS_LOCK_FILE} could not be read at both ends` : skillsLockException({ baseLock, headLock, files, patterns });
       if (reason === null) return { ...evidence, files: files.length, protectedPaths: patterns.length, skillsLockSnapshotOnly: true };
-      throw new Denied(`This pull request changes the protected path ${SKILLS_LOCK_FILE} beyond skill snapshot hashes (${reason}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: touched });
+      throw new Denied(`This pull request changes the protected path ${SKILLS_LOCK_FILE} beyond skill snapshot hashes (${reason}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: kept });
     }
-    const listed = touched.slice(0, 20).join(", ") + (touched.length > 20 ? `, and ${touched.length - 20} more` : "");
-    throw new Denied(`This pull request changes protected paths (${listed}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: touched });
+    const listed = kept.slice(0, 20).join(", ") + (kept.length > 20 ? `, and ${kept.length - 20} more` : "");
+    throw new Denied(`This pull request changes protected paths (${listed}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: kept, ...(optIn.problems.length ? { agentMergeablePathsProblems: optIn.problems.slice(0, 5) } : {}) });
+  }
+
+  /**
+   * The instance admin's opt-in for one repository, from the company's plugin config at the moment of the merge. An entry that
+   * is not valid releases nothing; a problem is logged and shown in the refusal's evidence, never guessed around.
+   */
+  async function agentMergeableRule(companyId: string, repository: string): Promise<{ rule: AgentMergeableRule | null; problems: string[] }> {
+    const { rules, problems } = parseAgentMergeablePaths((await ctx.config.get(companyId)).agentMergeablePaths);
+    if (problems.length) ctx.logger.warn("agentMergeablePaths has entries that are not valid and release nothing", { companyId, problems: problems.slice(0, 5) });
+    return { rule: rules.find(rule => rule.repository === repository.toLowerCase()) ?? null, problems };
   }
 
   /**
@@ -499,24 +653,177 @@ export function registerWriteIdentity(
       ...statuses.map(status => ({ name: status.context, result: status.state }))];
     evidence.checks = checks;
     if (!checks.length) throw new Denied(`No check has reported on ${headSha.slice(0, 12)}; an admin merge needs green checks.`, { ...evidence, failing: [] });
-    const failing = required.filter(check => !runs.some(run => run.name === check.context && run.status === "completed" && run.conclusion === "success" && (check.integrationId === null || run.appId === check.integrationId))
+    // GitHub passes a required check that succeeded or was skipped (a job its path filter or condition skipped); a commit status has no skipped state.
+    const failing = required.filter(check => !runs.some(run => run.name === check.context && run.status === "completed" && PASSING_CONCLUSIONS.includes(String(run.conclusion)) && (check.integrationId === null || run.appId === check.integrationId))
       && !(check.integrationId === null && statuses.some(status => status.context === check.context && status.state === "success"))).map(check => check.context);
-    if (failing.length) throw new Denied(`Required checks have not all succeeded on ${headSha.slice(0, 12)}: ${[...new Set(failing)].join(", ")}.`, { ...evidence, failing: [...new Set(failing)] });
+    if (failing.length) throw new Denied(`Required checks have not all passed (success or skipped) on ${headSha.slice(0, 12)}: ${[...new Set(failing)].join(", ")}.`, { ...evidence, failing: [...new Set(failing)] });
     return evidence;
+  }
+
+  /**
+   * A push of workflow changes goes ahead without `editWorkflows` only when all
+   * the history it adds is the base branch's own, checked against GitHub now
+   * (read with the App's read-only token) and not against the checkout alone:
+   * - every new commit that changes workflow files is a merge of exactly two
+   *   parents whose changed files are what the base branch has, and whose second
+   *   parent is part of the base branch (a clean tip cannot hide an earlier edit);
+   * - every parent where the new history joins existing history is on the pushed
+   *   branch or on the base branch on GitHub (a made-up remote ref hides nothing);
+   * - the pushed commit's workflow files, where they differ from the branch it
+   *   replaces on GitHub, are the base branch's (a move to an older commit is a change).
+   * The base is the base of the open pull request from the pushed branch, else
+   * the default branch, and counts only when it is the default branch or
+   * protected. Anything not read in full, and any path that is not a regular
+   * file, refuses.
+   */
+  async function workflowBaseEvidence(companyId: string, current: GitHubWriteIdentityPolicy, repository: string, push: GitHubWorkflowPush, reason: string) {
+    const evidence: Record<string, unknown> = { branch: push.branch, tip: push.tip };
+    const off = reason;
+    const irregular = push.commits.flatMap(commit => commit.changes).filter(change => change.mode !== null && !REGULAR_FILE_MODES.includes(change.mode)).map(change => change.path);
+    if (irregular.length) throw new Denied(`This push changes workflow paths that are not regular files, symlinks or submodules (${listPaths(irregular)}); ${off}.`, { ...evidence, offending: irregular });
+    const token = await readToken(companyId, current, repository);
+    let base: string | null = null;
+    let defaultBranch: string | null = null;
+    const readDefaultBranch = async () => String((await github.request<any>(`/repos/${repository}`, token)).data?.default_branch ?? "");
+    try {
+      // The owner as GitHub spells it, for the head filter.
+      const owner = ((await repositoryFor(companyId, repository))?.fullName ?? repository).split("/")[0];
+      const pulls = await github.request<any[]>(`/repos/${repository}/pulls?${new URLSearchParams({ state: "open", head: `${owner}:${push.branch}`, per_page: "100" })}`, token);
+      if (pulls.next || !Array.isArray(pulls.data)) throw new Error("GitHub did not list the pull requests whole.");
+      // Pull requests of a fork, or from another branch, are not this branch's.
+      const bases = [...new Set(pulls.data.filter(pull => pull?.head?.ref === push.branch && String(pull?.head?.repo?.full_name ?? "").toLowerCase() === repository).map(pull => String(pull?.base?.ref ?? "")))];
+      if (bases.length > 1) {
+        throw new Denied(`Branch ${clip(push.branch, 60)} has open pull requests into more than one base branch (${bases.slice(0, 3).map(name => clip(name, 40)).join(", ")}), so Paperclip cannot tell which one this push merges; ${off}.`, evidence);
+      }
+      if (bases.length) base = bases[0]!;
+      else { defaultBranch = await readDefaultBranch(); base = defaultBranch; }
+      if (!base) throw new Error("GitHub did not name the base branch.");
+      const baseName = clip(base, 40);
+      // A branch as GitHub has it: its commit, tree and protection.
+      const readBranch = async (name: string) => {
+        const branch = (await github.request<any>(`/repos/${repository}/branches/${encodeURIComponent(name)}`, token)).data;
+        const commit = String(branch?.commit?.sha ?? ""), root = String(branch?.commit?.commit?.tree?.sha ?? "");
+        if (!FULL_SHA.test(commit) || !FULL_SHA.test(root)) throw new Error("GitHub did not report the branch's commit.");
+        return { commit, root, protected: branch?.protected === true };
+      };
+      // A tree GitHub cut short does not show every file.
+      const tree = async (sha: string, recursive = false) => {
+        const { data } = await github.request<any>(`/repos/${repository}/git/trees/${sha}${recursive ? "?recursive=1" : ""}`, token);
+        if (data?.truncated !== false || !Array.isArray(data.tree)) throw new Error("GitHub did not list the tree whole.");
+        const entries: any[] = data.tree;
+        return entries;
+      };
+      // Every file under .github/workflows of a commit's tree: path -> mode and blob.
+      const filesOf = async (root: string) => {
+        const files = new Map<string, { mode: string; oid: string }>();
+        const dotGithub = (await tree(root)).find(entry => entry?.path === ".github");
+        if (dotGithub) {
+          if (dotGithub.type !== "tree" || !GIT_OID.test(String(dotGithub.sha))) throw new Error("A .github is not a directory.");
+          const workflows = (await tree(String(dotGithub.sha))).find(entry => entry?.path === "workflows");
+          if (workflows && workflows.type !== "tree") files.set(WORKFLOWS, { mode: String(workflows.mode), oid: String(workflows.sha) });
+          else if (workflows) {
+            for (const entry of await tree(String(workflows.sha), true)) {
+              if (entry?.type === "blob" || entry?.type === "commit") files.set(`${WORKFLOWS}/${String(entry.path)}`, { mode: String(entry.mode), oid: String(entry.sha) });
+            }
+          }
+        }
+        return files;
+      };
+      const baseBranch = await readBranch(base);
+      // Whoever opens the pull request chooses its base, so only the default branch or a protected branch counts as reviewed.
+      if (!baseBranch.protected && base !== (defaultBranch ??= await readDefaultBranch())) {
+        throw new Denied(`${baseName} is neither the default branch nor protected, so Paperclip does not take its workflow files as reviewed; ${off}.`, { ...evidence, base });
+      }
+      const baseFiles = await filesOf(baseBranch.root);
+      evidence.base = base;
+      evidence.baseSha = baseBranch.commit;
+      // The pushed branch as GitHub has it now; a branch GitHub does not have yet is a new one.
+      let destination: Awaited<ReturnType<typeof readBranch>> | null = null;
+      try { destination = await readBranch(push.branch); } catch (error) {
+        if (!(error instanceof GitHubError && error.status === 404)) throw error;
+      }
+      const destinationFiles = destination ? await filesOf(destination.root) : null;
+      evidence.destinationSha = destination?.commit ?? null;
+
+      const same = (a: { mode: string | null; oid: string | null } | undefined, b: { mode: string | null; oid: string | null } | undefined) => (a?.mode ?? null) === (b?.mode ?? null) && (a?.oid ?? null) === (b?.oid ?? null);
+      // Whether a commit is the tip of a branch on GitHub or part of its history (one compare, remembered).
+      const within = new Map<string, Promise<boolean>>();
+      const onBranch = (sha: string, tipSha: string | null): Promise<boolean> => {
+        if (!tipSha) return Promise.resolve(false);
+        if (sha === tipSha) return Promise.resolve(true);
+        const key = `${sha}...${tipSha}`;
+        if (!within.has(key)) {
+          within.set(key, github.request<any>(`/repos/${repository}/compare/${key}?per_page=1`, token).then(
+            response => response.data?.status === "ahead" || response.data?.status === "identical",
+            error => { if (error instanceof GitHubError && (error.status === 404 || error.status === 422)) return false; throw error; }));
+        }
+        return within.get(key)!;
+      };
+
+      // Every new commit that changes workflow files must be a merge of the base branch.
+      const offendingCommits: string[] = [];
+      const offending = new Set<string>();
+      let problem: string | null = null;
+      for (const commit of push.commits) {
+        const paths = commit.changes.map(change => change.path);
+        let found: string | null = null;
+        if (commit.parents.length > 2) found = `Commit ${short(commit.sha)} merges more than two parents and changes workflow files (${listPaths(paths)}); ${off}.`;
+        else if (commit.parents.length < 2) {
+          found = `Commit ${short(commit.sha)} changes workflow files (${listPaths(paths)}) and is not a merge of ${baseName}; ${off}. Workflow changes may only arrive by merging ${baseName}.`;
+        } else {
+          const differing = commit.changes.filter(change => !same(change, baseFiles.get(change.path))).map(change => change.path);
+          if (differing.length) {
+            for (const path of differing) offending.add(path);
+            found = `Commit ${short(commit.sha)} changes workflow files that differ from ${baseName} (${listPaths(differing)}); ${off}. Workflow changes may only arrive by merging ${baseName}.`;
+          } else if (!await onBranch(commit.parents[1]!, baseBranch.commit)) {
+            found = `Commit ${short(commit.sha)} changes workflow files and merges ${short(commit.parents[1]!)}, which is not part of ${baseName}; ${off}.`;
+          }
+        }
+        if (found) { offendingCommits.push(commit.sha); problem ??= found; if (commit.parents.length !== 2) for (const path of paths) offending.add(path); }
+      }
+      if (problem) throw new Denied(problem, { ...evidence, offendingCommits, offending: [...offending].sort() });
+
+      // Where the new history joins existing history, GitHub must have it on the branch or on the base.
+      for (const entry of push.entries) {
+        if (await onBranch(entry, baseBranch.commit) || await onBranch(entry, destination?.commit ?? null)) continue;
+        const where = destination ? `neither on ${clip(push.branch, 60)} nor on ${baseName}` : `not part of ${baseName}`;
+        throw new Denied(`This push builds on commit ${short(entry)}, which is ${where} on GitHub, so Paperclip cannot tell what its workflow files are; ${off}.`, { ...evidence, entry });
+      }
+
+      // The pushed commit against the branch it replaces: whatever differs must be the base branch's.
+      const tipFiles = new Map(push.files.map(file => [file.path, { mode: file.mode, oid: file.oid }]));
+      let paths = [...new Set(push.commits.flatMap(commit => commit.changes.map(change => change.path)))].sort();
+      if (destinationFiles) {
+        paths = [...new Set([...tipFiles.keys(), ...destinationFiles.keys()])].sort().filter(path => !same(tipFiles.get(path), destinationFiles.get(path)));
+        const differing = paths.filter(path => !same(tipFiles.get(path), baseFiles.get(path)) || (tipFiles.has(path) && !REGULAR_FILE_MODES.includes(tipFiles.get(path)!.mode)));
+        if (differing.length) {
+          throw new Denied(`This push changes workflow files of ${clip(push.branch, 60)} that differ from ${baseName} (${listPaths(differing)}), and ${off}. Workflow changes may only arrive by merging ${baseName}.`, { ...evidence, offending: differing });
+        }
+      }
+      return { ...evidence, commits: push.commits.map(commit => commit.sha), paths };
+    } catch (error) {
+      if (error instanceof Denied) throw error;
+      throw new Denied(`Paperclip cannot read the workflow files of ${base ? clip(base, 40) : "the base branch"}, so it cannot check that this push only brings them in; ${off}.`, evidence);
+    }
   }
 
   /** Every gate a user-identity write passes. Returns the person, token and any privileged-action evidence. */
   async function authorizeUserWrite(companyId: string, current: GitHubWriteIdentityPolicy, input: {
     repository: string | null; action: GitHubOperationAction; privileged: GitHubPrivilegedAction[]; pullRequest?: number | null; expectedHeadSha?: string | null;
-    merge?: boolean; autoMerge?: boolean; retarget?: boolean;
+    merge?: boolean; autoMerge?: boolean; retarget?: boolean; workflowPush?: GitHubWorkflowPush; route?: string;
+    /** The agent and run that made the call, from the host (never from the command): scoped grants match on the agent. */
+    agentId?: string | null; runId?: string | null;
   }) {
     if (!current.enabled) throw new Denied("GitHub writes are switched off for this company (write identity kill switch).");
     if (input.repository === null && input.action !== "project") {
       throw new Denied("Paperclip cannot check this write against the repository fence. Name the repository (-R owner/name or a repos/<owner>/<name> path).");
     }
     if (input.repository !== null && !isGitHubRepositoryAllowed(current, input.repository)) throw new Denied(`${input.repository} is not in this company's GitHub write allowlist.`);
-    const off = input.privileged.filter(action => !current.privileged[action]);
-    if (off.length) throw new Denied(`This is a privileged GitHub action (${off.join(", ")}) and it is turned off for this company.`);
+    const off = input.privileged.filter(action => !isGitHubPrivilegedAllowed(current.privileged, action, input.agentId));
+    // With editWorkflows off for this agent, a push of one commit that only brings in the base branch's own workflow files is checked below instead.
+    const byBase = off.includes("editWorkflows") && input.repository !== null ? input.workflowPush : undefined;
+    const refused = byBase ? off.filter(action => action !== "editWorkflows") : off;
+    if (refused.length) throw new Denied(privilegedRefusal(current.privileged, refused, input.agentId));
     const user = await fencedUser(companyId);
     // Phase 1: no auto-merge and no merge queue as the App user (GitHub would merge later, unchecked).
     if (input.autoMerge) throw new Denied(`Agents do not enable auto-merge or the merge queue: a human must merge this pull request, ${current.userLogin ?? "the App user"} in the GitHub web UI.`);
@@ -528,7 +835,17 @@ export function registerWriteIdentity(
     const admin = input.privileged.includes("adminMerge") && input.repository
       ? await adminMergeEvidence(companyId, current, input.repository, input.pullRequest, input.expectedHeadSha)
       : undefined;
-    const evidence = merged || admin ? { ...(merged ? { protectedPaths: merged } : {}), ...(admin ? { adminMerge: admin } : {}) } : undefined;
+    let workflows: Awaited<ReturnType<typeof workflowBaseEvidence>> | undefined;
+    if (byBase && input.repository) {
+      try { workflows = await workflowBaseEvidence(companyId, current, input.repository, byBase, privilegedReason(current.privileged, "editWorkflows")); }
+      catch (error) {
+        // A push that is not the base branch's own is refused as an edit nobody granted: say how the board grants it.
+        if (error instanceof Denied) throw new Denied(withHint(error.message, grantHint(current.privileged, "editWorkflows", input.agentId)), error.evidence);
+        throw error;
+      }
+    }
+    const evidence = merged || admin || workflows
+      ? { ...(merged ? { protectedPaths: merged } : {}), ...(admin ? { adminMerge: admin } : {}), ...(workflows ? { workflowBaseMerge: workflows } : {}) } : undefined;
     const wait = throttle.take(user.userId, current.throttle, now());
     if (wait !== null) throw new Denied(`rate_limited: the GitHub write budget for ${user.login} is spent; retry in ${wait} seconds.`, evidence);
     // The checks above can take a while (an admin merge reads checks and statuses): the kill switch,
@@ -536,9 +853,38 @@ export function registerWriteIdentity(
     const latest = await policy(companyId);
     if (!latest || latest.userSource !== "app" || !latest.enabled) throw new Denied("GitHub writes are switched off for this company (write identity kill switch).", evidence);
     if (input.repository !== null && !isGitHubRepositoryAllowed(latest, input.repository)) throw new Denied(`${input.repository} is not in this company's GitHub write allowlist.`, evidence);
-    if (input.privileged.some(action => !latest.privileged[action])) throw new Denied("A privileged GitHub action this write needs was turned off for this company.", evidence);
+    if (input.privileged.some(action => !isGitHubPrivilegedAllowed(latest.privileged, action, input.agentId) && !(workflows && action === "editWorkflows"))) {
+      throw new Denied("A privileged GitHub action this write needs was turned off for this company.", evidence);
+    }
     await fencedUser(companyId);
-    return { user, token: await userToken(companyId), evidence };
+    // The token is taken first so a failed token leaves no "allowed" record; the record is written before it is returned.
+    const token = await userToken(companyId);
+    await recordPrivilegedAllowed(companyId, latest.privileged, input, workflows !== undefined);
+    return { user, token, evidence };
+  }
+
+  /**
+   * Every allowed workflow push and every allowed workflow dispatch is recorded, whoever the policy lets do it (an agent
+   * grant, every agent, or the base-branch exception): who, which run, where, and for a push which workflow files the
+   * checkout reported or which API endpoint was used. It is written before a credential is returned, so an action that
+   * cannot be recorded does not happen: a failed write refuses the call.
+   */
+  async function recordPrivilegedAllowed(companyId: string, toggles: GitHubPrivilegedToggles, input: {
+    repository: string | null; privileged: GitHubPrivilegedAction[]; workflowPush?: GitHubWorkflowPush; route?: string; agentId?: string | null; runId?: string | null;
+  }, byBase: boolean): Promise<void> {
+    for (const action of input.privileged) {
+      if (!isGitHubScopablePrivilegedAction(action)) continue;
+      const scope = toggles[action];
+      const push = input.workflowPush;
+      const paths = push ? [...new Set(push.commits.flatMap(commit => commit.changes.map(change => change.path)))].sort().slice(0, MAX_WORKFLOW_CHANGES) : null;
+      const via = action === "editWorkflows" && byBase && !isGitHubPrivilegedAllowed(toggles, action, input.agentId) ? "base-merge" : typeof scope === "object" ? "agent-grant" : "company";
+      await ctx.activity.log({
+        companyId, message: action === "editWorkflows" ? "github.workflow_push_allowed" : "github.workflow_dispatch_allowed",
+        ...(input.agentId ? { entityType: "agent", entityId: input.agentId } : {}),
+        metadata: { action, via, agentId: input.agentId ?? null, runId: input.runId ?? null, repository: input.repository,
+          ...(action === "editWorkflows" ? { branch: push?.branch ?? null, tip: push?.tip ?? null, paths, ...(input.route ? { route: input.route } : {}) } : {}) },
+      });
+    }
   }
 
   async function decide(companyId: string, request: GitHubWriteIdentityRequest): Promise<GitHubWriteIdentityDecision> {
@@ -552,18 +898,25 @@ export function registerWriteIdentity(
         if (!current.enabled) return { identity: "user", unavailable: "GitHub writes are switched off for this company (write identity kill switch)." };
         if (current.allowedRepositories.length && !repository) return { identity: "user", unavailable: "Paperclip cannot tell which repository this write targets; name it with -R owner/name." };
         if (repository && !isGitHubRepositoryAllowed(current, repository)) return { identity: "user", unavailable: `${repository} is not in this company's GitHub write allowlist.` };
-        const off = request.privileged.filter(action => !current.privileged[action]);
-        if (off.length) return { identity: "user", unavailable: `This is a privileged GitHub action (${off.join(", ")}) and it is turned off for this company.` };
+        const off = request.privileged.filter(action => !isGitHubPrivilegedAllowed(current.privileged, action, request.agentId));
+        if (off.length) return { identity: "user", unavailable: privilegedRefusal(current.privileged, off, request.agentId) };
       }
       const identity = identityKind(current, repository, request.action, "runtime");
+      /**
+       * The run's own token (or the App's) goes out next: the grant that allowed it is recorded first, as it is for the App user.
+       * The re-ask for the App after a missing user connection is the same command, already recorded by the ask before it.
+       */
+      const allowed = async () => { if (current && request.fallback !== true) await recordPrivilegedAllowed(companyId, current.privileged, { ...request, repository }, false); };
       if (identity === "user") {
-        if (request.fallback !== true) return { identity: "user", missingUserConnection: current?.missingUserConnection ?? "fail" };
+        if (request.fallback !== true) { await allowed(); return { identity: "user", missingUserConnection: current?.missingUserConnection ?? "fail" }; }
         if ((current?.missingUserConnection ?? "fail") !== "use_bot") return { identity: "bot", unavailable: "Connect your GitHub account in Paperclip to write as yourself." };
       }
       if (!repository) return { identity: "bot", unavailable: "Run this command in a GitHub checkout or pass --repo so Paperclip can write as the GitHub App." };
       const target = await repositoryFor(companyId, repository);
       if (!target) return { identity: "bot", unavailable: `${repository} is not available through the company's GitHub App.` };
-      return { identity: "bot", credential: await botCredential(companyId, target) };
+      const credential = await botCredential(companyId, target);
+      await allowed();
+      return { identity: "bot", credential };
     }
 
     // userSource "app": the plugin answers every operation; nothing defers to the
@@ -592,7 +945,8 @@ export function registerWriteIdentity(
       }
       const action = request.action ?? "other";
       const granted = await authorizeUserWrite(companyId, current, { repository, action, privileged: request.privileged, pullRequest: request.pullRequest, expectedHeadSha: request.expectedHeadSha,
-        merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true });
+        merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true, workflowPush: request.workflowPush, route: request.route,
+        agentId: request.agentId, runId: request.runId });
       return {
         identity: "user", credential: { token: granted.token, ...granted.user },
         ...(await signing()), bodyFooter: current.bodyFooter, ...(granted.evidence ? { evidence: granted.evidence } : {}),
@@ -609,12 +963,22 @@ export function registerWriteIdentity(
     return { companyId, policy: current && "policy" in current ? current.policy : null, invalid: !!current && "invalid" in current };
   });
 
-  ctx.actions.register("write-identity.set", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
+  /** A board action only an instance administrator may take; the administrator is who an alert about this company goes to. */
+  function adminScope(params: Record<string, unknown>, actor: PluginPerformActionContext) {
+    const scope = boardScope(params, actor);
     requireInstanceAdmin(actor);
+    // Not awaited: the action does not wait on it (it never rejects), and the alert queue keeps it ahead of any alert this action raises.
+    void alerts.contact(scope.companyId, scope.userId);
+    return scope;
+  }
+
+  ctx.actions.register("write-identity.set", async (params, actor) => {
+    const { companyId } = adminScope(params, actor);
     const next = params.policy === null ? null : parseGitHubWriteIdentityPolicy(params.policy);
     if (next) await savePolicy(companyId, next);
     else { await ctx.state.delete(policyKey(companyId)); policyChanged(companyId); }
+    // An alert about writes switched off or paused applies only while the company writes as its App user.
+    if (next?.userSource !== "app") await alerts.clear(companyId);
     await ctx.activity.log({ companyId, message: next ? "GitHub write identity updated" : "GitHub write identity reset to default", metadata: next ? {
       ...Object.fromEntries(GITHUB_WRITE_ACTIONS.map(action => [action, next.default[action]])),
       overrideCount: next.overrides.length, missingUserConnection: next.missingUserConnection, userSource: next.userSource, enabled: next.enabled,
@@ -630,20 +994,51 @@ export function registerWriteIdentity(
     return { companyId, policy: saved && "policy" in saved ? saved.policy : null, ...(fence ? { fence } : {}) };
   });
 
+  /**
+   * The board changes who holds editWorkflows or workflowDispatch: nobody, every agent, or chosen agents. Only an
+   * instance administrator in the company can (an agent never can), only in a saved policy, and only for agents of
+   * the company. Nothing else in the policy changes, and the change is recorded.
+   */
+  ctx.actions.register("write-identity.grant", async (params, actor) => {
+    const { companyId, userId } = boardScope(params, actor);
+    requireInstanceAdmin(actor);
+    const action = params.action;
+    if (action !== "editWorkflows" && action !== "workflowDispatch") throw new Error("Choose editWorkflows or workflowDispatch to grant.");
+    const scope = parseGitHubPrivilegedScope(params.scope, action);
+    if (typeof scope === "object") {
+      for (const agentId of scope.agentIds) {
+        if (!(await ctx.agents.get(agentId, companyId))) throw new Error(`${agentId} is not an agent of this company.`);
+      }
+    }
+    const current = await stored(companyId);
+    if (!current) throw new Error("Save a write identity first (write-identity.set): a grant changes a saved policy.");
+    if ("invalid" in current) throw new Error("The saved GitHub write identity is invalid. An instance administrator must save it again before granting.");
+    const previous = current.policy.privileged[action];
+    const next = parseGitHubWriteIdentityPolicy({ ...current.policy, privileged: { ...current.policy.privileged, [action]: scope } });
+    await savePolicy(companyId, next);
+    await ctx.activity.log({ companyId, message: "github.privileged_grant_changed", metadata: { action, previous, scope: next.privileged[action], by: userId } });
+    return { companyId, action, scope: next.privileged[action] };
+  });
+
+  /** The company's agents, for the board to choose whom to grant. */
+  ctx.actions.register("write-identity.agents", async (params, actor) => {
+    const { companyId } = boardScope(params, actor);
+    const agents = await ctx.agents.list({ companyId, limit: 500 });
+    return { companyId, agents: agents.map(agent => ({ id: agent.id, name: agent.name, status: agent.status })).sort((a, b) => a.name.localeCompare(b.name)) };
+  });
+
   ctx.actions.register("user-authorization.status", async (params, actor) => {
     const { companyId } = boardScope(params, actor);
     return { companyId, authorization: await users.state(companyId) };
   });
   ctx.actions.register("user-authorization.start", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     const current = await policy(companyId);
     if (current?.userSource !== "app" || !current.userLogin) throw new Error("Save a write identity with userSource app and userLogin first.");
     return { companyId, ...(await users.start(companyId)), login: current.userLogin };
   });
   ctx.actions.register("user-authorization.poll", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     const current = await policy(companyId);
     if (current?.userSource !== "app" || !current.userLogin) throw new Error("Save a write identity with userSource app and userLogin first.");
     const result = await users.poll(companyId, current.userLogin);
@@ -652,13 +1047,11 @@ export function registerWriteIdentity(
     return { companyId, ...result, fence: await checkFence(companyId) };
   });
   ctx.actions.register("user-authorization.check", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     return { companyId, fence: await checkFence(companyId) };
   });
   ctx.actions.register("user-authorization.revoke", async (params, actor) => {
-    const { companyId } = boardScope(params, actor);
-    requireInstanceAdmin(actor);
+    const { companyId } = adminScope(params, actor);
     await users.forget(companyId, "An administrator revoked the GitHub user authorization. Authorize the GitHub user again.");
     // Writes stay off after a new authorization until an administrator turns them back on.
     const current = await stored(companyId);
@@ -690,11 +1083,17 @@ export function registerWriteIdentity(
     if (privileged.some(name => !(GITHUB_PRIVILEGED_ACTIONS as readonly unknown[]).includes(name))) throw new Error("Unknown privileged GitHub action.");
     const pullRequest = Number.isSafeInteger(params.pullRequest) && Number(params.pullRequest) > 0 ? Number(params.pullRequest) : null;
     const expectedHeadSha = typeof params.expectedHeadSha === "string" && FULL_SHA.test(params.expectedHeadSha.toLowerCase()) ? params.expectedHeadSha.toLowerCase() : null;
+    const workflowPush = parseWorkflowPush(params.workflowPush);
+    // A receipt for the audit record only: it grants nothing, and the host's classification already decided what the write needs.
+    const route = typeof params.route === "string" && params.route ? clip(params.route, 200) : undefined;
+    // Only the host calls this action, and it names the agent and run from the run's own token: a scoped grant matches on them.
+    const agentId = normalizeGitHubAgentId(params.agentId), runId = normalizeGitHubAgentId(params.runId);
     try {
       return await decide(companyId, {
-        companyId, repository, access, action: action as GitHubOperationAction | null, privileged: privileged as GitHubPrivilegedAction[],
+        companyId, repository, access, action: action as GitHubOperationAction | null, privileged: privileged as GitHubPrivilegedAction[], agentId, runId,
         wiki: params.wiki === true, pullRequest, expectedHeadSha, ...(params.fallback === true ? { fallback: true } : {}),
         ...(params.merge === true ? { merge: true } : {}), ...(params.autoMerge === true ? { autoMerge: true } : {}), ...(params.retarget === true ? { retarget: true } : {}),
+        ...(workflowPush ? { workflowPush } : {}), ...(route ? { route } : {}),
       });
     } catch (error) {
       if (error instanceof Denied) return { identity: "user", unavailable: error.message };
@@ -743,7 +1142,8 @@ export function registerWriteIdentity(
       const name = repository ? normalizeGitHubRepository(repository)?.repository ?? null : null;
       try {
         const granted = await authorizeUserWrite(companyId, current, { repository: name, action: request.action, privileged: request.privileged ?? [], pullRequest: request.pullRequest, expectedHeadSha: request.expectedHeadSha,
-          merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true });
+          merge: request.merge === true, autoMerge: request.autoMerge === true, retarget: request.retarget === true,
+          agentId: normalizeGitHubAgentId(request.agentId), runId: normalizeGitHubAgentId(request.runId) });
         await ctx.activity.log({ companyId, message: "github.user_identity_write", metadata: {
           repository: name, action: request.action, privileged: request.privileged ?? [], source: request.source, login: granted.user.login,
           ...(request.agentId ? { agentId: request.agentId } : {}), ...(request.runId ? { runId: request.runId } : {}),
@@ -768,10 +1168,20 @@ export function registerWriteIdentity(
     },
     /** Hourly fence check from the sync job, for companies using the App user identity. */
     async maintain(companyId: string): Promise<void> {
+      // Every minute: a pause that has lasted long enough alerts, and an alert issue that failed to write is tried again.
+      await alerts.reconcile(companyId);
       const current = await stored(companyId);
       if (!current || !("policy" in current) || current.policy.userSource !== "app") return;
       const state = await users.state(companyId);
-      if (!state || (state.fence && now() - Date.parse(state.fence.checkedAt) < FENCE_CHECK_INTERVAL_MS)) return;
+      if (!state) return;
+      const fence = state.fence;
+      if (fence) {
+        // A transient pause is retried every few minutes at first, so writes resume on their own; then hourly.
+        const paused = fence.transient && fence.pausedSince ? githubNow() - Date.parse(fence.pausedSince) : Infinity;
+        const age = githubNow() - Date.parse(fence.checkedAt);
+        // A check dated in the future was stamped under another clock offset: it is due now.
+        if (age >= -CLOCK_SKEW_ALERT_MS && age < (paused < FENCE_CHECK_INTERVAL_MS ? FENCE_RETRY_INTERVAL_MS : FENCE_CHECK_INTERVAL_MS)) return;
+      }
       await checkFence(companyId);
     },
   };

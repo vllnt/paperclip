@@ -255,6 +255,72 @@ describe("errorHandler", () => {
     });
   });
 
+  describe("Postgres invalid_text_representation (22P02)", () => {
+    // Shape of the driver error: the message quotes the submitted value.
+    function invalidUuidError() {
+      return Object.assign(
+        new Error('invalid input syntax for type uuid: "uuid-canary-value"'),
+        { name: "PostgresError", code: "22P02", severity: "ERROR" },
+      );
+    }
+
+    // Drizzle wraps the driver error and puts the SQL in its own message.
+    function drizzleWrapped(cause: unknown) {
+      return Object.assign(
+        new Error(
+          'Failed query: select "id" from "routines" where "routines"."id" = $1\nparams: uuid-canary-value',
+        ),
+        { name: "DrizzleQueryError", cause },
+      );
+    }
+
+    it.each([
+      ["on the error itself", () => invalidUuidError()],
+      ["on err.cause", () => drizzleWrapped(invalidUuidError())],
+      [
+        "two causes deep",
+        () => new Error("outer", { cause: drizzleWrapped(invalidUuidError()) }),
+      ],
+    ])("returns a safe 400 when the code is %s", (_label, makeError) => {
+      const req = makeReq();
+      const res = makeRes() as any;
+      const next = vi.fn() as unknown as NextFunction;
+
+      errorHandler(makeError(), req, res, next);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith({
+        error: "Invalid identifier or value in request",
+      });
+      expect(JSON.stringify((res.json as any).mock.calls)).not.toMatch(
+        /uuid-canary-value|routines|select/i,
+      );
+      expect(res.err).toBeUndefined();
+      expect(res.__errorContext).toBeUndefined();
+      expect(captureExceptionMock).not.toHaveBeenCalled();
+      expect(telemetryMocks.trackErrorHandlerCrash).not.toHaveBeenCalled();
+    });
+
+    it("keeps unrelated Postgres errors on the 500 crash path", () => {
+      const req = makeReq();
+      const res = makeRes() as any;
+      const next = vi.fn() as unknown as NextFunction;
+      const err = drizzleWrapped(
+        Object.assign(new Error('column "nope" does not exist'), {
+          name: "PostgresError",
+          code: "42703",
+        }),
+      );
+
+      errorHandler(err, req, res, next);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+      expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
+      expect(res.err).toBe(err);
+      expect(captureExceptionMock).toHaveBeenCalledWith(err);
+    });
+  });
+
   it("records responsible-user denial codes on the active agent run", () => {
     const db = { marker: "db" };
     const req = {

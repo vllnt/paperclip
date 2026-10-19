@@ -1,4 +1,8 @@
 import { AgentAvatar } from "@/components/AgentAvatar";
+import {
+  AUTOMATION_WAKE_SETTINGS_HELP,
+  AutomationWakeSettingsFields,
+} from "../AutomationWakeSettingsFields";
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowRight,
@@ -34,6 +38,7 @@ import { ScheduleEditor, getScheduleCronValidation } from "../ScheduleEditor";
 import { RoutineVariablesEditor, RoutineVariablesHint } from "../RoutineVariablesEditor";
 import { RoutineTriggerCard } from "../RoutineTriggerCard";
 import { EnvironmentVariablesEditor } from "../environment-variables-editor";
+import { RunContextPolicyEditor } from "../RunContextPolicyEditor";
 import { createDefaultNewTrigger, useRoutineDetail } from "./context";
 import type { EnvBinding, RoutineDetail as RoutineDetailType } from "@paperclipai/shared";
 
@@ -731,6 +736,19 @@ export function DeliverySection() {
       </div>
       <div className="space-y-3">
         <p className="text-xs font-medium uppercase tracking-(--tracking-caps) text-muted-foreground">
+          Automation wakes
+        </p>
+        <p className="text-xs text-muted-foreground">{AUTOMATION_WAKE_SETTINGS_HELP}</p>
+        <AutomationWakeSettingsFields
+          idPrefix="routine"
+          value={editDraft.automationWakeSettings}
+          onChange={(automationWakeSettings) =>
+            setEditDraft((current) => ({ ...current, automationWakeSettings }))
+          }
+        />
+      </div>
+      <div className="space-y-3">
+        <p className="text-xs font-medium uppercase tracking-(--tracking-caps) text-muted-foreground">
           Advanced run policy
         </p>
         <RadioCardGroup
@@ -765,6 +783,18 @@ export function DeliverySection() {
         triggers={routine.triggers}
         concurrencyPolicy={editDraft.concurrencyPolicy}
       />
+      <div className="space-y-2">
+        <Label className="text-xs font-medium">Run context</Label>
+        <p className="text-xs text-muted-foreground">
+          How much issue history runs from this routine see. Blank fields inherit the agent and
+          company settings; wake-type overrides win over everything.
+        </p>
+        <RunContextPolicyEditor
+          value={editDraft.runContextPolicy}
+          onChange={(runContextPolicy) => setEditDraft((current) => ({ ...current, runContextPolicy }))}
+          testId="routine-run-context"
+        />
+      </div>
     </div>
   );
 }

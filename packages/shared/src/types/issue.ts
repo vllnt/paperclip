@@ -277,6 +277,7 @@ export interface IssueWakeDiagnosticWakeRequest {
   claimedAt: string | null;
   finishedAt: string | null;
   failureClass: IssueWakeDiagnosticWakeFailureClass | null;
+  executionWait?: { reason: string; message: string; recoveryActionId?: string };
 }
 
 export interface IssueWakeDiagnosticActivityRecord {
@@ -317,10 +318,24 @@ export interface IssueWakeDiagnosticsResponse {
   };
 }
 
+/** The latest heartbeat run whose context issue is the node. */
+export interface IssueSubtreeDiagnosticLastRun {
+  /** Null for actors without company-scope read, like wake-request run ids. */
+  id: string | null;
+  status: string;
+  /** Null for actors without company-scope read. */
+  agentId: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  createdAt: string;
+  errorCode: string | null;
+}
+
 export interface IssueSubtreeDiagnosticNode {
   issue: IssueBlockerDiagnosticIssueSummary;
   parentId: string | null;
   depth: number;
+  lastRun: IssueSubtreeDiagnosticLastRun | null;
   diagnosis: string | null;
   likelyReason: string | null;
   blockers: IssueBlockerDiagnosticNode[];
@@ -570,6 +585,16 @@ export interface IssueRecoveryAction {
   resolvedAt: Date | string | null;
   createdAt: Date | string;
   updatedAt: Date | string;
+}
+
+/** One row of `GET /api/companies/:companyId/recovery-actions`. */
+export interface CompanyIssueRecoveryActionListItem extends IssueRecoveryAction {
+  issue: {
+    id: string;
+    identifier: string | null;
+    title: string;
+    status: IssueStatus;
+  };
 }
 
 export type SuccessfulRunHandoffStateKind = "required" | "resolved" | "escalated";
@@ -996,6 +1021,12 @@ export interface IssueQueuedCommentEntry {
   position: number;
   canEdit: boolean;
   canDiscard: boolean;
+  /**
+   * `pending`: handed to the running process's live input, which takes it at
+   * its next tool boundary. It stays queued until the run acknowledges it, and
+   * goes back to plain queued if the run ends first.
+   */
+  steering?: "pending";
 }
 
 /**

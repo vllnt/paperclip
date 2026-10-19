@@ -4,6 +4,7 @@ import {
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
+import { isProviderQuotaMessage, parseProviderQuotaResetAt } from "@paperclipai/adapter-utils/provider-quota";
 
 const CODEX_TRANSIENT_UPSTREAM_RE =
   /(?:we(?:'|’)re\s+currently\s+experiencing\s+high\s+demand|temporary\s+errors|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|server\s+overloaded|service\s+unavailable|try\s+again\s+later)/i;
@@ -300,8 +301,8 @@ export function extractCodexRetryNotBefore(input: {
 }, now = new Date()): Date | null {
   const haystack = buildCodexErrorHaystack(input);
   const usageLimitMatch = haystack.match(CODEX_USAGE_LIMIT_RE);
-  if (!usageLimitMatch) return null;
-  return parseLocalClockTime(usageLimitMatch[1] ?? "", now);
+  if (usageLimitMatch) return parseLocalClockTime(usageLimitMatch[1] ?? "", now);
+  return isProviderQuotaMessage(haystack) ? parseProviderQuotaResetAt(haystack, now) : null;
 }
 
 export function isCodexTransientUpstreamError(input: {
@@ -318,11 +319,22 @@ export function isCodexTransientUpstreamError(input: {
   return CODEX_REMOTE_COMPACTION_RE.test(haystack) || /high\s+demand|temporary\s+errors/i.test(haystack);
 }
 
+/**
+ * Classifies a provider quota failure from Codex's structured error only: the
+ * message of a JSONL `error` or `turn.failed` event. Raw stdout and stderr are
+ * not read, because a task's tools can print any text there.
+ *
+ * @param input.errorMessage The message parsed from Codex's error event.
+ * @returns True when Codex reported a usage or capacity limit.
+ */
 export function isCodexProviderQuotaError(input: {
-  stdout?: string | null;
-  stderr?: string | null;
   errorMessage?: string | null;
 }): boolean {
-  const haystack = buildCodexErrorHaystack(input);
-  return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(input) != null;
+  const surface = { errorMessage: input.errorMessage };
+  const haystack = buildCodexErrorHaystack(surface);
+  return (
+    CODEX_PROVIDER_QUOTA_RE.test(haystack) ||
+    isProviderQuotaMessage(haystack) ||
+    extractCodexRetryNotBefore(surface) != null
+  );
 }

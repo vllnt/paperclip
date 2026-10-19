@@ -28,6 +28,10 @@ describe("isPrivateWebhookHttpRequest", () => {
     for (const path of [
       "/api/routine-triggers/public",
       "/api/routine-triggers/public/private-id/fire",
+      "/api/event-sources/public",
+      "/api/event-sources/public/private-id/events",
+      "/API/EVENT-SOURCES/PUBLIC/private-id/events?token=private",
+      "https://host.invalid/api/event-sources/public/../private-id",
       "https://host.invalid/api/routine-triggers/public/../private-id",
       "/api/chat-webhooks",
       "/api/chat-webhooks/id",
@@ -44,6 +48,8 @@ describe("isPrivateWebhookHttpRequest", () => {
   it("does not change adjacent non-webhook routes", () => {
     for (const path of [
       "/api/routine-triggers/id/rotate-secret",
+      "/api/event-sources/id/rotate-secret",
+      "/api/event-sources/public-extra/id/events",
       "/api/routine-triggers/public-extra/id/fire",
       "/api/chat-webhooks-extra/id/slack",
       "https://host.invalid/api/chat-webhooks-extra/id/slack",

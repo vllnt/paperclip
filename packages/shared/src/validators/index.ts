@@ -86,6 +86,8 @@ export {
   environmentDriverSchema,
   environmentStatusSchema,
   environmentLeaseStatusSchema,
+  listEnvironmentLeasesQuerySchema,
+  COMPANY_ENVIRONMENT_LEASES_DEFAULT_STATUSES,
   environmentLeaseCleanupStatusSchema,
   createEnvironmentSchema,
   updateEnvironmentSchema,
@@ -350,6 +352,12 @@ export {
   builtInAgentResetSchema,
   createAgentHireSchema,
   updateAgentSchema,
+  AGENT_CONFIG_FORBIDDEN_KEYS,
+  AGENT_CONFIG_MERGE_PATCH_MAX_DEPTH,
+  AGENT_CONFIG_MERGE_PATCH_MAX_VALUES,
+  describeAgentConfigMergePatchViolation,
+  findAgentConfigMergePatchViolation,
+  updateAgentMergePatchSchema,
   agentRuntimeConfigSchema,
   agentInstructionsBundleModeSchema,
   updateAgentInstructionsBundleSchema,
@@ -372,6 +380,8 @@ export {
   type BuiltInAgentReset,
   type CreateAgentHire,
   type UpdateAgent,
+  type AgentConfigMergePatchViolation,
+  type UpdateAgentMergePatch,
   type UpdateAgentInstructionsBundle,
   type UpsertAgentInstructionsFile,
   type UpdateAgentInstructionsPath,
@@ -417,6 +427,7 @@ export {
 
 export {
   createIssueSchema,
+  isValidExistingBranchName,
   setIssueTitleSchema,
   type SetIssueTitle,
   createIssueInputSchema,
@@ -435,7 +446,12 @@ export {
   issueExecutionStateSchema,
   issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_STATUSES,
+  COMPANY_RECOVERY_ACTIONS_DEFAULT_LIMIT,
+  COMPANY_RECOVERY_ACTIONS_MAX_LIMIT,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
@@ -507,6 +523,7 @@ export {
   type IssueExecutionWorkspaceSettings,
   type IssueRecoveryActionReadModel,
   type ResolveIssueRecoveryAction,
+  type ListCompanyIssueRecoveryActionsQuery,
   type CheckoutIssue,
   type AddIssueComment,
   type CreateIssueThreadInteraction,
@@ -691,6 +708,10 @@ export {
 
 export {
   createRoutineSchema,
+  listRoutinesQuerySchema,
+  parseListRoutinesQuery,
+  ROUTINE_LIST_QUERY_MAX_LENGTH,
+  ROUTINE_LIST_TRIGGER_FILTERS,
   updateRoutineSchema,
   createRoutineTriggerSchema,
   updateRoutineTriggerSchema,
@@ -702,6 +723,8 @@ export {
   runRoutineSchema,
   rotateRoutineTriggerSecretSchema,
   type CreateRoutine,
+  type ListRoutinesQuery,
+  type RoutineListTriggerFilter,
   type UpdateRoutine,
   type CreateRoutineTrigger,
   type UpdateRoutineTrigger,
@@ -981,6 +1004,7 @@ export {
 } from "./tool-access.js";
 export * from "./skill-policy.js";
 export * from "./provider-trace.js";
+export * from "./heartbeat-run.js";
 export * from "./app-definition.js";
 export * from "./chat-channels.js";
 export * from "./chat-github.js";

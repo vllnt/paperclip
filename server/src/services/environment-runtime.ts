@@ -32,13 +32,14 @@ import type {
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
-import { removeRestoredSshRunDirectory } from "@paperclipai/adapter-utils/remote-managed-runtime";
 import {
   getActiveStepContext,
   runWithRuntimeParent,
   type StartupSpanContext,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { environmentService } from "./environments.js";
+import { assertRunDirectoryNotBeingRemoved, recordSshWorkspaceSeed, sshRunDirectoryReaperService } from "./ssh-run-directory-reaper.js";
+import { readSshWorkspaceSeed } from "@paperclipai/adapter-utils/ssh";
 import { instanceSettingsService } from "./instance-settings.js";
 import { verifyNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import {
@@ -64,6 +65,7 @@ import {
   sandboxConfigFromLeaseMetadataLoose,
 } from "./sandbox-provider-runtime.js";
 import { pluginRegistryService } from "./plugin-registry.js";
+import { resourceCapacityService } from "./resource-capacity.js";
 import type {
   ExecuteLogSink,
   PluginWorkerManager,
@@ -80,7 +82,7 @@ import {
   resolvePluginExecuteRpcTimeoutMs,
   resumePluginEnvironmentLease,
 } from "./plugin-environment-driver.js";
-import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
+import { redactProviderMetadata } from "./json-schema-secret-refs.js";
 import { buildWorkspaceRealizationRecordFromDriverInput } from "./workspace-realization.js";
 import {
   createSandboxOrphanCleanupSpool,
@@ -386,47 +388,7 @@ function stripSecretRefValuesFromPluginLeaseMetadata(input: {
   metadata: Record<string, unknown> | null | undefined;
   schema: Record<string, unknown> | null | undefined;
 }): Record<string, unknown> {
-  const sanitized = structuredClone(input.metadata ?? {}) as Record<string, unknown>;
-
-  for (const path of collectSecretRefPaths(input.schema)) {
-    const keys = path.split(".");
-    const parents: Array<{ container: Record<string, unknown>; key: string }> = [];
-    let cursor: Record<string, unknown> | null = sanitized;
-
-    for (let index = 0; index < keys.length - 1; index += 1) {
-      const key = keys[index]!;
-      const next = cursor?.[key];
-      if (!next || typeof next !== "object" || Array.isArray(next)) {
-        cursor = null;
-        break;
-      }
-      parents.push({ container: cursor, key });
-      cursor = next as Record<string, unknown>;
-    }
-
-    if (!cursor) continue;
-
-    const leafKey = keys[keys.length - 1]!;
-    if (!Object.prototype.hasOwnProperty.call(cursor, leafKey)) continue;
-    delete cursor[leafKey];
-
-    for (let index = parents.length - 1; index >= 0; index -= 1) {
-      const { container, key } = parents[index]!;
-      const value = container[key];
-      if (
-        value &&
-        typeof value === "object" &&
-        !Array.isArray(value) &&
-        Object.keys(value as Record<string, unknown>).length === 0
-      ) {
-        delete container[key];
-      } else {
-        break;
-      }
-    }
-  }
-
-  return sanitized;
+  return redactProviderMetadata(input.metadata, input.schema);
 }
 
 export interface EnvironmentDriverAcquireInput {
@@ -1177,67 +1139,10 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   };
 }
 
-const TERMINAL_RUN_STATUSES: readonly string[] = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"];
-// The removal runs in the background, so it can afford a large, busy tree.
-const SSH_RUN_DIRECTORY_REMOVAL_TIMEOUT_MS = 10 * 60 * 1000;
-
-// Every SSH run syncs into its own `runs/<runId>` directory on the host, and
-// nothing removed it, so finished runs filled a worker disk (519 directories,
-// 67 GB, 2026-10-08). After the lease releases, remove the run's directory.
-// Best effort and in the background: the lease is already released, a slow
-// delete never holds up the run's teardown, and a failure only keeps the
-// directory. It runs only for a terminal run on the host the lease was
-// acquired on, and the directory goes only when the run's sync-back left its
-// restored marker, so a run whose restore failed or never ran (a crash) keeps
-// the only copy of its work.
-async function removeReleasedSshRunDirectory(db: Db, environment: Environment, lease: EnvironmentLease): Promise<void> {
-  const runId = lease.heartbeatRunId;
-  const metadata = lease.metadata ?? {};
-  const remoteRoot = typeof metadata.remoteCwd === "string" ? metadata.remoteCwd : null;
-  if (lease.provider !== "ssh" || lease.leasePolicy !== "ephemeral" || !runId || !remoteRoot) return;
-  if (!["released", "expired", "failed"].includes(lease.status)) return;
-  try {
-    const [run] = await db
-      .select({ status: heartbeatRuns.status })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId));
-    if (!run || !TERMINAL_RUN_STATUSES.includes(run.status)) return;
-    const parsed = await resolveEnvironmentDriverConfigForRuntime(db, lease.companyId, environment, {
-      issueId: lease.issueId,
-      heartbeatRunId: runId,
-    });
-    if (parsed.driver !== "ssh") return;
-    // An environment re-pointed after the acquire names another host.
-    if (
-      metadata.host !== parsed.config.host ||
-      Number(metadata.port) !== parsed.config.port ||
-      metadata.username !== parsed.config.username
-    ) {
-      logger.info({ leaseId: lease.id, runId }, "kept a finished SSH run directory: the environment now points at another host");
-      return;
-    }
-    const outcome = await removeRestoredSshRunDirectory({
-      spec: parsed.config,
-      remoteRoot,
-      runId,
-      timeoutMs: SSH_RUN_DIRECTORY_REMOVAL_TIMEOUT_MS,
-    });
-    if (outcome === "symlink" || outcome === "rm_failed") {
-      logger.warn({ leaseId: lease.id, runId, outcome }, "kept a finished SSH run directory");
-    } else if (outcome === "not_restored") {
-      logger.info({ leaseId: lease.id, runId, outcome }, "kept a finished SSH run directory without a completed sync-back");
-    }
-  } catch {
-    // Log a constant kind only: an SSH error can carry host or credential detail.
-    logger.warn(
-      { errorKind: "ssh_run_directory_cleanup_failed", leaseId: lease.id, runId },
-      "could not remove a finished SSH run directory; it stays on the host",
-    );
-  }
-}
-
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
+  const resourceCapacity = resourceCapacityService(db);
+  const reaper = sshRunDirectoryReaperService(db);
 
   return {
     driver: "ssh",
@@ -1252,8 +1157,9 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         throw new Error(`Expected SSH environment config for driver "${input.environment.driver}".`);
       }
 
-      const { remoteCwd } = await ensureSshWorkspaceReady(parsed.config);
-      return await environmentsSvc.acquireLease({
+      const { remoteCwd, resourceProbe } = await ensureSshWorkspaceReady(parsed.config, { probeResources: true });
+      const probedAt = new Date();
+      const lease = await environmentsSvc.acquireLease({
         companyId: input.companyId,
         environmentId: input.environment.id,
         executionWorkspaceId: input.executionWorkspaceId,
@@ -1273,13 +1179,24 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           remoteCwd,
         },
       });
+      // The lease is visible now. A reaper that claimed this run directory
+      // before it was must not delete under a run that is about to use it.
+      if (input.heartbeatRunId) {
+        await assertRunDirectoryNotBeingRemoved(db, input.heartbeatRunId, lease.id).catch(async (error) => {
+          await environmentsSvc.releaseLease(lease.id, "failed", { failureReason: "The workspace directory of this run is being removed." }).catch(() => undefined);
+          throw error;
+        });
+      }
+      // Never awaited: it cannot throw, and recording must not delay the run.
+      void resourceCapacity.recordLeaseAcquireProbe(input.environment.id, resourceProbe ?? null, probedAt);
+      return lease;
     },
 
     async releaseRunLease(input) {
       const released = await environmentsSvc.releaseLease(input.lease.id, input.status);
       // Never awaited: it cannot throw, and a large delete must not delay the
       // run's teardown.
-      if (released) void removeReleasedSshRunDirectory(db, input.environment, released);
+      if (released) void reaper.reapReleasedLease(input.environment, released).catch(() => undefined);
       return released;
     },
 
@@ -1295,6 +1212,12 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async realizeWorkspace(input) {
+      // The commit the workspace upload starts from, recorded before the upload.
+      // The run reaper reads it to tell commits the host already has from the
+      // run's own. A workspace that is not a git repository has none, and its
+      // run directory is then kept if the worker made commits.
+      const seed = input.workspace.localPath ? await readSshWorkspaceSeed(input.workspace.localPath) : null;
+      if (seed) await recordSshWorkspaceSeed(db, input.lease.id, seed);
       const record = buildWorkspaceRealizationRecordFromDriverInput({
         environment: input.environment,
         lease: input.lease,
@@ -3676,7 +3599,10 @@ function createPluginEnvironmentDriver(
         expiresAt: providerAttestedLeaseExpiry(input.requestedExpiresAt, parseExpiresAt(providerLease.expiresAt)),
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
-          providerMetadata: providerLease.metadata ?? {},
+          providerMetadata: stripSecretRefValuesFromPluginLeaseMetadata({
+            metadata: providerLease.metadata,
+            schema: driver.configSchema as Record<string, unknown> | null | undefined,
+          }),
           driver: input.environment.driver,
           executionWorkspaceMode: input.executionWorkspaceMode,
           pluginId: plugin.id,

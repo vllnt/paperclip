@@ -1,10 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   ArrowLeft,
+  BellRing,
   Cpu,
   Download,
   FlaskConical,
   Globe,
+  Gauge,
   KeyRound,
   MonitorCog,
   Puzzle,
@@ -136,11 +138,25 @@ export function CompanySettingsSidebar() {
             <SidebarNavItem to="/company/settings/secrets" label="Secrets" icon={KeyRound} end />
           )}
           <SidebarNavItem to="/company/settings/browser" label="Shared browser" icon={Globe} end />
+          <SidebarNavItem
+            to="/company/settings/event-sources"
+            label="Event sources"
+            icon={BellRing}
+            end
+          />
           {showPage("instance.environments") && (
             <SidebarNavItem
               to={`${INSTANCE_SETTINGS_PATH_PREFIX}/environments`}
               label="Environments"
               icon={MonitorCog}
+              end
+            />
+          )}
+          {showPage("instance.resource-capacity") && (
+            <SidebarNavItem
+              to={`${INSTANCE_SETTINGS_PATH_PREFIX}/resource-capacity`}
+              label="Resource capacity"
+              icon={Gauge}
               end
             />
           )}

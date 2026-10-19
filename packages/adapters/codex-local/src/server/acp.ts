@@ -38,7 +38,9 @@ import {
   asStringArray,
   parseObject,
 } from "@paperclipai/adapter-utils/server-utils";
+import { removePaperclipTempDir } from "@paperclipai/adapter-utils/paperclip-temp";
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
+import { resolveCodexHomeSeedSelection } from "@paperclipai/adapter-utils/codex-home-seed";
 import { normalizeCodexModel } from "../index.js";
 import { classifyCodexAuthRefreshFailure, extractCodexRetryNotBefore } from "./parse.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
@@ -180,7 +182,7 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
 async function prepareCodexRemoteManagedHome(
   input: AcpxRemoteManagedHomeContext,
 ): Promise<AcpxRemoteManagedHomeResult> {
-  const { env, runId, onLog } = input;
+  const { env, onLog } = input;
   // The host managed Codex home the engine seeded and set on env.CODEX_HOME.
   const effectiveCodexHome = env.CODEX_HOME;
   if (!effectiveCodexHome) {
@@ -195,7 +197,10 @@ async function prepareCodexRemoteManagedHome(
     || process.env.OPENAI_API_KEY?.trim() || process.env.CODEX_API_KEY?.trim(),
   );
   // Curated allowlist temp dir (auth/config/skills only); caller owns cleanup.
-  const stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId });
+  const stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
+    extraEntries: resolveCodexHomeSeedSelection(input.config.codexHomeSeed, process.env).names,
+    onLog,
+  });
   let stagedRuntime;
   try {
     stagedRuntime = await input.stage([
@@ -218,7 +223,7 @@ async function prepareCodexRemoteManagedHome(
       },
     ]);
   } catch (err) {
-    await fs.rm(stagedCodexHomeDir, { recursive: true, force: true }).catch(() => {});
+    await removePaperclipTempDir(stagedCodexHomeDir).catch(() => {});
     throw err;
   }
   // Repoint CODEX_HOME from the HOST path onto the seeded in-sandbox home.
@@ -253,7 +258,7 @@ async function prepareCodexRemoteManagedHome(
     // warm — so it can't remove the staged home while a reuse still depends on
     // it. Idempotent: `force: true` no-ops if it was already removed.
     disposeStaged: async () => {
-      await fs.rm(stagedCodexHomeDir, { recursive: true, force: true }).catch(async (error) => {
+      await removePaperclipTempDir(stagedCodexHomeDir).catch(async (error) => {
         await onLog(
           "stderr",
           `[paperclip] Failed to remove staged Codex home "${stagedCodexHomeDir}": ${
