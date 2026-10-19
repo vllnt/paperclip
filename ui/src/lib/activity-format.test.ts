@@ -15,6 +15,11 @@ describe("activity formatting", () => {
     expect(formatActivityVerb("issue.updated", { status: "in_review" })).toBe("changed status to in review on");
   });
 
+  it("uses readable verbs for harness fallback switches and returns", () => {
+    expect(formatActivityVerb("agent.harness_fallback_activated")).toBe("switched to a fallback harness for");
+    expect(formatActivityVerb("agent.harness_fallback_returned")).toBe("returned to the primary harness for");
+  });
+
   it("uses readable verbs for task read-state changes", () => {
     expect(formatActivityVerb("issue.read_marked")).toBe("read");
     expect(formatActivityVerb("issue.read_unmarked")).toBe("marked unread");
