@@ -4,8 +4,9 @@
  *
  * Reads the changed paths as NUL-separated text on stdin (from
  * `git diff --no-renames -z --name-only`), prints one JSON object
- *   { "mode": "none" | "full", "need_sentry": boolean, "reason": string }
- * and, when $GITHUB_OUTPUT is set, appends `mode=` and `need_sentry=` to it.
+ *   { "mode": "none" | "full", "need_sentry": boolean, "need_perf_guards": boolean, "reason": string }
+ * and, when $GITHUB_OUTPUT is set, appends `mode=`, `need_sentry=` and
+ * `need_perf_guards=` to it.
  *
  * Fails closed: an unknown event, an empty list or an unsafe path means `full`.
  * `none` is a strict allowlist (only docs/ and screenshots/ at the repo root);
@@ -30,7 +31,22 @@ const SENTRY_PATTERNS = [
   /^\.github\/workflows\/ci\.yml$/,
 ];
 
-const full = (reason, needSentry = true) => ({ mode: "full", need_sentry: needSentry, reason });
+// The code the query plan, migration and statement budget guards exercise: the
+// server, the schema and migrations, shared types, the dependency versions (the
+// driver and the ORM shape every statement), the Vitest setup, and this workflow.
+const PERF_GUARD_PATTERNS = [
+  /^server\//,
+  /^packages\/db\//,
+  /^packages\/shared\//,
+  /^pnpm-lock\.yaml$/,
+  /^vitest\.config\.ts$/,
+  /^scripts\/ci\/assert-vitest-ran\.mjs$/,
+  /^\.github\/workflows\/ci\.yml$/,
+];
+
+const full = (reason, needSentry = true, needPerfGuards = true) => ({
+  mode: "full", need_sentry: needSentry, need_perf_guards: needPerfGuards, reason,
+});
 const isUnsafe = (changedPath) => changedPath.startsWith("/") || changedPath.split("/").includes("..");
 
 export function parsePaths(text) {
@@ -42,10 +58,10 @@ export function classify({ event, paths }) {
   if (paths.length === 0) return full("no changed paths found");
   if (paths.some(isUnsafe)) return full("unsafe path in the change list");
   if (paths.every((changedPath) => NONE_PREFIXES.some((prefix) => changedPath.startsWith(prefix)))) {
-    return { mode: "none", need_sentry: false, reason: `${paths.length} path(s), all under docs/ or screenshots/` };
+    return { mode: "none", need_sentry: false, need_perf_guards: false, reason: `${paths.length} path(s), all under docs/ or screenshots/` };
   }
-  const needSentry = paths.some((changedPath) => SENTRY_PATTERNS.some((pattern) => pattern.test(changedPath)));
-  return full(`${paths.length} path(s) outside docs/ and screenshots/`, needSentry);
+  const matches = (patterns) => paths.some((changedPath) => patterns.some((pattern) => pattern.test(changedPath)));
+  return full(`${paths.length} path(s) outside docs/ and screenshots/`, matches(SENTRY_PATTERNS), matches(PERF_GUARD_PATTERNS));
 }
 
 function readStdin() {
@@ -66,7 +82,9 @@ async function main(argv, env) {
   }
   const result = classify({ event, paths: parsePaths(await readStdin()) });
   console.log(JSON.stringify(result));
-  if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `mode=${result.mode}\nneed_sentry=${result.need_sentry}\n`);
+  if (env.GITHUB_OUTPUT) {
+    appendFileSync(env.GITHUB_OUTPUT, `mode=${result.mode}\nneed_sentry=${result.need_sentry}\nneed_perf_guards=${result.need_perf_guards}\n`);
+  }
   return 0;
 }
 
