@@ -129,8 +129,13 @@ The stable company-management action keys are:
 - `allowed-owners.get`, `allowed-owners.set` (GitHub logins are case-insensitive;
   both return the logins and the pinned `accounts` with numeric IDs)
 - `repositories.list` (returns only allowlisted owners)
-- `sync.trigger` (starts one company’s sync and returns its company ID)
-- `sync-status` reports `connection` without loading the private key.
+- `sync.trigger` (queues one company’s sync for the scheduled job and returns its
+  company ID with `queued`, `queuedAt`, `busy` and `lastRunAt`; it does not run
+  the sync itself)
+- `sync-now` (the same queue request, for the web UI and the API; see
+  [Sync now](#sync-now-queues-a-request))
+- `sync-status` reports `connection` without loading the private key, and
+  `queued`, `queuedAt` and `busy`.
 
 Invoke them with `paperclipai plugin action <pluginKey|pluginId> <actionKey>
 -C <companyId> [--params-json <json> | --params-file <path>]`. The generic
@@ -312,6 +317,34 @@ recorded as `github.clock_skew` in the company activity.
 The kill switch is the same save with `"enabled": false`: writes stop at the
 next command, reads continue.
 
+**The board hears when writes stop on their own.** The moment the plugin
+switches a company's writes off (drift, or an authorization GitHub no longer
+honors) it opens one Paperclip issue, `origin plugin:vllnt.paperclip-github:write-alert`,
+named after the company. It gives the reason and the exact recovery commands:
+re-authorize first when the reason is a revocation, then save the policy with
+`"enabled": true`. It is assigned to the instance administrator who last
+changed the company's write identity (unassigned when none is known). There is at most one
+open alert per company: later checks update it, they never add another. Two
+softer conditions use the same issue and raise its priority only as far as they
+need:
+
+- **A pause that lasts 30 minutes.** The fence check keeps failing for a reason
+  that is not drift, so writes are refused but nothing was switched off. This
+  covers a pause that never clears on its own: a 401 after every refresh,
+  `incorrect_client_credentials`, a revoked or rotated App private key, or a
+  403 or 404 on the user endpoints. The pause is timed from its first failure
+  (`fence.pausedSince`) by GitHub's clock, so a host clock that lags does not
+  delay the alert. At 30 minutes the plugin opens (or escalates) the issue with
+  the reason, and writes `github.fence_paused` to the company activity once for
+  that pause, however long it lasts. The plugin keeps re-checking, every 5
+  minutes for the pause's first hour and hourly after, and the issue closes
+  when a check passes.
+- **A host clock more than 60 seconds from GitHub's** (`fence.clockSkewSeconds`).
+
+The issue closes itself when an administrator has turned writes back on and the
+check passes, when the pause or the skew ends, or when the company stops using
+the App user. The plugin never re-enables writes itself.
+
 ### Releasing protected paths for agent merges
 
 By default an agent never merges a pull request that touches a protected path (`.github/**`, CODEOWNERS and, in a control repository, its control paths); a person merges it in the GitHub web UI. An **instance administrator** can release some of these paths for chosen repositories with the company's plugin config, field `agentMergeablePaths`:
@@ -358,7 +391,28 @@ Repository discovery, issue/PR pages and details, comments, diffs, and Projects 
 
 **Refresh** fetches current GitHub data. Successful or uncertain writes invalidate the company cache, and connection changes clear it. Provider writes, merge/review head checks and ownership checks always use fresh data. Access revocations can take up to 30 seconds to affect an already cached read; they cannot authorize a provider write. The view shows when its data was fetched and retains an explicit error if refreshing fails.
 
-The Tasks toolbar polls local sync status every 30 seconds while idle and every second during sync. Page/focus refreshes reuse a sync report less than a minute old; **Sync now** bypasses that limit and the discovery cache. Background synchronization still reads GitHub issue changes directly every minute.
+The Tasks toolbar polls local sync status every 30 seconds while idle, every 5 seconds while a request waits and every second during a sync. Opening the page or focusing the window only reads that status; it starts no sync.
+
+### Sync now queues a request
+
+Sync runs only in the scheduled `github-sync` job. The host starts the job every minute, skips a start while the previous run is still going, and the job syncs every connected company on each run. A run takes as long as the companies have issues to check, so the next run starts within about a minute after the previous one ends. A sync started anywhere else (an event handler, an action) would run in a worker call that the host closes when the call ends, and the host would then refuse its later calls.
+
+**Sync now** (`sync-now`, `sync.trigger`, the **Sync now** buttons in the toolbar, the task panels and **Retry sync**, and `paperclipai plugin action vllnt.paperclip-github sync-now -C <companyId>`) therefore queues a request and answers at once:
+
+```json
+{ "queued": true, "queuedAt": "2026-10-10T12:00:00.000Z", "busy": false, "lastRunAt": "2026-10-10T11:58:00.000Z" }
+```
+
+- `queued`: a request waits for the job. A run that starts for the company takes it. `queuedAt` is when it was made.
+- `busy`: a run is going now. A request made during a run stays queued for the next one.
+- `lastRunAt`: when the last sync finished and wrote its report (`null` before the first).
+- With `refresh: true` (what the buttons send) the request also clears the discovery cache. Without it, a call made less than a minute after the last report queues nothing and answers `queued: false` with `lastRunAt`.
+
+The web UI shows a queued request as **GitHub sync queued**, then **Syncing GitHub…**, then the time of the last sync. The API and the CLI print the answer above unchanged. The answer never says a sync has finished.
+
+If the host denies a call during a run, the run stops at once instead of retrying, writes no report and no more links, and the job logs the failure.
+
+Background synchronization still reads GitHub issue changes directly. A sync writes a link only when it changed.
 
 ## Event routing
 
