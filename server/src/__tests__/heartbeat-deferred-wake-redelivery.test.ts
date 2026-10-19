@@ -571,7 +571,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
 
   describe("wakes parked behind an execution-recovery hold", () => {
     /**
-     * ANT-3892 as production holds it: a todo task, its assignee with a free
+     * The production case: a todo task, its assignee with a free
      * slot, no lock and no live run. Its latest run was cancelled before it ever
      * started (`execution_reconciliation_required`), the run before it was
      * orphaned, and the recovery action recorded for that run is resolved with a
@@ -579,7 +579,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
      * saved behind the hold, each parked with a recovery wait.
      */
     async function seedRecoveryHeldTask(companyId: string) {
-      const agentId = await seedAgent(companyId, { name: "Anthm DX", maxConcurrentRuns: 2 });
+      const agentId = await seedAgent(companyId, { name: "Deferred Wake Agent", maxConcurrentRuns: 2 });
       const busyIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: "Other work" });
       const busyRunId = await seedRun(companyId, agentId, busyIssueId, { status: "running" });
       const issueId = await seedIssue(companyId, {
