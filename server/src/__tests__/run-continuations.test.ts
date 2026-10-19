@@ -144,6 +144,23 @@ describe("run liveness continuations", () => {
     expect(decision.comment).toContain("Attempts used: 2/2");
   });
 
+  it("leaves an issue with an active wait alone and continues once the wait is past due", () => {
+    const decide = (monitorNextCheckAt: Date) =>
+      decideRunLivenessContinuation({
+        run: run(),
+        issue: issue({ monitorNextCheckAt }),
+        agent: agent(),
+        livenessState: "plan_only",
+        livenessReason: "Planned without acting",
+        nextAction: "Check CI.",
+        budgetBlocked: false,
+        idempotentWakeExists: false,
+      });
+
+    expect(decide(new Date(Date.now() + 10 * 60_000))).toEqual({ kind: "skip", reason: "issue has an active wait" });
+    expect(decide(new Date(Date.now() - 60_000)).kind).toBe("enqueue");
+  });
+
   it("skips non-actionable and guarded issues", () => {
     const guardedCases = [
       { livenessState: "advanced" as const },

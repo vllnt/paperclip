@@ -188,6 +188,16 @@ async function appFixture(options: { revoked?: () => boolean; config?: Record<st
     appPermissions: { ...permissions } as Record<string, string>,
     unreachable: false,
     refreshGate: null as Promise<void> | null,
+    /** GitHub's clock minus this host's (a VM paused and resumed lags behind). */
+    offsetMs: 0,
+    /** When GitHub expires each user access token, on GitHub's clock. */
+    expiresAt: new Map<string, number>(),
+    /** GitHub refuses every user token at the API, even a fresh one, while refreshes still work. */
+    rejectUser: false,
+    /** 401s GitHub answered to user tokens. */
+    unauthorized: 0,
+    /** Runs as GitHub receives a refresh, before it answers (another worker rotating the token first). */
+    beforeRefresh: null as (() => void) | null,
     checkRuns: [{ name: "lint", status: "completed", conclusion: "success", app: { id: 15368 } }, { name: "typecheck", status: "completed", conclusion: "success", app: { id: 15368 } }] as any[],
     statuses: [] as any[],
   };
@@ -195,6 +205,9 @@ async function appFixture(options: { revoked?: () => boolean; config?: Record<st
     ref.secretId === "refresh" ? github.refresh : ref.secretId === "signing" ? signing : `value-${ref.secretId}`);
   const storeOwn = vi.spyOn(h.ctx.secrets, "storeOwn").mockImplementation(async (value: string) => { github.refresh = value; });
   const client = new GitHubClient((async () => { throw new Error("GitHub network is blocked in tests."); }) as unknown as typeof fetch);
+  const githubTime = () => Date.now() + github.offsetMs;
+  // Every GitHub answer carries its Date header, as the real transport reads it.
+  const answered = () => client.clock.observe(new Date(githubTime()).toUTCString(), client.clock.started());
   vi.spyOn(client, "verify").mockImplementation(async id => ({ id, slug: "anthm-agents", name: "anthm-agents" }));
   vi.spyOn(client, "catalog").mockImplementation(async id => ({ app: { id, slug: "anthm-agents", name: "anthm-agents", permissions: github.appPermissions },
     installations: [{ id: 101, login: "Anthm-FR", accountId: 1, accountType: "Organization" as const, suspended: false, permissions }], repositories: repos, warnings: [], truncated: false }));
@@ -204,15 +217,19 @@ async function appFixture(options: { revoked?: () => boolean; config?: Record<st
   const oauth = vi.spyOn(client, "oauth").mockImplementation(async (path, body) => {
     if (path === "/login/device/code") return { device_code: "device-code", user_code: "ABCD-1234", verification_uri: "https://github.com/login/device", expires_in: 900, interval: 5 };
     if (body.grant_type === "refresh_token" && github.refreshGate) await github.refreshGate;
+    if (body.grant_type === "refresh_token") github.beforeRefresh?.();
+    answered();
     if (body.grant_type === "refresh_token" && (github.revoked || options.revoked?.() || body.refresh_token !== github.refresh)) return { error: "bad_refresh_token" };
     github.issued += 1;
     current = token("ghu", github.issued);
     userTokens.add(current);
+    github.expiresAt.set(current, githubTime() + 28_800_000);
     return { access_token: current, refresh_token: token("ghr", github.issued), expires_in: 28_800, refresh_token_expires_in: 15_897_600, token_type: "bearer" };
   });
   const request = vi.spyOn(client, "request").mockImplementation(async (path: string, auth?: string, body?: unknown, method?: string) => {
+    answered();
     const user = !!auth && userTokens.has(auth);
-    if (user && github.revoked) throw new GitHubError(401);
+    if (user && (github.revoked || github.rejectUser || github.expiresAt.get(auth)! <= githubTime())) { github.unauthorized += 1; throw new GitHubError(401); }
     if (user && github.unreachable) throw new Error("GitHub did not return a valid response. Please try again.");
     if (path === "/users/anthm-agents%5Bbot%5D") return { data: { id: 99 } as any, next: false };
     if (path === "/user" && user) return { data: { login: "agent-owner", id: Number(USER_ID) } as any, next: false };
@@ -750,6 +767,446 @@ describe("GitHub write identity: App user (anthm)", () => {
 // ---------------------------------------------------------------------------
 // Security review, round 2: each test is an attack the previous code let through.
 // ---------------------------------------------------------------------------
+
+describe("VLL-1192: a 401 alone is not a revocation, and GitHub's clock decides token expiry", () => {
+  const HOUR = 3_600_000;
+  const SUSPECTED = "GitHub rejected the user token (authorization revoked). Authorize the GitHub user again.";
+  const authorizationKey = { scopeKind: "company" as const, scopeId: "anthm", namespace: "identity", stateKey: "user-authorization" };
+  const status = async (f: Awaited<ReturnType<typeof appFixture>>) =>
+    (await f.h.performAction<any>("user-authorization.status", { companyId: "anthm" }, actors("anthm").member)).authorization;
+  const refreshes = (f: Awaited<ReturnType<typeof appFixture>>) => f.oauth.mock.calls.filter(([, body]) => body.grant_type === "refresh_token").length;
+  const messages = (f: Awaited<ReturnType<typeof appFixture>>) => f.h.activity.map(entry => entry.message);
+  /** Writes stay on and nothing was revoked. */
+  async function stillAuthorized(f: Awaited<ReturnType<typeof appFixture>>) {
+    expect((await f.policy()).enabled).toBe(true);
+    expect(messages(f)).not.toContain("github.fence_violation");
+    expect((await status(f)).needsReauthorization).toBeUndefined();
+  }
+
+  it("transient 401: a cached token GitHub expired early is refreshed and the check retried once; writes stay on", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    // GitHub expires the cached token early; this host still calls it fresh.
+    f.github.expiresAt.set(token("ghu", 1), 0);
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.github.unauthorized).toBe(1);
+    expect(refreshes(f)).toBe(1);
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    await stillAuthorized(f);
+    // The rotated refresh token was stored and the new access token is the one handed out.
+    expect(f.github.refresh).toBe(token("ghr", 2));
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 2), login: "agent-owner" } });
+  });
+
+  it("clock behind (the incident): after a VM paused 4.5 hours, GitHub's 401 refreshes instead of switching writes off, and the skew is reported", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    vi.setSystemTime(Date.now() + 4 * HOUR);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    // The VM is paused 4.5 hours: GitHub's clock moves on, this host's does not. GitHub has
+    // expired the token (8 hours on its clock) while this host still gives it 3 more hours.
+    f.github.offsetMs = 4.5 * HOUR;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.github.unauthorized).toBe(1);
+    expect(refreshes(f)).toBe(1);
+    const after = await status(f);
+    expect(after.fence).toMatchObject({ ok: true });
+    expect(Math.abs(after.fence.clockSkewSeconds - 4.5 * 3600)).toBeLessThanOrEqual(1);
+    expect(f.h.activity).toContainEqual(expect.objectContaining({ message: "github.clock_skew", metadata: expect.objectContaining({ fenceOk: true }) }));
+    await stillAuthorized(f);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 2) } });
+  });
+
+  it("clock behind: once a GitHub answer shows the skew, a token GitHub expired is refreshed before use, never handed out", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    vi.setSystemTime(Date.now() + 4 * HOUR);
+    await f.h.runJob("github-sync");
+    f.github.offsetMs = 4.5 * HOUR;
+    vi.setSystemTime(Date.now() + 60_000);
+    // Any GitHub answer carries its Date: the plugin now knows the last check is 4.5 hours old on GitHub's clock.
+    f.client.clock.observe(new Date(Date.now() + f.github.offsetMs).toUTCString(), f.client.clock.started());
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("out of date") });
+    await f.h.runJob("github-sync");
+    // The token was refreshed before GitHub could refuse it.
+    expect(f.github.unauthorized).toBe(0);
+    expect(refreshes(f)).toBe(1);
+    await stillAuthorized(f);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 2) } });
+  });
+
+  it("clock ahead: a host clock 2 hours ahead, then corrected backwards, neither keeps an expired token nor revokes", async () => {
+    const f = await appFixture();
+    // This host runs 2 hours ahead of GitHub from the start.
+    f.github.offsetMs = -2 * HOUR;
+    await f.authorize();
+    expect(f.client.clock.skewMs()).toBeLessThan(-2 * HOUR + 2_000);
+    // The host clock is corrected: it jumps back 2 hours and now agrees with GitHub.
+    vi.setSystemTime(Date.now() - 2 * HOUR);
+    f.github.offsetMs = 0;
+    vi.setSystemTime(Date.now() + 7 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(0);
+    expect(f.client.clock.skewMs()).toBe(0);
+    // 7h58 after GitHub issued it: GitHub's clock says the token expires within the margin, so it is
+    // refreshed first. By this host's clock at issue time it would have looked good for 2 more hours.
+    vi.setSystemTime(Date.now() + 58 * 60_000);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 2) } });
+    expect(f.github.unauthorized).toBe(0);
+    await stillAuthorized(f);
+  });
+
+  it("real revocation: GitHub refuses a fresh-looking token and then the refresh; writes go off and the refresh token is kept", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    // agent-owner revokes the App on GitHub: every token, the refresh token included, is dead.
+    f.github.revoked = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    // The 401 alone decided nothing: the refresh GitHub refused (bad_refresh_token) did.
+    expect(f.github.unauthorized).toBe(1);
+    expect(refreshes(f)).toBe(1);
+    expect(f.h.activity).toContainEqual(expect.objectContaining({ message: "github.fence_violation", metadata: expect.objectContaining({
+      writesDisabled: true, reason: expect.stringContaining("refused to refresh"),
+    }) }));
+    expect((await f.policy()).enabled).toBe(false);
+    expect((await status(f)).needsReauthorization).toMatch(/refused to refresh/);
+    expect(f.github.refresh).toBe(token("ghr", 1));
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+  });
+
+  it("a 401 right after a good refresh pauses writes without revoking anything; they resume after the next good check", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.github.unauthorized).toBe(2);
+    expect(refreshes(f)).toBe(1);
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining("right after a refresh") });
+    await stillAuthorized(f);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("right after a refresh") });
+    f.github.rejectUser = false;
+    expect((await f.action("user-authorization.check")).fence).toMatchObject({ ok: true });
+    expect(await f.write("anthm-fr/songtrivia")).toHaveProperty("credential");
+  });
+
+  it("an OAuth error that is not about the authorization (incorrect_client_credentials) keeps it and only pauses writes", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.oauth.mockImplementationOnce(async () => ({ error: "incorrect_client_credentials" }));
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining("incorrect_client_credentials") });
+    await stillAuthorized(f);
+    expect(f.github.refresh).toBe(token("ghr", 1));
+    expect((await f.action("user-authorization.check")).fence).toMatchObject({ ok: true });
+  });
+
+  it("bad_refresh_token for a refresh token another worker already rotated is not a revocation: the newer one is used", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    // Another worker refreshes first and stores GitHub's next refresh token; ours is then stale.
+    f.github.beforeRefresh = () => { f.github.beforeRefresh = null; f.github.refresh = token("ghr", 50); };
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(2);
+    expect(f.oauth.mock.calls.filter(([, body]) => body.grant_type === "refresh_token").map(([, body]) => body.refresh_token)).toEqual([token("ghr", 1), token("ghr", 50)]);
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    await stillAuthorized(f);
+  });
+
+  it("a revocation recorded for a bare 401 before this fix is cleared by the next good refresh; the kill switch stays an administrator's", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    // What the old fence check left after the incident: writes off and a suspected revocation.
+    await f.setPolicy({ ...anthmPolicy, enabled: false });
+    await f.h.ctx.state.set(authorizationKey, { ...(await status(f)), needsReauthorization: SUSPECTED });
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+    // Hours later the cached token has expired: the next check refreshes.
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(1);
+    expect((await status(f)).needsReauthorization).toBeUndefined();
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    // Writes stay off until an administrator turns them on.
+    expect((await f.policy()).enabled).toBe(false);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+    expect((await f.setPolicy(anthmPolicy)).fence).toMatchObject({ ok: true });
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  it("a suspected revocation whose refresh GitHub refuses becomes a confirmed one", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    await f.setPolicy({ ...anthmPolicy, enabled: false });
+    await f.h.ctx.state.set(authorizationKey, { ...(await status(f)), needsReauthorization: SUSPECTED });
+    f.github.revoked = true;
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).needsReauthorization).toMatch(/refused to refresh/);
+    expect((await f.setPolicy(anthmPolicy)).fence).toMatchObject({ ok: false, reason: expect.stringContaining("refused to refresh") });
+    expect((await f.policy()).enabled).toBe(false);
+  });
+
+  it("a transient pause is retried within minutes, so writes resume on their own", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, pausedSince: expect.any(String) });
+    f.github.rejectUser = false;
+    vi.setSystemTime(Date.now() + 4 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("right after a refresh") });
+    vi.setSystemTime(Date.now() + 60_000);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    expect((await status(f)).fence).not.toHaveProperty("pausedSince");
+    expect(await f.write("anthm-fr/songtrivia")).toHaveProperty("credential");
+    await stillAuthorized(f);
+  });
+
+  it("refreshes at most once per call: a token GitHub refuses right after it was minted is not refreshed again", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    // The cached token expired: the check refreshes first, and GitHub refuses the new token too.
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(1);
+    expect(f.github.unauthorized).toBe(1);
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true });
+    await stillAuthorized(f);
+  });
+
+  it("a 401 to the App's own credentials (a JWT a skewed clock dated) never touches the user's authorization", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    vi.mocked(f.client.catalog).mockRejectedValueOnce(new GitHubError(401));
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(0);
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining("App's credentials") });
+    await stillAuthorized(f);
+  });
+
+  it("a fence check stamped in the future (under another clock offset) proves nothing: writes wait and it is re-checked at once", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    const current = await status(f);
+    await f.h.ctx.state.set(authorizationKey, { ...current, fence: { ...current.fence, checkedAt: new Date(Date.now() + 2 * HOUR).toISOString() } });
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("out of date") });
+    const checks = f.request.mock.calls.filter(([path]) => path === "/user").length;
+    await f.h.runJob("github-sync");
+    expect(f.request.mock.calls.filter(([path]) => path === "/user").length).toBe(checks + 1);
+    expect(await f.write("anthm-fr/songtrivia")).toHaveProperty("credential");
+  });
+
+  it("records a lasting skew once, not at every check, and a failing activity log never holds back the kill switch", async () => {
+    const f = await appFixture();
+    f.github.offsetMs = 2 * HOUR;
+    await f.authorize();
+    expect(messages(f).filter(message => message === "github.clock_skew")).toHaveLength(1);
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(messages(f).filter(message => message === "github.clock_skew")).toHaveLength(1);
+    // The skew moves (the host lags further) while the installation drifts and the activity log is failing for it.
+    f.github.offsetMs = 4 * HOUR;
+    f.github.installationRepos.push("Anthm-FR/spotzic");
+    const log = f.h.ctx.activity.log.bind(f.h.ctx.activity);
+    vi.spyOn(f.h.ctx.activity, "log").mockImplementation(async entry => {
+      if (entry.message === "github.clock_skew") throw new Error("activity log unavailable");
+      return log(entry);
+    });
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect((await f.policy()).enabled).toBe(false);
+    expect((await status(f)).fence).toMatchObject({ ok: false, reason: expect.stringContaining("extra: anthm-fr/spotzic") });
+    expect(messages(f)).toContain("github.fence_violation");
+  });
+
+  it("a network failure while refreshing keeps the authorization and only pauses writes", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.oauth.mockImplementationOnce(async () => { throw new Error("socket hang up"); });
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect((await status(f)).fence).toMatchObject({ ok: false, transient: true, reason: expect.stringContaining("could not be reached to refresh") });
+    await stillAuthorized(f);
+    expect(f.github.refresh).toBe(token("ghr", 1));
+    expect((await f.action("user-authorization.check")).fence).toMatchObject({ ok: true });
+  });
+
+  it("two checks that both meet GitHub's 401 share one refresh", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.expiresAt.set(token("ghu", 1), 0);
+    const [a, b] = await Promise.all([f.action("user-authorization.check"), f.action("user-authorization.check")]);
+    expect(a.fence).toMatchObject({ ok: true });
+    expect(b.fence).toMatchObject({ ok: true });
+    expect(refreshes(f)).toBe(1);
+    expect(f.github.unauthorized).toBe(2);
+    await stillAuthorized(f);
+  });
+
+  it("a late 401 for the old token does not throw away the token another check already refreshed", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.expiresAt.set(token("ghu", 1), 0);
+    const original = f.request.getMockImplementation()!;
+    let seen = 0;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.request.mockImplementation(async (path: string, auth?: string, ...rest: any[]) => {
+      if (path === "/user" && auth === token("ghu", 1) && ++seen === 2) await gate;
+      return (original as any)(path, auth, ...rest);
+    });
+    const a = f.action("user-authorization.check"), b = f.action("user-authorization.check");
+    await Promise.race([a, b]);
+    release();
+    const [ra, rb] = await Promise.all([a, b]);
+    expect(ra.fence).toMatchObject({ ok: true });
+    expect(rb.fence).toMatchObject({ ok: true });
+    expect(f.github.unauthorized).toBe(2);
+    expect(refreshes(f)).toBe(1);
+  });
+
+  it("an administrator's revoke while the retry's refresh is in flight wins: nothing handed out, refresh token stays overwritten", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.expiresAt.set(token("ghu", 1), 0);
+    let release!: () => void;
+    f.github.refreshGate = new Promise<void>(resolve => { release = resolve; });
+    const check = f.action("user-authorization.check");
+    await vi.waitFor(() => expect(refreshes(f)).toBe(1));
+    const revoke = f.action("user-authorization.revoke");
+    release();
+    await Promise.allSettled([check, revoke]);
+    expect(f.github.refresh).toBe("revoked");
+    expect((await status(f)).needsReauthorization).toMatch(/revoked/);
+    expect((await f.policy()).enabled).toBe(false);
+    expect(await f.write("anthm-fr/songtrivia")).not.toHaveProperty("credential");
+  });
+
+  it.each(["/user/installations?", "/user/installations/101/repositories"])("a 401 on a later call (%s) of the same check is also refreshed and retried", async (prefix) => {
+    const f = await appFixture();
+    await f.authorize();
+    const original = f.request.getMockImplementation()!;
+    let thrown = false;
+    f.request.mockImplementation(async (path: string, auth?: string, ...rest: any[]) => {
+      if (!thrown && path.startsWith(prefix)) { thrown = true; f.github.unauthorized += 1; throw new GitHubError(401); }
+      return (original as any)(path, auth, ...rest);
+    });
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(1);
+    expect((await status(f)).fence).toMatchObject({ ok: true });
+    await stillAuthorized(f);
+  });
+
+  it("the stored refresh token was rotated by another worker AND GitHub refuses the newer one too: confirmed revocation", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.beforeRefresh = () => { f.github.beforeRefresh = null; f.github.refresh = token("ghr", 50); f.github.revoked = true; };
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");
+    expect(refreshes(f)).toBe(2);
+    expect((await status(f)).needsReauthorization).toMatch(/refused to refresh/);
+    expect((await f.policy()).enabled).toBe(false);
+  });
+
+  it("after the post-refresh 401 the refused token is not reused: the next check refreshes again", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    f.github.rejectUser = false;
+    await f.action("user-authorization.check");
+    expect(refreshes(f)).toBe(2);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 3) } });
+  });
+
+  it("logs the skew warning once and the recovery once", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.offsetMs = 4.5 * HOUR;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.h.logs.filter(l => l.level === "warn" && /clock differs/.test(l.message))).toHaveLength(1);
+    f.github.offsetMs = 0;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.h.logs.filter(l => /agrees with GitHub's again/.test(l.message))).toHaveLength(1);
+  });
+
+  it("a cached read token GitHub's clock says is expired is minted again", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    await f.read("anthm-fr/linkzic");
+    expect(f.scoped).toHaveBeenCalledTimes(1);
+    f.github.offsetMs = 4.5 * HOUR;
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    f.client.clock.observe(new Date(Date.now() + f.github.offsetMs).toUTCString(), f.client.clock.started());
+    await f.read("anthm-fr/linkzic");
+    expect(f.scoped).toHaveBeenCalledTimes(2);
+  });
+
+  it("the first answer that shows a host clock 2h ahead is the refresh: the new token's expiry is on GitHub's clock", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.offsetMs = -2 * HOUR;
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    await f.h.runJob("github-sync");          // The refresh: its answer is the first to show the skew.
+    expect(refreshes(f)).toBe(1);
+    for (let i = 0; i < 4; i += 1) { vi.setSystemTime(Date.now() + 2 * HOUR); await f.h.runJob("github-sync"); }
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    await f.h.runJob("github-sync");
+    expect(f.github.unauthorized).toBe(0);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ credential: { token: token("ghu", 3) } });
+  });
+
+
+  it("a failing activity log does not fail the admin's check action", async () => {
+    const f = await appFixture();
+    f.github.offsetMs = 2 * HOUR;
+    const log = f.h.ctx.activity.log.bind(f.h.ctx.activity);
+    await f.setPolicy(anthmPolicy);
+    vi.spyOn(f.h.ctx.activity, "log").mockImplementation(async entry => { if (entry.message === "github.clock_skew") throw new Error("down"); return log(entry); });
+    await f.action("user-authorization.start");
+    vi.setSystemTime(Date.now() + 6_000);
+    await expect(f.action("user-authorization.poll")).resolves.toMatchObject({ status: "authorized" });
+  });
+
+  it("after the first hour of a pause the retry backs off to hourly", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    f.github.rejectUser = true;
+    vi.setSystemTime(Date.now() + 61 * 60_000);
+    await f.h.runJob("github-sync");              // The pause starts.
+    const calls = () => f.request.mock.calls.filter(([path]) => path === "/user").length;
+    for (let i = 0; i < 12; i += 1) { vi.setSystemTime(Date.now() + 5 * 60_000); await f.h.runJob("github-sync"); }
+    const afterHour = calls();
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    await f.h.runJob("github-sync");              // 70 minutes into the pause: hourly now, so not due yet.
+    expect(calls()).toBe(afterHour);
+  });
+
+  it("an administrator's revoke still overwrites the stored refresh token", async () => {
+    const f = await appFixture();
+    await f.authorize();
+    await f.action("user-authorization.revoke");
+    expect(f.github.refresh).toBe("revoked");
+    vi.setSystemTime(Date.now() + 8 * HOUR);
+    expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.stringContaining("kill switch") });
+    expect(refreshes(f)).toBe(0);
+  });
+});
 
 describe("security review round 2 (attack regressions)", () => {
   const me = () => `agent-owner <${USER_ID}+agent-owner@users.noreply.github.com> ${Math.floor(Date.now() / 1000)} +0000`;
