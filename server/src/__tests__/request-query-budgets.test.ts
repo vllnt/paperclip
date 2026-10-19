@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issueComments,
@@ -37,6 +38,17 @@ if (!embeddedPostgresSupport.supported) {
 
 type Db = ReturnType<typeof createDb>;
 type Seeded = { companyId: string; issueId: string };
+type Actor = "operator" | "member";
+
+const MEMBER_USER_ID = "budget-member";
+
+/**
+ * postgres.js sends this once on each new pool connection, to learn the array
+ * types. Whether a request opens a connection depends on how many statements it
+ * sends at once, so the count leaves it out.
+ */
+const DRIVER_TYPE_FETCH =
+  "select b.oid, b.typarray from pg_catalog.pg_type a left join pg_catalog.pg_type b on b.oid = a.typelem where a.typcategory = 'A' group by b.oid, b.typarray order by b.oid";
 
 /**
  * Statements that one board request sends to the database, counted on a warm
@@ -45,39 +57,53 @@ type Seeded = { companyId: string; issueId: string };
  * one of these requests, such as a query per row or a lost batch, fails here.
  * Raise a budget only with the reason in the commit.
  *
+ * Actors: "operator" is the local operator (local_implicit, instance admin),
+ * for whom authorization reads nothing. "member" is a signed-in user with a
+ * plain membership in the company, for whom authorization and membership
+ * lookups read the database; it covers the requests where that adds statements.
+ *
  * `rows` is the length of the list the request returns from the seed, so that
  * a request that finds nothing cannot pass its budget. `perRow` adds that many
  * statements to the budget for each listed row.
  */
 const REQUESTS: Array<{
   name: string;
+  actor: Actor;
   path: (seeded: Seeded) => string;
   budget: number;
   rows?: number;
   perRow?: number;
 }> = [
-  { name: "health", path: () => "/api/health", budget: 4 }, // 3
-  { name: "companies", path: () => "/api/companies", budget: 3, rows: 1 }, // 2
-  { name: "agents", path: ({ companyId }) => `/api/companies/${companyId}/agents`, budget: 5, rows: 6 }, // 4
-  { name: "issues list", path: ({ companyId }) => `/api/companies/${companyId}/issues`, budget: 27, rows: 40 }, // 24
-  { name: "issue detail", path: ({ issueId }) => `/api/issues/${issueId}`, budget: 33 }, // 30
-  { name: "issue comments", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 7, rows: 12 }, // 6
-  { name: "routines", path: ({ companyId }) => `/api/companies/${companyId}/routines`, budget: 7, rows: 3 }, // 6
+  { name: "health", actor: "operator", path: () => "/api/health", budget: 4 }, // 3
+  { name: "companies", actor: "operator", path: () => "/api/companies", budget: 3, rows: 1 }, // 2
+  { name: "agents", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/agents`, budget: 5, rows: 6 }, // 4
+  { name: "issues list", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/issues`, budget: 27, rows: 40 }, // 24
+  { name: "issue detail", actor: "operator", path: ({ issueId }) => `/api/issues/${issueId}`, budget: 33 }, // 30
+  { name: "issue comments", actor: "operator", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 7, rows: 12 }, // 6
+  { name: "routines", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/routines`, budget: 7, rows: 3 }, // 6
   // Equal to the count, not above it. Each list request imports the bundled
   // skills again from disk, and each skill ensures its bundled category folder
   // in its own folder-lock transaction: 12 statements per skill (8 listed here,
   // 27 + 12 * 8 = 123). The budget follows the number of bundled skills and
   // keeps the count per skill from growing; it is not a target.
-  { name: "skills", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 27, perRow: 12 }, // 123
-  { name: "plugins", path: () => "/api/plugins", budget: 2, rows: 0 }, // 1
-  { name: "heartbeat runs", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 3, rows: 30 }, // 2
-  { name: "dashboard", path: ({ companyId }) => `/api/companies/${companyId}/dashboard`, budget: 9 }, // 8
-  { name: "sidebar badges", path: ({ companyId }) => `/api/companies/${companyId}/sidebar-badges`, budget: 5 }, // 4
+  { name: "skills", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 27, perRow: 12 }, // 123
+  { name: "plugins", actor: "operator", path: () => "/api/plugins", budget: 2, rows: 0 }, // 1
+  { name: "heartbeat runs", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 3, rows: 30 }, // 2
+  { name: "dashboard", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/dashboard`, budget: 9 }, // 8
+  { name: "sidebar badges", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/sidebar-badges`, budget: 5 }, // 4
+  // Includes 2 statements per agent: the list authorizes each agent on its own
+  // (filterAgentsForActor in routes/agents.ts). The budget is not a target.
+  { name: "agents", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/agents`, budget: 17, rows: 6 }, // 16
+  { name: "issues list", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/issues`, budget: 29, rows: 40 }, // 26
+  { name: "issue detail", actor: "member", path: ({ issueId }) => `/api/issues/${issueId}`, budget: 35 }, // 32
+  { name: "issue comments", actor: "member", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 9, rows: 12 }, // 8
+  { name: "heartbeat runs", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 5, rows: 30 }, // 4
+  { name: "sidebar badges", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/sidebar-badges`, budget: 7 }, // 6
 ];
 
 describeEmbeddedPostgres("statements per board request", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-  let app!: express.Express;
+  let apps!: Record<Actor, express.Express>;
   let seeded!: Seeded;
   let recording: string[] | null = null;
 
@@ -87,17 +113,37 @@ describeEmbeddedPostgres("statements per board request", () => {
     // postgres.js calls `options.debug` for each statement it sends, on every
     // connection of the pool.
     db.$client.options.debug = (_connection, statement) => {
-      recording?.push(statement);
+      if (statement.replace(/\s+/g, " ").trim() !== DRIVER_TYPE_FETCH) recording?.push(statement);
     };
     seeded = await seed(db);
-    app = createApp(db);
+    apps = {
+      operator: createApp(db, {
+        type: "board",
+        userId: "local-board",
+        userName: "Local Board",
+        userEmail: null,
+        isInstanceAdmin: true,
+        source: "local_implicit",
+      }),
+      member: createApp(db, {
+        type: "board",
+        userId: MEMBER_USER_ID,
+        userName: "Member",
+        userEmail: null,
+        companyIds: [seeded.companyId],
+        memberships: [{ companyId: seeded.companyId, membershipRole: "member", status: "active" }],
+        isInstanceAdmin: false,
+        source: "session",
+      }),
+    };
   }, 60_000);
 
   afterAll(async () => {
     await tempDb?.cleanup();
   });
 
-  it.each(REQUESTS)("$name stays within its statement budget", async ({ name, path, budget: base, rows, perRow }) => {
+  it.each(REQUESTS)("$name as $actor stays within its statement budget", async ({ name, actor, path, budget: base, rows, perRow }) => {
+    const app = apps[actor];
     const url = path(seeded);
     // The first request warms the caches; count the second.
     await request(app).get(url).expect(200);
@@ -117,23 +163,16 @@ describeEmbeddedPostgres("statements per board request", () => {
     }
     expect(
       statements.length,
-      `${name} sent ${statements.length} statements (budget ${budget}):\n${statements.join("\n")}`,
+      `${name} as ${actor} sent ${statements.length} statements (budget ${budget}):\n${statements.join("\n")}`,
     ).toBeLessThanOrEqual(budget);
   }, 30_000);
 });
 
-function createApp(db: Db) {
+function createApp(db: Db, actor: Express.Request["actor"]) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    req.actor = {
-      type: "board",
-      userId: "local-board",
-      userName: "Local Board",
-      userEmail: null,
-      isInstanceAdmin: true,
-      source: "local_implicit",
-    };
+    req.actor = actor;
     next();
   });
   app.use("/api/health", healthRoutes(db, {
@@ -161,6 +200,9 @@ async function seed(db: Db) {
     .values({ name: `Budget ${randomUUID()}`, issuePrefix: `QB${randomUUID().slice(0, 6).toUpperCase()}` })
     .returning();
   const companyId = company!.id;
+  await db.insert(companyMemberships).values({
+    companyId, principalType: "user", principalId: MEMBER_USER_ID, status: "active", membershipRole: "member",
+  });
   const agentRows = await db
     .insert(agents)
     .values(Array.from({ length: 6 }, (_, index) => ({
