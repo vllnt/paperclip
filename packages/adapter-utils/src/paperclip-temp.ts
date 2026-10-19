@@ -42,7 +42,6 @@ export const SWEPT_PAPERCLIP_TEMP_PREFIXES = [
   "paperclip-tar-list-",
   "paperclip-syncin-fallback-",
   "paperclip-managed-repositories-",
-  "paperclip-snapshot-thread-",
 ] as const;
 
 export type PaperclipTempPrefix = (typeof SWEPT_PAPERCLIP_TEMP_PREFIXES)[number];

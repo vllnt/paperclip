@@ -2,8 +2,8 @@ import { Worker } from "node:worker_threads";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { createPaperclipTempDir, removePaperclipTempDir } from "./paperclip-temp.js";
 import type { SerializedDirectorySnapshot } from "./workspace-restore-merge.js";
 import type { WorkspacePaths } from "./workspace-manifest.js";
 
@@ -40,8 +40,7 @@ export async function runSnapshotThread(request: SnapshotThreadRequest): Promise
   let worker: Worker | undefined;
   let published = false;
   try {
-    // Swept prefix: a dead run's leftover worker directory is removed by the temp sweep.
-    directory = await createPaperclipTempDir("paperclip-snapshot-thread-");
+    directory = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-snapshot-thread-"));
     const source = new URL(import.meta.url).pathname.endsWith(".ts");
     const url = new URL(source ? "./workspace-snapshot-thread-worker.ts" : "./workspace-snapshot-thread-worker.js", import.meta.url);
     const options = { workerData: request, env: { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory } };
@@ -75,7 +74,7 @@ export async function runSnapshotThread(request: SnapshotThreadRequest): Promise
   } finally {
     try {
       if (worker) await worker.terminate();
-      if (directory && !published) await removePaperclipTempDir(directory);
+      if (directory && !published) await fs.rm(directory, { recursive: true, force: true });
     } finally { release(); }
   }
 }
