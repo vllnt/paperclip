@@ -20,16 +20,18 @@ worker and every terminal run status.
   the path it keeps `tmp/`. A root that is not absolute and normalized, or is
   `/`, gets no `tmp/`. A `tmp/` left without a stop proof, after a failed
   removal, or by a server that stopped first goes with the rest of the
-  directory as below, except the `tmp/`-only case under `not_git_backed`.
+  directory as below, except the `tmp/`-only case under `not_git_backed`, which
+  goes once its keep window is over.
 - **On lease release.** When an ephemeral SSH lease releases, expires, or
   fails, and its run is `succeeded`, `failed`, `cancelled`, `interrupted`, or
   `timed_out`, the server removes `runs/<runId>`. The release does not wait for
   it.
 - **By a sweep.** Every 10 minutes the server looks at SSH leases released in
-  the last 14 days whose directory it has not decided about. It removes a
+  the last 14 days whose directory it has not decided about, or whose kept
+  decision is older than the keep window (below). It removes a
   directory when its run is terminal, no other lease of the run is `active`,
   `retained`, or `pending_cleanup`, and the lease finished at least
-  `PAPERCLIP_SSH_RUN_REAPER_MAX_AGE_MINUTES` ago (default 360). Above
+  `PAPERCLIP_SSH_RUN_REAPER_MAX_AGE_MINUTES` ago (default 60). Above
   `PAPERCLIP_SSH_RUN_REAPER_DISK_PRESSURE_PERCENT` disk use on the worker
   (default 80) the threshold is
   `PAPERCLIP_SSH_RUN_REAPER_PRESSURE_MAX_AGE_MINUTES` (default 15).
@@ -42,6 +44,22 @@ worker and every terminal run status.
   worker's identity and the provider's session id, and every run uploads its own
   directory. The folder of a run held by an open issue stays for as long as the
   issue is open.
+- **After the keep window.** A kept directory (see below) is tried again by the
+  sweep once `PAPERCLIP_SSH_RUN_REAPER_KEEP_WINDOW_HOURS` (default 24) have
+  passed since the decision: `not_git_backed`, `preserve_failed`, `rm_failed`,
+  `external_worktree`, `unreadable`, and `worktree_dirty` decisions recorded
+  before the reaper saved extra worktrees. A directory that is not a git
+  repository is then deleted, because nothing in it can be saved, unless a git
+  repository lies below it or its `workspace` is a link: that one stays kept.
+  If the reaper cannot read every folder below it, it cannot rule a repository
+  out, so the directory stays kept as `unreadable`. The others go through the
+  save step again and are kept again, for another window, if it still fails.
+  Retries stop once the lease is older than the sweep's 14-day look-back, except
+  for `external_worktree` and `unreadable`. Every other reason (`symlink`,
+  `root_mismatch`, `mount_point`, and the ones of a folder with no seed record)
+  stays kept.
+- The age thresholds and the keep window are capped at one year; a larger value
+  counts as one year.
 
 - **A run with no seed record.** A lease from before the seed record existed, or
   of a workspace that was not a git repository with a commit, has no commit to
@@ -102,6 +120,7 @@ is saved; `tmp/` holds scratch files and is deleted with the directory.
 | Each stash entry | `stash-<n>` |
 | The detached HEAD of an extra worktree | `worktree-head-<n>` |
 | Uncommitted work: tracked and untracked files git does not ignore, as a snapshot commit | `worktree` |
+| The same for each extra worktree (`git worktree list`), on top of its HEAD | `worktree-dirty-<n>` |
 
 To bring a run's work back, fetch from the bundle into a clone that has the
 start commit:
@@ -111,25 +130,33 @@ git fetch <remote root>/.paperclip-runtime/preserved/<runId>.bundle \
   'refs/paperclip/preserved/<runId>/*:refs/paperclip/preserved/<runId>/*'
 ```
 
-Git runs with the repository's `core.fsmonitor` and hooks switched off.
+Git runs with the repository's `core.fsmonitor` and hooks switched off. Files
+that git ignores (`node_modules`, build output) are not saved.
 
 ## When a directory is kept
 
-The directory stays, with a reason in the activity entry and in the lease's
-`metadata.sshRunDirectory`:
+The directory stays, with a reason in the activity entry (written once per
+reason) and in the lease's `metadata.sshRunDirectory`. The API returns it with
+the lease (`GET /api/environment-leases/:leaseId` and the lease lists), and the
+CLI with `environment lease`, `environment leases` and `environment
+leases:list`:
 
 - `not_git_backed`: no marker and `workspace/` is missing or not a git
   repository, so nothing can be saved. This includes a directory that holds only
   `tmp/`, which a server that stops before the run ends leaves behind when the
   run has no `workspace/` yet: the heartbeat makes `tmp/` before the workspace
   sync, and an in-place run (`syncWorkspace: false`) never syncs one. The reaper
-  keeps such a directory.
-- `worktree_dirty`: an extra worktree has uncommitted work.
-- `preserve_failed`: the bundle could not be written, was over 1 GiB, or did not
-  verify; or `.git` is a link or a file; or a git
+  keeps such a directory for the keep window, then deletes it.
+- `worktree_dirty`: an extra worktree had uncommitted work. Only decisions from
+  before the reaper saved extra worktrees have this reason; they are tried again
+  after the keep window.
+- `preserve_failed`: the state could not be saved (for example a file in an
+  extra worktree could not be read), the bundle could not be written, was over
+  1 GiB, or did not verify; or `.git` is a link or a file; or a git
   read failed (the `detail` field names the command); or a
   bundle already at the published path is a link or not a regular file, or the
   bundle could not be replaced or still does not match this pass's refs exactly.
+  It is tried again after the keep window.
 - `seed_unknown`: the server has no record of the commit the run's workspace was
   uploaded from and the caller did not ask for the rule for folders with no
   record. The server always asks once the run is dead and old enough, so this is
@@ -141,10 +168,35 @@ The directory stays, with a reason in the activity entry and in the lease's
   (the run has no finish time).
 - `mount_point`: `runs/<runId>` is on another device than `runs`, or is a mount
   point (a bind mount on the same device included). Nothing in it is touched.
-- `rm_failed`: the removal failed. It is retried up to 5 times. A mount below the
+- `rm_failed`: the removal failed. It is retried up to 5 times, then again after
+  each keep window. A mount below the
   run directory ends here too: the delete stays on the run directory's own
   filesystem (`find -xdev`), so the mounted contents are left and the mount point
   itself cannot be removed.
+- `external_worktree`: the run's repository has a worktree registered outside
+  `runs/<runId>` (an agent's `git worktree add ../<folder>`), and that folder
+  still exists. Deleting the run directory would leave the folder without its
+  repository, so the directory stays, with the folder's path in
+  `externalWorktree`. This applies to restored runs too, and it is checked before
+  the folder-with-no-seed-record rule, so such a folder is kept as
+  `external_worktree`, not `linked_worktree`. The reaper reads git's
+  registration files (`workspace/.git/worktrees/*/gitdir`) and runs no git in
+  the folder. After each keep window it looks again, also past the sweep's
+  14-day look-back, and removes the run directory once the folder is gone (its
+  folder or its `.git` is missing, seen from a folder the reaper can enter). It
+  never removes the folder itself.
+- `unreadable`: the reaper could not read something that may hold the run's
+  work, so it does not guess. The path is in `unreadablePath` when it is known.
+  Causes:
+  - A worktree registration it cannot list, read or understand. Git writes
+    `<folder>/.git` into `gitdir`, so anything else counts, as does a missing
+    `gitdir` file or a link.
+  - A worktree folder it cannot enter.
+  - A `workspace` or `workspace/.git` it cannot enter.
+  - For a directory that is not a git repository, a folder below it that `find`
+    cannot read.
+
+  It is checked again after each keep window, also past the 14-day look-back.
 - `symlink`: a link replaced `.paperclip-runtime`, `runs`, or the run directory.
 - `root_mismatch`: the root recorded on the lease is not the root the environment
   is configured with now (or the lease did not record that root), or it is too
@@ -365,7 +417,7 @@ against `workspace/` inside the run directory, which the agent controls.
 - Activity `environment.ssh_run_directory_reaped` for each removal, with
   `bytesFreed`, `trigger` (`lease_release` or `sweep`), the preserved refs, and
   the bundle path.
-- Activity `environment.ssh_run_directory_kept`, once, with the reason.
+- Activity `environment.ssh_run_directory_kept`, once per reason, with the reason.
 - A log line per removal with `bytesFreed`, and one per sweep with the totals.
   The totals include `keptByReason`, the number of folders kept in that sweep for
   each reason, and `legacyRemoved`, the number removed under the rule for folders
