@@ -18,6 +18,7 @@ server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
+ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/CommandPalette.real.test.tsx
 ui/src/components/CommandPalette.test.tsx
 ui/src/components/KeyboardShortcutsCheatsheet.test.tsx
@@ -28,6 +29,7 @@ ui/src/lib/agent-setup-fields.test.ts
 ui/src/lib/command-action-usage.test.ts
 ui/src/lib/issue-list-invalidation.test.ts
 ui/src/lib/keyboardShortcuts.test.ts
+ui/src/lib/live-run-card-count.test.ts
 ui/src/lib/main-content-focus.test.ts
 ui/src/lib/saved-provider-credentials.test.ts
 ui/src/lib/test-agent-setup.test.ts
