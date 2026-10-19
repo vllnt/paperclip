@@ -90,6 +90,7 @@ import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { budgetService } from "./budgets.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
@@ -2511,9 +2512,15 @@ export function routineService(
           return updated ?? createdRun;
         }
 
-        // The wake refuses an assignee it cannot invoke (a paused agent is assignable but not
-        // invokable). Apply the wake's own rule first, so no issue is committed only to be deleted;
-        // the throw is recorded below exactly like that wake failure.
+        // The wake refuses a budget hard-stop, then an assignee it cannot invoke (a paused agent is
+        // assignable but not invokable). Apply the wake's own rules first, in its order, so no issue
+        // is committed only to be deleted; the throw is recorded below exactly like that wake failure.
+        const budgetBlock = await budgetService(txDb).getInvocationBlock(input.routine.companyId, assigneeAgentId, {
+          projectId,
+        });
+        if (budgetBlock) {
+          throw conflict(budgetBlock.reason, { scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId });
+        }
         const assignee = await txDb
           .select()
           .from(agents)

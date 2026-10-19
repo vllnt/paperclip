@@ -1,7 +1,7 @@
 /**
- * A routine whose assignee cannot be invoked (a paused agent is assignable but
- * not invokable). The dispatch used to commit the routine issue, let the wake
- * fail with "Agent is not invokable", then delete the issue. A recovery sweep
+ * A routine whose assignee the wake refuses: a paused agent (assignable but not
+ * invokable) or an agent over its budget hard-stop. The dispatch used to commit
+ * the routine issue, let the wake fail, then delete the issue. A recovery sweep
  * that read the issue in between then failed its recovery-action insert with an
  * FK violation. Uses the real heartbeat wake and the real stranded-issue sweep.
  */
@@ -12,7 +12,9 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
+  budgetPolicies,
   companies,
+  costEvents,
   createDb,
   heartbeatRuns,
   issueComments,
@@ -89,6 +91,8 @@ describeEmbeddedPostgres("routine dispatch to an assignee that cannot be invoked
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(costEvents);
+    await db.delete(budgetPolicies);
     await db.delete(routines);
     await db.delete(projects);
     await db.delete(agents);
@@ -158,8 +162,11 @@ describeEmbeddedPostgres("routine dispatch to an assignee that cannot be invoked
     };
   }
 
-  it("creates no issue and records the failed dispatch when the assignee is paused", async () => {
-    const { companyId, routine, svc, wakeAttempts } = await seed("paused");
+  /** Fires one scheduled dispatch and checks it failed with `reason`, created no issue, and was audited as usual. */
+  async function expectScheduledDispatchFailsWithoutIssue(
+    { companyId, routine, svc, wakeAttempts }: Awaited<ReturnType<typeof seed>>,
+    reason: string,
+  ) {
     const { trigger } = await svc.createTrigger(
       routine.id,
       { kind: "schedule", label: "daily", cronExpression: "0 0 * * *", timezone: "UTC" },
@@ -176,7 +183,7 @@ describeEmbeddedPostgres("routine dispatch to an assignee that cannot be invoked
     expect(runs[0]).toMatchObject({
       source: "schedule",
       status: "failed",
-      failureReason: NOT_INVOKABLE,
+      failureReason: reason,
       linkedIssueId: null,
     });
     expect(runs[0]?.completedAt).not.toBeNull();
@@ -201,6 +208,36 @@ describeEmbeddedPostgres("routine dispatch to an assignee that cannot be invoked
       entityId: runs[0]!.id,
       details: expect.objectContaining({ routineId: routine.id, source: "schedule", status: "failed" }),
     });
+  }
+
+  it("creates no issue and records the failed dispatch when the assignee is paused", async () => {
+    await expectScheduledDispatchFailsWithoutIssue(await seed("paused"), NOT_INVOKABLE);
+  });
+
+  it("creates no issue and records the failed dispatch when the assignee is over its budget hard-stop", async () => {
+    const fixture = await seed("idle");
+    await db.insert(budgetPolicies).values({
+      companyId: fixture.companyId,
+      scopeType: "agent",
+      scopeId: fixture.agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 1,
+      hardStopEnabled: true,
+      isActive: true,
+    });
+    await db.insert(costEvents).values({
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      provider: "test",
+      biller: "test",
+      billingType: "tokens",
+      model: "test-model",
+      costCents: 1,
+      occurredAt: new Date(),
+    });
+
+    await expectScheduledDispatchFailsWithoutIssue(fixture, "Agent cannot start because its budget hard-stop is still exceeded.");
   });
 
   it("a failed wake leaves no orphan issue and no FK error in a recovery sweep that read the issue", async () => {
