@@ -102,6 +102,10 @@ The first visit to a lazy page in a session waits for its chunk, so the page are
 
 A tab left open across a deploy asks for chunk names that no longer exist. `installStaleChunkReload` (`ui/src/lib/stale-chunk-reload.ts`) reloads the page once, at most every 30 seconds, when Vite reports that a chunk failed to load. It does not reload while the browser is offline or for a failed background prefetch.
 
+### Precompressed UI assets
+
+`vite build` writes a `.br` (Brotli) and a `.gz` (gzip) file next to every script, stylesheet, SVG and JSON file in `assets/` that is at least 1 KB and compresses smaller. The server (`server/src/middleware/precompressed-static.ts`) sends the Brotli file to clients that accept it, the gzip file to the rest of the clients that accept gzip, and the plain file otherwise, with `Vary: Accept-Encoding`. The app therefore does not depend on a reverse proxy to compress its own bundle. Range requests and files without a sibling get the plain file. The server reads the list of precompressed files when it starts, so restart it after rebuilding the UI to serve the new copies; until then new files go out uncompressed. `index.html` and the service worker are not precompressed. Compression time depends on the emitted assets.
+
 ## Storybook
 
 The board UI Storybook keeps stories and Storybook config under `ui/storybook/` so component review files stay out of the app source routes.

@@ -6,6 +6,7 @@ import { createUiDevWatchOptions } from "./src/lib/vite-watch";
 import { createApiProxy } from "./src/lib/vite-api-proxy";
 import { serviceWorkerBuildIdPlugin } from "./src/lib/vite-sw-build-id";
 import { bundleBudgetPlugin } from "./src/lib/vite-bundle-budget";
+import { precompressAssetsPlugin } from "./src/lib/vite-precompress";
 import { readBrowserBuildCommit } from "./src/lib/vite-build-commit";
 
 const apiProxy = createApiProxy();
@@ -21,6 +22,7 @@ export default defineConfig(({ mode }) => ({
     tailwindcss(),
     serviceWorkerBuildIdPlugin(),
     bundleBudgetPlugin(path.resolve(__dirname, "bundle-budget.json")),
+    precompressAssetsPlugin(),
   ],
   build: {
     minify: "esbuild",
