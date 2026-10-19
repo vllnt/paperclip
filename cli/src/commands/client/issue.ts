@@ -1,3 +1,4 @@
+import { buildRunProfileOverrides, hasRunProfileOptions, type RunProfileOptions } from "./run-profile-options.js";
 import { Command } from "commander";
 import { readFile, writeFile } from "node:fs/promises";
 import {
@@ -12,6 +13,7 @@ import {
   createIssueTreeHoldSchema,
   createIssueWorkProductSchema,
   DUPLICATE_PAIR_LABELS,
+  type CompanyIssueRecoveryActionListItem,
   type FeedbackTrace,
   issueWaitRequestSchema,
   findSimilarIssuesSchema,
@@ -64,7 +66,7 @@ interface IssueSimilarOptions extends BaseClientOptions {
   parentId?: string;
 }
 
-interface IssueCreateOptions extends BaseClientOptions {
+interface IssueCreateOptions extends BaseClientOptions, RunProfileOptions {
   title: string;
   description?: string;
   status?: string;
@@ -79,7 +81,7 @@ interface IssueCreateOptions extends BaseClientOptions {
   adapterOverridesFile?: string;
 }
 
-interface IssueUpdateOptions extends BaseClientOptions {
+interface IssueUpdateOptions extends BaseClientOptions, RunProfileOptions {
   title?: string;
   description?: string;
   status?: string;
@@ -219,6 +221,17 @@ interface IssueRecoveryResolveOptions extends BaseClientOptions {
   outcome: string;
   sourceIssueStatus: string;
   resolutionNote?: string;
+  reconciliationRunId?: string;
+  providerStopped?: boolean;
+  actionOutcome?: string;
+  outcomeEvidence?: string;
+  workspaceRepairEvidence?: string;
+}
+
+interface IssueRecoveryListOptions extends BaseClientOptions {
+  companyId?: string;
+  status?: string;
+  limit?: string;
 }
 
 interface IssueTreeOptions extends BaseClientOptions {
@@ -372,6 +385,10 @@ export function registerIssueCommands(program: Command): void {
       .option("--parent-id <id>", "Parent issue ID")
       .option("--request-depth <n>", "Request depth integer")
       .option("--billing-code <code>", "Billing code")
+      .option("--run-profile <tier>", "Run this issue on a company tier (for example fast, standard or deep)")
+      .option("--adapter-type <type>", "Run this issue on another harness: claude_local, codex_local or grok_local")
+      .option("--model <model>", "Run this issue on this model")
+      .option("--effort <effort>", "Reasoning effort for the run")
       .option("--adapter-overrides-json <json>", "Per-issue assignee adapter overrides as JSON (see docs/cli)")
       .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .action(async (opts: IssueCreateOptions) => {
@@ -389,7 +406,9 @@ export function registerIssueCommands(program: Command): void {
             parentId: opts.parentId,
             requestDepth: parseOptionalInt(opts.requestDepth),
             billingCode: opts.billingCode,
-            assigneeAdapterOverrides,
+            assigneeAdapterOverrides: hasRunProfileOptions(opts)
+              ? buildRunProfileOverrides(opts, assigneeAdapterOverrides)
+              : assigneeAdapterOverrides,
           });
 
           const created = await ctx.api.post<Issue>(apiPath`/api/companies/${ctx.companyId}/issues`, payload);
@@ -492,6 +511,11 @@ export function registerIssueCommands(program: Command): void {
       .option("--adapter-overrides-file <path>", "Read the adapter overrides JSON from a file")
       .option("--comment <text>", "Optional comment to add with update")
       .option("--hidden-at <iso8601|null>", "Set hiddenAt timestamp or literal 'null'")
+      .option("--run-profile <tier>", "Run this issue on a company tier (for example fast, standard or deep)")
+      .option("--adapter-type <type>", "Run this issue on another harness: claude_local, codex_local or grok_local")
+      .option("--model <model>", "Run this issue on this model")
+      .option("--effort <effort>", "Reasoning effort for the run")
+      .option("--clear-run-profile", "Remove the run profile so the issue runs on the agent's default")
       .option(
         "--unblock-owner <owner>",
         "Who must act on a blocked issue: board, agent:<id> or user:<id> (agents may name only board or themselves)",
@@ -500,7 +524,18 @@ export function registerIssueCommands(program: Command): void {
       .action(async (issueId: string, opts: IssueUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
-          const assigneeAdapterOverrides = await parseAdapterOverridesOption(opts);
+          const parsedAdapterOverrides = await parseAdapterOverridesOption(opts);
+          const current = hasRunProfileOptions(opts) && parsedAdapterOverrides === undefined
+            ? await ctx.api.get<Issue>(apiPath`/api/issues/${issueId}`)
+            : null;
+          const assigneeAdapterOverrides = hasRunProfileOptions(opts)
+            ? buildRunProfileOverrides(
+                opts,
+                parsedAdapterOverrides !== undefined
+                  ? parsedAdapterOverrides
+                  : current?.assigneeAdapterOverrides as Record<string, unknown> | null | undefined,
+              )
+            : parsedAdapterOverrides;
           const payload = updateIssueSchema.parse({
             unblockDescriptor: unblockDescriptorFromOptions(opts),
             title: opts.title,
@@ -516,6 +551,7 @@ export function registerIssueCommands(program: Command): void {
             assigneeAdapterOverrides,
             comment: opts.comment,
             hiddenAt: parseHiddenAt(opts.hiddenAt),
+            ...(assigneeAdapterOverrides !== undefined ? { assigneeAdapterOverrides } : {}),
           });
 
           const updated = await ctx.api.patch<Issue & { comment?: IssueComment | null }>(apiPath`/api/issues/${issueId}`, payload);
@@ -689,6 +725,51 @@ export function registerIssueCommands(program: Command): void {
 
   addCommonClientOptions(
     issue
+      .command("recovery-actions:list")
+      .description("List recovery actions across a company, newest first (default: open actions)")
+      .option("-C, --company-id <id>", "Company ID")
+      .option("--status <csv>", "Comma-separated statuses: active, escalated, resolved, cancelled (default active,escalated)")
+      .option("--limit <n>", "Maximum rows, 1-200 (default 50)")
+      .action(async (opts: IssueRecoveryListOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const params = new URLSearchParams();
+          if (opts.status) params.set("status", opts.status);
+          if (opts.limit) params.set("limit", opts.limit);
+          const query = params.toString();
+          const rows =
+            (await ctx.api.get<CompanyIssueRecoveryActionListItem[]>(
+              `${apiPath`/api/companies/${ctx.companyId}/recovery-actions`}${query ? `?${query}` : ""}`,
+            )) ?? [];
+          if (ctx.json || rows.length === 0) {
+            printOutput(rows, { json: ctx.json });
+            return;
+          }
+          for (const row of rows) {
+            console.log(
+              formatInlineRecord({
+                identifier: row.issue.identifier ?? row.issue.id,
+                id: row.id,
+                status: row.status,
+                kind: row.kind,
+                issueStatus: row.issue.status,
+                owner: row.ownerAgentId ?? row.ownerUserId ?? row.ownerType,
+                attempts: row.maxAttempts === null ? String(row.attemptCount) : `${row.attemptCount}/${row.maxAttempts}`,
+                createdAt: String(row.createdAt),
+                title: row.issue.title,
+                nextAction: row.nextAction,
+              }),
+            );
+          }
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    issue
       .command("recovery:resolve")
       .description("Resolve an issue recovery action")
       .argument("<issueId>", "Issue ID")
@@ -696,14 +777,34 @@ export function registerIssueCommands(program: Command): void {
       .requiredOption("--source-issue-status <status>", "todo, done, or in_review for restored outcomes; blocked is only valid for blocked outcomes")
       .option("--action-id <id>", "Specific recovery action ID")
       .option("--resolution-note <text>", "Resolution note")
+      .option("--reconciliation-run-id <id>", "Execution reconciliation: the stopped run ID (board only)")
+      .option("--provider-stopped", "Execution reconciliation: confirm the provider process is stopped")
+      .option("--action-outcome <outcome>", "Execution reconciliation: completed, not_performed, or mixed")
+      .option("--outcome-evidence <text>", "Execution reconciliation: evidence for the action outcome (20-12000 chars)")
+      .option("--workspace-repair-evidence <text>", "Execution reconciliation: optional workspace repair evidence (20-12000 chars)")
       .action(async (issueId: string, opts: IssueRecoveryResolveOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
+          const reconciling =
+            opts.reconciliationRunId !== undefined ||
+            opts.providerStopped !== undefined ||
+            opts.actionOutcome !== undefined ||
+            opts.outcomeEvidence !== undefined ||
+            opts.workspaceRepairEvidence !== undefined;
           const payload = resolveIssueRecoveryActionSchema.parse({
             actionId: opts.actionId,
             outcome: opts.outcome,
             sourceIssueStatus: opts.sourceIssueStatus,
             resolutionNote: opts.resolutionNote,
+            executionReconciliation: reconciling
+              ? {
+                  runId: opts.reconciliationRunId,
+                  providerStopped: opts.providerStopped,
+                  actionOutcome: opts.actionOutcome,
+                  outcomeEvidence: opts.outcomeEvidence,
+                  workspaceRepairEvidence: opts.workspaceRepairEvidence,
+                }
+              : undefined,
           });
           const result = await ctx.api.post(apiPath`/api/issues/${issueId}/recovery-actions/resolve`, payload);
           printOutput(result, { json: ctx.json });

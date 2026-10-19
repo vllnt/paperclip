@@ -6,6 +6,7 @@ import {
 import { Router } from "express";
 import { z } from "zod";
 import {
+  companyRunTiersSchema,
   createAiConnectionSchema,
   testAiGatewaySchema,
   aiConnectionLoginIntentSchema,
@@ -237,6 +238,9 @@ import {
   resolveIssueRecoveryActionSchema,
   reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
+  issueRecoveryActionReadModelSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  ISSUE_STATUSES,
   cancelIssueThreadInteractionSchema,
   issueWaitRequestSchema,
   // Secret provider configs and remote import
@@ -323,6 +327,7 @@ import {
   observabilityFailuresQuerySchema,
   observabilityFailuresResponseSchema,
   observabilityHealthSchema,
+  listRoutinesQuerySchema,
   observabilityUsageQuerySchema,
   observabilityUsageResponseSchema,
 } from "@paperclipai/shared";
@@ -1600,6 +1605,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
+  "GET /api/instance/resource-capacity",
   "POST /api/companies",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
@@ -2035,6 +2041,33 @@ registry.registerPath({
   tags: ["companies"],
   summary: "Company stats",
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/run-tiers",
+  tags: ["companies"],
+  summary: "Get a company's run tiers and the tiers agents may set",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/run-tiers",
+  tags: ["companies"],
+  summary: "Replace a company's run tiers (board only)",
+  request: { params: z.object({ companyId: z.string() }), body: jsonBody(companyRunTiersSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/run-target-stats",
+  tags: ["companies"],
+  summary: "In-flight runs per provider pool and finished runs by run target source and tier",
+  request: { params: z.object({ companyId: z.string() }), query: z.object({ hours: z.string().optional() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -3497,6 +3530,21 @@ registry.registerPath({
   path: "/api/agents/{id}",
   tags: ["agents"],
   summary: "Update an agent",
+  description:
+    "By default `adapterConfig` merges at the top level and `runtimeConfig` is replaced. Set " +
+    "`replaceAdapterConfig: true` to replace `adapterConfig`. Set `mergeConfig: true` to apply `adapterConfig` and " +
+    "`runtimeConfig` as JSON merge patches (RFC 7396) over the stored config: only the named keys change, `null` " +
+    "removes a key, arrays replace, and each `adapterConfig.env` entry and `adapterConfig.workspaceStrategy` is " +
+    "replaced whole. Keys you do not name keep their stored values, including secrets, so they never have to be " +
+    "resent. An env value read back from GET as a redacted plain binding restores the stored value. The merged " +
+    "configs are validated like a full update. A config that changed while the patch was applied returns 409. " +
+    "`mergeConfig` cannot be combined with `replaceAdapterConfig` or an `adapterType` change, and cannot remove " +
+    "`runtimeConfig.aiConnection` (422). A merge patch is refused with 400, the path of the offending value in " +
+    "`details[].path`, and nothing stored, when a key anywhere in it (arrays included) is `__proto__`, " +
+    "`constructor` or `prototype`, when it is nested deeper than 32 levels, or when it holds more than 10,000 values. " +
+    "An agent key gets 403 when the merged `adapterConfig` would add, change or remove a host-executed " +
+    "`workspaceStrategy` command (`provisionCommand`, `runtimeProvisionCommand` or `teardownCommand`), also when " +
+    "the patch replaces or removes the whole strategy; a board user with `agents:configure` may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateAgentSchema.omit({ permissions: true })),
@@ -3505,7 +3553,10 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
@@ -3787,6 +3838,20 @@ registry.registerPath({
   summary: "Resume an agent",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/harness-cooldowns/clear",
+  tags: ["agents"],
+  summary: "Clear an agent's provider quota cooldowns (board only)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registry.registerPath({
@@ -4808,9 +4873,9 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/routines",
   tags: ["routines"],
-  summary: "List routines in a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  summary: "List routines in a company; optional filters q, assigneeAgentId, folderId (or none), projectId, status and trigger combine with AND",
+  request: { params: z.object({ companyId: z.string() }), query: listRoutinesQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -8667,6 +8732,32 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/instance/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get host CPU, memory and disk for every server host and environment (instance admins)",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get CPU, memory and disk of the environments the company's agents run on",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/environments/{id}/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get an environment's CPU, memory and disk (404 unless the caller's company runs on it)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/environments/{id}/delete-blast-radius",
   tags: ["environments"],
   summary: "Get environment delete blast radius",
@@ -9313,6 +9404,152 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
+// ─── Convex plugin action contracts ───────────────────────────────────────────
+// The bundled Convex plugin (vllnt.paperclip-convex) serves these board actions
+// through the URL-keyed action route below. Agents use the plugin's tools
+// (GET /api/plugins/tools) instead. The guards (activity window, delete cap,
+// call rate, dry-run-only) apply to both; the grants apply to agent tools only,
+// because a board action and the reaper are not subject to them.
+const convexEnvironment = z.enum(["production", "staging", "preview", "dev", "custom"]);
+const convexDeploymentSchema = z.object({
+  name: z.string(),
+  environment: convexEnvironment.describe("Computed by the server from the re-fetched Convex record; unknown means production"),
+  environmentReason: z.string().optional(),
+  deploymentType: z.string().nullable(),
+  reference: z.string().nullable(),
+  previewIdentifier: z.string().nullable(),
+  isDefault: z.boolean().nullable(),
+  createTime: z.number().nullable().describe("Milliseconds since epoch"),
+  lastDeployTime: z.number().nullable(),
+  expiresAt: z.number().nullable(),
+  region: z.string().nullable(),
+  deploymentClass: z.string().nullable(),
+  creator: z.string().nullable(),
+  project: z.string().nullable(),
+});
+// The compact row of deployments.list; the detail above is the plugin's get tool and the delete-preview result.
+const convexDeploymentSummarySchema = z.object({
+  name: z.string(),
+  environment: convexEnvironment,
+  deploymentType: z.string().nullable(),
+  previewIdentifier: z.string().nullable(),
+  lastDeployTime: z.number().nullable().describe("Milliseconds since epoch"),
+  expiresAt: z.number().nullable().describe("Milliseconds since epoch"),
+});
+const convexQuotaSchema = z.object({
+  count: z.number(), quota: z.number(), percent: z.number(), partial: z.boolean(), alert: z.boolean(), issueId: z.string().nullable().optional(),
+  lowerBound: z.boolean().optional().describe("True when the team has more deployments than could be counted; count is then a minimum"),
+});
+const convexStatusSchema = z.object({
+  connection: z.enum(["connected", "disconnected", "not-configured", "not-connected"]),
+  configError: z.string().optional().describe("Set when the company's Convex config is invalid; connection is then not-configured and projects is empty"),
+  // The config-error branch omits or nulls everything below.
+  teamId: z.string().nullable().optional(),
+  projects: z.array(z.object({ convexProjectId: z.string(), name: z.string(), repository: z.string().nullable(), paperclipProjectId: z.string().nullable(), reserved: z.boolean() })),
+  credentials: z.object({ teamToken: z.boolean(), github: z.boolean() }).nullable().optional().describe("Whether a credential is configured; values are never returned"),
+  grants: z.number().nullable().optional().describe("Number of agent grants; grants apply to agent tools only"),
+  guards: z.object({ activityHours: z.number(), maxDeletesPerRun: z.number(), callsPerMinute: z.number(), dryRunOnly: z.boolean() }).nullable().optional(),
+  reaper: z.object({ enabled: z.boolean(), ttlHours: z.number(), quota: z.number(), alertPercent: z.number() }).nullable().optional(),
+  lastReport: z.object({ at: z.string(), dryRun: z.boolean(), quota: convexQuotaSchema.nullable() }).nullable().optional().describe("Summary of the last reaper report"),
+});
+const convexConnectResultSchema = z.object({ projects: z.array(z.string()).describe("Convex project ids now reserved for the company") });
+const convexDisconnectResultSchema = z.object({ connection: z.literal("disconnected") });
+const convexDeploymentsListParamsSchema = z.object({
+  convexProjectId: z.string().optional(),
+  deploymentType: z.enum(["preview", "dev", "prod", "custom"]).optional(),
+  limit: z.number().int().min(1).max(200).optional().describe("Rows per page, 1 to 200; default 50"),
+  cursor: z.string().optional().describe("Opaque; the nextCursor of the previous page"),
+});
+const convexDeploymentsListSchema = z.object({
+  deployments: z.array(convexDeploymentSummarySchema),
+  total: z.number().int().describe("Rows in the whole listing, not only this page"),
+  nextCursor: z.string().nullable().describe("Pass as cursor to get the next page; null on the last page"),
+  truncated: z.boolean(),
+});
+const convexDeletePreviewParamsSchema = z.object({
+  name: z.string(),
+  dryRun: z.boolean().optional().describe("Absent or true runs every guard and deletes nothing. Only false deletes"),
+});
+const convexDeletePreviewResultSchema = z.object({
+  dryRun: z.boolean().describe("True also when the plugin's dryRunOnly guard turned a real request into a plan"),
+  wouldDelete: z.boolean(),
+  deleted: z.boolean(),
+  environment: convexEnvironment,
+  deployment: convexDeploymentSchema,
+  evidence: z.object({
+    prState: z.enum(["none", "closed", "merged"]), prNumber: z.number().nullable(), branchExists: z.boolean(), lastCommitAt: z.number().nullable(), idleMs: z.number(),
+  }).nullable(),
+  reason: z.string().nullable(),
+  note: z.string().optional().describe("Set when a real request was turned into a plan by the dryRunOnly guard"),
+});
+const convexReaperRunParamsSchema = z.object({
+  dryRun: z.boolean().optional().describe("Absent or true only plans. false runs for real and needs reaper.enabled and an instance administrator"),
+});
+const convexReaperReportSchema = z.object({
+  at: z.string(),
+  trigger: z.enum(["schedule", "manual", "retry", "api"]),
+  dryRun: z.boolean(),
+  projects: z.array(z.object({
+    convexProjectId: z.string(), name: z.string(), previews: z.number(), kept: z.number(),
+    ciMatched: z.number().optional().describe("Previews the company's CI preview template matched; absent without a template"),
+    delete: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+    setExpiry: z.array(z.object({ name: z.string(), from: z.number().nullable(), to: z.number() })),
+    deleted: z.array(z.string()), expirySet: z.array(z.string()),
+    failed: z.array(z.object({ name: z.string(), error: z.string() })),
+    skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+    dev: z.object({
+      listed: z.number(), kept: z.number(),
+      executed: z.boolean().describe("False for a plan only: dry run, dev policy off, or a pass an agent started"),
+      delete: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+      deleted: z.array(z.string()),
+      failed: z.array(z.object({ name: z.string(), error: z.string() })),
+      skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+      error: z.string().optional(),
+    }).optional().describe("Dev deployments older than the company's age limit; deleted only by the scheduled or a board-run reaper"),
+    deferred: z.number().int().optional().describe("Previews not examined, and expiry changes not planned, because the time budget or the per-pass limit was reached; the next pass continues with the oldest"),
+    error: z.string().optional(),
+  })),
+  quota: convexQuotaSchema.nullable(),
+  errors: z.array(z.string()),
+  incomplete: z.string().optional().describe("Why the pass stopped early, when it did"),
+});
+// The body of every failure of a plugin bridge call; a permission refusal or a plugin error is code WORKER_ERROR.
+const pluginBridgeErrorSchema = z.object({
+  code: z.enum(["WORKER_UNAVAILABLE", "CAPABILITY_DENIED", "INVOCATION_SCOPE_DENIED", "WORKER_ERROR", "TIMEOUT", "UNKNOWN"]),
+  message: z.string(),
+  details: z.unknown().optional(),
+});
+const convexSchemaRefs = {
+  deployment: registry.register("ConvexDeployment", convexDeploymentSchema),
+  deploymentSummary: registry.register("ConvexDeploymentSummary", convexDeploymentSummarySchema),
+  status: registry.register("ConvexStatus", convexStatusSchema),
+  connectResult: registry.register("ConvexConnectResult", convexConnectResultSchema),
+  disconnectResult: registry.register("ConvexDisconnectResult", convexDisconnectResultSchema),
+  deploymentsListParams: registry.register("ConvexDeploymentsListParams", convexDeploymentsListParamsSchema),
+  deploymentsList: registry.register("ConvexDeploymentsList", convexDeploymentsListSchema),
+  deletePreviewParams: registry.register("ConvexDeletePreviewParams", convexDeletePreviewParamsSchema),
+  deletePreviewResult: registry.register("ConvexDeletePreviewResult", convexDeletePreviewResultSchema),
+  reaperRunParams: registry.register("ConvexReaperRunParams", convexReaperRunParamsSchema),
+  reaperReport: registry.register("ConvexReaperReport", convexReaperReportSchema),
+  bridgeError: registry.register("PluginBridgeError", pluginBridgeErrorSchema),
+};
+export const CONVEX_PLUGIN_ACTIONS = [
+  "status", "connection.connect", "connection.disconnect", "deployments.list", "deployments.delete-preview", "reaper.run", "reaper.report",
+] as const;
+/** The result and params schemas of the Convex actions, for tests and typed callers. */
+export const CONVEX_PLUGIN_SCHEMAS = {
+  status: convexStatusSchema,
+  connectResult: convexConnectResultSchema,
+  disconnectResult: convexDisconnectResultSchema,
+  deploymentsListParams: convexDeploymentsListParamsSchema,
+  deploymentsList: convexDeploymentsListSchema,
+  deletePreviewParams: convexDeletePreviewParamsSchema,
+  deletePreviewResult: convexDeletePreviewResultSchema,
+  reaperRunParams: convexReaperRunParamsSchema,
+  reaperReport: convexReaperReportSchema,
+  bridgeError: pluginBridgeErrorSchema,
+} as const;
+
 registry.registerPath({
   method: "post",
   path: "/api/plugins/{pluginId}/data/{key}",
@@ -9335,6 +9572,19 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/actions/{key}",
   tags: ["plugins"],
   summary: "Invoke a plugin action (URL-keyed bridge)",
+  description:
+    "Board-authorised actions of a plugin. The body is { companyId, params }. A success is wrapped in the host envelope { data: T }; " +
+    "a failure of the plugin, of its guards or of a permission check is HTTP 502 with the PluginBridgeError body { code, message, details } " +
+    "(a refusal is code WORKER_ERROR; the host does not answer 403 for it). " +
+    "The bundled Convex plugin (pluginId vllnt.paperclip-convex) serves: " +
+    `${CONVEX_PLUGIN_ACTIONS.join(", ")}. ` +
+    "Results: status is ConvexStatus; connection.connect is ConvexConnectResult; connection.disconnect is ConvexDisconnectResult; " +
+    "deployments.list (ConvexDeploymentsListParams, paged by limit and cursor) is ConvexDeploymentsList; " +
+    "deployments.delete-preview (ConvexDeletePreviewParams) is ConvexDeletePreviewResult; " +
+    "reaper.run (ConvexReaperRunParams) is ConvexReaperReport; reaper.report is ConvexReaperReport or null. " +
+    "Mutating Convex actions (connection.connect, connection.disconnect, deployments.delete-preview and a real reaper.run) need an instance administrator; " +
+    "a real reaper.run also needs reaper.enabled. An omitted dryRun means plan only: only dryRun false deletes. " +
+    "The plugin's guards apply to board actions as they do to agent tools; the grants apply to agents only. No action returns a credential.",
   request: {
     params: z.object({ pluginId: z.string(), key: z.string() }),
     body: jsonBody(
@@ -9344,7 +9594,39 @@ registry.registerPath({
       }),
     ),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: {
+    200: {
+      description: "Success. The body is { data: T }; for the Convex plugin T is the result of the action as listed in the description.",
+      content: {
+        "application/json": {
+          schema: {
+            type: "object",
+            required: ["data"],
+            properties: {
+              data: {
+                nullable: true,
+                anyOf: [
+                  convexSchemaRefs.status,
+                  convexSchemaRefs.connectResult,
+                  convexSchemaRefs.disconnectResult,
+                  convexSchemaRefs.deploymentsList,
+                  convexSchemaRefs.deletePreviewResult,
+                  convexSchemaRefs.reaperReport,
+                  { type: "object", additionalProperties: true, description: "The result of an action of another plugin" },
+                ],
+              },
+            },
+          },
+        },
+      },
+    },
+    401: r.unauthorized,
+    404: r.notFound,
+    502: {
+      description: "The plugin worker is unavailable or the action failed. This includes a refusal by a guard or a missing instance administrator (code WORKER_ERROR).",
+      content: { "application/json": { schema: convexSchemaRefs.bridgeError } },
+    },
+  },
 });
 
 // ─── Instance database backups ────────────────────────────────────────────────
@@ -10531,6 +10813,33 @@ registerCurrentRoute({
     401: r.unauthorized,
     403: r.forbidden,
     404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["issues"],
+  summary:
+    "List issue recovery actions across a company, newest first, with their source issue. " +
+    "Read-only (no revalidation). Actors without company-scope read only see actions on issues they can read.",
+  query: listCompanyIssueRecoveryActionsQuerySchema,
+  responses: {
+    200: r.ok(
+      z.array(
+        issueRecoveryActionReadModelSchema.extend({
+          issue: z.object({
+            id: z.string(),
+            identifier: z.string().nullable(),
+            title: z.string(),
+            status: z.enum(ISSUE_STATUSES),
+          }),
+        }),
+      ),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
   },
 });
 

@@ -44,6 +44,7 @@ import { companyTransferRunService } from "./services/company-transfer-runs.js";
 import { healthRoutes } from "./routes/health.js";
 import { cloudRuntimeIdentityMiddleware } from "./middleware/cloud-runtime-identity.js";
 import { cloudControlMiddleware } from "./middleware/cloud-control.js";
+import { refuseNewWorkWhileStopping } from "./shutdown.js";
 import { cloudRoutes } from "./routes/cloud.js";
 import { companyRoutes } from "./routes/companies.js";
 import { companySkillRoutes } from "./routes/company-skills.js";
@@ -79,6 +80,7 @@ import { eventSourceBodyParser } from "./middleware/event-source-body.js";
 import { eventSourceService } from "./services/event-sources/service.js";
 import { pipelineRoutes } from "./routes/pipelines.js";
 import { environmentRoutes } from "./routes/environments.js";
+import { resourceCapacityRoutes } from "./routes/resource-capacity.js";
 import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
 import { goalRoutes } from "./routes/goals.js";
 import { onboardingSeedRoutes } from "./routes/onboarding-seed.js";
@@ -584,6 +586,9 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
+  // While the process stops, requests that only start new work get 503 with
+  // Retry-After; run callbacks and every other request are still served.
+  app.use(refuseNewWorkWhileStopping());
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
@@ -778,6 +783,7 @@ export async function createApp(
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(eventSourceRoutes(db, eventSources));
   api.use(pipelineRoutes(db));
+  api.use(resourceCapacityRoutes(db));
   api.use(
     environmentRoutes(db, {
       pluginWorkerManager: workerManager,

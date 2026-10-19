@@ -12,6 +12,8 @@ import { RoutineHistoryTab } from "../RoutineHistoryTab";
 import { RoutineActivityRow } from "../RoutineActivityRow";
 import { useRoutineDetail } from "./context";
 
+export { EventGroupsSection } from "./EventGroupsSection";
+
 export function RunsSection() {
   const { routine, companyId, agents, projects, hasLiveRun, activeIssueId } = useRoutineDetail();
   const queryClient = useQueryClient();

@@ -1,3 +1,4 @@
+import { runProfileSchema } from "../run-profile.js";
 import { z } from "zod";
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
@@ -36,6 +37,7 @@ import {
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
+import { commaSeparatedEnumQuerySchema } from "./query.js";
 import {
   lowTrustReviewPresetPolicySchema,
   trustAuthorizationPolicySchema,
@@ -298,6 +300,8 @@ export const issueAssigneeAdapterOverridesSchema = z
   .object({
     adapterConfig: z.record(z.string(), z.unknown()).optional(),
     useProjectWorkspace: z.boolean().optional(),
+    /** The harness, model and effort this issue runs on; see run-profile.ts. */
+    runProfile: runProfileSchema.optional(),
   })
   .strict();
 
@@ -555,6 +559,27 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "blocked",
   "cancelled",
 ] as const;
+
+export const COMPANY_RECOVERY_ACTIONS_DEFAULT_STATUSES = ["active", "escalated"] as const;
+export const COMPANY_RECOVERY_ACTIONS_DEFAULT_LIMIT = 50;
+export const COMPANY_RECOVERY_ACTIONS_MAX_LIMIT = 200;
+
+export const listCompanyIssueRecoveryActionsQuerySchema = z.object({
+  status: commaSeparatedEnumQuerySchema(ISSUE_RECOVERY_ACTION_STATUSES).describe(
+    "Comma-separated recovery action statuses. Defaults to active,escalated (open actions).",
+  ),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(COMPANY_RECOVERY_ACTIONS_MAX_LIMIT)
+    .optional()
+    .describe("Maximum rows, 1-200. Defaults to 50."),
+});
+
+export type ListCompanyIssueRecoveryActionsQuery = z.infer<
+  typeof listCompanyIssueRecoveryActionsQuerySchema
+>;
 
 export const retryWorkspaceExportSchema = z.object({
   actionId: z.string().guid(),

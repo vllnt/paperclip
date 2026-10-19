@@ -4,6 +4,7 @@ import { resolveCompanyEnvironmentDefault } from "@paperclipai/shared";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { completeConnectionIntentSchema } from "@paperclipai/shared";
 import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
+import { applyConfigMergePatch, isAtomicAdapterConfigPath } from "../services/agent-config-merge-patch.js";
 import { pipeline } from "node:stream/promises";
 import { isDeepStrictEqual } from "node:util";
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
@@ -60,6 +61,7 @@ import {
   heartbeatRunListQuerySchema,
   heartbeatRunStatsQuerySchema,
   HEARTBEAT_RUN_STATS_MAX_WINDOW_DAYS,
+  updateAgentMergePatchSchema,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
   startAdapterAuthSessionRequestSchema,
@@ -112,6 +114,7 @@ import { isLoginCommandSupportedAdapterType } from "../services/login-command.js
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectAgentAdapterWorkspaceCommandPaths,
+  collectChangedAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import {
   agentProtectedConfigAfterPatch,
@@ -159,8 +162,21 @@ import {
 import {
   REDACTED_EVENT_VALUE,
   redactAgentAdapterConfig,
+  redactAgentFallbacks,
   redactEventPayload,
 } from "../redaction.js";
+import {
+  HARNESS_FALLBACK_ADAPTER_TYPES,
+  agentFallbacksSchema,
+  harnessTargetKey,
+  type AgentFallbackTarget,
+} from "@paperclipai/shared";
+import {
+  checkRunHarnessCompatibility,
+  harnessFallbackService,
+  readAgentFallbacks,
+  readQuotaBackoffMaxMinutes,
+} from "../services/harness-fallback.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import {
   HarnessRuntimeRequestResolutionError,
@@ -758,6 +774,7 @@ export function agentRoutes(
   const recovery = recoveryService(db, { enqueueWakeup: heartbeat.wakeup });
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
+  const harnessFallbackSvc = harnessFallbackService(db);
   const instructions = agentInstructionsService(db);
   const agentFiles = agentFileStore(db);
   const instructionRevisions = agentInstructionRevisionService(db);
@@ -1685,9 +1702,13 @@ export function agentRoutes(
     const baseAgent = redactAgentRowForResponse(
       options?.restricted ? redactForRestrictedAgentView(agent) : agent,
     );
+    const harnessFallback = options?.restricted
+      ? null
+      : await harnessFallbackSvc.getAgentState(agent).catch(() => null);
 
     return {
       ...baseAgent,
+      harnessFallback,
       chainOfCommand,
       access: accessState,
     };
@@ -3330,6 +3351,7 @@ export function agentRoutes(
       ...agent,
       adapterConfig: {},
       runtimeConfig: {},
+      fallbacks: [],
     };
   }
 
@@ -3337,13 +3359,16 @@ export function agentRoutes(
   // views blank the config wholesale for authorization reasons; this runs for
   // config-reading (board) callers too, so plaintext `adapterConfig.env` values
   // never leave the API regardless of actor scope.
-  function redactAgentRowForResponse<T extends { adapterConfig?: unknown } | null | undefined>(
+  function redactAgentRowForResponse<T extends { adapterConfig?: unknown; fallbacks?: unknown } | null | undefined>(
     agent: T,
   ): T {
     if (!agent || typeof agent !== "object") return agent;
-    if (!agent.adapterConfig || typeof agent.adapterConfig !== "object") return agent;
+    const withFallbacks = hasOwn(agent, "fallbacks")
+      ? { ...agent, fallbacks: redactAgentFallbacks(agent.fallbacks) }
+      : agent;
+    if (!agent.adapterConfig || typeof agent.adapterConfig !== "object") return withFallbacks;
     return {
-      ...agent,
+      ...withFallbacks,
       adapterConfig: redactAgentAdapterConfig(agent.adapterConfig as Record<string, unknown>),
     };
   }
@@ -3361,6 +3386,7 @@ export function agentRoutes(
       adapterType: agent.adapterType,
       adapterConfig: redactAgentAdapterConfig(agent.adapterConfig),
       runtimeConfig: redactEventPayload(agent.runtimeConfig),
+      fallbacks: redactAgentFallbacks(agent.fallbacks),
       permissions: agent.permissions,
       updatedAt: agent.updatedAt,
     };
@@ -3388,11 +3414,145 @@ export function agentRoutes(
     return { ...requestedConfig, env: restoredEnv };
   }
 
+  /**
+   * Validates and normalizes an agent's fallback chain for storage: the
+   * primary must be a fallback-capable harness, an echoed redacted env value
+   * keeps its stored value, credential env keys must be secret references,
+   * and each harness gets the same adapter defaults a primary would.
+   */
+  async function normalizeAgentFallbacksForPersistence(input: {
+    req: Request;
+    companyId: string;
+    agentId: string;
+    agentName: string;
+    primaryAdapterType: string;
+    primaryAdapterConfig: Record<string, unknown>;
+    requested: AgentFallbackTarget[];
+    existing: unknown;
+  }): Promise<AgentFallbackTarget[]> {
+    if (input.requested.length === 0) return [];
+    if (!(HARNESS_FALLBACK_ADAPTER_TYPES as readonly string[]).includes(input.primaryAdapterType)) {
+      throw unprocessable(
+        `Fallbacks are supported only for ${HARNESS_FALLBACK_ADAPTER_TYPES.join(", ")} agents; remove the fallbacks first.`,
+      );
+    }
+    const primaryModel = typeof input.primaryAdapterConfig.model === "string" ? input.primaryAdapterConfig.model : null;
+    const primaryKey = harnessTargetKey({ adapterType: input.primaryAdapterType, model: primaryModel });
+    const stored = readAgentFallbacks(input.existing);
+    const normalized: AgentFallbackTarget[] = [];
+    for (const [index, entry] of input.requested.entries()) {
+      // A fallback's adapterConfig reaches the host like a primary's does, so
+      // agent keys get the same refusal for instruction paths and host commands.
+      assertNoAgentAdapterConfigMutation(input.req, entry.adapterConfig ?? {}, `fallbacks[${index}].adapterConfig`);
+      const key = harnessTargetKey(entry);
+      if (key === primaryKey) {
+        throw unprocessable(`fallbacks[${index}] repeats the primary harness and model (${key}).`);
+      }
+      const previous = stored.find((candidate) => harnessTargetKey(candidate) === key);
+      const requestedEnv = entry.env
+        ? asRecord(restoreRedactedAgentEnv({ env: entry.env }, { env: previous?.env ?? {} }).env) ?? {}
+        : undefined;
+      const env = requestedEnv
+        ? await secretsSvc.normalizeEnvBindingsForPersistence(input.companyId, requestedEnv, {
+            strictMode: true,
+            fieldPath: `fallbacks[${index}].env`,
+          })
+        : undefined;
+      const withDefaults = applyCodexLocalKeyIsolation(
+        input.companyId,
+        input.agentId,
+        entry.adapterType,
+        applyCreateDefaultsByAdapterType(entry.adapterType, { ...(entry.adapterConfig ?? {}), ...(env ? { env } : {}) }),
+      );
+      const fallbackInstructionsAgent = {
+        id: input.agentId,
+        name: input.agentName,
+        companyId: input.companyId,
+        adapterConfig: { ...input.primaryAdapterConfig, ...withDefaults },
+      };
+      assertExternalInstructionsAdmin(input.req, fallbackInstructionsAgent);
+      // A carried managed root must not hide a fallback's external file path.
+      assertExternalInstructionsAdmin(input.req, {
+        ...fallbackInstructionsAgent,
+        adapterConfig: syncInstructionsBundleConfigFromFilePath(
+          fallbackInstructionsAgent,
+          fallbackInstructionsAgent.adapterConfig,
+        ),
+      });
+      const { env: isolatedEnv, ...adapterConfig } = withDefaults;
+      const isolated = asRecord(isolatedEnv);
+      normalized.push({
+        adapterType: entry.adapterType,
+        model: entry.model,
+        ...(entry.effort ? { effort: entry.effort } : {}),
+        ...(Object.keys(adapterConfig).length > 0 ? { adapterConfig } : {}),
+        ...(isolated ? { env: isolated as AgentFallbackTarget["env"] } : {}),
+      });
+    }
+    const parsed = agentFallbacksSchema.safeParse(normalized);
+    if (!parsed.success) {
+      throw unprocessable(parsed.error.issues[0]?.message ?? "Invalid fallbacks");
+    }
+    return parsed.data;
+  }
+
+  /** Refuses a primary harness/model pair the compatibility matrix rejects. */
+  function assertPrimaryHarnessModelCompatible(adapterType: string, adapterConfig: Record<string, unknown>) {
+    const result = checkRunHarnessCompatibility({ adapterType, config: adapterConfig, fallback: false });
+    if (!result.ok) throw unprocessable(result.message, { code: result.code, model: result.model });
+  }
+
+  /**
+   * The quota settings an agent changes on itself: its `fallbacks` chain and
+   * the quota backoff. Values are compared after normalization, so an
+   * unchanged resubmit (including a redacted echo) passes.
+   */
+  function changedOwnFallbackFields(input: {
+    existing: { fallbacks: unknown; runtimeConfig: unknown };
+    nextFallbacks: unknown;
+    nextRuntimeConfig: unknown;
+  }): string[] {
+    const fields: string[] = [];
+    if (JSON.stringify(readAgentFallbacks(input.existing.fallbacks)) !== JSON.stringify(readAgentFallbacks(input.nextFallbacks))) {
+      fields.push("fallbacks");
+    }
+    if (readQuotaBackoffMaxMinutes(input.existing.runtimeConfig) !== readQuotaBackoffMaxMinutes(input.nextRuntimeConfig)) {
+      fields.push("runtimeConfig.heartbeat.quotaBackoffMaxMinutes");
+    }
+    return fields;
+  }
+
+  async function assertCanChangeOwnFallbacks(
+    req: Request,
+    target: { id: string; companyId: string },
+    fields: string[],
+    surface: "patch" | "config_rollback",
+  ) {
+    if (req.actor.type !== "agent" || req.actor.agentId !== target.id || fields.length === 0) return;
+    const actor = getActorInfo(req);
+    await assertAgentProtectedChangeGranted({
+      db,
+      access,
+      req,
+      activityActor: {
+        actorType: "agent",
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+      },
+      target,
+      fields,
+      surface,
+    });
+  }
+
   function redactRevisionSnapshot(snapshot: unknown): Record<string, unknown> {
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return {};
     const record = snapshot as Record<string, unknown>;
     return {
       ...record,
+      ...(hasOwn(record, "fallbacks") ? { fallbacks: redactAgentFallbacks(record.fallbacks) } : {}),
       adapterConfig: redactAgentAdapterConfig(
         typeof record.adapterConfig === "object" && record.adapterConfig !== null
           ? (record.adapterConfig as Record<string, unknown>)
@@ -4638,6 +4798,17 @@ export function agentRoutes(
       await assertSelectableAdapterType(rollbackAdapterType);
     }
     const rollbackAdapterConfig = asRecord(rollbackConfig.adapterConfig) ?? {};
+    assertPrimaryHarnessModelCompatible(rollbackAdapterType, rollbackAdapterConfig);
+    await assertCanChangeOwnFallbacks(
+      req,
+      existing,
+      changedOwnFallbackFields({
+        existing,
+        nextFallbacks: hasOwn(rollbackConfig, "fallbacks") ? rollbackConfig.fallbacks : existing.fallbacks,
+        nextRuntimeConfig: rollbackConfig.runtimeConfig ?? {},
+      }),
+      "config_rollback",
+    );
     assertExternalInstructionsAdmin(req, existing);
     assertExternalInstructionsAdmin(req, {
       ...existing,
@@ -4845,6 +5016,7 @@ export function agentRoutes(
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
     const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, hireInput.adapterType, normalizedAdapterConfig, hireInput.runtimeConfig, hireInput.defaultEnvironmentId);
+    assertPrimaryHarnessModelCompatible(hireInput.adapterType, normalizedAdapterConfig);
     const normalizedHireInput = {
       ...withoutInheritedCreateAuthority(req, hireInput),
       adapterConfig: normalizedAdapterConfig,
@@ -5159,6 +5331,17 @@ export function agentRoutes(
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
+    assertPrimaryHarnessModelCompatible(createInput.adapterType, normalizedAdapterConfig);
+    const normalizedFallbacks = await normalizeAgentFallbacksForPersistence({
+      req,
+      companyId,
+      agentId,
+      agentName: createInput.name,
+      primaryAdapterType: createInput.adapterType,
+      primaryAdapterConfig: normalizedAdapterConfig,
+      requested: createInput.fallbacks ?? [],
+      existing: [],
+    });
     const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, createInput.adapterType, normalizedAdapterConfig, createInput.runtimeConfig, createInput.defaultEnvironmentId);
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
     await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
@@ -5175,6 +5358,7 @@ export function agentRoutes(
         ...createInput,
         adapterConfig: normalizedAdapterConfig,
         runtimeConfig: normalizedRuntimeConfig,
+        fallbacks: normalizedFallbacks,
         status: "idle",
         spentMonthlyCents: 0,
         lastHeartbeatAt: null,
@@ -5713,7 +5897,16 @@ export function agentRoutes(
     }));
   });
 
-  router.patch("/agents/:id", validate(updateAgentSchema), async (req, res) => {
+  // A merge-mode body carries merge patches (nulls remove keys); the handler
+  // validates the merged configs with the ordinary schemas.
+  const validateAgentPatchBody = (req: Request, res: Response, next: NextFunction) =>
+    validate(readObject(req.body)?.mergeConfig === true ? updateAgentMergePatchSchema : updateAgentSchema)(
+      req,
+      res,
+      next,
+    );
+
+  router.patch("/agents/:id", validateAgentPatchBody, async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
@@ -5724,7 +5917,48 @@ export function agentRoutes(
     }
 
     const patchData = { ...(req.body as Record<string, unknown>) };
-    const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
+    const mergeConfig = patchData.mergeConfig === true;
+    delete patchData.mergeConfig;
+    if (
+      mergeConfig
+      && (patchData.replaceAdapterConfig === true
+        || (patchData.adapterType !== undefined && patchData.adapterType !== existing.adapterType))
+    ) {
+      res.status(422).json({
+        error: "mergeConfig cannot be combined with replaceAdapterConfig or an adapterType change",
+      });
+      return;
+    }
+    // Merge mode applies adapterConfig and runtimeConfig as JSON merge patches
+    // over the stored (unredacted) config, so callers change one key without
+    // resending secrets. The merged result then takes the ordinary replace
+    // path; only the presence-based guards and the audit summary read the delta.
+    const configDelta: Record<string, unknown> = {};
+    if (mergeConfig) {
+      for (const key of ["adapterConfig", "runtimeConfig"] as const) {
+        if (!hasOwn(patchData, key)) continue;
+        const delta = asRecord(patchData[key]) ?? {};
+        configDelta[key] = delta;
+        patchData[key] = applyConfigMergePatch(
+          asRecord(existing[key]) ?? {},
+          delta,
+          key === "adapterConfig" ? isAtomicAdapterConfigPath : undefined,
+          key,
+        );
+      }
+      if (asRecord(configDelta.runtimeConfig)?.aiConnection === null) {
+        res.status(422).json({
+          error: "runtimeConfig.aiConnection can't be removed with a merge patch; change the agent's AI connection instead",
+        });
+        return;
+      }
+      const merged: Record<string, unknown> = updateAgentSchema
+        .pick({ adapterConfig: true, runtimeConfig: true })
+        .parse(Object.fromEntries(Object.keys(configDelta).map((key) => [key, patchData[key]])));
+      for (const key of Object.keys(configDelta)) patchData[key] = merged[key];
+    }
+    const replaceAdapterConfig =
+      patchData.replaceAdapterConfig === true || (mergeConfig && hasOwn(patchData, "adapterConfig"));
     delete patchData.replaceAdapterConfig;
     // The apply-existing flag is not an agent column. The server binds the fixed
     // reference to the owner stored value with no login round trip. Remove it
@@ -5772,8 +6006,20 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
-      assertNoAgentAdapterConfigMutation(req, adapterConfig);
-      const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
+      const requestedAdapterConfigKeys = asRecord(configDelta.adapterConfig) ?? adapterConfig;
+      if (mergeConfig) {
+        // The instructions keys are plain keys, so the keys that the caller sent are what changes.
+        // A merge replaces `workspaceStrategy` whole, so the delta says nothing about the host
+        // commands that it removes: compare the result with the stored config.
+        assertNoAgentInstructionsConfigMutation(req, requestedAdapterConfigKeys, "adapterConfig");
+        assertNoAgentHostWorkspaceCommandMutation(
+          req,
+          collectChangedAgentAdapterWorkspaceCommandPaths(existing.adapterConfig, adapterConfig),
+        );
+      } else {
+        assertNoAgentAdapterConfigMutation(req, requestedAdapterConfigKeys);
+      }
+      const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(requestedAdapterConfigKeys);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
       }
@@ -5894,6 +6140,35 @@ export function agentRoutes(
     // (see mergePatchedRuntimeConfig).
     const clearsAiBinding = requestedRuntimeConfig?.aiConnection === null && Boolean(existing.runtimeConfig.aiConnection);
     if (requestedRuntimeConfig) requestedRuntimeConfig = mergePatchedRuntimeConfig(existing.runtimeConfig, requestedRuntimeConfig);
+    const nextPrimaryAdapterConfig = asRecord(patchData.adapterConfig ?? existing.adapterConfig) ?? {};
+    if (touchesAdapterConfiguration) {
+      assertPrimaryHarnessModelCompatible(requestedAdapterType, nextPrimaryAdapterConfig);
+    }
+    if (hasOwn(patchData, "fallbacks") || touchesAdapterConfiguration) {
+      const normalizedFallbacks = await normalizeAgentFallbacksForPersistence({
+        req,
+        companyId: existing.companyId,
+        agentId: existing.id,
+        agentName: existing.name,
+        primaryAdapterType: requestedAdapterType,
+        primaryAdapterConfig: nextPrimaryAdapterConfig,
+        requested: hasOwn(patchData, "fallbacks")
+          ? (patchData.fallbacks as AgentFallbackTarget[])
+          : readAgentFallbacks(existing.fallbacks),
+        existing: existing.fallbacks,
+      });
+      if (hasOwn(patchData, "fallbacks")) patchData.fallbacks = normalizedFallbacks;
+    }
+    await assertCanChangeOwnFallbacks(
+      req,
+      existing,
+      changedOwnFallbackFields({
+        existing,
+        nextFallbacks: hasOwn(patchData, "fallbacks") ? patchData.fallbacks : existing.fallbacks,
+        nextRuntimeConfig: requestedRuntimeConfig ?? existing.runtimeConfig,
+      }),
+      "patch",
+    );
     const nextAiBinding = aiConnectionBindingSchema.safeParse((requestedRuntimeConfig ?? existing.runtimeConfig).aiConnection).data;
     if (nextAiBinding) {
       await assertCanUpdateAgent(req, existing);
@@ -5929,6 +6204,9 @@ export function agentRoutes(
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
       verifyLockedRow: lockedRowVerifier(req, existing, () => patchData, "patch_conflict"),
+      ...(mergeConfig
+        ? { expectedConfig: { adapterConfig: existing.adapterConfig, runtimeConfig: existing.runtimeConfig } }
+        : {}),
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5957,7 +6235,12 @@ export function agentRoutes(
       action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: { ...summarizeAgentUpdateDetails(patchData), ...(clearsAiBinding ? { aiConnectionCleared: true } : {}) },
+      details: {
+        ...(mergeConfig
+          ? { ...summarizeAgentUpdateDetails({ ...patchData, ...configDelta }), mergeConfig: true }
+          : summarizeAgentUpdateDetails(patchData)),
+        ...(clearsAiBinding ? { aiConnectionCleared: true } : {}),
+      },
     });
 
     res.json(redactAgentRowForResponse(agent));
@@ -6022,6 +6305,33 @@ export function agentRoutes(
     });
 
     res.json(redactAgentRowForResponse(agent));
+  });
+
+  // A board user's escape hatch: forget every quota cooldown of an agent, for
+  // example after a provider reset earlier than its error announced.
+  router.post("/agents/:id/harness-cooldowns/clear", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const existing = await getAccessibleAgent(req, res, id);
+    if (!existing) return;
+    await assertCanUpdateAgent(req, existing);
+    const targets = await harnessFallbackSvc.clearCooldowns(existing);
+    if (targets.length > 0) {
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: existing.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "agent.harness_cooldowns_cleared",
+        entityType: "agent",
+        entityId: existing.id,
+        details: { targets },
+      });
+    }
+    res.json({ cleared: targets.length });
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {
