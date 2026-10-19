@@ -5,6 +5,8 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { routinesApi } from "@/api/routines";
+import { queryKeys } from "@/lib/queryKeys";
 import {
   RoutineContextualSidebar,
   resolveRoutineDetailDestination,
@@ -110,5 +112,30 @@ describe("routine contextual navigation", () => {
     expect(container.querySelector('a[href="/routines/routine-1/activity"]'))
       .not.toBeNull();
     expect(container.textContent).not.toContain("History");
+  });
+  async function renderWithRoutine(triggers: Array<{ id: string; kind: string }>) {
+    vi.mocked(routinesApi.get).mockResolvedValue({ id: "routine-1", title: "Alerts", triggers } as never);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    flushSync(() => root.render(
+      <QueryClientProvider client={queryClient}>
+        <RoutineContextualSidebar routineId="routine-1" />
+      </QueryClientProvider>,
+    ));
+    await vi.waitFor(() =>
+      expect(queryClient.getQueryData(queryKeys.routines.detail("routine-1"))).toBeDefined(),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  it("links Event groups only for routines with an Event trigger", async () => {
+    await renderWithRoutine([{ id: "t1", kind: "event" }]);
+    await vi.waitFor(() =>
+      expect(container.querySelector('a[href="/routines/routine-1/event-groups"]')?.textContent).toBe("Event groups"),
+    );
+  });
+
+  it("omits Event groups for routines without an Event trigger", async () => {
+    await renderWithRoutine([{ id: "t1", kind: "schedule" }]);
+    expect(container.querySelector('a[href="/routines/routine-1/event-groups"]')).toBeNull();
   });
 });

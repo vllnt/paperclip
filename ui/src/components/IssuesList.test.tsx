@@ -2178,6 +2178,8 @@ describe("IssuesList", () => {
         (label) => label.textContent?.includes("Hide routine runs"),
       );
       expect(toggle).not.toBeUndefined();
+      // Alert issues opened by event triggers are routine runs too.
+      expect(toggle?.textContent).toContain("Also hides alert issues opened by event triggers");
     });
 
     await act(async () => {
