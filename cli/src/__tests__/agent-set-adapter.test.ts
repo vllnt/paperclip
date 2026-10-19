@@ -83,6 +83,22 @@ describe("agent set-adapter", () => {
     ]);
   });
 
+  it.each(["***REDACTED***", { type: "plain", value: "***REDACTED***" }])(
+    "refuses a redacted gateway URL %j without --xai-base-url before calling PATCH",
+    async (baseUrl) => {
+      const fetchMock = stubApi(codexAgent({
+        ...GROK_CONFIG,
+        env: { ...GROK_CONFIG.env, OPENAI_BASE_URL: baseUrl },
+      }));
+      const exit = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit"); }) as never);
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      await expect(run(["agent", "set-adapter", AGENT_ID, "grok_local"])).rejects.toThrow("exit");
+      expect(fetchMock.mock.calls.map((call) => call[1]?.method ?? "GET")).toEqual(["GET"]);
+      expect(error.mock.calls.flat().join(" ")).toMatch(/OPENAI_BASE_URL.*--xai-base-url/s);
+      exit.mockRestore();
+    },
+  );
+
   it("takes the gateway URL from --xai-base-url, because the API returns the Codex base URL redacted", async () => {
     const fetchMock = stubApi(codexAgent({
       model: "grok-4.7",

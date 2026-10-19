@@ -88,26 +88,49 @@ describe("planCodexToGrokSwitch", () => {
     expect(plan.warnings.join("\n")).toMatch(/XAI_API_KEY/);
   });
 
-  it("warns that a base URL the API returned redacted was not carried, and names the option that sets it", () => {
+  it.each([
+    ["***REDACTED***", undefined],
+    [{ type: "plain", value: "***REDACTED***" }, undefined],
+    ["***REDACTED***", "  "],
+    [{ type: "plain", value: "***REDACTED***" }, "  "],
+  ])("refuses a redacted endpoint %j with replacement %j before moving the gateway key", (baseUrl, xaiBaseUrl) => {
+    const agent = codexAgent({
+      model: "grok-4.7",
+      env: { OPENAI_BASE_URL: baseUrl, OPENAI_API_KEY: SECRET },
+    });
+    const before = structuredClone(agent);
+    const plan = planCodexToGrokSwitch(agent, { xaiBaseUrl });
+    expect(plan).toMatchObject({
+      ok: false,
+      reason: "invalid_base_url",
+      message: expect.stringMatching(/OPENAI_BASE_URL.*--xai-base-url/s),
+    });
+    expect(plan).not.toHaveProperty("patch");
+    expect(agent).toEqual(before);
+  });
+
+  it("keeps an existing Grok endpoint when the Codex endpoint is redacted", () => {
+    const endpoint = { type: "plain", value: "***REDACTED***" };
     const plan = planCodexToGrokSwitch(codexAgent({
       model: "grok-4.7",
-      env: { OPENAI_BASE_URL: { type: "plain", value: "***REDACTED***" }, OPENAI_API_KEY: SECRET },
+      env: { OPENAI_BASE_URL: endpoint, GROK_XAI_API_BASE_URL: endpoint, OPENAI_API_KEY: SECRET },
     }));
-    expect(plan.ok).toBe(true);
-    if (!plan.ok) return;
-    expect(plan.patch.adapterConfig.env).toEqual({ XAI_API_KEY: SECRET });
-    expect(plan.warnings.join("\n")).toMatch(/OPENAI_BASE_URL.*--xai-base-url/s);
+    expect(plan.ok && plan.patch.adapterConfig.env).toEqual({
+      GROK_XAI_API_BASE_URL: endpoint,
+      XAI_API_KEY: SECRET,
+    });
   });
 
   it("sets GROK_XAI_API_BASE_URL from the xaiBaseUrl option, over a redacted OPENAI_BASE_URL", () => {
     const plan = planCodexToGrokSwitch(
-      codexAgent({ model: "grok-4.7", env: { OPENAI_BASE_URL: { type: "plain", value: "***REDACTED***" } } }),
+      codexAgent({ model: "grok-4.7", env: { OPENAI_BASE_URL: { type: "plain", value: "***REDACTED***" }, OPENAI_API_KEY: SECRET } }),
       { xaiBaseUrl: " https://gateway.example/v1 " },
     );
     expect(plan.ok).toBe(true);
     if (!plan.ok) return;
     expect(plan.patch.adapterConfig.env).toEqual({
       GROK_XAI_API_BASE_URL: { type: "plain", value: "https://gateway.example/v1" },
+      XAI_API_KEY: SECRET,
     });
     expect(plan.warnings.join("\n")).not.toMatch(/--xai-base-url/);
   });

@@ -190,7 +190,11 @@ export function planCodexToGrokSwitch(source: GrokSwitchSource, options: GrokSwi
     } else if (isRedactedBinding(sourceEnv[from])) {
       changes.push(`env ${from} dropped (its plain-text value is not readable through the API)`);
       if (to === "GROK_XAI_API_BASE_URL") {
-        warnings.push(`OPENAI_BASE_URL was not carried: the API hides plain-text values. Enter the gateway URL (CLI: --xai-base-url), or Grok calls api.x.ai directly with the gateway key.`);
+        return {
+          ok: false,
+          reason: "invalid_base_url",
+          message: "OPENAI_BASE_URL is redacted. Enter the gateway URL (CLI: --xai-base-url) before switching so Grok does not send the gateway key to api.x.ai.",
+        };
       }
     } else {
       env[to] = structuredClone(sourceEnv[from]);

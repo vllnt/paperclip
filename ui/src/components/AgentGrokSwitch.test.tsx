@@ -84,7 +84,7 @@ describe("AgentGrokSwitchNotice", () => {
     expect(mockPushToast).toHaveBeenCalledWith(expect.objectContaining({ tone: "success" }));
   });
 
-  it("sends the gateway URL typed into the page, because the API returns the Codex base URL redacted", async () => {
+  it("blocks a redacted endpoint until the operator enters a replacement, then sends that URL with the gateway key", async () => {
     mockAgentsApi.update.mockResolvedValue({});
     render(makeAgent({
       adapterConfig: {
@@ -92,7 +92,9 @@ describe("AgentGrokSwitchNotice", () => {
         env: { OPENAI_API_KEY: SECRET, OPENAI_BASE_URL: { type: "plain", value: "***REDACTED***" } },
       },
     }));
-    expect(container.textContent).toContain("OPENAI_BASE_URL was not carried");
+    expect(container.querySelector("[data-testid='agent-grok-switch-apply']")).toBeNull();
+    expect(container.querySelector("[data-testid='agent-grok-switch-blocked']")?.textContent).toMatch(/OPENAI_BASE_URL.*--xai-base-url/s);
+    expect(mockAgentsApi.update).not.toHaveBeenCalled();
 
     const input = container.querySelector<HTMLInputElement>("[data-testid='agent-grok-switch-base-url']")!;
     const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
@@ -100,7 +102,7 @@ describe("AgentGrokSwitchNotice", () => {
       setValue.call(input, "https://gateway.example/v1");
       input.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    expect(container.textContent).not.toContain("OPENAI_BASE_URL was not carried");
+    expect(container.querySelector("[data-testid='agent-grok-switch-blocked']")).toBeNull();
     flushSync(() => container.querySelector<HTMLButtonElement>("[data-testid='agent-grok-switch-apply']")!.click());
     await flush();
 
