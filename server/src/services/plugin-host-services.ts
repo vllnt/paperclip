@@ -79,6 +79,8 @@ import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
+import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
+import { currentPluginHostCallAgent } from "./plugin-host-call-actor.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
 import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 import {
@@ -713,6 +715,43 @@ export function buildHostServices(
   const secretsHandler = createPluginSecretsHandler({ db, pluginId });
   const companies = companyService(db);
   const agents = agentService(db);
+
+  /**
+   * Pausing or resuming an agent is board-only on the routes, and resuming one
+   * needs `agents:configure` for an agent caller. A plugin call started by an
+   * agent keeps that rule: the agent behind the call needs `agents:configure`
+   * for the target, so a plugin cannot resume a budget-paused agent (including
+   * the caller) for it. Board, user, and system calls keep their access.
+   */
+  async function assertAgentCallerMayChangeStatus(
+    agent: { id: string; companyId: string },
+    change: "pause" | "resume",
+  ) {
+    const caller = currentPluginHostCallAgent();
+    if (!caller) return;
+    await assertAgentProtectedChangeGranted({
+      actor: { type: "agent", agentId: caller.agentId, companyId: caller.companyId, runId: caller.runId, source: "agent_jwt" },
+      decide: (request) => authorizationService(db).decide(request),
+      recordDenial: async (details) => {
+        await logActivity(db, {
+          companyId: agent.companyId,
+          actorType: "agent",
+          actorId: caller.agentId,
+          agentId: caller.agentId,
+          runId: caller.runId,
+          action: "agent.self_config_update_denied",
+          entityType: "agent",
+          entityId: agent.id,
+          details,
+        });
+      },
+      target: agent,
+      fields: ["status"],
+      surface: "plugin_status_change",
+      details: { sourcePluginKey: pluginKey, change },
+    });
+  }
+
   const managedAgents = pluginManagedAgentService(db, {
     pluginId,
     pluginKey,
@@ -1125,6 +1164,22 @@ export function buildHostServices(
     }));
   };
 
+  /**
+   * The actor of an issue write that a plugin makes. When the host knows the agent behind the call
+   * (`currentPluginHostCallAgent`), that agent is the actor, with its run, and nothing the worker
+   * sends can remove it or put a user in its place. Otherwise the fields that the worker sent are used.
+   * A write with no actor at all cannot lift a block that the board or a person owns.
+   */
+  function issueWriteActor(requested: { actorAgentId?: unknown; actorUserId?: unknown; actorRunId?: unknown }) {
+    const caller = currentPluginHostCallAgent();
+    if (caller) return { actorAgentId: caller.agentId, actorUserId: null, actorRunId: caller.runId };
+    return {
+      actorAgentId: typeof requested.actorAgentId === "string" ? requested.actorAgentId : null,
+      actorUserId: typeof requested.actorUserId === "string" ? requested.actorUserId : null,
+      actorRunId: typeof requested.actorRunId === "string" ? requested.actorRunId : null,
+    };
+  }
+
   const setBlockedByWithActivity = async (params: {
     issueId: string;
     companyId: string;
@@ -1136,10 +1191,11 @@ export function buildHostServices(
   }) => {
     const existing = requireInCompany("Issue", await issues.getById(params.issueId), params.companyId);
     const previous = await issues.getRelationSummaries(params.issueId);
+    const writer = issueWriteActor(params);
     await issues.update(params.issueId, {
       blockedByIssueIds: params.blockedByIssueIds,
-      actorAgentId: params.actorAgentId ?? null,
-      actorUserId: params.actorUserId ?? null,
+      actorAgentId: writer.actorAgentId,
+      actorUserId: writer.actorUserId,
     } as any);
     const relations = await issues.getRelationSummaries(params.issueId);
     await logPluginActivity({
@@ -1148,9 +1204,9 @@ export function buildHostServices(
       entityType: "issue",
       entityId: params.issueId,
       actor: {
-        actorAgentId: params.actorAgentId,
-        actorUserId: params.actorUserId,
-        actorRunId: params.actorRunId,
+        actorAgentId: writer.actorAgentId,
+        actorUserId: writer.actorUserId,
+        actorRunId: writer.actorRunId,
       },
       details: {
         identifier: existing.identifier,
@@ -2012,9 +2068,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const patch = { ...(params.patch as Record<string, unknown>) };
-        const actorAgentId = typeof patch.actorAgentId === "string" ? patch.actorAgentId : null;
-        const actorUserId = typeof patch.actorUserId === "string" ? patch.actorUserId : null;
-        const actorRunId = typeof patch.actorRunId === "string" ? patch.actorRunId : null;
+        const { actorAgentId, actorUserId, actorRunId } = issueWriteActor(patch);
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
@@ -2863,6 +2917,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
+        await assertAgentCallerMayChangeStatus({ id: params.agentId, companyId }, "pause");
         return (await agents.pause(params.agentId)) as Agent;
       },
       async resume(params) {
@@ -2870,6 +2925,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
+        await assertAgentCallerMayChangeStatus({ id: params.agentId, companyId }, "resume");
         return (await agents.resume(params.agentId)) as Agent;
       },
       async invoke(params) {

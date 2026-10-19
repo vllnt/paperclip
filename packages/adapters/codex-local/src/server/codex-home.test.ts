@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CODEX_HOME_SEED_MAX_BYTES } from "@paperclipai/adapter-utils/codex-home-seed";
 import {
   CODEX_SYNC_ALLOWLIST,
   codexHomeHasUsableAuth,
@@ -1100,7 +1101,7 @@ describe("stageCodexHomeForSync", () => {
     let staged: string | null = null;
     try {
       const { home, authBytes, skillBytes } = await buildFakeHome(root);
-      staged = await stageCodexHomeForSync(home, { runId: "run-1" });
+      staged = await stageCodexHomeForSync(home);
 
       const entries = (await fs.readdir(staged)).sort();
       expect(entries).toEqual([...CODEX_SYNC_ALLOWLIST].sort());
@@ -1134,7 +1135,7 @@ describe("stageCodexHomeForSync", () => {
     let staged: string | null = null;
     try {
       const { home } = await buildFakeHome(root);
-      staged = await stageCodexHomeForSync(home, { runId: "run-mode" });
+      staged = await stageCodexHomeForSync(home);
       const mode = (await fs.stat(path.join(staged, "auth.json"))).mode & 0o777;
       expect(mode).toBe(0o600);
     } finally {
@@ -1158,7 +1159,7 @@ describe("stageCodexHomeForSync", () => {
         "[mcp_servers.paperclip]\nheaders = { Authorization = \"Bearer secret-token\" }\n",
         { mode: 0o600 },
       );
-      staged = await stageCodexHomeForSync(home, { runId: "run-toml-mode" });
+      staged = await stageCodexHomeForSync(home);
       const mode = (await fs.stat(path.join(staged, "config.toml"))).mode & 0o777;
       expect(mode).toBe(0o600);
     } finally {
@@ -1174,7 +1175,7 @@ describe("stageCodexHomeForSync", () => {
     let staged: string | null = null;
     try {
       const { home } = await buildFakeHome(root);
-      staged = await stageCodexHomeForSync(home, { runId: "run-all-mode" });
+      staged = await stageCodexHomeForSync(home);
       for (const entry of ["auth.json", "config.toml", "config.json", "instructions.md"]) {
         const mode = (await fs.stat(path.join(staged, entry))).mode & 0o777;
         expect(mode, `${entry} should be staged 0600`).toBe(0o600);
@@ -1191,7 +1192,7 @@ describe("stageCodexHomeForSync", () => {
     let staged: string | null = null;
     try {
       const { home } = await buildFakeHome(root);
-      staged = await stageCodexHomeForSync(home, { runId: "run-dir" });
+      staged = await stageCodexHomeForSync(home);
       const mode = (await fs.stat(staged)).mode & 0o777;
       expect(mode).toBe(0o700);
     } finally {
@@ -1209,7 +1210,7 @@ describe("stageCodexHomeForSync", () => {
       await fs.mkdir(home, { recursive: true });
       await fs.writeFile(path.join(home, "config.toml"), "x\n", "utf8");
 
-      staged = await stageCodexHomeForSync(home, { runId: "run-absent" });
+      staged = await stageCodexHomeForSync(home);
       const entries = await fs.readdir(staged);
       expect(entries).toEqual(["config.toml"]);
     } finally {
@@ -1227,7 +1228,7 @@ describe("stageCodexHomeForSync", () => {
       await fs.symlink(path.join(root, "gone", "auth.json"), path.join(home, "auth.json"));
       await fs.writeFile(path.join(home, "config.toml"), "x\n", "utf8");
 
-      staged = await stageCodexHomeForSync(home, { runId: "run-dangling" });
+      staged = await stageCodexHomeForSync(home);
       expect(await fs.readdir(staged)).toEqual(["config.toml"]);
     } finally {
       if (staged) await fs.rm(staged, { recursive: true, force: true });
@@ -1253,7 +1254,7 @@ describe("stageCodexHomeForSync", () => {
         Object.assign(new Error("boom"), { code: "EACCES" }),
       );
 
-      await expect(stageCodexHomeForSync(home, { runId: "run-fail" })).rejects.toThrow("boom");
+      await expect(stageCodexHomeForSync(home)).rejects.toThrow("boom");
       expect(createdDir).not.toBeNull();
       // The staged temp dir was cleaned up despite the failure.
       await expect(fs.access(createdDir as unknown as string)).rejects.toMatchObject({ code: "ENOENT" });
@@ -1278,7 +1279,7 @@ describe("stageCodexHomeForSync", () => {
       // A normal skill file — must still be staged.
       await fs.writeFile(path.join(home, "skills", "legit.md"), "# ok\n", "utf8");
 
-      staged = await stageCodexHomeForSync(home, { runId: "run-circular" });
+      staged = await stageCodexHomeForSync(home);
       const stagedSkillEntries = await fs.readdir(path.join(staged, "skills"));
       // Circular link must be absent.
       expect(stagedSkillEntries).not.toContain("loop.md");
@@ -1302,7 +1303,7 @@ describe("stageCodexHomeForSync", () => {
       await fs.writeFile(path.join(home, "skills", "my-skill", "SKILL.md"), "# skill\n", { mode: 0o644 });
       await fs.writeFile(path.join(home, "skills", "my-skill", "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
 
-      staged = await stageCodexHomeForSync(home, { runId: "run-skill-mode" });
+      staged = await stageCodexHomeForSync(home);
       for (const rel of ["my-skill/SKILL.md", "my-skill/run.sh"]) {
         const mode = (await fs.stat(path.join(staged, "skills", rel))).mode & 0o777;
         expect(mode, `skills/${rel} mode`).toBe(rel.endsWith(".sh") ? 0o700 : 0o600);
@@ -1330,7 +1331,7 @@ describe("stageCodexHomeForSync", () => {
       // directory already on the active traversal path; must be skipped.
       await fs.symlink(".", path.join(skillDir, "back"));
 
-      staged = await stageCodexHomeForSync(home, { runId: "run-cycle" });
+      staged = await stageCodexHomeForSync(home);
 
       // Completed without hanging; the real file is staged and the cyclic link
       // produced no runaway nested `back/back/…` chain (it is skipped entirely).
@@ -1368,7 +1369,7 @@ describe("stageCodexHomeForSync", () => {
       await fs.symlink(secretFile, path.join(skillDir, "stolen.txt"));
       await fs.symlink(secretDir, path.join(skillDir, "stolen-dir"));
 
-      staged = await stageCodexHomeForSync(home, { runId: "run-escape" });
+      staged = await stageCodexHomeForSync(home);
 
       const stagedEntries = await fs.readdir(path.join(staged, "skills", "my-skill"));
       // The legit in-skill file is staged…
@@ -1398,7 +1399,7 @@ describe("stageCodexHomeForSync", () => {
       // `up -> ..` resolves to the home dir (an ancestor of skills/).
       await fs.symlink("..", path.join(home, "skills", "up"));
 
-      staged = await stageCodexHomeForSync(home, { runId: "run-ancestor" });
+      staged = await stageCodexHomeForSync(home);
 
       const stagedSkillEntries = await fs.readdir(path.join(staged, "skills"));
       expect(stagedSkillEntries).toContain("legit.md");
@@ -1512,6 +1513,39 @@ describe("worker Codex file seeding", () => {
     });
   });
 
+  it.each(["symlink", "credentials", "oversized", "directory"] as const)(
+    "refuses unsafe extra entries from an external Codex home: %s",
+    async (kind) => {
+      await withHomes(async ({ root, sharedHome }) => {
+        const entry = "notes.md";
+        const source = path.join(sharedHome, entry);
+        if (kind === "symlink") {
+          const outside = path.join(root, "outside.md");
+          await fs.writeFile(outside, "synthetic private contents");
+          await fs.symlink(outside, source);
+        } else if (kind === "credentials") {
+          await fs.writeFile(source, 'OPENAI_API_KEY="synthetic-test-credential"');
+        } else if (kind === "oversized") {
+          await fs.writeFile(source, "x".repeat(CODEX_HOME_SEED_MAX_BYTES + 1));
+        } else {
+          await fs.mkdir(source);
+          await fs.writeFile(path.join(source, "nested.md"), "synthetic private contents");
+        }
+
+        const staged = await stageCodexHomeForSync(sharedHome, {
+          extraEntries: [entry, "RTK.md"],
+        });
+        try {
+          expect(await fs.readdir(staged)).toEqual(["RTK.md"]);
+          expect(await fs.readFile(path.join(staged, "RTK.md"), "utf8")).toBe("# RTK\n");
+          expect((await fs.stat(path.join(staged, "RTK.md"))).mode & 0o777).toBe(0o600);
+        } finally {
+          await fs.rm(staged, { recursive: true, force: true });
+        }
+      });
+    },
+  );
+
   it("stages the seeded files for a sandbox run", async () => {
     await withHomes(async ({ sharedHome, agentHome }) => {
       await seedManagedCodexHome(agentHome, { CODEX_HOME: sharedHome }, async () => {}, {
@@ -1520,11 +1554,13 @@ describe("worker Codex file seeding", () => {
       await fs.writeFile(path.join(agentHome, "unrelated.sqlite"), "x");
 
       const staged = await stageCodexHomeForSync(agentHome, {
-        runId: "run-seed",
         extraEntries: ["AGENTS.md", "hooks.json"],
       });
       try {
         expect((await fs.readdir(staged)).sort()).toEqual(["AGENTS.md", "hooks.json"]);
+        const stagedAgents = await fs.readFile(path.join(staged, "AGENTS.md"), "utf8");
+        expect(stagedAgents).toBe(await fs.readFile(path.join(agentHome, "AGENTS.md"), "utf8"));
+        expect(stagedAgents.match(/BEGIN PAPERCLIP WORKER SEED/g)).toHaveLength(1);
       } finally {
         await fs.rm(staged, { recursive: true, force: true });
       }

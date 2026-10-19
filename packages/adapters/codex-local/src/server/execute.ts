@@ -54,6 +54,7 @@ import {
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
+import { removePaperclipTempDir } from "@paperclipai/adapter-utils/paperclip-temp";
 import {
   parseLocalProcessFilesystemScope,
   parseLocalProcessSandboxExtraPaths,
@@ -818,8 +819,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // large runtime state (`sessions/`, `*.sqlite`, `plugins/`, …) that the
           // 4-name denylist missed and that a sandbox run never needs.
           stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, {
-            runId,
             extraEntries: resolveCodexHomeSeedSelection(config.codexHomeSeed, process.env).names,
+            onLog,
           });
           return await prepareAdapterExecutionTargetRuntime({
             runId,
@@ -1480,11 +1481,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const providerQuota =
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&
-        isCodexProviderQuotaError({
-          stdout: attempt.proc.stdout,
-          stderr: attempt.proc.stderr,
-          errorMessage: fallbackErrorMessage,
-        });
+        isCodexProviderQuotaError({ errorMessage: parsedError });
       const transientUpstream =
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&
@@ -1624,7 +1621,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // (teardown AND error), never only the happy path. Cleanup failure is
     // logged, not fatal — a leaked temp dir must not crash the run.
     if (stagedCodexHomeDir) {
-      await fs.rm(stagedCodexHomeDir, { recursive: true, force: true }).catch(async (error) => {
+      await removePaperclipTempDir(stagedCodexHomeDir).catch(async (error) => {
         await onLog(
           "stderr",
           `[paperclip] Failed to remove staged Codex home "${stagedCodexHomeDir}": ${

@@ -34,6 +34,7 @@ export type {
 } from "./sandbox-managed-runtime.js";
 import {
   createCommandManagedSandboxCallbackBridgeQueueClient,
+  formatSandboxCallbackBridgeSlowPickup,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
@@ -1575,6 +1576,18 @@ export async function cleanupGitHubOperationLaunchers(input: GitHubLauncherLocat
   }
 }
 
+/** Error code of a pre-dispatch remote probe that failed for a transient reason. */
+export const REMOTE_PREFLIGHT_UNAVAILABLE_CODE = "remote_preflight_unavailable";
+
+/**
+ * The remote execution target could not be reached in time before dispatch
+ * (an SSH connection failure, exit 255, or the probe timed out). Retrying
+ * later can succeed, unlike a missing directory or a broken login profile.
+ */
+export class RemotePreflightUnavailableError extends Error {
+  readonly code = REMOTE_PREFLIGHT_UNAVAILABLE_CODE;
+}
+
 async function githubOperationLauncherBasePath(
   target: AdapterCommandCapableExecutionTarget | null,
   env: Record<string, string>,
@@ -1594,7 +1607,10 @@ async function githubOperationLauncherBasePath(
   });
   // Frame the value so login banners cannot become executable search paths.
   const remotePath = result.stdout.match(/\0([^\0]+)\0/)?.[1];
-  if (result.timedOut || result.exitCode !== 0 || !remotePath) {
+  if (result.timedOut || result.exitCode === 255) {
+    throw new RemotePreflightUnavailableError("Could not resolve remote PATH for managed GitHub launchers");
+  }
+  if (result.exitCode !== 0 || !remotePath) {
     throw new Error("Could not resolve remote PATH for managed GitHub launchers");
   }
   return remotePath;
@@ -1714,9 +1730,113 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
   };
 }
 
-/** Stage token-free launchers next to the execution, not in shared global Git config. */
+const GITHUB_LAUNCHER_STAGING_TIMEOUT_MS = 15_000;
+const GITHUB_LAUNCHER_STAGING_RETRY_DELAYS_MS: readonly number[] = [1_000, 3_000];
+const GITHUB_LAUNCHER_STAGING_DETAIL_LIMIT = 300;
+
+interface GitHubLauncherStagingFailure {
+  step: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  detail: string;
+}
+
+/**
+ * The remote staging of the managed GitHub launchers failed on every attempt.
+ * It names the step that failed last, its exit code, whether it timed out and
+ * the tail of its output, so a failed run row says why. The staging used to
+ * throw one fixed string and drop all of this.
+ */
+export class GitHubLauncherStagingError extends Error {
+  readonly step: string;
+  readonly exitCode: number | null;
+  readonly timedOut: boolean;
+  /** Last characters of the failed step's stderr (or stdout), trimmed. */
+  readonly detail: string;
+  readonly attempts: number;
+
+  constructor(failure: GitHubLauncherStagingFailure & { attempts: number }) {
+    const outcome = failure.timedOut
+      ? `timed out after ${GITHUB_LAUNCHER_STAGING_TIMEOUT_MS / 1000} s`
+      : failure.exitCode === null ? "failed" : `failed with exit code ${failure.exitCode}`;
+    const tries = failure.attempts === 1 ? "1 attempt" : `${failure.attempts} attempts`;
+    super(
+      `Could not prepare managed GitHub launchers: ${failure.step} ${outcome} (${tries})` +
+        (failure.detail ? `: ${failure.detail}` : ""),
+    );
+    this.name = "GitHubLauncherStagingError";
+    this.step = failure.step;
+    this.exitCode = failure.exitCode;
+    this.timedOut = failure.timedOut;
+    this.detail = failure.detail;
+    this.attempts = failure.attempts;
+  }
+}
+
+function launcherStagingDetail(...outputs: string[]): string {
+  const text = outputs.map((output) => output.trim()).find((output) => output.length > 0) ?? "";
+  return text.length > GITHUB_LAUNCHER_STAGING_DETAIL_LIMIT ? text.slice(-GITHUB_LAUNCHER_STAGING_DETAIL_LIMIT) : text;
+}
+
+/**
+ * One pass over the remote staging: every launcher file, then the permissions.
+ * A pass is safe to run again. Each file is content-hash-skipped, written under
+ * a lock and renamed into place, and `chmod` plus `mkdir -p` are idempotent, so
+ * a pass that timed out part-way can be repeated without a torn file.
+ * Returns the failure instead of throwing so the caller can count attempts.
+ */
+async function stageRemoteGitHubLaunchers(input: {
+  remote: AdapterExecutionTarget & { kind: "remote" };
+  directory: string;
+  configDirectory: string;
+  files: Record<string, string>;
+}): Promise<GitHubLauncherStagingFailure | null> {
+  const { remote, directory, configDirectory, files } = input;
+  const runner = adapterExecutionTargetCommandRunner(remote);
+  for (const [program, body] of Object.entries(files)) {
+    try {
+      await syncRemoteTextFileWithHashSkip({
+        runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
+        remotePath: path.posix.join(directory, program), body,
+        label: "GitHub operation launcher", action: "stage GitHub operation launcher",
+        lockDir: path.posix.join(directory, `.${program}.lock`),
+        timeoutMs: GITHUB_LAUNCHER_STAGING_TIMEOUT_MS, shellCommand: adapterExecutionTargetShellCommand(remote),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { step: `staging ${program}`, exitCode: null, timedOut: /timed out/i.test(message), detail: launcherStagingDetail(message) };
+    }
+  }
+  const step = "setting launcher permissions";
+  try {
+    const permissions = await runner.execute({
+      command: "sh",
+      args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh ${shellQuote(directory)}/paperclip-ssh-sign && mkdir -p ${shellQuote(configDirectory)}`],
+      cwd: remote.remoteCwd, timeoutMs: GITHUB_LAUNCHER_STAGING_TIMEOUT_MS,
+    });
+    if (permissions.exitCode === 0 && !permissions.timedOut) return null;
+    return {
+      step, exitCode: permissions.exitCode, timedOut: permissions.timedOut,
+      detail: launcherStagingDetail(permissions.stderr, permissions.stdout),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { step, exitCode: null, timedOut: /timed out/i.test(message), detail: launcherStagingDetail(message) };
+  }
+}
+
+/**
+ * Stage token-free launchers next to the execution, not in shared global Git config.
+ *
+ * A remote target needs eleven round trips (ten files, then the permissions). One slow or dropped exec on a loaded
+ * worker used to end the run, so a failed pass is repeated, with a short
+ * backoff, before it fails as a {@link GitHubLauncherStagingError}.
+ *
+ * @param input.retryDelaysMs Wait before retry N; its length is the retry budget.
+ */
 export async function prepareGitHubOperationLaunchers(input: {
   runId: string; target: AdapterExecutionTarget | null | undefined; cwd: string; env: Record<string, string>;
+  retryDelaysMs?: readonly number[];
 }): Promise<Record<string, string>> {
   const remote = input.target?.kind === "remote" ? input.target : null;
   const directory = githubOperationLauncherDirectory(input);
@@ -1741,18 +1861,14 @@ export async function prepareGitHubOperationLaunchers(input: {
     ...[".zshenv", ".zprofile", ".zshrc", ".bash_profile", ".bashrc", ".profile"].map((name) => [name, profile] as const),
   ]);
   if (remote) {
-    const runner = adapterExecutionTargetCommandRunner(remote);
-    for (const [program, body] of Object.entries(files)) {
-      await syncRemoteTextFileWithHashSkip({
-        runner, remoteCwd: remote.remoteCwd, remoteDir: directory,
-        remotePath: path.posix.join(directory, program), body,
-        label: "GitHub operation launcher", action: "stage GitHub operation launcher",
-        lockDir: path.posix.join(directory, `.${program}.lock`),
-        timeoutMs: 15_000, shellCommand: adapterExecutionTargetShellCommand(remote),
-      });
+    const retryDelaysMs = input.retryDelaysMs ?? GITHUB_LAUNCHER_STAGING_RETRY_DELAYS_MS;
+    for (let attempt = 1; ; attempt += 1) {
+      const failure = await stageRemoteGitHubLaunchers({ remote, directory, configDirectory, files });
+      if (!failure) break;
+      const delayMs = retryDelaysMs[attempt - 1];
+      if (delayMs === undefined) throw new GitHubLauncherStagingError({ ...failure, attempts: attempt });
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
     }
-    const permissions = await runner.execute({ command: "sh", args: ["-c", `chmod 700 ${shellQuote(directory)}/git ${shellQuote(directory)}/gh ${shellQuote(directory)}/paperclip-ssh-sign && mkdir -p ${shellQuote(configDirectory)}`], cwd: remote.remoteCwd, timeoutMs: 15_000 });
-    if (permissions.exitCode !== 0) throw new Error("Could not prepare managed GitHub launchers");
   } else {
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     await fs.mkdir(configDirectory, { recursive: true, mode: 0o700 });
@@ -4864,6 +4980,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       maxBodyBytes,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
+      // A request the worker picked up late goes to the run log, without
+      // waiting for it: the operator's measure of pickup delay.
+      onSlowPickup: (pickup) => {
+        void Promise.resolve().then(() => onLog("stdout", formatSandboxCallbackBridgeSlowPickup(pickup))).catch(() => undefined);
+      },
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
         reservation: options?.reservation,
@@ -4879,6 +5000,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       timeoutMs: bridgeTimeoutMs,
       maxBodyBytes,
       shellCommand,
+      runId: input.runId,
     });
   } catch (error) {
     await Promise.allSettled([

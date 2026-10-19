@@ -167,6 +167,8 @@ export async function seedCodexHomeFiles(input: {
   sourceHome: string;
   targetHome: string;
   selection: CodexHomeSeedSelection;
+  /** Defaults to merging worker notes; staging an already prepared home copies them unchanged. */
+  mergeAgentsInstructions?: boolean;
   onLog: SeedLog;
 }): Promise<SeedCodexHomeFilesResult> {
   const { sourceHome, targetHome, selection, onLog } = input;
@@ -198,7 +200,7 @@ export async function seedCodexHomeFiles(input: {
         continue;
       }
       let next = source.content;
-      if (name === CODEX_HOME_SEED_AGENTS_FILE) {
+      if (name === CODEX_HOME_SEED_AGENTS_FILE && input.mergeAgentsInstructions !== false) {
         const current = existing ? await fs.readFile(target, "utf8") : "";
         next = mergeAgentsFile(current, source.content);
         if (next === current) {

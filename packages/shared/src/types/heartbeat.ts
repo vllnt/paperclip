@@ -359,6 +359,83 @@ export interface AgentWakeupRequest {
   updatedAt: Date;
 }
 
+/** One agent's deferred-wake queue: wakes parked behind an issue's execution lock. */
+export interface DeferredWakeAgentStats {
+  agentId: string;
+  agentName: string;
+  /** Wakes currently parked as `deferred_issue_execution`. */
+  deferredCount: number;
+  /** When the oldest parked wake was requested; `null` when nothing is parked. */
+  oldestDeferredAt: Date | null;
+  /** How long the oldest parked wake has waited. A growing value is a stall. */
+  oldestDeferredAgeSeconds: number | null;
+  /** Wakes requested in the last 24 hours that were promoted into a run. */
+  promotedLast24h: number;
+}
+
+/**
+ * Counters for the deferred-wake redelivery sweep for ONE company since the
+ * server last started. They never include another company's activity, and
+ * they are not durable.
+ */
+export interface DeferredWakeSweepCounters {
+  /** This company's orphaned wakes read: parked with no run left to promote them. */
+  examined: number;
+  promoted: number;
+  /** Retired by admission instead of started (for example, skipped as final). */
+  retired: number;
+  /** Left parked after admission declined to start them yet. */
+  stillDeferred: number;
+  /** Not woken: a pause hold, an execution blocker or an operator Stop. The sum of the three below. */
+  skippedHeld: number;
+  /** Held by an active subtree pause hold on the issue. */
+  skippedPauseHold: number;
+  /** Held by an execution blocker (a recovery action or an unreleased execution) that awaits an operator. */
+  skippedExecutionBlocker: number;
+  /** Held by an operator Stop of the issue's latest run. */
+  skippedOperatorStop: number;
+  /** Not woken: a company, agent or project budget hard stop. */
+  skippedBudget: number;
+  skippedNotInvokable: number;
+  /** Issues with an eligible wake that a pass left for later: no free agent slot, or the per-pass cap. */
+  skippedCapacity: number;
+  /** Execution blockers behind `skippedExecutionBlocker`, counted by their cause. */
+  executionBlockerCauses: Record<string, number>;
+  failed: number;
+  /** When the sweep last read one of this company's orphaned wakes. */
+  lastExaminedAt: Date | null;
+}
+
+/**
+ * Why a company's parked wakes are parked, read from durable state, so it holds
+ * across restarts and whichever process answers. The classes are exclusive.
+ */
+export interface DeferredWakeParkedBreakdown {
+  /** On a done, cancelled, hidden or deleted issue; the next run's release retires the wake. */
+  closedIssue: number;
+  /** Parked by an execution-recovery gate, counted by that gate's reason. The sweep leaves these to the recovery. */
+  awaitingRecovery: Record<string, number>;
+  /** Behind a held issue lock or a live run; the release drain promotes it. */
+  behindIssueLock: number;
+  /** Owned by another recovery: a queued-comment interrupt, a limit-parked self-reblock wake, chat input. */
+  otherRecovery: number;
+  /** The wake's agent is paused, terminated or awaiting approval; the sweep leaves it parked until the agent resumes. */
+  heldAgent: number;
+  /** No lock, no live run, no recovery wait, an active agent: the periodic sweep's own work. */
+  orphaned: number;
+}
+
+export interface DeferredWakeStats {
+  generatedAt: Date;
+  deferredTotal: number;
+  promotedLast24h: number;
+  oldestDeferredAt: Date | null;
+  oldestDeferredAgeSeconds: number | null;
+  agents: DeferredWakeAgentStats[];
+  parked: DeferredWakeParkedBreakdown;
+  sweep: DeferredWakeSweepCounters;
+}
+
 export interface InstanceSchedulerHeartbeatAgent {
   id: string;
   companyId: string;
