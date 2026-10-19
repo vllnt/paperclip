@@ -1,6 +1,8 @@
 cli/src/__tests__/search-parity.test.ts
 packages/adapter-utils/src/directory-merge-lock.test.ts
+packages/adapter-utils/src/log-value-redaction.test.ts
 packages/adapter-utils/src/paperclip-temp.test.ts
+packages/adapter-utils/src/redact-env-for-logs.test.ts
 packages/adapter-utils/src/remote-process-identity.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-idle-poll.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-lifecycle.test.ts
@@ -19,6 +21,8 @@ server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
+server/src/__tests__/run-log-chunk-compactor.test.ts
+server/src/__tests__/run-log-redaction-policy.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/AgentCharacterRuntime.test.ts
 ui/src/components/CommandPalette.real.test.tsx
