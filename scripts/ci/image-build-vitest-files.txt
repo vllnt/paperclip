@@ -58,6 +58,10 @@ server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
+server/src/__tests__/periodic-heartbeat-recovery.test.ts
+server/src/__tests__/run-log-chunk-compactor.test.ts
+server/src/__tests__/run-log-redaction-policy.test.ts
+server/src/modules/run-dispatch/domain/policy.test.ts
 server/src/__tests__/routine-gate-command.test.ts
 server/src/__tests__/routine-gate-outcome.test.ts
 server/src/__tests__/routine-gate-source.test.ts

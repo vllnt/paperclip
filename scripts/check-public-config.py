@@ -17,6 +17,9 @@ PUBLISHED_EXCEPTIONS = frozenset({
     # Tailnet gateway host mapping in deploy/compose*.yaml; replaced by
     # PAPERCLIP_AI_GATEWAY_HOST and PAPERCLIP_AI_GATEWAY_HOST_IP.
     "6e3d56d8f52a0a9e9cc00978e394e7c253c02c2a",
+    # Redaction test fixtures with a literal key header (fake base64 bodies only);
+    # server/src/__tests__ now builds the header at runtime.
+    "af8ec238f327fabcccfaf9db3e10e8d8e4562b68",
 })
 COMMIT_MARKER = "\0commit "
 
