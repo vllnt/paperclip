@@ -2103,10 +2103,17 @@
       "breakpoints": true
     },
     {
-      "idx": 303,
+      "idx": 302,
       "version": "7",
-      "when": 1792371010803,
-      "tag": "0303_illegal_rattler",
+      "when": 1792371010802,
+      "tag": "0302_wise_professor_monster",
+      "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1792371010804,
+      "tag": "0304_illegal_rattler",
       "breakpoints": true
     }
   ]

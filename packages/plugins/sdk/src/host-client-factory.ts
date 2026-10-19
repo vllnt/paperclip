@@ -159,13 +159,16 @@ export interface HostServices {
 
   /** Provides `activity.log`. */
   activity: {
-    log(params: {
-      companyId: string;
-      message: string;
-      entityType?: string;
-      entityId?: string;
-      metadata?: Record<string, unknown>;
-    }): Promise<void>;
+    log(
+      params: {
+        companyId: string;
+        message: string;
+        entityType?: string;
+        entityId?: string;
+        metadata?: Record<string, unknown>;
+      },
+      context?: WorkerHostCallContext,
+    ): Promise<void>;
   };
 
   /** Provides `metrics.write`. */
@@ -795,8 +798,8 @@ export function createHostClientHandlers(
     }),
 
     // Activity
-    "activity.log": gated("activity.log", async (params) => {
-      return services.activity.log(params);
+    "activity.log": gated("activity.log", async (params, context) => {
+      return services.activity.log(params, context);
     }),
 
     // Metrics
