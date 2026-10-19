@@ -1,3 +1,4 @@
+import { companyRunTiersSchema } from "../run-profile.js";
 import { z } from "zod";
 import { DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE } from "../types/feedback.js";
 import {
@@ -32,6 +33,8 @@ export const instanceGeneralSettingsSchema = z.object({
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
   companyEnvironmentDefaults: z.record(z.string().guid(), z.string().guid()).optional(),
+  /** Named run tiers and the agent allowlist, keyed by company ID. */
+  companyRunTiers: z.record(z.string().guid(), companyRunTiersSchema).optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z
