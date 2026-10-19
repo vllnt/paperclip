@@ -4,9 +4,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import {
   activityLog,
   agents,
+  authUsers,
   agentRuntimeState,
   agentWakeupRequests,
   companies,
+  companyMemberships,
   companySkills,
   costEvents,
   createDb,
@@ -147,6 +149,7 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       try {
         await db.transaction(async (tx) => {
           await tx.delete(companySkills);
+          await tx.delete(companyMemberships);
           await tx.delete(companies);
         });
         break;
@@ -169,6 +172,15 @@ describeEmbeddedPostgres("issue wake loop guard", () => {
       issuePrefix: `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+    });
+    // Agents act within their responsible user's access, so that user must
+    // exist and be an active member for a later run to reuse the task's workspace.
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible user", email: "responsible-user@example.test",
+      createdAt: new Date(), updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
     });
     return companyId;
   }
