@@ -29,6 +29,15 @@ import { InlineEntitySelector, type InlineEntityOption } from "../components/Inl
 import { MarkdownEditor, type MarkdownEditorRef, type MentionOption } from "../components/MarkdownEditor";
 import { RoutineListRow, nextRoutineStatus } from "../components/RoutineList";
 import {
+  ROUTINE_FILTER_PARAM_KEYS,
+  RoutineListFilterBar,
+  changeSearchParams,
+  hasActiveRoutineFilters,
+  readRoutineUrlFilters,
+  routineListQueryFromFilters,
+  useRoutineSearchDraft,
+} from "../components/RoutineListFilters";
+import {
   RoutineRunVariablesDialog,
   type RoutineRunDialogSubmitData,
 } from "../components/RoutineRunVariablesDialog";
@@ -113,14 +122,16 @@ const defaultRoutineViewState: RoutineViewState = {
   collapsedGroups: [],
 };
 
-function getRoutineViewState(key: string): RoutineViewState {
+const embeddedRoutineViewState: RoutineViewState = { ...defaultRoutineViewState, groupBy: "none" };
+
+function getRoutineViewState(key: string, defaults: RoutineViewState = defaultRoutineViewState): RoutineViewState {
   try {
     const raw = localStorage.getItem(key);
-    if (raw) return { ...defaultRoutineViewState, ...JSON.parse(raw) };
+    if (raw) return { ...defaults, ...JSON.parse(raw) };
   } catch {
     // Ignore malformed local state and fall back to defaults.
   }
-  return { ...defaultRoutineViewState };
+  return { ...defaults };
 }
 
 function saveRoutineViewState(key: string, state: RoutineViewState) {
@@ -311,7 +322,17 @@ function RoutineSectionHeader({
   );
 }
 
-export function Routines() {
+/** Options for showing the routine list inside another page (the agent page's Routines tab). */
+export interface RoutinesProps {
+  /** Fixes the agent filter and pre-fills new routines with this agent. */
+  fixedAssigneeAgentId?: string;
+  /** Drops the page heading, breadcrumbs and legacy tabs. */
+  embedded?: boolean;
+  /** Routines shown elsewhere on the same page, such as a built-in agent's managed routine. */
+  excludeRoutineIds?: readonly string[];
+}
+
+export function Routines({ fixedAssigneeAgentId, embedded = false, excludeRoutineIds }: RoutinesProps = {}) {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
@@ -336,7 +357,11 @@ export function Routines() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
   const legacyRunsRequested = searchParams.get("tab") === "runs";
-  const activeTab: RoutinesTab = !streamlinedUiEnabled && legacyRunsRequested ? "runs" : "routines";
+  const activeTab: RoutinesTab = !embedded && !streamlinedUiEnabled && legacyRunsRequested ? "runs" : "routines";
+  const urlFilters = readRoutineUrlFilters(searchParams);
+  const listFilters = routineListQueryFromFilters(urlFilters, fixedAssigneeAgentId);
+  const filtersActive = hasActiveRoutineFilters(urlFilters, fixedAssigneeAgentId);
+  const [searchDraft, setSearchDraft] = useRoutineSearchDraft();
   const [draft, setDraft] = useState<{
     title: string;
     description: string;
@@ -352,29 +377,31 @@ export function Routines() {
     description: "",
     projectId: "",
     folderId: null,
-    assigneeAgentId: "",
+    assigneeAgentId: fixedAssigneeAgentId ?? "",
     priority: "medium",
     concurrencyPolicy: "coalesce_if_active",
     catchUpPolicy: "skip_missed",
     variables: [],
   });
-  const routineViewStateKey = selectedCompanyId
-    ? `paperclip:routines-view:${selectedCompanyId}`
-    : "paperclip:routines-view";
-  const [routineViewState, setRoutineViewState] = useState<RoutineViewState>(() => getRoutineViewState(routineViewStateKey));
+  const routineViewStateKey = `paperclip:${embedded ? "agent-routines-view" : "routines-view"}${selectedCompanyId ? `:${selectedCompanyId}` : ""}`;
+  const routineViewDefaults = embedded ? embeddedRoutineViewState : defaultRoutineViewState;
+  const [routineViewState, setRoutineViewState] = useState<RoutineViewState>(() => getRoutineViewState(routineViewStateKey, routineViewDefaults));
   const folderSelection = normalizeFolderSelection(searchParams.get("folder"));
 
   useEffect(() => {
+    if (embedded) return;
     setBreadcrumbs([{ label: "Routines" }]);
-  }, [setBreadcrumbs]);
+  }, [embedded, setBreadcrumbs]);
 
   useEffect(() => {
-    setRoutineViewState(getRoutineViewState(routineViewStateKey));
-  }, [routineViewStateKey]);
+    setRoutineViewState(getRoutineViewState(routineViewStateKey, routineViewDefaults));
+  }, [routineViewDefaults, routineViewStateKey]);
 
   const { data: routines, isLoading, error } = useQuery({
-    queryKey: queryKeys.routines.list(selectedCompanyId!),
-    queryFn: () => routinesApi.list(selectedCompanyId!),
+    queryKey: queryKeys.routines.list(selectedCompanyId!, listFilters),
+    queryFn: () => routinesApi.list(selectedCompanyId!, listFilters),
+    // Keep the last list on screen while a filter change loads, but never carry it into another company.
+    placeholderData: (previous, previousQuery) => (previousQuery?.queryKey[1] === selectedCompanyId ? previous : undefined),
     enabled: !!selectedCompanyId,
   });
   const { data: routineFolders, isLoading: foldersLoading } = useQuery({
@@ -642,9 +669,11 @@ export function Routines() {
     () => new Map((routineFolders?.folders ?? []).map((folder) => [folder.id, folder])),
     [routineFolders],
   );
+  const excludedRoutineIds = useMemo(() => new Set(excludeRoutineIds ?? []), [excludeRoutineIds]);
   const visibleRoutines = useMemo(
-    () => (routines ?? []).filter((routine) => routine.status !== "archived"),
-    [routines],
+    () => (routines ?? []).filter((routine) =>
+      (urlFilters.status === "archived" || routine.status !== "archived") && !excludedRoutineIds.has(routine.id)),
+    [excludedRoutineIds, routines, urlFilters.status],
   );
   const liveIssueIds = useMemo(
     () => collectLiveIssueIds(liveRuns, routineExecutionIssues),
@@ -717,14 +746,26 @@ export function Routines() {
     });
   }
 
+  function setRoutineFilterParam(key: (typeof ROUTINE_FILTER_PARAM_KEYS)[number], value: string | null) {
+    changeSearchParams(setSearchParams, (params) => {
+      if (value) params.set(key, value);
+      else params.delete(key);
+    });
+  }
+
+  function clearRoutineFilters() {
+    setSearchDraft("");
+    changeSearchParams(setSearchParams, (params) => {
+      for (const key of ROUTINE_FILTER_PARAM_KEYS) params.delete(key);
+    });
+  }
+
   function setFolderSelection(selection: FolderSelection) {
-    setSearchParams((current) => {
-      const params = new URLSearchParams(current);
+    changeSearchParams(setSearchParams, (params) => {
       const value = folderSearchValue(selection);
       if (value) params.set("folder", value);
       else params.delete("folder");
-      return params;
-    });
+    }, {});
   }
 
   function openCreateFolder(moveItemIds: string[] = []) {
@@ -737,6 +778,7 @@ export function Routines() {
     setDraft((current) => ({
       ...current,
       folderId: folderSelection === "all" || folderSelection === "unfiled" ? null : folderSelection,
+      ...(fixedAssigneeAgentId ? { assigneeAgentId: fixedAssigneeAgentId } : {}),
     }));
     setComposerOpen(true);
   }
@@ -844,26 +886,28 @@ export function Routines() {
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="space-y-1">
-          <h1 className="text-xl font-bold">Routines</h1>
-          <p className="text-sm text-muted-foreground">
-            Recurring work definitions that materialize into auditable execution tasks.
-          </p>
-        </div>
+        {embedded ? null : (
+          <div className="space-y-1">
+            <h1 className="text-xl font-bold">Routines</h1>
+            <p className="text-sm text-muted-foreground">
+              Recurring work definitions that materialize into auditable execution tasks.
+            </p>
+          </div>
+        )}
         <div className="flex items-center gap-2">
-          {streamlinedUiEnabled ? (
+          {streamlinedUiEnabled && !embedded ? (
             <Button variant="outline" asChild>
               <Link to={auditSectionHref("runs", {})}>View all runs</Link>
             </Button>
           ) : null}
           <Button onClick={openCreateRoutine}>
             <Plus className="mr-2 h-4 w-4" />
-            Create routine
+            {embedded ? "New routine" : "Create routine"}
           </Button>
         </div>
       </div>
 
-      {!streamlinedUiEnabled ? (
+      {!streamlinedUiEnabled && !embedded ? (
         <Tabs value={activeTab} onValueChange={handleLegacyTabChange}>
           <PageTabBar
             align="start"
@@ -968,6 +1012,15 @@ export function Routines() {
               ) : null}
           </div>
         </div>
+        <RoutineListFilterBar
+          searchDraft={searchDraft}
+          onSearchDraftChange={setSearchDraft}
+          filters={urlFilters}
+          agents={fixedAssigneeAgentId ? undefined : (agents ?? []).map((agent) => ({ id: agent.id, name: agent.name }))}
+          onFilterChange={setRoutineFilterParam}
+          onClear={clearRoutineFilters}
+          active={filtersActive}
+        />
         {routineViewState.groupBy === "folder" ? (
           <div className="md:hidden">
             <FolderChip
@@ -1313,11 +1366,19 @@ export function Routines() {
               }}
             />
           ) : null}
-          {visibleRoutines.length === 0 ? (
+          {visibleRoutines.length === 0 && filtersActive ? (
+            <div className="py-12">
+              <EmptyState icon={Repeat} message="No routines match these filters. Use Clear filters to see them all." />
+            </div>
+          ) : visibleRoutines.length === 0 ? (
             <div className="py-12">
               <EmptyState
                 icon={Repeat}
-                message="No active routines. Use Create routine to define the first recurring workflow."
+                message={!embedded
+                  ? "No active routines. Use Create routine to define the first recurring workflow."
+                  : excludeRoutineIds?.length
+                    ? "No other routines are assigned to this agent. Use New routine to add one."
+                    : "No routines are assigned to this agent yet. Use New routine to create one."}
               />
             </div>
           ) : sortedRoutines.length === 0 ? (

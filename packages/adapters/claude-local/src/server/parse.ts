@@ -6,6 +6,7 @@ import {
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
+import { isProviderQuotaMessage, parseProviderQuotaResetAt } from "@paperclipai/adapter-utils/provider-quota";
 
 // The legacy login-prompt markers. The Claude CLI prints these words when it
 // asks the user to log in. The detector matches them against the parsed result
@@ -528,8 +529,9 @@ export function extractClaudeRetryNotBefore(
 ): Date | null {
   const haystack = buildClaudeTransientHaystack(input);
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
-  if (!match) return null;
-  return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
+  const clockReset = match ? parseClaudeResetClockTime(match[1] ?? "", now, match[2]) : null;
+  if (clockReset) return clockReset;
+  return isProviderQuotaMessage(haystack) ? parseProviderQuotaResetAt(haystack, now) : null;
 }
 
 export function isClaudeTransientUpstreamError(input: {
@@ -580,5 +582,5 @@ export function isClaudeProviderQuotaError(input: {
   const errorFields = parsed && parsed.is_error !== true ? { errors: parsed.errors } : parsed;
   const haystack = buildClaudeTransientHaystack({ errorMessage: input.errorMessage, parsed: errorFields });
   if (!haystack) return false;
-  return CLAUDE_PROVIDER_QUOTA_RE.test(haystack);
+  return CLAUDE_PROVIDER_QUOTA_RE.test(haystack) || isProviderQuotaMessage(haystack);
 }

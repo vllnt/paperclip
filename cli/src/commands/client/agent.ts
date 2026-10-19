@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import {
+  agentFallbacksSchema,
   agentSkillSyncSchema,
   createAgentSchema,
   resetAgentSessionSchema,
@@ -57,6 +58,10 @@ interface AgentWakeOptions extends BaseClientOptions {
   payload?: string;
   idempotencyKey?: string;
   forceFreshSession?: boolean;
+}
+
+interface AgentFallbacksSetOptions extends BaseClientOptions {
+  fallbacksJson: string;
 }
 
 interface AgentJsonPayloadOptions extends BaseClientOptions {
@@ -459,6 +464,61 @@ export function registerAgentCommands(program: Command): void {
 
   addCommonClientOptions(
     agent
+      .command("fallbacks:set")
+      .description(
+        "Set an agent's ordered harness/model fallback chain. Env values that hold credentials must be secret references.",
+      )
+      .argument("<agentId>", "Agent ID")
+      .requiredOption(
+        "--fallbacks-json <json>",
+        'Fallback entries, for example [{"adapterType":"codex_local","model":"gpt-5.5","effort":"high","env":{"OPENAI_API_KEY":{"type":"secret_ref","secretId":"<id>"}}}]',
+      )
+      .action(async (agentId: string, opts: AgentFallbacksSetOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const fallbacks = agentFallbacksSchema.parse(parseJson(opts.fallbacksJson));
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, { fallbacks });
+          printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("fallbacks:clear")
+      .description("Remove an agent's fallback chain; runs use only the primary harness and model")
+      .argument("<agentId>", "Agent ID")
+      .action(async (agentId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const updated = await ctx.api.patch<Agent>(apiPath`/api/agents/${agentId}`, { fallbacks: [] });
+          printOutput(updated, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
+      .command("cooldowns:clear")
+      .description("Clear an agent's provider quota cooldowns so its next run may use any harness and model")
+      .argument("<agentId>", "Agent ID")
+      .action(async (agentId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const result = await ctx.api.post(apiPath`/api/agents/${agentId}/harness-cooldowns/clear`, {});
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    agent
       .command("delete")
       .description("Delete an agent")
       .argument("<agentId>", "Agent ID")
@@ -480,7 +540,6 @@ export function registerAgentCommands(program: Command): void {
     ["resume", "resume", "Resume an agent"],
     ["approve", "approve", "Approve a pending agent"],
     ["terminate", "terminate", "Terminate an agent"],
-    ["heartbeat:invoke", "heartbeat/invoke", "Invoke an agent heartbeat"],
     ["claude-login", "claude-login", "Trigger Claude login for an agent"],
   ] as const) {
     addCommonClientOptions(
@@ -499,6 +558,24 @@ export function registerAgentCommands(program: Command): void {
         }),
     );
   }
+
+  addCommonClientOptions(
+    agent
+      .command("heartbeat:invoke")
+      .description("Invoke an agent heartbeat, optionally for one assigned issue")
+      .argument("<agentId>", "Agent ID")
+      .option("--issue <issueId>", "Wake the agent for this issue (sends payload.issueId)")
+      .action(async (agentId: string, opts: BaseClientOptions & { issue?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const body = opts.issue ? { payload: { issueId: opts.issue } } : {};
+          const result = await ctx.api.post(`${apiPath`/api/agents/${agentId}`}/heartbeat/invoke`, body);
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
 
   addCommonClientOptions(
     agent

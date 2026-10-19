@@ -86,7 +86,13 @@ export const gitHubOperationSchema = z.object({
   /** The launcher shortened the command to report it. */
   truncated: z.boolean().optional(),
 });
-export type GitHubOperation = z.infer<typeof gitHubOperationSchema>;
+/**
+ * The agent and run an operation came from. The server sets it from the run's own token with
+ * {@link attachGitHubCaller}; the launcher's report can never name them (the schema above has no such field and
+ * drops one), so no command can claim to come from another agent.
+ */
+export interface GitHubOperationCaller { agentId: string; runId: string }
+export type GitHubOperation = z.infer<typeof gitHubOperationSchema> & { caller?: GitHubOperationCaller };
 
 /** A launcher body that names an operation Paperclip cannot read. */
 export const UNREADABLE_GITHUB_OPERATION = "unreadable" as const;
@@ -102,6 +108,14 @@ export function readGitHubOperation(body: unknown): GitHubOperation | typeof UNR
 export function parseGitHubOperation(body: unknown): GitHubOperation | null {
   const operation = readGitHubOperation(body);
   return operation === UNREADABLE_GITHUB_OPERATION ? null : operation;
+}
+
+/**
+ * The reported operation with the run that sent it, taken from the run's token on the server (never from the
+ * report). Scoped privileged grants match on this agent. A report that is missing or unreadable stays as it is.
+ */
+export function attachGitHubCaller<T extends GitHubOperation | typeof UNREADABLE_GITHUB_OPERATION | null>(operation: T, run: { agentId: string; runId: string }): T {
+  return operation && typeof operation === "object" ? { ...operation, caller: { agentId: run.agentId, runId: run.runId } } : operation;
 }
 
 /** Values of gh flags that always hold free text, never a repository or URL selector. */
@@ -273,6 +287,10 @@ export interface ClassifiedGitHubOperation {
    * plugin lets it through without the toggle only when every path is the base branch's own.
    */
   workflowPush?: GitHubWorkflowPush;
+  /** The endpoint of a `gh api` write that needs `editWorkflows`: the plugin records it with the allowed write. */
+  route?: string;
+  /** The agent and run that sent the command, when the server attached them (see {@link GitHubOperationCaller}). */
+  caller?: GitHubOperationCaller;
 }
 
 /** A reported command Paperclip could not read: it is treated as a write it cannot check. */
@@ -447,6 +465,8 @@ export function classifyGitHubOperation(reported: GitHubOperation): ClassifiedGi
     ...(retarget ? { retarget: true as const } : {}),
     ...(branchRewrites ? { branchRewrites } : {}),
     ...(workflowPush ? { workflowPush } : {}),
+    ...(command.route ? { route: command.route } : {}),
+    ...(operation.caller ? { caller: operation.caller } : {}),
     ...(operation.program === "git" && command.action === "commit" ? { signing: true } : {}),
   };
 }
@@ -550,6 +570,8 @@ export async function resolveGitHubWriteIdentityDecision(
       wiki: operation.wiki, pullRequest: operation.pullRequest, expectedHeadSha: operation.expectedHeadSha,
       ...(operation.merge ? { merge: true } : {}), ...(operation.autoMerge ? { autoMerge: true } : {}), ...(operation.retarget ? { retarget: true } : {}),
       ...(operation.workflowPush ? { workflowPush: operation.workflowPush } : {}),
+      ...(operation.route ? { route: operation.route } : {}),
+      ...(operation.caller ? { agentId: operation.caller.agentId, runId: operation.caller.runId } : {}),
       ...(input.fallback ? { fallback: true } : {}),
     }, 15_000);
     return raw === null ? UNAVAILABLE : decisionSchema.parse(raw) as GitHubWriteIdentityDecision;

@@ -156,6 +156,31 @@ describe("runBoundedShutdown", () => {
     expect(clean).toHaveBeenCalledWith(0);
   });
 
+  it("reports a forced exit when the teardown timeout runs before the hard-deadline callback", async () => {
+    vi.useFakeTimers();
+    const schedule = globalThis.setTimeout;
+    const timer = vi.spyOn(globalThis, "setTimeout").mockImplementationOnce(
+      (callback, delay, ...args) => schedule(callback, (delay ?? 0) + 1, ...args),
+    );
+    const exit = vi.fn();
+    const log = stubLogger();
+    const { steps: s } = steps({ finalize: () => new Promise<void>(() => {}) });
+
+    try {
+      const done = runBoundedShutdown({ signal: "SIGTERM", budgetMs: 300, steps: s, log, exit });
+      await vi.advanceTimersByTimeAsync(300);
+      await done;
+
+      expect(exit).toHaveBeenCalledExactlyOnceWith(SHUTDOWN_FORCED_EXIT_CODE);
+      expect(log.info).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "hard_deadline", code: 70 }),
+        "shutdown exiting",
+      );
+    } finally {
+      timer.mockRestore();
+    }
+  });
+
   it("aborts a scheduler step that outlives its 10 seconds, and starts the drain only after it settled", async () => {
     vi.useFakeTimers();
     const events: string[] = [];
