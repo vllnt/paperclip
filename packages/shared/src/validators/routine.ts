@@ -20,6 +20,7 @@ import {
 import { envConfigSchema } from "./secret.js";
 import { isValidRoutineDateString } from "../routine-variables.js";
 import { transientRetryPolicySchema } from "../transient-retry-policy.js";
+import { eventGroupingSchema, eventMatchSchema } from "../event-sources.js";
 import { objectWithoutDefaults } from "./partial.js";
 
 const routineVariableValueSchema = z.union([z.string(), z.number().finite(), z.boolean()]);
@@ -130,6 +131,12 @@ export const routineRevisionSnapshotTriggerV1Schema = z.object({
   publicId: z.string().nullable(),
   signingMode: z.enum(ROUTINE_TRIGGER_SIGNING_MODES).nullable(),
   replayWindowSec: z.number().int().min(30).max(86_400).nullable(),
+  // Present on `event` triggers only, so snapshots of every other trigger kind
+  // keep their exact stored shape.
+  eventSourceId: z.string().guid().nullable().optional(),
+  eventMatch: eventMatchSchema.nullable().optional(),
+  eventGrouping: eventGroupingSchema.nullable().optional(),
+  fallback: z.boolean().optional(),
 }).strict();
 
 export const routineRevisionSnapshotV1Schema = z.object({
@@ -162,6 +169,13 @@ export const createRoutineTriggerSchema = z.discriminatedUnion("kind", [
   baseTriggerSchema.extend({
     kind: z.literal("api"),
   }),
+  baseTriggerSchema.extend({
+    kind: z.literal("event"),
+    eventSourceId: z.string().guid(),
+    eventMatch: eventMatchSchema.optional().nullable(),
+    eventGrouping: eventGroupingSchema.optional(),
+    fallback: z.boolean().optional().default(false),
+  }),
 ]);
 
 export type CreateRoutineTrigger = z.infer<typeof createRoutineTriggerSchema>;
@@ -175,6 +189,10 @@ export const updateRoutineTriggerSchema = z.object({
   timezone: z.string().trim().min(1).optional().nullable(),
   signingMode: z.enum(ROUTINE_TRIGGER_SIGNING_MODES).optional().nullable(),
   replayWindowSec: z.number().int().min(30).max(86_400).optional().nullable(),
+  eventSourceId: z.string().guid().optional(),
+  eventMatch: eventMatchSchema.optional().nullable(),
+  eventGrouping: eventGroupingSchema.optional(),
+  fallback: z.boolean().optional(),
 });
 
 export type UpdateRoutineTrigger = z.infer<typeof updateRoutineTriggerSchema>;

@@ -45,6 +45,32 @@ object: `adapterConfig` (keys that override the agent's adapter config for runs 
 `useProjectWorkspace` (boolean). Unknown keys are rejected before the request is sent. Use only one of the
 two options.
 
+### Issue Recovery Actions
+
+```sh
+# Open recovery actions across a company, newest first
+npx paperclipai issue recovery-actions:list [-C <company-id>] [--status active,escalated] [--limit 50] [--json]
+
+# The open recovery action of one issue
+npx paperclipai issue recovery-actions <issue-id>
+
+# Resolve a recovery action
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  [--action-id <id>] [--resolution-note "..."]
+
+# Resolve an execution recovery with a reconciliation (board only)
+npx paperclipai issue recovery:resolve <issue-id> --outcome restored --source-issue-status todo \
+  --reconciliation-run-id <run-id> --provider-stopped --action-outcome completed \
+  --outcome-evidence "..." [--workspace-repair-evidence "..."]
+```
+
+`recovery-actions:list` statuses are `active`, `escalated`, `resolved`, and
+`cancelled`; the default is the open ones (`active,escalated`). The limit is
+1-200 (default 50). The list is read-only and does not re-check stale actions.
+For `recovery:resolve`, any reconciliation flag sends an `executionReconciliation`
+object; `--provider-stopped` is required in that case, and evidence texts need
+20-12000 characters.
+
 ### Issue Tree
 
 ```sh
@@ -204,6 +230,25 @@ npx paperclipai approval resubmit <approval-id> [--payload '{"..."}']
 npx paperclipai approval comment <approval-id> --body "..."
 ```
 
+## Event Source Commands
+
+External signed events that wake routines. See `docs/api/event-sources.md`.
+
+```sh
+npx paperclipai event-sources list --company-id <id> [--include-archived]
+
+# Board only. The ingress URL and signing secret are shown once.
+npx paperclipai event-sources create --company-id <id> --name "Gatus" [--signing-mode hmac_sha256|bearer] [--normalizer generic_v1|gatus]
+
+# Board only. The previous secret stops working immediately.
+npx paperclipai event-sources rotate <source-id>
+
+# Dry run: shows each stage and writes nothing
+npx paperclipai event-sources test <source-id> --file event.json
+
+npx paperclipai event-sources deliveries <source-id> [--status failed] [--limit 50] [--cursor <cursor>]
+```
+
 ## Activity Commands
 
 ```sh
@@ -242,6 +287,31 @@ npx paperclipai run stats --since 7d --agent-id <agent-id> --json
 `runsToday` counts what `runtimeConfig.heartbeat.maxDailyRuns` counts: runs started in the current UTC day that
 are not queued or waiting to retry, less the provider quota failures that the cap forgives (see
 `providerQuotaRetry.maxDailyUncountedRuns`).
+
+## Plugin Actions
+
+Plugin actions that the board UI runs also work from the CLI with a board API key (from
+`paperclipai auth login`), with no browser session. The CLI sends the company from `-C`, `PAPERCLIP_COMPANY_ID`
+or the context profile; the server overrides any `companyId` inside `--params-json` with it.
+
+```sh
+# GitHub write identity and user authorization (set/check/start need a board key whose user is an instance admin)
+npx paperclipai plugin action vllnt.paperclip-github write-identity.get --params-json '{}'
+npx paperclipai plugin action vllnt.paperclip-github write-identity.set --params-file policy.json
+npx paperclipai plugin action vllnt.paperclip-github user-authorization.status --params-json '{}'
+npx paperclipai plugin action vllnt.paperclip-github user-authorization.check --params-json '{}'
+
+# Repositories and sync
+npx paperclipai plugin action vllnt.paperclip-github repositories.list --params-json '{"refresh":true}'
+npx paperclipai plugin action vllnt.paperclip-github sync.trigger --params-json '{}'
+
+# Update a PR branch from its base (board-only; the head SHA must match)
+npx paperclipai plugin action vllnt.paperclip-github manage-repository \
+  --params-json '{"op":"update-branch","repositoryId":123,"number":45,"sha":"<head-sha>","requestId":"update-45-1"}'
+```
+
+Board-only GitHub actions refuse an agent credential with "board-only, but it was called with an agent credential".
+Use `paperclipai auth whoami` to check which credential the CLI is using.
 
 ## Heartbeat
 
