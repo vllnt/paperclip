@@ -33,6 +33,7 @@ server/src/__tests__/routine-gate-command.test.ts
 server/src/__tests__/routine-gate-outcome.test.ts
 server/src/__tests__/routine-gate-source.test.ts
 server/src/__tests__/routine-gate-worker.test.ts
+server/src/__tests__/routine-gate-worker.test.ts
 server/src/__tests__/run-log-chunk-compactor.test.ts
 server/src/__tests__/run-log-redaction-policy.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx

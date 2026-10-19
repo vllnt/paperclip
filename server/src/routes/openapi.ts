@@ -4895,6 +4895,26 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/routines/{id}/gate/test",
+  tags: ["routines"],
+  summary: "Test a routine gate without dispatching",
+  description:
+    "Runs the configured gate once without creating a routine run, issue, or wake. " +
+    "Available to board users and the routine's assigned agent. Returns the redacted gate result " +
+    "and a verdict of wake, skip, fail_open, or unavailable. Returns 422 when no gate is configured.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/routines/{id}/triggers",
   tags: ["routines"],
   summary: "Create a routine trigger",
