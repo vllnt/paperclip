@@ -1454,6 +1454,11 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/routines/r-1/triggers" },
       { method: "PATCH", path: "/api/routine-triggers/t-1" },
       { method: "DELETE", path: "/api/routine-triggers/t-1" },
+      { method: "GET", path: "/api/routines/r-1/event-groups" },
+      { method: "GET", path: "/api/companies/co-1/event-sources" },
+      { method: "GET", path: "/api/event-sources/es-1" },
+      { method: "GET", path: "/api/event-sources/es-1/deliveries" },
+      { method: "POST", path: "/api/event-sources/es-1/test" },
     ];
     for (const request of allowed) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
@@ -1493,6 +1498,12 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/companies/co-1/logo" },
       { method: "GET", path: "/api/companies/co-1/secrets" },
       { method: "PATCH", path: "/api/secrets/secret-1" },
+      // Sources are board-managed; only reads and the dry run are reachable.
+      { method: "POST", path: "/api/companies/co-1/event-sources" },
+      { method: "PATCH", path: "/api/event-sources/es-1" },
+      { method: "DELETE", path: "/api/event-sources/es-1" },
+      { method: "POST", path: "/api/event-sources/es-1/rotate-secret" },
+      { method: "POST", path: "/api/event-sources/public/abc/events" },
     ];
     for (const request of denied) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
@@ -1611,6 +1622,45 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/companies/../skills" },
       { method: "POST", path: "/api/companies/co.1/skills/import" },
       { method: "POST", path: "/api/companies/co\\1/skills" },
+    ];
+    for (const request of denied) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
+        `Route not allowed: ${request.method} ${request.path}`,
+      );
+    }
+  });
+
+  it("admits the agent wakeup route and nothing next to it", () => {
+    expect(
+      authorizeSandboxCallbackBridgeRequestWithRoutes({
+        method: "POST",
+        path: "/api/agents/6c75cff9-f7cf-4745-a84c-4ddf8eea7e76/wakeup",
+      }),
+    ).toBeNull();
+
+    const denied: Array<{ method: string; path: string }> = [
+      { method: "GET", path: "/api/agents/agent-1/wakeup" },
+      { method: "PUT", path: "/api/agents/agent-1/wakeup" },
+      { method: "PATCH", path: "/api/agents/agent-1/wakeup" },
+      { method: "DELETE", path: "/api/agents/agent-1/wakeup" },
+      // The legacy wake route reads its body without schema validation; it stays denied.
+      { method: "POST", path: "/api/agents/agent-1/heartbeat/invoke" },
+      { method: "POST", path: "/api/agents/agent-1/wakeup/x" },
+      { method: "POST", path: "/api/agents/agent-1/wakeup/" },
+      { method: "POST", path: "/api/agents/agent-1/x/wakeup" },
+      { method: "POST", path: "/api/agents//wakeup" },
+      // queue_v1 forwards the raw path: no encoded, dot, query, fragment or backslash segment may ride on the rule.
+      { method: "POST", path: "/api/agents/agent-1%2fx/wakeup" },
+      { method: "POST", path: "/api/agents/..%2Fagent-1/wakeup" },
+      { method: "POST", path: "/api/agents/../wakeup" },
+      { method: "POST", path: "/api/agents/./wakeup" },
+      { method: "POST", path: "/api/agents/%2e%2e/wakeup" },
+      { method: "POST", path: "/api/agents/agent.1/wakeup" },
+      { method: "POST", path: "/api/agents/agent-1/wakeup?failedRunId=run-1" },
+      { method: "POST", path: "/api/agents/agent-1?/wakeup" },
+      { method: "POST", path: "/api/agents/agent-1#/wakeup" },
+      { method: "POST", path: "/api/agents/agent-1/wakeup#x" },
+      { method: "POST", path: "/api/agents/agent-1\\x/wakeup" },
     ];
     for (const request of denied) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(

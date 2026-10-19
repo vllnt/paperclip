@@ -70,6 +70,20 @@ describe("agent lifecycle commands", () => {
     ]);
   });
 
+  it("targets one issue with heartbeat:invoke --issue and keeps the empty body without it", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+    const ISSUE_ID = "44444444-4444-4444-8444-444444444444";
+
+    await run(["agent", "heartbeat:invoke", AGENT_ID, "--issue", ISSUE_ID]);
+    await run(["agent", "heartbeat:invoke", AGENT_ID]);
+
+    expect(fetchMock.mock.calls.map((call) => [call[0], JSON.parse(call[1].body)])).toEqual([
+      [`http://localhost:3100/api/agents/${AGENT_ID}/heartbeat/invoke`, { payload: { issueId: ISSUE_ID } }],
+      [`http://localhost:3100/api/agents/${AGENT_ID}/heartbeat/invoke`, {}],
+    ]);
+  });
+
   it("wraps configuration, runtime, skills, and instructions endpoints", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);
@@ -117,6 +131,39 @@ describe("agent lifecycle commands", () => {
       ["PUT", `http://localhost:3100/api/agents/${AGENT_ID}/instructions-bundle/file`],
       ["DELETE", `http://localhost:3100/api/agents/${AGENT_ID}/instructions-bundle/file?path=AGENTS.md`],
     ]);
+  });
+
+  it("diffs one config revision client-side in text and JSON", async () => {
+    const revision = {
+      id: REVISION_ID,
+      agentId: AGENT_ID,
+      changedKeys: ["adapterConfig", "budgetMonthlyCents"],
+      beforeConfig: { budgetMonthlyCents: 1000, adapterConfig: { model: "a", env: { K: { type: "plain", value: "***REDACTED***" } } } },
+      afterConfig: { budgetMonthlyCents: 2000, adapterConfig: { model: "b", env: { K: { type: "plain", value: "***REDACTED***" } } } },
+    };
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(revision)));
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await run(["agent", "config-revision:diff", AGENT_ID, REVISION_ID]);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      `http://localhost:3100/api/agents/${AGENT_ID}/config-revisions/${REVISION_ID}`,
+    );
+    expect(log.mock.calls.map((call) => call[0])).toEqual([
+      'adapterConfig.model: "a" -> "b"',
+      "budgetMonthlyCents: 1000 -> 2000",
+    ]);
+
+    log.mockClear();
+    await run(["agent", "config-revision:diff", AGENT_ID, REVISION_ID, "--json"]);
+    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual({
+      changedKeys: ["adapterConfig", "budgetMonthlyCents"],
+      changes: [
+        { path: "adapterConfig.model", kind: "changed", before: "a", after: "b" },
+        { path: "budgetMonthlyCents", kind: "changed", before: 1000, after: 2000 },
+      ],
+      redactedOnlyKeys: [],
+    });
   });
 });
 

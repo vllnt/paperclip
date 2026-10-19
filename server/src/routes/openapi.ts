@@ -6,6 +6,7 @@ import {
 import { Router } from "express";
 import { z } from "zod";
 import {
+  companyRunTiersSchema,
   createAiConnectionSchema,
   testAiGatewaySchema,
   aiConnectionLoginIntentSchema,
@@ -99,6 +100,13 @@ import {
   updateRoutineTriggerSchema,
   rotateRoutineTriggerSecretSchema,
   runRoutineSchema,
+  // Event sources
+  createEventSourceSchema,
+  updateEventSourceSchema,
+  testEventSourceSchema,
+  rotateEventSourceSecretSchema,
+  listEventDeliveriesQuerySchema,
+  genericV1EventSchema,
   // Folders
   createFolderSchema,
   ensureMySkillFolderSchema,
@@ -228,8 +236,13 @@ import {
   // Issue recovery and decomposition
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
+  reconcileIssueExecutionSchema,
   retryWorkspaceExportSchema,
+  issueRecoveryActionReadModelSchema,
+  listCompanyIssueRecoveryActionsQuerySchema,
+  ISSUE_STATUSES,
   cancelIssueThreadInteractionSchema,
+  issueWaitRequestSchema,
   // Secret provider configs and remote import
   createSecretProviderConfigSchema,
   updateSecretProviderConfigSchema,
@@ -311,7 +324,12 @@ import {
   resolveChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
   updateChatEndpointSchema,
+  observabilityFailuresQuerySchema,
+  observabilityFailuresResponseSchema,
   observabilityHealthSchema,
+  listRoutinesQuerySchema,
+  observabilityUsageQuerySchema,
+  observabilityUsageResponseSchema,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -1308,6 +1326,7 @@ const RUNTIME_TOOLS_OPERATIONS = new Set([
 ]);
 
 const PUBLIC_OPERATIONS = new Set([
+  "POST /api/event-sources/public/{publicId}/events",
   "GET /api/agent-avatars/{version}/{palette}/{file}",
   "GET /api/health",
   "GET /api/openapi.json",
@@ -1351,6 +1370,10 @@ const browserUseOperations = [
 ] as const;
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/event-sources",
+  "PATCH /api/event-sources/{id}",
+  "DELETE /api/event-sources/{id}",
+  "POST /api/event-sources/{id}/rotate-secret",
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
@@ -1364,6 +1387,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections/{connectionId}/usage",
   "GET /api/companies/{companyId}/ai-connections/login/{sessionId}",
 
+  "GET /api/companies/{companyId}/chats",
+  "GET /api/companies/{companyId}/chats/{agentRef}",
+  "POST /api/companies/{companyId}/chats/{agentRef}",
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
   "DELETE /api/issues/{id}/documents/{key}",
@@ -1580,6 +1606,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
+  "GET /api/instance/resource-capacity",
   "POST /api/companies",
   "POST /api/plugins/install",
   "POST /api/instance/database-backups",
@@ -1589,6 +1616,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
 ]);
 
 const CREATED_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/event-sources",
   "POST /api/adapters/install",
   "POST /api/chat-endpoints/{endpointId}/setup-secret",
   "POST /api/companies/{companyId}/agent-hires",
@@ -2014,6 +2042,33 @@ registry.registerPath({
   tags: ["companies"],
   summary: "Company stats",
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/run-tiers",
+  tags: ["companies"],
+  summary: "Get a company's run tiers and the tiers agents may set",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/run-tiers",
+  tags: ["companies"],
+  summary: "Replace a company's run tiers (board only)",
+  request: { params: z.object({ companyId: z.string() }), body: jsonBody(companyRunTiersSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/run-target-stats",
+  tags: ["companies"],
+  summary: "In-flight runs per provider pool and finished runs by run target source and tier",
+  request: { params: z.object({ companyId: z.string() }), query: z.object({ hours: z.string().optional() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -3476,6 +3531,21 @@ registry.registerPath({
   path: "/api/agents/{id}",
   tags: ["agents"],
   summary: "Update an agent",
+  description:
+    "By default `adapterConfig` merges at the top level and `runtimeConfig` is replaced. Set " +
+    "`replaceAdapterConfig: true` to replace `adapterConfig`. Set `mergeConfig: true` to apply `adapterConfig` and " +
+    "`runtimeConfig` as JSON merge patches (RFC 7396) over the stored config: only the named keys change, `null` " +
+    "removes a key, arrays replace, and each `adapterConfig.env` entry and `adapterConfig.workspaceStrategy` is " +
+    "replaced whole. Keys you do not name keep their stored values, including secrets, so they never have to be " +
+    "resent. An env value read back from GET as a redacted plain binding restores the stored value. The merged " +
+    "configs are validated like a full update. A config that changed while the patch was applied returns 409. " +
+    "`mergeConfig` cannot be combined with `replaceAdapterConfig` or an `adapterType` change, and cannot remove " +
+    "`runtimeConfig.aiConnection` (422). A merge patch is refused with 400, the path of the offending value in " +
+    "`details[].path`, and nothing stored, when a key anywhere in it (arrays included) is `__proto__`, " +
+    "`constructor` or `prototype`, when it is nested deeper than 32 levels, or when it holds more than 10,000 values. " +
+    "An agent key gets 403 when the merged `adapterConfig` would add, change or remove a host-executed " +
+    "`workspaceStrategy` command (`provisionCommand`, `runtimeProvisionCommand` or `teardownCommand`), also when " +
+    "the patch replaces or removes the whole strategy; a board user with `agents:configure` may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateAgentSchema.omit({ permissions: true })),
@@ -3484,7 +3554,10 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
   },
 });
 
@@ -3770,6 +3843,20 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/agents/{id}/harness-cooldowns/clear",
+  tags: ["agents"],
+  summary: "Clear an agent's provider quota cooldowns (board only)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/agents/{id}/clear-error",
   tags: ["agents"],
   summary: "Clear an agent error",
@@ -3942,6 +4029,26 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Get the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. `agentRef` is an agent ID or URL key. Returns the conversation issue, or null when none exists yet. Read-only.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/chats/{agentRef}",
+  tags: ["issues"],
+  summary: "Open the current board user's conversation with an agent",
+  description: "Requires Agent Chat to be enabled. Returns the existing conversation issue, or creates it. `agentRef` is an agent ID or URL key.",
+  request: { params: z.object({ companyId: z.string(), agentRef: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/issues",
   tags: ["issues"],
   summary: "List issues in a company",
@@ -4001,7 +4108,9 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads.",
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. " +
+    "Agents may name themselves or `\"board\"` as `unblockDescriptor.owner`, never a specific user or another agent (403). " +
+    "While the board or a user owns a block, an agent may not move the issue out of `blocked` or change or clear its descriptor (403). The same rule applies to a comment that asks to `resume` or `reopen` the issue (POST /api/issues/{id}/comments).",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateIssueSchema.partial()),
@@ -4010,6 +4119,7 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
     422: r.unprocessable,
   },
@@ -4320,11 +4430,13 @@ registry.registerPath({
   path: "/api/issues/{id}/comments",
   tags: ["issues"],
   summary: "Add a comment to an issue",
+  description:
+    "An agent may not use `resume` or `reopen` to move an issue out of a block that the board or a user owns, or change that block's descriptor (403). Nothing is posted when this refuses. A board user may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(addIssueCommentSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -4371,11 +4483,13 @@ registry.registerPath({
   path: "/api/issues/{id}/checkout",
   tags: ["issues"],
   summary: "Check out an issue",
+  description:
+    "While the board or a user owns a block, an agent may not check the issue out of `blocked` (403), the same rule as for PATCH /api/issues/{id}. A board user may. The issue stays blocked and keeps its `unblockDescriptor`.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(checkoutIssueSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -4760,9 +4874,9 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/routines",
   tags: ["routines"],
-  summary: "List routines in a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  summary: "List routines in a company; optional filters q, assigneeAgentId, folderId (or none), projectId, status and trigger combine with AND",
+  request: { params: z.object({ companyId: z.string() }), query: listRoutinesQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -4880,6 +4994,148 @@ registry.registerPath({
   tags: ["routines"],
   summary: "Fire a public routine trigger",
   request: { params: z.object({ publicId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+// ─── Event sources ───────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "post",
+  path: "/api/event-sources/public/{publicId}/events",
+  tags: ["event-sources"],
+  summary: "Deliver a signed external event",
+  description:
+    "Sender-facing ingress. Authenticated by the source's own secret, not by a Paperclip credential: " +
+    "send `Authorization: Bearer <secret>` for bearer sources, or `X-Paperclip-Timestamp` plus " +
+    "`X-Paperclip-Signature` (HMAC-SHA256 over `<timestamp>.<raw body>`) for HMAC sources. " +
+    "The body is capped at 64 KB. 202 means accepted; 200 `{duplicate:true}` means the delivery was already " +
+    "processed; 409 `{inProgress:true}` with `Retry-After` means another attempt holds the delivery; " +
+    "503 with `Retry-After` is a transient failure the sender should retry.",
+  request: {
+    params: z.object({ publicId: z.string() }),
+    body: jsonBody(genericV1EventSchema),
+  },
+  responses: {
+    200: r.ok(),
+    202: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
+    413: r.payloadTooLarge,
+    415: r.unsupportedMediaType,
+    422: r.unprocessable,
+    429: { description: "Rate limited", content: { "application/json": { schema: ErrorSchema } } },
+    503: { description: "Transient failure; retry", content: { "application/json": { schema: ErrorSchema } } },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/event-sources",
+  tags: ["event-sources"],
+  summary: "List event sources in a company",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({ includeArchived: z.enum(["true", "false", "1", "0"]).optional() }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/event-sources",
+  tags: ["event-sources"],
+  summary: "Create an event source",
+  description: "The response carries the ingress URL and signing secret. The secret is shown only here and on rotation.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(createEventSourceSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/event-sources/{id}",
+  tags: ["event-sources"],
+  summary: "Get an event source",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/event-sources/{id}",
+  tags: ["event-sources"],
+  summary: "Update an event source",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(updateEventSourceSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/event-sources/{id}",
+  tags: ["event-sources"],
+  summary: "Archive an event source",
+  description: "Soft delete: the source stops accepting events and its trigger subscriptions stay for audit.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/event-sources/{id}/rotate-secret",
+  tags: ["event-sources"],
+  summary: "Rotate an event source secret",
+  description: "Returns the new secret once. The previous secret stops working immediately.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(rotateEventSourceSecretSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/event-sources/{id}/test",
+  tags: ["event-sources"],
+  summary: "Dry-run an event payload against a source",
+  description: "Reports what each stage would do for the payload. Writes no issues, comments, or wakeups.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(testEventSourceSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/event-sources/{id}/deliveries",
+  tags: ["event-sources"],
+  summary: "List recent deliveries for an event source",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: listEventDeliveriesQuerySchema,
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/routines/{id}/event-groups",
+  tags: ["event-sources"],
+  summary: "List event groups (alert issues) of a routine",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: z.object({
+      open: z.enum(["true", "false", "1", "0"]).optional(),
+      limit: z.coerce.number().int().min(1).max(200).optional(),
+    }),
+  },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
 
@@ -5380,6 +5636,34 @@ registry.registerPath({
   request: { params: z.object({ companyId: z.string() }) },
   responses: {
     200: r.ok(observabilityHealthSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/usage",
+  tags: ["observability"],
+  summary: "Tokens, cost and duration of runs, grouped by one dimension",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityUsageQuerySchema },
+  responses: {
+    200: r.ok(observabilityUsageResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/observability/failures",
+  tags: ["observability"],
+  summary: "Failed runs by cause or other dimension, with the count of all runs for a rate",
+  request: { params: z.object({ companyId: z.string() }), query: observabilityFailuresQuerySchema },
+  responses: {
+    200: r.ok(observabilityFailuresResponseSchema),
+    400: r.badRequest,
     401: r.unauthorized,
     403: r.forbidden,
   },
@@ -8447,6 +8731,32 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/instance/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get host CPU, memory and disk for every server host and environment (instance admins)",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get CPU, memory and disk of the environments the company's agents run on",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/environments/{id}/resource-capacity",
+  tags: ["resource-capacity"],
+  summary: "Get an environment's CPU, memory and disk (404 unless the caller's company runs on it)",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/environments/{id}/delete-blast-radius",
   tags: ["environments"],
   summary: "Get environment delete blast radius",
@@ -9093,6 +9403,152 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
+// ─── Convex plugin action contracts ───────────────────────────────────────────
+// The bundled Convex plugin (vllnt.paperclip-convex) serves these board actions
+// through the URL-keyed action route below. Agents use the plugin's tools
+// (GET /api/plugins/tools) instead. The guards (activity window, delete cap,
+// call rate, dry-run-only) apply to both; the grants apply to agent tools only,
+// because a board action and the reaper are not subject to them.
+const convexEnvironment = z.enum(["production", "staging", "preview", "dev", "custom"]);
+const convexDeploymentSchema = z.object({
+  name: z.string(),
+  environment: convexEnvironment.describe("Computed by the server from the re-fetched Convex record; unknown means production"),
+  environmentReason: z.string().optional(),
+  deploymentType: z.string().nullable(),
+  reference: z.string().nullable(),
+  previewIdentifier: z.string().nullable(),
+  isDefault: z.boolean().nullable(),
+  createTime: z.number().nullable().describe("Milliseconds since epoch"),
+  lastDeployTime: z.number().nullable(),
+  expiresAt: z.number().nullable(),
+  region: z.string().nullable(),
+  deploymentClass: z.string().nullable(),
+  creator: z.string().nullable(),
+  project: z.string().nullable(),
+});
+// The compact row of deployments.list; the detail above is the plugin's get tool and the delete-preview result.
+const convexDeploymentSummarySchema = z.object({
+  name: z.string(),
+  environment: convexEnvironment,
+  deploymentType: z.string().nullable(),
+  previewIdentifier: z.string().nullable(),
+  lastDeployTime: z.number().nullable().describe("Milliseconds since epoch"),
+  expiresAt: z.number().nullable().describe("Milliseconds since epoch"),
+});
+const convexQuotaSchema = z.object({
+  count: z.number(), quota: z.number(), percent: z.number(), partial: z.boolean(), alert: z.boolean(), issueId: z.string().nullable().optional(),
+  lowerBound: z.boolean().optional().describe("True when the team has more deployments than could be counted; count is then a minimum"),
+});
+const convexStatusSchema = z.object({
+  connection: z.enum(["connected", "disconnected", "not-configured", "not-connected"]),
+  configError: z.string().optional().describe("Set when the company's Convex config is invalid; connection is then not-configured and projects is empty"),
+  // The config-error branch omits or nulls everything below.
+  teamId: z.string().nullable().optional(),
+  projects: z.array(z.object({ convexProjectId: z.string(), name: z.string(), repository: z.string().nullable(), paperclipProjectId: z.string().nullable(), reserved: z.boolean() })),
+  credentials: z.object({ teamToken: z.boolean(), github: z.boolean() }).nullable().optional().describe("Whether a credential is configured; values are never returned"),
+  grants: z.number().nullable().optional().describe("Number of agent grants; grants apply to agent tools only"),
+  guards: z.object({ activityHours: z.number(), maxDeletesPerRun: z.number(), callsPerMinute: z.number(), dryRunOnly: z.boolean() }).nullable().optional(),
+  reaper: z.object({ enabled: z.boolean(), ttlHours: z.number(), quota: z.number(), alertPercent: z.number() }).nullable().optional(),
+  lastReport: z.object({ at: z.string(), dryRun: z.boolean(), quota: convexQuotaSchema.nullable() }).nullable().optional().describe("Summary of the last reaper report"),
+});
+const convexConnectResultSchema = z.object({ projects: z.array(z.string()).describe("Convex project ids now reserved for the company") });
+const convexDisconnectResultSchema = z.object({ connection: z.literal("disconnected") });
+const convexDeploymentsListParamsSchema = z.object({
+  convexProjectId: z.string().optional(),
+  deploymentType: z.enum(["preview", "dev", "prod", "custom"]).optional(),
+  limit: z.number().int().min(1).max(200).optional().describe("Rows per page, 1 to 200; default 50"),
+  cursor: z.string().optional().describe("Opaque; the nextCursor of the previous page"),
+});
+const convexDeploymentsListSchema = z.object({
+  deployments: z.array(convexDeploymentSummarySchema),
+  total: z.number().int().describe("Rows in the whole listing, not only this page"),
+  nextCursor: z.string().nullable().describe("Pass as cursor to get the next page; null on the last page"),
+  truncated: z.boolean(),
+});
+const convexDeletePreviewParamsSchema = z.object({
+  name: z.string(),
+  dryRun: z.boolean().optional().describe("Absent or true runs every guard and deletes nothing. Only false deletes"),
+});
+const convexDeletePreviewResultSchema = z.object({
+  dryRun: z.boolean().describe("True also when the plugin's dryRunOnly guard turned a real request into a plan"),
+  wouldDelete: z.boolean(),
+  deleted: z.boolean(),
+  environment: convexEnvironment,
+  deployment: convexDeploymentSchema,
+  evidence: z.object({
+    prState: z.enum(["none", "closed", "merged"]), prNumber: z.number().nullable(), branchExists: z.boolean(), lastCommitAt: z.number().nullable(), idleMs: z.number(),
+  }).nullable(),
+  reason: z.string().nullable(),
+  note: z.string().optional().describe("Set when a real request was turned into a plan by the dryRunOnly guard"),
+});
+const convexReaperRunParamsSchema = z.object({
+  dryRun: z.boolean().optional().describe("Absent or true only plans. false runs for real and needs reaper.enabled and an instance administrator"),
+});
+const convexReaperReportSchema = z.object({
+  at: z.string(),
+  trigger: z.enum(["schedule", "manual", "retry", "api"]),
+  dryRun: z.boolean(),
+  projects: z.array(z.object({
+    convexProjectId: z.string(), name: z.string(), previews: z.number(), kept: z.number(),
+    ciMatched: z.number().optional().describe("Previews the company's CI preview template matched; absent without a template"),
+    delete: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+    setExpiry: z.array(z.object({ name: z.string(), from: z.number().nullable(), to: z.number() })),
+    deleted: z.array(z.string()), expirySet: z.array(z.string()),
+    failed: z.array(z.object({ name: z.string(), error: z.string() })),
+    skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+    dev: z.object({
+      listed: z.number(), kept: z.number(),
+      executed: z.boolean().describe("False for a plan only: dry run, dev policy off, or a pass an agent started"),
+      delete: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+      deleted: z.array(z.string()),
+      failed: z.array(z.object({ name: z.string(), error: z.string() })),
+      skipped: z.array(z.object({ name: z.string(), previewIdentifier: z.string().nullable(), reason: z.string() })),
+      error: z.string().optional(),
+    }).optional().describe("Dev deployments older than the company's age limit; deleted only by the scheduled or a board-run reaper"),
+    deferred: z.number().int().optional().describe("Previews not examined, and expiry changes not planned, because the time budget or the per-pass limit was reached; the next pass continues with the oldest"),
+    error: z.string().optional(),
+  })),
+  quota: convexQuotaSchema.nullable(),
+  errors: z.array(z.string()),
+  incomplete: z.string().optional().describe("Why the pass stopped early, when it did"),
+});
+// The body of every failure of a plugin bridge call; a permission refusal or a plugin error is code WORKER_ERROR.
+const pluginBridgeErrorSchema = z.object({
+  code: z.enum(["WORKER_UNAVAILABLE", "CAPABILITY_DENIED", "INVOCATION_SCOPE_DENIED", "WORKER_ERROR", "TIMEOUT", "UNKNOWN"]),
+  message: z.string(),
+  details: z.unknown().optional(),
+});
+const convexSchemaRefs = {
+  deployment: registry.register("ConvexDeployment", convexDeploymentSchema),
+  deploymentSummary: registry.register("ConvexDeploymentSummary", convexDeploymentSummarySchema),
+  status: registry.register("ConvexStatus", convexStatusSchema),
+  connectResult: registry.register("ConvexConnectResult", convexConnectResultSchema),
+  disconnectResult: registry.register("ConvexDisconnectResult", convexDisconnectResultSchema),
+  deploymentsListParams: registry.register("ConvexDeploymentsListParams", convexDeploymentsListParamsSchema),
+  deploymentsList: registry.register("ConvexDeploymentsList", convexDeploymentsListSchema),
+  deletePreviewParams: registry.register("ConvexDeletePreviewParams", convexDeletePreviewParamsSchema),
+  deletePreviewResult: registry.register("ConvexDeletePreviewResult", convexDeletePreviewResultSchema),
+  reaperRunParams: registry.register("ConvexReaperRunParams", convexReaperRunParamsSchema),
+  reaperReport: registry.register("ConvexReaperReport", convexReaperReportSchema),
+  bridgeError: registry.register("PluginBridgeError", pluginBridgeErrorSchema),
+};
+export const CONVEX_PLUGIN_ACTIONS = [
+  "status", "connection.connect", "connection.disconnect", "deployments.list", "deployments.delete-preview", "reaper.run", "reaper.report",
+] as const;
+/** The result and params schemas of the Convex actions, for tests and typed callers. */
+export const CONVEX_PLUGIN_SCHEMAS = {
+  status: convexStatusSchema,
+  connectResult: convexConnectResultSchema,
+  disconnectResult: convexDisconnectResultSchema,
+  deploymentsListParams: convexDeploymentsListParamsSchema,
+  deploymentsList: convexDeploymentsListSchema,
+  deletePreviewParams: convexDeletePreviewParamsSchema,
+  deletePreviewResult: convexDeletePreviewResultSchema,
+  reaperRunParams: convexReaperRunParamsSchema,
+  reaperReport: convexReaperReportSchema,
+  bridgeError: pluginBridgeErrorSchema,
+} as const;
+
 registry.registerPath({
   method: "post",
   path: "/api/plugins/{pluginId}/data/{key}",
@@ -9115,6 +9571,19 @@ registry.registerPath({
   path: "/api/plugins/{pluginId}/actions/{key}",
   tags: ["plugins"],
   summary: "Invoke a plugin action (URL-keyed bridge)",
+  description:
+    "Board-authorised actions of a plugin. The body is { companyId, params }. A success is wrapped in the host envelope { data: T }; " +
+    "a failure of the plugin, of its guards or of a permission check is HTTP 502 with the PluginBridgeError body { code, message, details } " +
+    "(a refusal is code WORKER_ERROR; the host does not answer 403 for it). " +
+    "The bundled Convex plugin (pluginId vllnt.paperclip-convex) serves: " +
+    `${CONVEX_PLUGIN_ACTIONS.join(", ")}. ` +
+    "Results: status is ConvexStatus; connection.connect is ConvexConnectResult; connection.disconnect is ConvexDisconnectResult; " +
+    "deployments.list (ConvexDeploymentsListParams, paged by limit and cursor) is ConvexDeploymentsList; " +
+    "deployments.delete-preview (ConvexDeletePreviewParams) is ConvexDeletePreviewResult; " +
+    "reaper.run (ConvexReaperRunParams) is ConvexReaperReport; reaper.report is ConvexReaperReport or null. " +
+    "Mutating Convex actions (connection.connect, connection.disconnect, deployments.delete-preview and a real reaper.run) need an instance administrator; " +
+    "a real reaper.run also needs reaper.enabled. An omitted dryRun means plan only: only dryRun false deletes. " +
+    "The plugin's guards apply to board actions as they do to agent tools; the grants apply to agents only. No action returns a credential.",
   request: {
     params: z.object({ pluginId: z.string(), key: z.string() }),
     body: jsonBody(
@@ -9124,7 +9593,39 @@ registry.registerPath({
       }),
     ),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: {
+    200: {
+      description: "Success. The body is { data: T }; for the Convex plugin T is the result of the action as listed in the description.",
+      content: {
+        "application/json": {
+          schema: {
+            type: "object",
+            required: ["data"],
+            properties: {
+              data: {
+                nullable: true,
+                anyOf: [
+                  convexSchemaRefs.status,
+                  convexSchemaRefs.connectResult,
+                  convexSchemaRefs.disconnectResult,
+                  convexSchemaRefs.deploymentsList,
+                  convexSchemaRefs.deletePreviewResult,
+                  convexSchemaRefs.reaperReport,
+                  { type: "object", additionalProperties: true, description: "The result of an action of another plugin" },
+                ],
+              },
+            },
+          },
+        },
+      },
+    },
+    401: r.unauthorized,
+    404: r.notFound,
+    502: {
+      description: "The plugin worker is unavailable or the action failed. This includes a refusal by a guard or a missing instance administrator (code WORKER_ERROR).",
+      content: { "application/json": { schema: convexSchemaRefs.bridgeError } },
+    },
+  },
 });
 
 // ─── Instance database backups ────────────────────────────────────────────────
@@ -10273,11 +10774,72 @@ registerCurrentRoute({
   summary: "Get wake diagnostics for an issue",
 });
 
+const issueSubtreeDiagnosticLastRunSchema = z
+  .object({
+    id: z.string().nullable().describe("Null for actors without company-scope read"),
+    status: z.string(),
+    agentId: z.string().nullable().describe("Null for actors without company-scope read"),
+    startedAt: z.string().nullable(),
+    finishedAt: z.string().nullable(),
+    createdAt: z.string(),
+    errorCode: z.string().nullable(),
+  })
+  .describe("Latest heartbeat run whose context issue is this node");
+
 registerCurrentRoute({
   method: "get",
   path: "/api/issues/{id}/diagnostics/subtree",
   tags: ["issues"],
   summary: "Get bounded subtree wake and blocker diagnostics for an issue",
+  responses: {
+    200: r.ok(
+      z
+        .object({
+          nodes: z.array(
+            z
+              .object({
+                issue: z.object({ id: z.string(), identifier: z.string().nullable(), title: z.string() }).passthrough(),
+                parentId: z.string().nullable(),
+                depth: z.number().int(),
+                lastRun: issueSubtreeDiagnosticLastRunSchema.nullable(),
+              })
+              .passthrough(),
+          ),
+        })
+        .passthrough(),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/recovery-actions",
+  tags: ["issues"],
+  summary:
+    "List issue recovery actions across a company, newest first, with their source issue. " +
+    "Read-only (no revalidation). Actors without company-scope read only see actions on issues they can read.",
+  query: listCompanyIssueRecoveryActionsQuerySchema,
+  responses: {
+    200: r.ok(
+      z.array(
+        issueRecoveryActionReadModelSchema.extend({
+          issue: z.object({
+            id: z.string(),
+            identifier: z.string().nullable(),
+            title: z.string(),
+            status: z.enum(ISSUE_STATUSES),
+          }),
+        }),
+      ),
+    ),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
 });
 
 registerCurrentRoute({
@@ -10285,6 +10847,15 @@ registerCurrentRoute({
   path: "/api/issues/{id}/recovery-actions",
   tags: ["issues"],
   summary: "List issue recovery actions",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/execution/reconcile",
+  tags: ["issues"],
+  summary: "Reconcile stopped issue executions and queue a continuation",
+  body: reconcileIssueExecutionSchema,
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registerCurrentRoute({
@@ -10316,6 +10887,14 @@ registerCurrentRoute({
   path: "/api/issues/{id}/monitor/check-now",
   tags: ["issues"],
   summary: "Run an issue monitor check now",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/wait",
+  tags: ["issues"],
+  summary: "Wait on the caller's own issue and re-check it after a bounded delay",
+  body: issueWaitRequestSchema,
 });
 
 registerCurrentRoute({

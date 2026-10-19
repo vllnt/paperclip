@@ -28,6 +28,7 @@ import { ExternalObjectStatusSummary } from "./ExternalObjectStatusSummary";
 import { ProjectTile } from "./ProjectTile";
 import { SidebarSection, type SidebarSectionRadioChoice } from "./SidebarSection";
 import { Button } from "@/components/ui/button";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -88,26 +89,6 @@ function sortProjects(projects: Project[], sortMode: ProjectSidebarSortMode): Pr
     return timeDiff !== 0 ? timeDiff : left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
   });
   return sorted;
-}
-
-function hasFineReorderPointer() {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return true;
-  return window.matchMedia(REORDER_POINTER_MEDIA).matches;
-}
-
-function useFineReorderPointer() {
-  const [matches, setMatches] = useState(hasFineReorderPointer);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const query = window.matchMedia(REORDER_POINTER_MEDIA);
-    const onChange = (event: MediaQueryListEvent) => setMatches(event.matches);
-    setMatches(query.matches);
-    query.addEventListener("change", onChange);
-    return () => query.removeEventListener("change", onChange);
-  }, []);
-
-  return matches;
 }
 
 function ProjectItem({
@@ -258,7 +239,7 @@ export function SidebarProjects() {
   const { openNewProject } = useDialogActions();
   const { isMobile, setSidebarOpen, collapsed, peeking } = useSidebar();
   const rail = collapsed && !peeking;
-  const fineReorderPointer = useFineReorderPointer();
+  const fineReorderPointer = useMediaQuery(REORDER_POINTER_MEDIA, true);
   const location = useLocation();
 
   const { data: projects } = useQuery({

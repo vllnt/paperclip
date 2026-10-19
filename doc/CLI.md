@@ -536,6 +536,7 @@ npx paperclipai agent create --company-id <company-id> --payload-json '{"name":"
 npx paperclipai agent hire --company-id <company-id> --payload-json '{...}'
 npx paperclipai agent update <agent-id> --payload-json '{"title":"Senior Builder"}'
 npx paperclipai agent delete <agent-id> --yes
+npx paperclipai agent set-adapter <agent-id> grok_local [--dry-run] [--xai-base-url https://gateway.example/v1]
 npx paperclipai agent me
 npx paperclipai agent inbox
 npx paperclipai agent inbox-mine --user-id <board-user-id>
@@ -544,7 +545,7 @@ npx paperclipai agent pause <agent-id>
 npx paperclipai agent resume <agent-id>
 npx paperclipai agent approve <agent-id>
 npx paperclipai agent terminate <agent-id>
-npx paperclipai agent heartbeat:invoke <agent-id>
+npx paperclipai agent heartbeat:invoke <agent-id> [--issue <issue-id>]
 npx paperclipai agent claude-login <agent-id>
 npx paperclipai agent local-cli <agent-id-or-shortname> --company-id <company-id>
 ```
@@ -639,8 +640,10 @@ npx paperclipai archive export --company-id <company-id> [--since <iso>] [--unti
 
 `paperclipai routines disable-all` remains the local maintenance command. The singular `routine` group maps to the REST API.
 
+`routine list` filters combine with AND: `--q` searches the title and description (case-insensitive), `--folder-id none` lists routines in no folder, and `--trigger manual` lists routines that have no trigger and only run when started by hand. With no filter it lists every routine, as before.
+
 ```sh
-npx paperclipai routine list --company-id <company-id> [--project-id <project-id>]
+npx paperclipai routine list --company-id <company-id> [--project-id <project-id>] [--q <text>] [--agent-id <agent-id>] [--folder-id <folder-id>|none] [--status active|paused|archived] [--trigger schedule|webhook|api|event|manual]
 npx paperclipai routine create --company-id <company-id> --payload-json '{...}'
 npx paperclipai routine get <routine-id>
 npx paperclipai routine update <routine-id> --payload-json '{...}'
@@ -1090,6 +1093,18 @@ npx paperclipai environment update <environment-id> --payload-json '{...}'
 npx paperclipai environment delete <environment-id>
 npx paperclipai environment probe <environment-id>
 npx paperclipai environment probe-config --company-id <company-id> --payload-json '{...}'
+```
+
+Resource capacity: free disk, available memory and load per CPU core, with a
+level (`ok`, `low`, `critical`, or `unknown` when nothing was measured in the
+last 15 minutes). Members and agents of a company see the environments its
+agents run on; `--instance` (every server host and environment) is for instance
+admins.
+
+```sh
+npx paperclipai capacity --company-id <company-id>
+npx paperclipai capacity --instance
+npx paperclipai environment capacity <environment-id>
 ```
 
 ```sh

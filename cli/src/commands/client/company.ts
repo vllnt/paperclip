@@ -1,3 +1,4 @@
+import { companyRunTiersSchema } from "@paperclipai/shared";
 import { Command } from "commander";
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -51,6 +52,9 @@ interface CompanyCommandOptions extends BaseClientOptions {}
 interface CompanyJsonOptions extends BaseClientOptions {
   companyId?: string;
   payloadJson?: string;
+}
+interface CompanyUpdateOptions extends CompanyJsonOptions {
+  runContextJson?: string;
 }
 interface AgentMeResponse {
   id: string;
@@ -1399,6 +1403,38 @@ export function registerCompanyCommands(program: Command): void {
 
   addCommonClientOptions(
     company
+      .command("run-tiers")
+      .description("Show a company's run tiers and the tiers agents may set")
+      .argument("<companyId>", "Company ID")
+      .action(async (companyId: string, opts: CompanyCommandOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          printOutput(await ctx.api.get(apiPath`/api/companies/${companyId}/run-tiers`), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    company
+      .command("run-tiers:set")
+      .description("Set a company's run tiers. Use --tiers-json '{\"tiers\":{\"fast\":{\"adapterType\":\"codex_local\",\"model\":\"grok-4.7\"}},\"agentAllowlist\":[\"fast\"]}'")
+      .argument("<companyId>", "Company ID")
+      .requiredOption("--tiers-json <json>", "Tiers and the agent allowlist")
+      .action(async (companyId: string, opts: CompanyCommandOptions & { tiersJson: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const body = companyRunTiersSchema.parse(JSON.parse(opts.tiersJson));
+          printOutput(await ctx.api.put(apiPath`/api/companies/${companyId}/run-tiers`, body), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    company
       .command("current")
       .description("Get the current scoped company from --company-id, context, env, or agent authentication")
       .action(async (opts: CompanyCommandOptions) => {
@@ -1448,11 +1484,20 @@ export function registerCompanyCommands(program: Command): void {
       .command("update")
       .description("Update a company")
       .argument("<companyId>", "Company ID")
-      .requiredOption("--payload-json <json>", "UpdateCompany JSON payload")
-      .action(async (companyId: string, opts: CompanyJsonOptions) => {
+      .option("--payload-json <json>", "UpdateCompany JSON payload")
+      .option(
+        "--run-context-json <json>",
+        "Company run-context policy as JSON (maxComments, maxCommentChars, maxTotalCommentChars, window, truncationMarker, byWakeReason), or null to clear",
+      )
+      .action(async (companyId: string, opts: CompanyUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
-          printOutput(await ctx.api.patch(apiPath`/api/companies/${companyId}`, parseJson(opts.payloadJson ?? "{}")), { json: ctx.json });
+          const payload = {
+            ...(opts.payloadJson ? (parseJson(opts.payloadJson) as Record<string, unknown>) : {}),
+            ...(opts.runContextJson ? { runContextPolicy: parseJson(opts.runContextJson) } : {}),
+          };
+          if (Object.keys(payload).length === 0) throw new Error("Provide --payload-json or --run-context-json.");
+          printOutput(await ctx.api.patch(apiPath`/api/companies/${companyId}`, payload), { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }

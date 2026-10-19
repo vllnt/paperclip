@@ -866,54 +866,63 @@
       "expectedMockState": "operation_result"
     },
     {
-      "id": "skill:skills/paperclip/references/api-reference.md:1486",
+      "id": "skill:skills/paperclip/references/api-reference.md:1487",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1486:approvals-costs-activity-dashboard",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1487:event-sources",
+      "heading": "Event Sources",
+      "primaryDisposition": "optional_agent_tool",
+      "semanticOperation": "scoped_discovery",
+      "expectedMockState": "operation_result"
+    },
+    {
+      "id": "skill:skills/paperclip/references/api-reference.md:1503",
+      "kind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1503:approvals-costs-activity-dashboard",
       "heading": "Approvals, Costs, Activity, Dashboard",
       "primaryDisposition": "control_plane_owned",
       "semanticOperation": "runtime_reconciliation",
       "expectedMockState": "runtime_decision_record"
     },
     {
-      "id": "skill:skills/paperclip/references/api-reference.md:1508",
+      "id": "skill:skills/paperclip/references/api-reference.md:1525",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1508:secrets",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1525:secrets",
       "heading": "Secrets",
       "primaryDisposition": "optional_agent_tool",
       "semanticOperation": "scoped_discovery",
       "expectedMockState": "operation_result"
     },
     {
-      "id": "skill:skills/paperclip/references/api-reference.md:1521",
+      "id": "skill:skills/paperclip/references/api-reference.md:1538",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1521:agent-secret-proposals",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1538:agent-secret-proposals",
       "heading": "Agent secret proposals",
       "primaryDisposition": "optional_agent_tool",
       "semanticOperation": "scoped_discovery",
       "expectedMockState": "operation_result"
     },
     {
-      "id": "skill:skills/paperclip/references/api-reference.md:1574",
+      "id": "skill:skills/paperclip/references/api-reference.md:1591",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1574:re-bind-an-existing-secret-under-a-new-path-no-secret-id",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1591:re-bind-an-existing-secret-under-a-new-path-no-secret-id",
       "heading": "Re-bind an existing secret under a new path (no secret ID)",
       "primaryDisposition": "optional_agent_tool",
       "semanticOperation": "scoped_discovery",
       "expectedMockState": "operation_result"
     },
     {
-      "id": "skill:skills/paperclip/references/api-reference.md:1621",
+      "id": "skill:skills/paperclip/references/api-reference.md:1638",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1621:agent-secret-access",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1638:agent-secret-access",
       "heading": "Agent secret access",
       "primaryDisposition": "optional_agent_tool",
       "semanticOperation": "scoped_discovery",
       "expectedMockState": "operation_result"
     },
     {
-      "id": "skill:skills/paperclip/references/api-reference.md:1661",
+      "id": "skill:skills/paperclip/references/api-reference.md:1678",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1661:common-mistakes",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1678:common-mistakes",
       "heading": "Common Mistakes",
       "primaryDisposition": "optional_agent_tool",
       "semanticOperation": "scoped_discovery",
@@ -1361,36 +1370,54 @@
       "expectedMockState": "runtime_decision_record"
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:179",
+      "id": "skill:skills/paperclip/references/routines.md:177",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md#L179:updating-and-deleting-triggers",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L177:event",
+      "heading": "Event",
+      "primaryDisposition": "control_plane_owned",
+      "semanticOperation": "runtime_reconciliation",
+      "expectedMockState": "runtime_decision_record"
+    },
+    {
+      "id": "skill:skills/paperclip/references/routines.md:183",
+      "kind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L183:event-triggers",
+      "heading": "Event Triggers",
+      "primaryDisposition": "control_plane_owned",
+      "semanticOperation": "runtime_reconciliation",
+      "expectedMockState": "runtime_decision_record"
+    },
+    {
+      "id": "skill:skills/paperclip/references/routines.md:230",
+      "kind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L230:updating-and-deleting-triggers",
       "heading": "Updating and Deleting Triggers",
       "primaryDisposition": "control_plane_owned",
       "semanticOperation": "runtime_reconciliation",
       "expectedMockState": "runtime_decision_record"
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:196",
+      "id": "skill:skills/paperclip/references/routines.md:247",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md#L196:manual-run",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L247:manual-run",
       "heading": "Manual Run",
       "primaryDisposition": "control_plane_owned",
       "semanticOperation": "runtime_reconciliation",
       "expectedMockState": "runtime_decision_record"
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:212",
+      "id": "skill:skills/paperclip/references/routines.md:263",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md#L212:updating-a-routine",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L263:updating-a-routine",
       "heading": "Updating a Routine",
       "primaryDisposition": "optional_agent_tool",
       "semanticOperation": "scoped_discovery",
       "expectedMockState": "operation_result"
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:223",
+      "id": "skill:skills/paperclip/references/routines.md:274",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md#L223:reading-routines-and-runs",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L274:reading-routines-and-runs",
       "heading": "Reading Routines and Runs",
       "primaryDisposition": "optional_agent_tool",
       "semanticOperation": "scoped_discovery",

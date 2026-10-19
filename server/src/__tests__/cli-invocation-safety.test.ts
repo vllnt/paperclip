@@ -865,11 +865,12 @@ describe("paperclipai CLI invocation safety", () => {
     expect(source).not.toContain("pnpm exec paperclipai auth bootstrap-ceo");
   });
 
-  it("emits the setup form from the board skill", () => {
+  it("keeps the board skill free of the unsafe pnpm form and of the nonexistent board setup command", () => {
     const source = read("skills/paperclip-board/SKILL.md");
-    expect(source).toContain("npx paperclipai board setup");
-    expect(source).not.toContain("pnpm paperclipai board setup");
-    expect(source).not.toContain("pnpm exec paperclipai board setup");
+    // `paperclipai board` has one subcommand, `prompt`. Board chat sets PAPERCLIP_API_URL itself, so the skill must not send the user to a setup command.
+    expect(source).not.toContain("board setup");
+    expect(source).not.toContain("pnpm paperclipai");
+    expect(source).not.toContain("pnpm exec paperclipai");
   });
 
   // ── The safe-invocation note ─────────────────────────────────────────────
