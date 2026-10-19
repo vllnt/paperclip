@@ -367,6 +367,55 @@ describeEmbeddedPostgres("companySkillService.installFromCatalog", () => {
     await expect(fs.readFile(path.join(result!.skill.sourceLocator!, "SKILL.md"), "utf8")).resolves.toContain("# Review");
   });
 
+  it("files packaged catalog skills of two categories, imported together, under one folder per category", async () => {
+    const companyId = await createCompany();
+    const packaged = (category: string, slug: string) => {
+      const key = `paperclipai/bundled/${category}/${slug}`;
+      return {
+        [`skills/${key}/SKILL.md`]: [
+          "---",
+          `key: "${key}"`,
+          `slug: "${slug}"`,
+          `name: "${slug}"`,
+          "metadata:",
+          "  paperclip:",
+          `    skillKey: "${key}"`,
+          `    slug: "${slug}"`,
+          "    catalog:",
+          `      skillKey: "${key}"`,
+          `      catalogKey: "${key}"`,
+          '      catalogKind: "bundled"',
+          `      catalogPath: "catalog/bundled/${category}/${slug}"`,
+          "---",
+          "",
+          `# ${slug}`,
+          "",
+        ].join("\n"),
+      };
+    };
+
+    const results = await svc.importPackageFiles(companyId, {
+      ...packaged("software-development", "review"),
+      ...packaged("research", "survey"),
+      ...packaged("software-development", "refactor"),
+    });
+
+    expect(results.map((result) => result.action)).toEqual(["created", "created", "created"]);
+    const folderOf = new Map((await db
+      .select({ key: companySkills.key, folderId: folders.id, name: folders.name, systemKey: folders.systemKey })
+      .from(companySkills)
+      .innerJoin(folders, eq(folders.id, companySkills.folderId))
+      .where(eq(companySkills.companyId, companyId)))
+      .map(({ key, ...folder }) => [key, folder]));
+    const review = folderOf.get("paperclipai/bundled/software-development/review");
+    const refactor = folderOf.get("paperclipai/bundled/software-development/refactor");
+    const survey = folderOf.get("paperclipai/bundled/research/survey");
+    expect(review).toMatchObject({ name: "Software Development", systemKey: "bundled:software-development" });
+    expect(refactor).toEqual(review);
+    expect(survey).toMatchObject({ name: "Research", systemKey: "bundled:research" });
+    expect(survey?.folderId).not.toBe(review?.folderId);
+  });
+
   it("returns unchanged for an already-current catalog skill", async () => {
     const companyId = await createCompany();
     await svc.installFromCatalog(companyId, { catalogSkillId: sampleCatalogSkill.id });

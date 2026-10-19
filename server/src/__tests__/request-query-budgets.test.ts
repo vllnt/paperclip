@@ -82,11 +82,11 @@ const REQUESTS: Array<{
   { name: "issue comments", actor: "operator", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 7, rows: 12 }, // 6
   { name: "routines", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/routines`, budget: 7, rows: 3 }, // 6
   // Equal to the count, not above it. Each list request imports the bundled
-  // skills again from disk, and each skill ensures its bundled category folder
-  // in its own folder-lock transaction: 12 statements per skill (8 listed here,
-  // 27 + 12 * 8 = 123). The budget follows the number of bundled skills and
-  // keeps the count per skill from growing; it is not a target.
-  { name: "skills", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 27, perRow: 12 }, // 123
+  // skills again from disk: it reads each skill (8 listed here) and ensures each
+  // bundled category folder once, in a folder-lock transaction (52 + 1 * 8 = 60).
+  // The budget follows the number of bundled skills and keeps the count per
+  // skill from growing; it is not a target.
+  { name: "skills", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 52, perRow: 1 }, // 60
   { name: "plugins", actor: "operator", path: () => "/api/plugins", budget: 2, rows: 0 }, // 1
   { name: "heartbeat runs", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 3, rows: 30 }, // 2
   { name: "dashboard", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/dashboard`, budget: 9 }, // 8
