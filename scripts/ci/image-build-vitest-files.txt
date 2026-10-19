@@ -1,6 +1,7 @@
 cli/src/__tests__/agent-lifecycle.test.ts
 # Vitest files required before building the production image.
 # One path per line; blank lines and comments are ignored.
+cli/src/__tests__/routine-list-filters.test.ts
 cli/src/__tests__/agent-config.test.ts
 cli/src/__tests__/search-parity.test.ts
 packages/adapter-utils/src/directory-merge-lock.test.ts
@@ -24,6 +25,7 @@ packages/shared/src/agent-config-merge-patch.test.ts
 packages/shared/src/command-action-rank.test.ts
 packages/shared/src/command-actions.test.ts
 packages/shared/src/company-environment-defaults.test.ts
+packages/shared/src/validators/routine-list-query.test.ts
 server/src/__tests__/agent-config-merge-patch.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
 server/src/__tests__/decision-wakeup.test.ts
@@ -39,10 +41,12 @@ server/src/services/heartbeat-remote-run-temp.test.ts
 server/src/shutdown-budget.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/AgentCharacterRuntime.test.ts
+ui/src/components/BuiltInBundlePanel.test.tsx
 ui/src/components/CommandPalette.real.test.tsx
 ui/src/components/CommandPalette.test.tsx
 ui/src/components/IssueFiltersPopover.test.tsx
 ui/src/components/KeyboardShortcutsCheatsheet.test.tsx
+ui/src/components/RoutineListFilters.test.tsx
 ui/src/components/onboarding/onboarding-motion-reduced.test.ts
 ui/src/components/task-side-panel/TaskSidePanel.test.tsx
 ui/src/components/ui/command.test.tsx
@@ -64,7 +68,11 @@ ui/src/lib/main-content-focus.test.ts
 ui/src/lib/no-direct-match-media.test.ts
 ui/src/lib/onboarding-motion-tokens.test.ts
 ui/src/lib/pwa-display-mode.test.ts
+ui/src/lib/queryKeys.test.ts
 ui/src/lib/safe-match-media.test.ts
 ui/src/lib/saved-provider-credentials.test.ts
 ui/src/lib/test-agent-setup.test.ts
+ui/src/pages/AgentRoutinesTab.test.tsx
 ui/src/pages/IssueDetail.test.tsx
+ui/src/pages/Routines.test.tsx
+ui/src/pages/agent-detail-navigation.test.ts

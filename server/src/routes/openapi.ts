@@ -327,6 +327,7 @@ import {
   observabilityFailuresQuerySchema,
   observabilityFailuresResponseSchema,
   observabilityHealthSchema,
+  listRoutinesQuerySchema,
   observabilityUsageQuerySchema,
   observabilityUsageResponseSchema,
 } from "@paperclipai/shared";
@@ -4874,9 +4875,9 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/routines",
   tags: ["routines"],
-  summary: "List routines in a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  summary: "List routines in a company; optional filters q, assigneeAgentId, folderId (or none), projectId, status and trigger combine with AND",
+  request: { params: z.object({ companyId: z.string() }), query: listRoutinesQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
