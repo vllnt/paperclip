@@ -94,7 +94,7 @@ export function readConfigPath(agent: Record<string, unknown>, dottedPath: strin
   let cursor: unknown = agent[root];
   for (const key of keys) {
     const container = asPlainObject(cursor);
-    if (!container) return undefined;
+    if (!container || !Object.hasOwn(container, key)) return undefined;
     cursor = container[key];
   }
   return cursor;

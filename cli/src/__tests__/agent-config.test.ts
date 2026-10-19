@@ -23,6 +23,13 @@ function jsonResponse(body: unknown = { ok: true }): Response {
   return new Response(JSON.stringify(body), { status: 200 });
 }
 
+describe("readConfigPath", () => {
+  it("returns missing values for inherited object properties", () => {
+    expect(readConfigPath({ adapterConfig: {} }, "adapterConfig.toString")).toBeUndefined();
+    expect(readConfigPath({ adapterConfig: { toString: "saved" } }, "adapterConfig.toString")).toBe("saved");
+  });
+});
+
 describe("buildAgentConfigMergePatch", () => {
   it("builds nested merge patches from dotted assignments and unsets", () => {
     expect(
