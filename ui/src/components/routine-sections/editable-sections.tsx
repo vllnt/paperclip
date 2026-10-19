@@ -34,6 +34,7 @@ import { DocumentAnnotationsCountChip, IssueDocumentAnnotations } from "../Issue
 import { MarkdownEditor } from "../MarkdownEditor";
 import { RoutineVariablesEditor, RoutineVariablesHint } from "../RoutineVariablesEditor";
 import { EnvironmentVariablesEditor } from "../environment-variables-editor";
+import { RunContextPolicyEditor } from "../RunContextPolicyEditor";
 import { useRoutineDetail } from "./context";
 import type { EnvBinding, RoutineDetail as RoutineDetailType } from "@paperclipai/shared";
 
@@ -562,6 +563,18 @@ export function DeliverySection() {
         triggers={routine.triggers}
         concurrencyPolicy={editDraft.concurrencyPolicy}
       />
+      <div className="space-y-2">
+        <Label className="text-xs font-medium">Run context</Label>
+        <p className="text-xs text-muted-foreground">
+          How much issue history runs from this routine see. Blank fields inherit the agent and
+          company settings; wake-type overrides win over everything.
+        </p>
+        <RunContextPolicyEditor
+          value={editDraft.runContextPolicy}
+          onChange={(runContextPolicy) => setEditDraft((current) => ({ ...current, runContextPolicy }))}
+          testId="routine-run-context"
+        />
+      </div>
     </div>
   );
 }

@@ -286,6 +286,132 @@ describeEmbeddedPostgres("issue subtree diagnostics route", () => {
     expect(serialized).not.toContain("\"error\"");
   });
 
+  it("adds the latest heartbeat run of each node as lastRun", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const otherAgent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Root with runs",
+      status: "in_progress",
+      assigneeAgentId: agent.id,
+    });
+    const child = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      parentId: root.id,
+      title: "Child with one failed run",
+      status: "todo",
+      assigneeAgentId: otherAgent.id,
+    });
+    const quiet = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      parentId: root.id,
+      title: "Child without runs",
+    });
+    const startedLong = new Date(Date.now() - 3_600_000);
+    await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: agent.id,
+      status: "succeeded",
+      contextSnapshot: { issueId: root.id },
+      startedAt: startedLong,
+      finishedAt: new Date(startedLong.getTime() + 60_000),
+      createdAt: startedLong,
+    });
+    const startedRecent = new Date(Date.now() - 60_000);
+    const [latestRootRun] = await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: agent.id,
+      status: "running",
+      contextSnapshot: { issueId: root.id },
+      startedAt: startedRecent,
+      createdAt: startedRecent,
+    }).returning();
+    const [childRun] = await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: otherAgent.id,
+      status: "failed",
+      errorCode: "process_exit",
+      contextSnapshot: { issueId: child.id },
+      startedAt: startedRecent,
+      finishedAt: new Date(),
+      createdAt: startedRecent,
+    }).returning();
+    // A run without an issue context does not count for any node.
+    await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: agent.id,
+      status: "queued",
+      contextSnapshot: {},
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${root.id}/diagnostics/subtree`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const byId = new Map<string, { lastRun: unknown }>(
+      res.body.nodes.map((node: { issue: { id: string }; lastRun: unknown }) => [node.issue.id, node]),
+    );
+    expect(byId.get(root.id)?.lastRun).toEqual({
+      id: latestRootRun!.id,
+      status: "running",
+      agentId: agent.id,
+      startedAt: startedRecent.toISOString(),
+      finishedAt: null,
+      createdAt: startedRecent.toISOString(),
+      errorCode: null,
+    });
+    expect(byId.get(child.id)?.lastRun).toMatchObject({
+      id: childRun!.id,
+      status: "failed",
+      agentId: otherAgent.id,
+      errorCode: "process_exit",
+    });
+    expect(byId.get(quiet.id)?.lastRun).toBeNull();
+  });
+
+  it("hides last-run ids from actors without company-scope read", async () => {
+    const company = await seedCompany(db);
+    const ownerAgent = await seedAgent(db, company.id);
+    const mentionedAgent = await seedAgent(db, company.id);
+    const allowedProject = await seedProject(db, company.id, "Allowed");
+    const targetProject = await seedProject(db, company.id, "Target");
+    const root = await seedIssue(db, {
+      companyId: company.id,
+      projectId: targetProject.id,
+      title: "Mention-visible root",
+      status: "in_progress",
+      assigneeAgentId: ownerAgent.id,
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId: company.id,
+      agentId: ownerAgent.id,
+      status: "failed",
+      errorCode: "timeout",
+      contextSnapshot: { issueId: root.id },
+      startedAt: new Date(Date.now() - 1_000),
+      finishedAt: new Date(),
+    });
+    const run = await attachMentionScopedLowTrustRun(db, {
+      company,
+      ownerAgent,
+      mentionedAgent,
+      allowedProject,
+      root,
+    });
+
+    const res = await request(createApp(db, agentActor(company, mentionedAgent, run.id)))
+      .get(`/api/issues/${root.id}/diagnostics/subtree`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    // The mention-scoped run itself targets the root and is the latest run.
+    expect(res.body.nodes[0].lastRun).toMatchObject({ id: null, agentId: null, status: "running" });
+  });
+
   it("returns null diagnosis for a quiet unblocked singleton subtree", async () => {
     const company = await seedCompany(db);
     const project = await seedProject(db, company.id, "Core");

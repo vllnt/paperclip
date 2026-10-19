@@ -214,6 +214,7 @@ export function companyService(db: Db) {
     duplicateDetectionMode: companies.duplicateDetectionMode,
     automationWakeSettings: companies.automationWakeSettings,
     routineNoopSkipSettings: companies.routineNoopSkipSettings,
+    runContextPolicy: companies.runContextPolicy,
     feedbackDataSharingEnabled: companies.feedbackDataSharingEnabled,
     feedbackDataSharingConsentAt: companies.feedbackDataSharingConsentAt,
     feedbackDataSharingConsentByUserId: companies.feedbackDataSharingConsentByUserId,

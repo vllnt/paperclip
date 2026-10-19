@@ -1,3 +1,4 @@
+import { runContextPolicySchema } from "../run-context.js";
 import { z } from "zod";
 import { automationWakeSettingsSchema } from "../automation-wake.js";
 import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
@@ -83,6 +84,7 @@ export const createRoutineSchema = z.object({
   env: envConfigSchema.optional().nullable(),
   automationWakeSettings: automationWakeSettingsSchema.optional(),
   routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
+  runContextPolicy: runContextPolicySchema.optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
@@ -111,6 +113,7 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   activityGatePolicy: z.enum(ROUTINE_ACTIVITY_GATE_POLICIES).default("always"),
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).default("company"),
   variables: z.array(routineVariableSchema),
+  runContextPolicy: runContextPolicySchema.optional(),
   env: envConfigSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
 }).strict();
