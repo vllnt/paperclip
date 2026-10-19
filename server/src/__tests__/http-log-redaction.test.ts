@@ -839,6 +839,11 @@ describe("browser sign-in input failure logs", () => {
     ["mixed-case segments", "POST", `/api/companies/${companyId}/Browser/Profiles/${profileId}/SignIn/Input`, 409],
     ["an absolute-form target", "POST", `http://paperclip.invalid${route}`, 409],
     ["a trailing slash", "POST", `${route}/`, 409],
+    ["a fragment", "POST", `${route}#x`, 409],
+    ["a query and a fragment", "POST", `${route}?a=1#x`, 409],
+    ["an absolute-form target with a custom scheme", "POST", `foo://h${route}`, 409],
+    ["an absolute-form target with the ftp scheme", "POST", `ftp://h${route}`, 409],
+    ["backslash separators with a fragment", "POST", `${route.replace(/\/(?=browser|profiles|signin|input|[0-9a-f]{8}-)/g, "\\")}#x`, 409],
     ["another method with a body", "PUT", route, 404],
   ])("keeps typed text out of the log for %s", async (_label, method, target, status) => {
     const { app, output } = await failingSignInApp(async () => {

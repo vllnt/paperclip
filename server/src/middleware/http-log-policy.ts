@@ -51,21 +51,15 @@ const BROWSER_SIGN_IN_INPUT_PATH = /^\/api\/companies\/[^/]+\/browser\/profiles\
 
 /**
  * Board keystrokes sent to a shared browser sign-in: the typed text can be a
- * password or one-time code. Express routes case-insensitively and accepts
- * absolute-form targets, and a rejected method still carries the body, so the
- * match ignores the method and case and reads absolute-form paths too.
+ * password or one-time code. The match follows what Express routes: any method
+ * (a rejected one still carries the body), any letter case, a dropped fragment,
+ * an absolute-form target with any `scheme://authority` prefix, and backslashes
+ * read as slashes (Express parses a target with a fragment through `url.parse`).
  */
 export function isBrowserSignInInputHttpRequest(url: string | undefined): boolean {
   if (!url) return false;
-  const pathname = normalizePath(url);
-  if (BROWSER_SIGN_IN_INPUT_PATH.test(pathname)) return true;
-  if (!/^https?:\/\//i.test(pathname)) return false;
-  if (BROWSER_SIGN_IN_INPUT_PATH.test(pathname.replace(/^https?:\/\/[^/]*/i, ""))) return true;
-  try {
-    return BROWSER_SIGN_IN_INPUT_PATH.test(new URL(url).pathname);
-  } catch {
-    return false;
-  }
+  const target = normalizePath((url.split("#")[0] ?? "").replace(/\\/g, "/"));
+  return BROWSER_SIGN_IN_INPUT_PATH.test(target.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, ""));
 }
 
 /** Provider payloads are private even when a method/signature is rejected. */
