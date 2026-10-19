@@ -231,6 +231,13 @@ describe("CompanySettingsSidebar", () => {
     );
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
       expect.objectContaining({
+        to: "/company/settings/event-sources",
+        label: "Event sources",
+        end: true,
+      }),
+    );
+    expect(sidebarNavItemMock).toHaveBeenCalledWith(
+      expect.objectContaining({
         to: "/company/settings/instance/profile",
         label: "Profile",
         end: true,

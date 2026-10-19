@@ -47,6 +47,7 @@ function renderSidebar(overrides?: {
   dirty?: RoutineSectionKey[];
   hasLiveRun?: boolean;
   onNavigate?: (section: RoutineSectionKey) => void;
+  showEventGroups?: boolean;
 }) {
   const dirty = new Set(overrides?.dirty ?? []);
   const onNavigate = overrides?.onNavigate ?? vi.fn();
@@ -58,6 +59,7 @@ function renderSidebar(overrides?: {
         isSectionDirty={(section) => dirty.has(section)}
         hasLiveRun={overrides?.hasLiveRun ?? false}
         onNavigate={onNavigate}
+        showEventGroups={overrides?.showEventGroups}
       />,
     );
   });
@@ -113,5 +115,44 @@ describe("RoutineSubSidebar", () => {
       triggers.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     expect(onNavigate).toHaveBeenCalledWith("triggers");
+  });
+  it("hides Event groups unless the routine has an Event trigger", () => {
+    renderSidebar();
+    expect(container.textContent).not.toContain("Event groups");
+  });
+
+  it("lists Event groups in Operate, before History, for routines with an Event trigger", () => {
+    renderSidebar({ showEventGroups: true });
+    const links = Array.from(container.querySelectorAll("a"));
+    expect(links.map((link) => link.textContent?.trim())).toEqual([
+      "Overview",
+      "Triggers",
+      "Variables",
+      "Secrets",
+      "Delivery",
+      "Runs",
+      "Activity",
+      "Event groups",
+      "History",
+    ]);
+    const eventGroups = links.find((link) => link.textContent?.trim() === "Event groups");
+    expect(eventGroups?.getAttribute("href")).toBe("/routines/r1/event-groups");
+  });
+
+  it("keeps Event groups visible and active when opened directly without an Event trigger", () => {
+    renderSidebar({ activeSection: "event-groups" });
+    const active = container.querySelector('a[aria-current="page"]');
+    expect(active?.textContent?.trim()).toBe("Event groups");
+  });
+
+  it("includes Event groups in arrow-key navigation", () => {
+    const { onNavigate } = renderSidebar({ activeSection: "activity", showEventGroups: true });
+    const activity = Array.from(container.querySelectorAll("a")).find(
+      (link) => link.textContent?.trim() === "Activity",
+    ) as HTMLAnchorElement;
+    act(() => {
+      activity.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }));
+    });
+    expect(onNavigate).toHaveBeenCalledWith("event-groups");
   });
 });

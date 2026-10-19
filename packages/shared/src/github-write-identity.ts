@@ -122,6 +122,40 @@ export interface GitHubWriteIdentityPolicy {
 }
 
 /** What the host asks a GitHub plugin's `writeIdentityAction` for one managed operation. */
+/** One workflow path (`.github/workflows` or below) as a commit has it: git mode and blob id, both null when the path is gone there. */
+export interface GitHubWorkflowChange {
+  path: string;
+  mode: string | null;
+  oid: string | null;
+}
+
+/** A new commit of a push that changes workflow paths: its parents, and those paths as it has them (against its first parent). */
+export interface GitHubWorkflowCommit {
+  sha: string;
+  parents: string[];
+  changes: GitHubWorkflowChange[];
+}
+
+/**
+ * A push of one commit to one named branch that changes workflow files, as the
+ * checkout reports it. The plugin allows it without `editWorkflows` only when
+ * the push brings in nothing but the base branch's own workflow files: each new
+ * commit that changes them is a merge of the base branch, the history it builds
+ * on exists on GitHub, and the branch ends up with the base branch's files.
+ */
+export interface GitHubWorkflowPush {
+  /** The branch name, without `refs/heads/`. */
+  branch: string;
+  /** The pushed commit. */
+  tip: string;
+  /** Every file under `.github/workflows` at the pushed commit. */
+  files: Array<{ path: string; mode: string; oid: string }>;
+  /** The new commits (not on any remote ref of the checkout) that change workflow paths. */
+  commits: GitHubWorkflowCommit[];
+  /** Parents of new commits that are not new themselves; the pushed commit when nothing is new. */
+  entries: string[];
+}
+
 export interface GitHubWriteIdentityRequest {
   companyId: string;
   /** Lowercase `owner/name` (a wiki folded into its repository), or null when unknown. */
@@ -141,6 +175,8 @@ export interface GitHubWriteIdentityRequest {
   autoMerge?: boolean;
   /** The command changes an open pull request's base branch. */
   retarget?: boolean;
+  /** A push whose workflow changes may arrive without `editWorkflows` when they are the base branch's own (see {@link GitHubWorkflowPush}). */
+  workflowPush?: GitHubWorkflowPush;
   /** Ask for the App after a `user` write found no GitHub identity. Honoured only under `use_bot`. */
   fallback?: boolean;
 }

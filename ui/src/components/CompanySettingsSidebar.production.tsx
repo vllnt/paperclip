@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import {
+  BellRing,
   ChevronLeft,
   Clock3,
   Cpu,
@@ -135,6 +136,12 @@ export function CompanySettingsSidebar() {
           {showPage("company.secrets") && (
             <SidebarNavItem to="/company/settings/secrets" label="Secrets" icon={KeyRound} end />
           )}
+          <SidebarNavItem
+            to="/company/settings/event-sources"
+            label="Event sources"
+            icon={BellRing}
+            end
+          />
           {showPage("instance.environments") && (
             <SidebarNavItem
               to={`${INSTANCE_SETTINGS_PATH_PREFIX}/environments`}
