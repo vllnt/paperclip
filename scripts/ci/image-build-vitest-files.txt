@@ -27,6 +27,8 @@ ui/src/components/KeyboardShortcutsCheatsheet.test.tsx
 ui/src/components/task-side-panel/TaskSidePanel.test.tsx
 ui/src/components/ui/command.test.tsx
 ui/src/context/CommandActionsContext.test.tsx
+ui/src/context/LiveUpdatesProvider.hook.test.tsx
+ui/src/context/LiveUpdatesProvider.recovery.test.tsx
 ui/src/context/LiveUpdatesProvider.test.ts
 ui/src/hooks/useKeyboardShortcuts.test.tsx
 ui/src/hooks/useTaskBrowsers.polling.test.tsx
@@ -34,8 +36,8 @@ ui/src/lib/agent-setup-fields.test.ts
 ui/src/lib/command-action-usage.test.ts
 ui/src/lib/issue-list-invalidation.test.ts
 ui/src/lib/keyboardShortcuts.test.ts
-ui/src/lib/live-run-polling.test.tsx
 ui/src/lib/live-run-card-count.test.ts
+ui/src/lib/live-run-polling.test.tsx
 ui/src/lib/main-content-focus.test.ts
 ui/src/lib/saved-provider-credentials.test.ts
 ui/src/lib/test-agent-setup.test.ts
