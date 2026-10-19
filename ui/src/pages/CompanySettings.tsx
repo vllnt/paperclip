@@ -1,9 +1,10 @@
-import { ChangeEvent, useEffect, useState } from "react";
+import { ChangeEvent, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   type AutomationWakeSettings,
   type InteractionResolverGovernance,
+  type TransientRetryPolicy,
   type RunContextPolicy,
   type IssueThreadInteractionKind,
 } from "@paperclipai/shared";
@@ -60,14 +61,10 @@ export function CompanySettings() {
   const [description, setDescription] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
   const [logoUploadError, setLogoUploadError] = useState<string | null>(null);
-  const [runContextDraft, setRunContextDraft] = useState<RunContextPolicy | null | undefined>(undefined);
+  const [runContextDrafts, setRunContextDrafts] = useState<Record<string, RunContextPolicy | null>>({});
+  const runContextDraft = selectedCompanyId ? runContextDrafts[selectedCompanyId] : undefined;
   const [governance, setGovernance] = useState<InteractionResolverGovernance>({});
   const [wakeSettings, setWakeSettings] = useState<AutomationWakeSettings>({});
-
-  // A draft belongs to one company; refreshing that company must keep its edits.
-  useEffect(() => {
-    setRunContextDraft(undefined);
-  }, [selectedCompanyId]);
 
   // Sync local state from selected company
   useEffect(() => {
@@ -94,20 +91,90 @@ export function CompanySettings() {
     }
   });
 
+  // Save failures are remembered per company so one company's error never
+  // shows on another. `resets` remounts the retry input back to the saved value.
+  const [hiringErrors, setHiringErrors] = useState<Record<string, string>>({});
+  const [retryErrors, setRetryErrors] = useState<Record<string, string>>({});
+  const [retryResets, setRetryResets] = useState<Record<string, number>>({});
+  const errorMessage = (error: unknown, fallback: string) =>
+    error instanceof Error ? error.message : fallback;
+  const setCompanyEntry = <T,>(
+    setter: (update: (prev: Record<string, T>) => Record<string, T>) => void,
+    companyId: string,
+    value: T | null,
+  ) =>
+    setter((prev) => {
+      const { [companyId]: _dropped, ...rest } = prev;
+      return value === null ? rest : { ...rest, [companyId]: value };
+    });
+
   const settingsMutation = useMutation({
-    mutationFn: (requireApproval: boolean) =>
-      companiesApi.update(selectedCompanyId!, {
+    mutationFn: ({ companyId, requireApproval }: { companyId: string; requireApproval: boolean }) =>
+      companiesApi.update(companyId, {
         requireBoardApprovalForNewAgents: requireApproval
       }),
-    onSuccess: () => {
+    onMutate: ({ companyId }) => setCompanyEntry(setHiringErrors, companyId, null),
+    onError: (error, { companyId }) =>
+      setCompanyEntry(setHiringErrors, companyId, errorMessage(error, "Failed to save")),
+    onSuccess: (_company, { companyId }) => {
+      setCompanyEntry(setHiringErrors, companyId, null);
       queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
 
+  const retryPolicy: TransientRetryPolicy = selectedCompany?.transientRetryPolicy ?? {};
+  const retryPolicyMutation = useMutation({
+    mutationFn: ({ companyId, policy }: { companyId: string; policy: TransientRetryPolicy }) =>
+      companiesApi.update(companyId, { transientRetryPolicy: policy }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+    }
+  });
+  // Each field edit is queued per company and saves run one at a time. A save
+  // sends the company's last known policy plus every edit still queued for it,
+  // so a quick second edit cannot erase the first, a failed edit drops only
+  // itself, and switching companies cannot redirect a queued save.
+  const retrySaves = useRef(
+    new Map<string, { base: TransientRetryPolicy; queued: TransientRetryPolicy[]; tail: Promise<void> }>(),
+  );
+  useEffect(() => {
+    for (const company of companies) {
+      const saves = retrySaves.current.get(company.id);
+      if (saves && saves.queued.length === 0) saves.base = company.transientRetryPolicy ?? {};
+    }
+  }, [companies]);
+  const saveRetryPolicy = (patch: TransientRetryPolicy) => {
+    const companyId = selectedCompanyId;
+    if (!companyId) return;
+    let state = retrySaves.current.get(companyId);
+    if (!state) {
+      state = { base: retryPolicy, queued: [], tail: Promise.resolve() };
+      retrySaves.current.set(companyId, state);
+    }
+    const saves = state;
+    saves.queued.push(patch);
+    setCompanyEntry(setRetryErrors, companyId, null);
+    saves.tail = saves.tail.then(async () => {
+      const policy = Object.assign({}, saves.base, ...saves.queued);
+      try {
+        const updated = await retryPolicyMutation.mutateAsync({ companyId, policy });
+        saves.base = updated.transientRetryPolicy ?? policy;
+        setCompanyEntry(setRetryErrors, companyId, null);
+      } catch (error) {
+        // Only the failed edit is dropped; edits queued after it still apply.
+        // Show the error and snap the input back to the saved value.
+        setCompanyEntry(setRetryErrors, companyId, errorMessage(error, "Failed to save retry policy"));
+        setRetryResets((prev) => ({ ...prev, [companyId]: (prev[companyId] ?? 0) + 1 }));
+      } finally {
+        saves.queued.splice(saves.queued.indexOf(patch), 1);
+      }
+    });
+  };
+
   const runContextMutation = useMutation({
-    mutationFn: (next: RunContextPolicy | null) =>
-      companiesApi.update(selectedCompanyId!, { runContextPolicy: next }),
-    onSuccess: (saved) => {
+    mutationFn: ({ companyId, policy }: { companyId: string; policy: RunContextPolicy | null }) =>
+      companiesApi.update(companyId, { runContextPolicy: policy }),
+    onSuccess: (saved, { companyId }) => {
       // Adopt the saved company before the draft clears and the editor unlocks,
       // so a slow or failed list refresh cannot show (or restore) the old policy.
       queryClient.setQueriesData<CompanyListResult>(
@@ -118,7 +185,7 @@ export function CompanySettings() {
             companies: current.companies.map((company) => (company.id === saved.id ? saved : company)),
           },
       );
-      setRunContextDraft(undefined);
+      setCompanyEntry(setRunContextDrafts, companyId, null);
       void queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
     }
   });
@@ -399,10 +466,59 @@ export function CompanySettings() {
             label="Require board approval for new hires"
             hint="New agent hires stay pending until approved by board."
             checked={!!selectedCompany.requireBoardApprovalForNewAgents}
-            onChange={(v) => settingsMutation.mutate(v)}
+            onChange={(requireApproval) =>
+              settingsMutation.mutate({ companyId: selectedCompany.id, requireApproval })
+            }
             toggleTestId="company-settings-team-approval-toggle"
           />
+          {hiringErrors[selectedCompany.id] && (
+            <span className="text-xs text-destructive" role="alert">
+              {hiringErrors[selectedCompany.id]}
+            </span>
+          )}
         </div>
+      </div>
+
+      {/* Run retries */}
+      <div className="max-w-2xl space-y-4" data-testid="company-settings-retry-section">
+        <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+          Run retries
+        </div>
+        <Field
+          label="Transient retries per issue per hour"
+          hint="0 means unlimited. Extra retries for the same issue and agent are deferred until the hour window allows them. Agents, routines and wake types can override this."
+        >
+          <input
+            key={`${selectedCompany.id}:${retryPolicy.perIssuePerHour ?? 0}:${retryResets[selectedCompany.id] ?? 0}`}
+            className="w-24 rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
+            type="number"
+            min={0}
+            max={100}
+            step={1}
+            defaultValue={retryPolicy.perIssuePerHour ?? 0}
+            data-testid="company-settings-transient-retry-input"
+            onBlur={(e) => {
+              const next = e.currentTarget.valueAsNumber;
+              if (Number.isInteger(next) && next >= 0 && next <= 100 && next !== (retryPolicy.perIssuePerHour ?? 0)) {
+                saveRetryPolicy({ perIssuePerHour: next });
+              }
+            }}
+          />
+        </Field>
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={retryPolicy.suppressWhenBlocked ?? false}
+            data-testid="company-settings-transient-retry-suppress-blocked"
+            onChange={(e) => saveRetryPolicy({ suppressWhenBlocked: e.currentTarget.checked })}
+          />
+          Skip transient retries while the issue is blocked
+        </label>
+        {retryErrors[selectedCompany.id] && (
+          <span className="text-xs text-destructive" role="alert" data-testid="company-settings-transient-retry-error">
+            {retryErrors[selectedCompany.id]}
+          </span>
+        )}
       </div>
 
       {/* Run context */}
@@ -417,23 +533,25 @@ export function CompanySettings() {
         {/* Locked while saving: an edit made mid-save would be dropped when the saved draft clears. */}
         <fieldset disabled={runContextMutation.isPending} className="m-0 min-w-0 border-0 p-0">
           <RunContextPolicyEditor
-            key={JSON.stringify([selectedCompany.id, selectedCompany.runContextPolicy ?? null])}
+            key={`${selectedCompany.id}:${JSON.stringify(selectedCompany.runContextPolicy ?? null)}`}
             value={runContextDraft === undefined ? selectedCompany.runContextPolicy : runContextDraft}
-            onChange={setRunContextDraft}
+            onChange={(policy) =>
+              setRunContextDrafts((current) => ({ ...current, [selectedCompany.id]: policy }))
+            }
             testId="company-settings-run-context"
           />
         </fieldset>
         {runContextDraft !== undefined && (
           <Button
             size="sm"
-            onClick={() => runContextMutation.mutate(runContextDraft)}
+            onClick={() => runContextMutation.mutate({ companyId: selectedCompany.id, policy: runContextDraft })}
             disabled={runContextMutation.isPending}
             data-testid="company-settings-run-context-save"
           >
             {runContextMutation.isPending ? "Saving..." : "Save run context"}
           </Button>
         )}
-        {runContextMutation.isError && (
+        {runContextMutation.isError && runContextMutation.variables.companyId === selectedCompany.id && (
           <span className="text-xs text-destructive">
             {runContextMutation.error instanceof Error ? runContextMutation.error.message : "Failed to save"}
           </span>
