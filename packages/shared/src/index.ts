@@ -1,5 +1,24 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  HARNESS_FALLBACK_ADAPTER_TYPES,
+  HARNESS_ALLOWED_MODEL_VENDORS,
+  MAX_AGENT_FALLBACKS,
+  MODEL_VENDORS,
+  agentFallbackTargetSchema,
+  agentFallbacksSchema,
+  checkHarnessModelCompatibility,
+  classifyModelVendor,
+  fallbackEffortConfigKey,
+  harnessTargetKey,
+  readModelOverridesFromArgs,
+  type AgentFallbackTarget,
+  type AgentHarnessFallbackState,
+  type HarnessFallbackAdapterType,
+  type HarnessModelCompatibilityInput,
+  type HarnessModelCompatibilityResult,
+  type ModelVendor,
+} from "./harness-fallback.js";
+export {
   RUNNER_GOAL_MAX_OBJECTIVE_CHARS,
   runnerGoalAvailabilitySchema,
   runnerGoalCapabilityActionSchema,
