@@ -14,7 +14,9 @@ import {
   retryTransientGitBundleTransfer,
   SSH_SIGNAL_TERMINATION_MESSAGE_PREFIX,
 } from "./git-workspace-sync.js";
+import type { ChildProcess } from "node:child_process";
 import type { RunProcessResult } from "./server-utils.js";
+import type { SshMultiplex } from "./ssh-multiplex.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { MERGE_STAGING_TAR_EXCLUDE, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
@@ -54,6 +56,9 @@ export function createSshCommandManagedRuntimeRunner(input: {
   spec: SshRemoteExecutionSpec;
   defaultCwd?: string | null;
   maxBufferBytes?: number | null;
+  // Share a master connection for this runner's commands. Only for runners
+  // whose commands are all short (the callback bridge).
+  multiplex?: SshMultiplex | null;
 }): CommandManagedRuntimeRunner {
   const defaultCwd = input.defaultCwd?.trim() || input.spec.remoteCwd;
   const maxBufferBytes =
@@ -84,6 +89,8 @@ export function createSshCommandManagedRuntimeRunner(input: {
 
       try {
         const result = await runSshCommand(input.spec, remoteCommand, {
+          multiplex: input.multiplex,
+          signal: commandInput.signal,
           stdin: commandInput.stdin,
           timeoutMs: commandInput.timeoutMs,
           maxBuffer: maxBufferBytes,
@@ -206,10 +213,11 @@ async function execFileText(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
-    execFile(
+    const child = execFile(
       file,
       args,
       {
@@ -227,7 +235,38 @@ async function execFileText(
         });
       },
     );
+    superviseSshChild(child, options.signal);
   });
+}
+
+// A multiplexed `ssh` hands its pipes to the master connection, so they stay
+// open until the remote command ends, also after this process killed the
+// local `ssh`. Once a child this process killed (timeout, abort, output limit)
+// has exited, close this side of its pipes, so the caller is not held until
+// the remote command ends. On abort, stop the child: SIGTERM, then SIGKILL
+// after 5 s.
+function superviseSshChild(child: ChildProcess, signal: AbortSignal | undefined): void {
+  child.once("exit", () => {
+    if (!child.killed) return;
+    child.stdin?.destroy();
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  });
+  if (!signal) return;
+  let escalation: NodeJS.Timeout | null = null;
+  const onAbort = () => {
+    child.kill("SIGTERM");
+    escalation = setTimeout(() => child.kill("SIGKILL"), 5_000);
+    escalation.unref?.();
+  };
+  const dispose = () => {
+    signal.removeEventListener("abort", onAbort);
+    if (escalation) clearTimeout(escalation);
+  };
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
+  child.once("close", dispose);
+  child.once("error", dispose);
 }
 
 async function spawnText(
@@ -237,12 +276,14 @@ async function spawnText(
     stdin?: string;
     timeout?: number;
     maxBuffer?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
     const child = spawn(file, args, {
       stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
     });
+    superviseSshChild(child, options.signal);
 
     const maxBuffer = options.maxBuffer ?? 1024 * 128;
     let stdout = "";
@@ -790,6 +831,17 @@ async function readLocalGitWorkspaceSnapshot(localDir: string): Promise<LocalGit
   } catch {
     return null;
   }
+}
+
+/**
+ * The commit a run's workspace upload starts from: the local HEAD, read the same
+ * way the upload reads it. The server records it before the upload, so the
+ * reaper knows which commits already exist on the host without asking the
+ * worker. Null when the workspace is not a git repository with a commit.
+ */
+export async function readSshWorkspaceSeed(localDir: string): Promise<string | null> {
+  const snapshot = await readLocalGitWorkspaceSnapshot(localDir);
+  return snapshot && /^[0-9a-f]{40}([0-9a-f]{24})?$/i.test(snapshot.headCommit) ? snapshot.headCommit.toLowerCase() : null;
 }
 
 /**
@@ -1380,6 +1432,10 @@ export async function runSshCommand(
   remoteCommand: string,
   options: {
     env?: Record<string, string>;
+    /** Share a master connection (short commands only); see `ssh-multiplex.ts`. */
+    multiplex?: SshMultiplex | null;
+    /** Stops the command: the local `ssh` gets SIGTERM, then SIGKILL after 5 s. */
+    signal?: AbortSignal;
     stdin?: string;
     timeoutMs?: number;
     maxBuffer?: number;
@@ -1387,11 +1443,14 @@ export async function runSshCommand(
     storeHints?: SshStoreHints;
   } = {},
 ): Promise<SshCommandResult> {
+  options.signal?.throwIfAborted();
   let cleanup: () => Promise<void> = () => Promise.resolve();
+  const channel = await options.multiplex?.channel(config);
+  let killed = false;
   try {
     const auth = await createSshAuthArgs(config);
     cleanup = auth.cleanup;
-    const sshArgs = [...auth.args];
+    const sshArgs = [...auth.args, ...(channel?.args ?? [])];
     const envEntries = Object.entries(options.env ?? {})
       .filter((entry): entry is [string, string] => typeof entry[1] === "string");
     for (const [key] of envEntries) {
@@ -1434,12 +1493,18 @@ export async function runSshCommand(
           stdin: options.stdin,
           timeout: options.timeoutMs ?? 15_000,
           maxBuffer: options.maxBuffer ?? 1024 * 128,
+          signal: options.signal,
         })
       : await execFileText("ssh", sshArgs, {
           timeout: options.timeoutMs ?? 15_000,
           maxBuffer: options.maxBuffer ?? 1024 * 128,
+          signal: options.signal,
         });
+  } catch (error) {
+    killed = options.signal?.aborted === true || (error as { killed?: unknown } | null)?.killed === true;
+    throw error;
   } finally {
+    await channel?.done({ killed });
     await cleanup();
   }
 }
@@ -2140,6 +2205,8 @@ export async function startSshEnvLabFixture(input: {
   // a regression test can force the start-failure cleanup path without a
   // real 10 second wait.
   readinessTimeoutMs?: number;
+  // Test-only. Extra sshd_config lines, for example `MaxSessions 3`.
+  sshdConfigExtra?: readonly string[];
 }): Promise<SshEnvLabFixtureState> {
   // Resolve a relative statePath against the current working directory once,
   // up front. Every derived path (rootDir and the persisted statePath field)
@@ -2218,6 +2285,7 @@ export async function startSshEnvLabFixture(input: {
       "PrintMotd no",
       "UseDNS no",
       "Subsystem sftp internal-sftp",
+      ...(input.sshdConfigExtra ?? []),
       "",
     ].join("\n"),
     { mode: 0o600 },
