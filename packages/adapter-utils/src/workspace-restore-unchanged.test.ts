@@ -11,6 +11,14 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 
+// A host scan lists the fixture's target or source. Disk-backed snapshots keep their
+// manifest in a Paperclip temp directory outside the fixture, and removing that
+// directory lists it; that is not a host scan.
+function isFixturePath(root: string, entry: unknown): boolean {
+  const relative = path.relative(root, path.resolve(String(entry)));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 async function fixture(diskBacked: boolean) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-unchanged-restore-"));
   roots.push(root);
@@ -32,8 +40,12 @@ it.each([
   await fs.writeFile(path.join(f.target, "file"), "concurrent host edit");
   await fs.mkdir(path.join(f.target, "cache"));
   await fs.writeFile(path.join(f.target, "cache", "private"), "host only");
+  const opendir = fs.opendir.bind(fs);
   const read = vi.spyOn(fs, "opendir");
-  read.mockImplementation(async () => { throw new Error("Unexpected host scan"); });
+  read.mockImplementation(async (...args: Parameters<typeof fs.opendir>) => {
+    if (isFixturePath(f.root, args[0])) throw new Error("Unexpected host scan");
+    return await opendir(...args);
+  });
   const callbacks: string[] = [];
   const hook = async (name: string) => {
     callbacks.push(name);
@@ -43,7 +55,7 @@ it.each([
   try {
     await mergeDirectoryWithBaseline({ baseline: f.baseline, sourceDir: f.source, targetDir: f.target,
       snapshots: { source: f.incoming }, conflictPolicy, beforeApply: () => hook("before"), afterApply: () => hook("after") });
-    expect(read).not.toHaveBeenCalled();
+    expect(read.mock.calls.filter(([entry]) => isFixturePath(f.root, entry))).toEqual([]);
     expect(callbacks).toEqual(["before", "after"]);
     expect(await fs.readFile(path.join(f.target, "file"), "utf8")).toBe("concurrent host edit");
     expect(await fs.readFile(path.join(f.target, "cache", "private"), "utf8")).toBe("host only");
@@ -54,7 +66,8 @@ it("skips the target scan when a captured full export is unchanged", async () =>
   const f = await fixture(false);
   const read = vi.spyOn(fs, "opendir");
   await mergeDirectoryWithBaseline({ baseline: f.baseline, sourceDir: f.source, targetDir: f.target, conflictPolicy: "reject" });
-  expect(read.mock.calls.map(call => path.resolve(String(call[0])))).toEqual([path.resolve(f.source)]);
+  expect(read.mock.calls.map(call => path.resolve(String(call[0]))).filter(entry => isFixturePath(f.root, entry)))
+    .toEqual([path.resolve(f.source)]);
 });
 
 it.each(["before", "after"])("propagates %s-hook denial for an unchanged checkpoint", async denied => {
