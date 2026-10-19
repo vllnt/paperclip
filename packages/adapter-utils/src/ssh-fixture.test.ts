@@ -618,6 +618,36 @@ describe("ssh env-lab fixture", () => {
       }
     });
 
+    it("executes the store prelude in a real shell without an SSH daemon", async () => {
+      const root = await createFixtureRootDir();
+      const project = path.join(root, "project");
+      const nested = path.join(project, "nested");
+      await mkdir(nested, { recursive: true });
+      const defaultStore = path.join(root, ".paperclip-runtime", "pnpm-store");
+      const probe = async (cwd: string, env: Record<string, string> = {}) => {
+        const target = await buildSshSpawnTarget({
+          spec: { ...unitSpec, remoteWorkspacePath: root, remoteCwd: cwd },
+          command: "sh", args: ["-c", 'printf %s "${npm_config_store_dir-UNSET}"'], env,
+        });
+        try {
+          return (await execFileAsync("sh", ["-c", String(target.args.at(-1))])).stdout;
+        } finally {
+          await target.cleanup();
+        }
+      };
+      expect(await probe(root)).toBe(defaultStore);
+      expect(await probe(root, { npm_config_store_dir: "/tmp/operator-store" })).toBe("/tmp/operator-store");
+      await writeFile(path.join(project, ".npmrc"), "store-dir=/tmp/project-store\n");
+      expect(await probe(nested)).toBe("UNSET");
+      await writeFile(path.join(project, ".npmrc"), "# store-dir=/tmp/ignored-store\n");
+      expect(await probe(project)).toBe(defaultStore);
+      await writeFile(path.join(project, "pnpm-workspace.yaml"), "storeDir: /tmp/yaml-store\n");
+      expect(await probe(project)).toBe("UNSET");
+      const userConfig = path.join(root, "user.npmrc");
+      await writeFile(userConfig, "store-dir=/tmp/user-store\n");
+      expect(await probe(root, { npm_config_userconfig: userConfig })).toBe("UNSET");
+    }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
     async function storeHost(label: string) {
       const rootDir = await createFixtureRootDir();
       const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), label);

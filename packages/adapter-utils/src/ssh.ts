@@ -516,7 +516,7 @@ function sharedPnpmStorePrelude(remoteWorkspacePath: string, hints: SshStoreHint
     "}",
   ].join(" ");
   return [
-    `{ paperclip_store=${shellQuote(store)}; ${hasProjectOrUserStore} if paperclip_sets_store ${dir} ${userConfig}; then :; else export npm_config_store_dir="$paperclip_store"; fi; }`,
+    `{ paperclip_store=${shellQuote(store)}; ${hasProjectOrUserStore}; if paperclip_sets_store ${dir} ${userConfig}; then :; else export npm_config_store_dir="$paperclip_store"; fi; }`,
   ];
 }
 
