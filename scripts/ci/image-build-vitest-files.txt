@@ -3,6 +3,7 @@ cli/src/__tests__/agent-lifecycle.test.ts
 # One path per line; blank lines and comments are ignored.
 cli/src/__tests__/routine-list-filters.test.ts
 cli/src/__tests__/agent-config.test.ts
+cli/src/__tests__/convex.test.ts
 cli/src/__tests__/search-parity.test.ts
 packages/adapter-utils/src/directory-merge-lock.test.ts
 packages/adapter-utils/src/execution-target-run-temp.test.ts
@@ -22,6 +23,22 @@ packages/adapters/codex-local/src/company-model-catalog.test.ts
 packages/adapters/codex-local/src/server/execute.remote.test.ts
 packages/adapters/codex-local/src/server/runtime-config.test.ts
 packages/adapters/codex-local/src/server/test.remote.test.ts
+packages/plugins/plugin-convex/tests/ci-previews.spec.ts
+packages/plugins/plugin-convex/tests/client.spec.ts
+packages/plugins/plugin-convex/tests/contract.spec.ts
+packages/plugins/plugin-convex/tests/dev-reaper.spec.ts
+packages/plugins/plugin-convex/tests/dry-run.spec.ts
+packages/plugins/plugin-convex/tests/evidence.spec.ts
+packages/plugins/plugin-convex/tests/guards.spec.ts
+packages/plugins/plugin-convex/tests/hard-guard.spec.ts
+packages/plugins/plugin-convex/tests/model.spec.ts
+packages/plugins/plugin-convex/tests/reaper.spec.ts
+packages/plugins/plugin-convex/tests/resilience.spec.ts
+packages/plugins/plugin-convex/tests/review.spec.ts
+packages/plugins/plugin-convex/tests/ui.spec.tsx
+packages/plugins/plugin-github/tests/sync-job-context.spec.ts
+packages/plugins/plugin-github/tests/sync-queued-ui.spec.tsx
+packages/plugins/plugin-github/tests/sync-scope-loss.spec.ts
 packages/shared/src/agent-config-merge-patch.test.ts
 packages/shared/src/command-action-rank.test.ts
 packages/shared/src/command-actions.test.ts
@@ -29,6 +46,7 @@ packages/shared/src/company-environment-defaults.test.ts
 packages/shared/src/validators/routine-list-query.test.ts
 server/src/__tests__/agent-config-merge-patch.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
+server/src/__tests__/bundled-plugins.test.ts
 server/src/__tests__/decision-wakeup.test.ts
 server/src/__tests__/external-objects-service.test.ts
 server/src/__tests__/github-commit-details.test.ts
