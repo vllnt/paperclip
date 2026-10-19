@@ -72,7 +72,7 @@ describe("RoutineListFilterBar", () => {
     container.remove();
   });
 
-  it("applies a chip value and closes the chip once it is picked", async () => {
+  it.each([["status", "Paused", "paused"], ["trigger", "Event", "event"]] as const)("applies the %s chip value %s and closes the chip", async (filter, label, value) => {
     const onFilterChange = vi.fn();
     root = createRoot(container);
     act(() => {
@@ -89,17 +89,17 @@ describe("RoutineListFilterBar", () => {
     });
     expect(container.querySelector('[aria-label="Filter by agent"]')).toBeNull();
 
-    const statusChip = container.querySelector<HTMLButtonElement>('[aria-label="Filter by status"]')!;
+    const chip = container.querySelector<HTMLButtonElement>(`[aria-label="Filter by ${filter}"]`)!;
     await act(async () => {
-      statusChip.click();
+      chip.click();
     });
-    const paused = [...document.body.querySelectorAll("button")].find((button) => button.textContent === "Paused");
-    expect(paused).toBeTruthy();
+    const option = [...document.body.querySelectorAll("button")].find((button) => button.textContent === label);
+    expect(option).toBeTruthy();
     await act(async () => {
-      paused!.click();
+      option!.click();
     });
-    expect(onFilterChange).toHaveBeenCalledWith("status", "paused");
-    expect([...document.body.querySelectorAll("button")].some((button) => button.textContent === "Paused")).toBe(false);
+    expect(onFilterChange).toHaveBeenCalledWith(filter, value);
+    expect([...document.body.querySelectorAll("button")].some((button) => button.textContent === label)).toBe(false);
   });
 });
 

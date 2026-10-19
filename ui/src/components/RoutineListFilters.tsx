@@ -31,6 +31,7 @@ const TRIGGER_LABELS: Record<RoutineListTriggerFilter, string> = {
   schedule: "Schedule",
   webhook: "Webhook",
   api: "API",
+  event: "Event",
   manual: "No trigger",
 };
 

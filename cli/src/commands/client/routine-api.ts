@@ -56,7 +56,7 @@ export function registerRoutineApiCommands(program: Command): void {
       .option("--agent-id <id>", "Only routines assigned to this agent")
       .option("--folder-id <id>", "Only routines in this folder; none for routines in no folder")
       .option("--status <status>", "active, paused or archived")
-      .option("--trigger <kind>", "schedule, webhook, api, or manual for routines with no trigger")
+      .option("--trigger <kind>", "schedule, webhook, api, event, or manual for routines with no trigger")
       .action(async (opts: RoutineListOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
