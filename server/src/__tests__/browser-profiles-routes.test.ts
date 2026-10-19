@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, browserProfileAgents, browserProfiles, companies, createDb } from "@paperclipai/db";
+import { activityLog, agents, browserProfileAgents, browserProfiles, companies, companySecrets, createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -14,6 +14,18 @@ vi.hoisted(() => {
   process.env.PAPERCLIP_INSTANCE_ID = "vitest";
   process.env.PAPERCLIP_LOG_DIR = "/tmp/paperclip-test-home/logs";
   process.env.PAPERCLIP_IN_WORKTREE = "false";
+});
+
+const auditControl = vi.hoisted(() => ({ failAction: null as string | null }));
+vi.mock("../services/activity-log.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/activity-log.js")>();
+  return {
+    ...actual,
+    logActivity: async (...args: Parameters<typeof actual.logActivity>) => {
+      if (auditControl.failAction !== null && args[1].action === auditControl.failAction) throw new Error("audit unavailable");
+      return actual.logActivity(...args);
+    },
+  };
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -437,6 +449,58 @@ describeEmbeddedPostgres("browser profile routes", () => {
       // The holder's tab was opened under the old allowlist; its next action gets a tab under the new one.
       await agent(holder).post(`${base}/actions`).send({ action: "snapshot" }).expect(200);
       expect(fake.openedTabs.at(-1)).toEqual({ key: holder, agentAllowedDomains: ["app.posthog.com"] });
+    });
+
+    it("does not run a queued action on a browser that closed or a company that turned the feature off", async () => {
+      const { companyId, board, agent, fake, harness, profile } = await setup();
+      const { id, base } = await profile();
+      const agentId = await newAgent(companyId);
+      await board().patch(base).send({ allowedAgentIds: [agentId] }).expect(200);
+      const queueBehindHeldWait = async () => {
+        await agent(agentId).post(`${base}/actions`).send({ action: "snapshot" }).expect(200);
+        fake.waitHold.held = true;
+        fake.waitHold.entered = false;
+        const blocking = harness.service.agentAction(companyId, id, { agentId, runId: "holder" }, { action: "wait", ms: 100 });
+        await vi.waitFor(() => expect(fake.waitHold.entered).toBe(true));
+        const queued = Promise.allSettled([
+          harness.service.agentAction(companyId, id, { agentId, runId: null }, { action: "snapshot" }),
+        ]);
+        // The queued call passes its first checks and waits behind the held action.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return {
+          async release() {
+            fake.waitHold.held = false;
+            fake.waitHold.release();
+            await blocking.catch(() => undefined);
+            return (await queued)[0];
+          },
+        };
+      };
+
+      const closed = await queueBehindHeldWait();
+      await harness.service.closeAll();
+      expect(await closed.release()).toMatchObject({ status: "rejected", reason: { status: 409 } });
+
+      const disabled = await queueBehindHeldWait();
+      await board().put(`/api/companies/${companyId}/browser/settings`).send({ enabled: false }).expect(200);
+      expect(await disabled.release()).toMatchObject({ status: "rejected", reason: { status: 404 } });
+    });
+
+    it("keeps the encryption key of a created profile when the audit write fails", async () => {
+      const { companyId, board } = await setup();
+      auditControl.failAction = "browser.profile_created";
+      try {
+        await board().post(`/api/companies/${companyId}/browser/profiles`).send({ name: "audited" }).expect(500);
+      } finally {
+        auditControl.failAction = null;
+      }
+      const [row] = await db
+        .select()
+        .from(browserProfiles)
+        .where(and(eq(browserProfiles.companyId, companyId), eq(browserProfiles.name, "audited")));
+      expect(row?.keySecretId).toBeTruthy();
+      const [secret] = await db.select().from(companySecrets).where(eq(companySecrets.id, row!.keySecretId!));
+      expect(secret?.status).not.toBe("deleted");
     });
   });
 

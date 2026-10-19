@@ -409,18 +409,20 @@ export function browserProfileService(db: Db, options: BrowserProfileServiceOpti
         },
         { userId },
       );
+      let row: ProfileRow;
       try {
-        const [row] = await db
+        [row] = await db
           .insert(browserProfiles)
           .values({ id, companyId, name: input.name, allowedDomains: input.allowedDomains, keySecretId: secret.id, createdByUserId: userId })
           .returning();
-        await audit(companyId, { type: "user", id: userId }, "profile_created", id, { name: input.name, allowedDomains: input.allowedDomains });
-        return toProfile(row, []);
       } catch (error) {
+        // Only an insert that wrote no row may drop the key; once the row exists it owns the key.
         await secrets.remove(secret.id).catch(() => undefined);
         if (isUniqueViolation(error, NAME_INDEX)) throw conflict("A browser profile with that name already exists");
         throw error;
       }
+      await audit(companyId, { type: "user", id: userId }, "profile_created", id, { name: input.name, allowedDomains: input.allowedDomains });
+      return toProfile(row, []);
     },
 
     async update(companyId: string, profileId: string, patch: UpdateBrowserProfile, userId: string): Promise<BrowserProfile> {
@@ -596,7 +598,9 @@ export function browserProfileService(db: Db, options: BrowserProfileServiceOpti
       const entry = await ensureLive(profile);
       const tabKey = actor.runId ?? actor.agentId;
       return enqueue(entry, async () => {
-        // The grant or the allowlist may have changed while this action waited in the queue.
+        // The company switch, the live browser, the grant or the allowlist may have changed while this action waited.
+        await assertEnabled(companyId);
+        if (live.get(profileId) !== entry) throw conflict("The browser closed; retry the action", { code: "browser_closed" });
         const fresh = await getOwned(companyId, profileId);
         await assertAgentMayAct(fresh, agentActor, action);
         if (activeLease(entry)) throw conflict("A board user is signing in to this profile", { code: "profile_busy" });
