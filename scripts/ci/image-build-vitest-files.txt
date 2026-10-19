@@ -10,6 +10,7 @@ packages/adapter-utils/src/execution-target-run-temp.test.ts
 packages/adapter-utils/src/log-value-redaction.test.ts
 packages/adapter-utils/src/paperclip-temp.test.ts
 packages/adapter-utils/src/redact-env-for-logs.test.ts
+packages/adapter-utils/src/remote-managed-runtime-reap.test.ts
 packages/adapter-utils/src/remote-process-identity.test.ts
 packages/adapter-utils/src/remote-process-tree-stop.test.ts
 packages/adapter-utils/src/sandbox-callback-bridge-abort.test.ts
@@ -56,6 +57,7 @@ server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
 server/src/__tests__/run-log-chunk-compactor.test.ts
 server/src/__tests__/run-log-redaction-policy.test.ts
+server/src/__tests__/ssh-run-directory-reaper-settings.test.ts
 server/src/services/heartbeat-remote-run-temp.test.ts
 server/src/shutdown-budget.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx
