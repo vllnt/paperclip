@@ -18,7 +18,9 @@ import {
   readAgentFallbacks,
   readClaimedHarnessDispatch,
   reclassifyProviderQuotaResult,
+  profileUnavailableReason,
   type HarnessDispatch,
+  type ProfileTargetInput,
 } from "./harness-fallback.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
@@ -58,7 +60,14 @@ import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from
 import { canRetryStoppedRun, isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import {
+  HARNESS_FALLBACK_ADAPTER_TYPES,
+  aiConnectionBindingSchema,
+  issueRunProfileFromOverrides,
+  resolveRunProfile,
+  runProfileSchema,
+  type RunProfile,
+} from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { selectInCommentBatches } from "./comment-id-batches.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
@@ -78,6 +87,11 @@ import {
   registerAdapterExecutionControl,
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
+import {
+  acknowledgeAdapterSteering,
+  clearAdapterSteering,
+  setAdapterSteeringHandle,
+} from "./adapter-steering.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
@@ -96,6 +110,11 @@ import {
   type DurableChatWakeupRequest,
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
+import {
+  cleanupHeartbeatRemoteRunTemp,
+  prepareHeartbeatRemoteRunTemp,
+  type HeartbeatRemoteRunTemp,
+} from "./heartbeat-remote-run-temp.js";
 import {
   cleanupGitHubOperationLaunchers,
   prepareGitHubExecutionEnvironment,
@@ -1219,6 +1238,7 @@ function readHeartbeatRunErrorFamily(
   if (
     run.errorCode === "codex_transient_upstream" ||
     run.errorCode === "claude_transient_upstream" ||
+    run.errorCode === "grok_transient_upstream" ||
     run.errorCode === "codex_harness_crash"
   ) {
     return "transient_upstream";
@@ -3680,6 +3700,7 @@ const heartbeatRunListColumns = {
   executedAdapterType: heartbeatRuns.executedAdapterType,
   executedModel: heartbeatRuns.executedModel,
   fallbackReason: heartbeatRuns.fallbackReason,
+  targetSource: sql<string | null>`${heartbeatRuns.runnerProfileJson} -> 'adapterDispatch' ->> 'source'`,
   externalRunId: heartbeatRuns.externalRunId,
   processPid: heartbeatRuns.processPid,
   processGroupId: heartbeatRunProcessGroupIdColumn,
@@ -4129,6 +4150,7 @@ type SessionCompactionDecision = {
 interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
   useProjectWorkspace: boolean | null;
+  runProfile: RunProfile | null;
 }
 
 /**
@@ -6008,10 +6030,13 @@ function parseIssueAssigneeAdapterOverrides(
     typeof parsed.useProjectWorkspace === "boolean"
       ? parsed.useProjectWorkspace
       : null;
-  if (!adapterConfig && useProjectWorkspace === null) return null;
+  const parsedProfile = runProfileSchema.safeParse(parsed.runProfile);
+  const runProfile = parsedProfile.success ? parsedProfile.data : null;
+  if (!adapterConfig && useProjectWorkspace === null && !runProfile) return null;
   return {
     adapterConfig,
     useProjectWorkspace,
+    runProfile,
   };
 }
 
@@ -10077,6 +10102,18 @@ export function heartbeatService(
       const policy = parseHeartbeatPolicy(agent);
       if (!policy.wakeOnDemand) return "heartbeat.wakeOnDemand.disabled";
       return (await getHeartbeatDailyCapBlock(agent, policy))?.reason ?? null;
+    },
+    // The same slot count as the deferred-wake sweep: running runs against
+    // the agent's limit. Queued work waits its turn and does not starve
+    // stranded issues behind a standing queue.
+    getAgentFreeRunSlots: async (agentId) => {
+      const agent = await getAgent(agentId);
+      if (!agent) return null;
+      const [row] = await db
+        .select({ running: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
+      return Math.max(0, parseHeartbeatPolicy(agent).maxConcurrentRuns - Number(row?.running ?? 0));
     },
   });
   const runDispatch = createRunDispatch(db);
@@ -16789,7 +16826,7 @@ export function heartbeatService(
     // harness/model of the agent is cooling down from a quota failure.
     const storedAgentForQuota = run.runtimeMode === "native" ? null : await getAgent(run.agentId).catch(() => null);
     const quotaHeldUntil = storedAgentForQuota
-      ? await harnessFallback.heldUntil(storedAgentForQuota, now)
+      ? await harnessFallback.heldUntil(storedAgentForQuota, now, await resolveRunProfileForRun(run, storedAgentForQuota))
       : null;
     const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
       .filter((value): value is Date => value !== null)
@@ -18586,6 +18623,164 @@ export function heartbeatService(
   }
 
   /**
+   * The run profile an issue gives its assignee's run: the issue's own profile
+   * (or the model and effort of its legacy adapter override) resolved against
+   * the company's tiers. Only legacy runs of the local Claude, Codex and Grok
+   * harnesses take a profile. An unknown tier runs on the agent's default and
+   * is noted on the run.
+   */
+  async function resolveRunProfileForRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType">,
+  ): Promise<ProfileTargetInput | null> {
+    if (run.runtimeMode === "native") return null;
+    if (!(HARNESS_FALLBACK_ADAPTER_TYPES as readonly string[]).includes(agent.adapterType)) return null;
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (!issueId) return null;
+    const issue = await getIssueExecutionContext(agent.companyId, issueId);
+    if (!issue || issue.assigneeAgentId !== agent.id) return null;
+    const overrides = parseIssueAssigneeAdapterOverrides(issue.assigneeAdapterOverrides);
+    const issueProfile = issueRunProfileFromOverrides(overrides);
+    if (!issueProfile) return null;
+    const tiers = (await instanceSettings.getGeneral()).companyRunTiers?.[agent.companyId] ?? null;
+    const resolved = resolveRunProfile(issueProfile.profile, tiers);
+    if (!resolved.ok) {
+      logger.warn({ runId: run.id, tier: resolved.tier }, "run profile names an unknown tier; running on the agent default");
+      return null;
+    }
+    if (!resolved.target) return null;
+    return { ...resolved.target, source: "issue_profile" };
+  }
+
+  /** Notes on a held queued run when it can start; written once per cooldown end. */
+  async function recordProviderQuotaWait(run: typeof heartbeatRuns.$inferSelect, heldUntil: Date) {
+    const waitUntil = heldUntil.toISOString();
+    // A merge in SQL: a comment wake can coalesce into this queued run while
+    // we hold it, and a read-modify-write of the snapshot would drop it.
+    const [held] = await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ providerQuotaWaitUntil: waitUntil })}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(and(
+        eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.status, "queued"),
+        sql`coalesce(${heartbeatRuns.contextSnapshot}->>'providerQuotaWaitUntil', '') <> ${waitUntil}`,
+      ))
+      .returning();
+    if (!held) return;
+    await appendRunEvent(held, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: `Waiting for the provider quota to reset; this run starts at or after ${waitUntil}`,
+      payload: { providerQuotaWaitUntil: waitUntil },
+    }).catch(() => undefined);
+  }
+
+  /**
+   * After a failed legacy run that hit a provider usage limit before useful
+   * work (or a capacity limit whose bounded retries are spent), cools the
+   * harness/model that ran down until the provider's reset, or a bounded
+   * backoff when none is known. With a healthy fallback the same wake is
+   * re-dispatched there once; otherwise every retry and new wake waits for
+   * the cooldown (see scheduleBoundedRetryForRun and claimQueuedRun).
+   */
+  async function handleProviderQuotaFailure(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    executedAgent: typeof agents.$inferSelect;
+    storedAgent: typeof agents.$inferSelect;
+    phase: "failure" | "retry_exhausted";
+  }): Promise<{ redispatched: boolean; awaitingRetryExhaustion: boolean; deferUntil: Date | null }> {
+    const none = { redispatched: false, awaitingRetryExhaustion: false, deferUntil: null };
+    const { run, executedAgent, storedAgent } = input;
+    if (run.runtimeMode === "native") return none;
+    const dispatch = readClaimedHarnessDispatch(run.runnerProfileJson) ?? primaryHarnessDispatch(storedAgent);
+    if (!isLlmHarnessAdapterType(dispatch.adapterType)) return none;
+    const outputTokens = asNumber(parseObject(run.usageJson).outputTokens, 0);
+    let usefulWork = outputTokens > 0;
+    if (!usefulWork) {
+      const evidence = await buildRunLivenessInput(run, parseObject(run.resultJson))
+        .then((liveness) => liveness.evidence)
+        .catch(() => null);
+      // An unreadable evidence lookup fails closed: the failure still has to
+      // read as a provider quota error, and cooling down is the safe side.
+      usefulWork = !!evidence && (
+        (evidence.issueCommentsCreated ?? 0) > 0 ||
+        (evidence.documentRevisionsCreated ?? 0) > 0 ||
+        (evidence.workProductsCreated ?? 0) > 0 ||
+        (evidence.activityEventsCreated ?? 0) > 0);
+    }
+    const decision = classifyQuotaFailure({
+      status: run.status,
+      errorCode: run.errorCode,
+      errorFamily: readHeartbeatRunErrorFamily(run),
+      errorMessage: run.error,
+      retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+      usefulWork,
+    });
+    if (!decision.trigger) return none;
+    if (decision.requiresRetryExhaustion && input.phase !== "retry_exhausted") {
+      return { ...none, awaitingRetryExhaustion: true };
+    }
+    const reason = `provider_${decision.kind}`;
+    const cooled = await harnessFallback.coolDown({
+      agent: storedAgent,
+      targetKey: dispatch.targetKey,
+      reason,
+      resetAt: decision.resetAt,
+      sourceRunId: run.id,
+      profile: dispatch.profile ?? null,
+    }).catch((err) => {
+      // Fail closed: without a recorded cooldown the normal 30 second retry
+      // would send this wake straight back at the exhausted target.
+      logger.warn({ err, runId: run.id, target: dispatch.targetKey }, "quota cooldown could not be recorded; deferring this wake");
+      return null;
+    });
+    if (!cooled) {
+      return { ...none, deferUntil: new Date(Date.now() + COOLDOWN_READ_FAILURE_BASE_MS) };
+    }
+    const { until, nextTarget } = cooled;
+    if (!until) return none;
+    const context = parseObject(run.contextSnapshot);
+    const alreadyRedispatched = readNonEmptyString(parseObject(context.harnessFallbackRedispatch).fromRunId) !== null;
+    await appendRunEvent(run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: `Harness ${dispatch.targetKey} cooled down until ${until.toISOString()} (${reason})`,
+      payload: {
+        harnessTarget: dispatch.targetKey,
+        reason,
+        cooldownUntil: until.toISOString(),
+        resetKnown: decision.resetAt !== null,
+        nextTarget: nextTarget?.key ?? null,
+        alreadyRedispatched,
+      },
+    });
+    // A wake gets one re-dispatch. A failed fallback run defers the wake to its
+    // own cooldown end instead of hopping to the next target a moment later.
+    if (alreadyRedispatched) return { ...none, deferUntil: until };
+    if (!nextTarget) return none;
+    const scheduled = await scheduleBoundedRetryForRun(run, executedAgent, {
+      retryReason: HARNESS_FALLBACK_RETRY_REASON,
+      wakeReason: HARNESS_FALLBACK_WAKE_REASON,
+      maxAttempts: executionRetryAttemptCount(run, HARNESS_FALLBACK_RETRY_REASON) + 1,
+      delayMs: 0,
+      contextPatch: {
+        harnessFallbackRedispatch: {
+          fromRunId: run.id,
+          fromTarget: dispatch.targetKey,
+          toTarget: nextTarget.key,
+          reason,
+        },
+      },
+    });
+    return { ...none, redispatched: scheduled.outcome === "scheduled" };
+  }
+
+  /**
    * The single definition of how many runs `maxDailyRuns` counts, per agent,
    * in one UTC day. The cap check (`getHeartbeatDailyCapBlock`), the run
    * stats (`runStats`) and the provider quota alarm all read it, so what
@@ -19209,7 +19404,14 @@ export function heartbeatService(
     }
     if (await waitForProviderQuotaLane(run, agent)) return null;
 
-    const harnessDecision = await harnessFallback.resolveDispatch(agent);
+    const runProfile = await resolveRunProfileForRun(run, agent);
+    const harnessDecision = await harnessFallback.resolveDispatch(agent, new Date(), runProfile);
+    if (runProfile && profileUnavailableReason(agent, runProfile)) {
+      logger.warn(
+        { runId: run.id, agentId: agent.id, profile: runProfile },
+        "run profile needs credentials this agent does not have for that harness; running on the agent default",
+      );
+    }
     if (harnessDecision.heldUntil && run.runtimeMode !== "native") {
       // Every harness/model of this agent is out of provider quota. Leave the
       // run queued: the scheduler tick claims it once a target recovers, and
@@ -22929,6 +23131,10 @@ export function heartbeatService(
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
+    let remoteRunTempLocation: HeartbeatRemoteRunTemp["cleanupLocation"] | null = null;
+    // Set when the adapter proves its last remote process exited, which a
+    // timeout or a dropped SSH channel does not.
+    let remoteProviderStopped = false;
     let nativeSessionResumeScheduled = false;
     let nativeOwnershipHeld = false;
     let nativeInstructionReservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
@@ -24337,7 +24543,7 @@ export function heartbeatService(
       const harnessCompatibility = checkRunHarnessCompatibility({
         adapterType: agent.adapterType,
         config: runtimeConfig,
-        fallback: claimedHarnessDispatch?.target === "fallback",
+        fallback: claimedHarnessDispatch?.target === "fallback" || claimedHarnessDispatch?.crossHarness === true,
       });
       if (!harnessCompatibility.ok) {
         throw unprocessable(harnessCompatibility.message, { code: harnessCompatibility.code });
@@ -25367,6 +25573,30 @@ export function heartbeatService(
         }
       } else {
         delete context.paperclipScratch;
+        // A remote run gets its own temp directory on the target, so agents
+        // do not fill the worker's shared /tmp.
+        try {
+          const existingRuntimeEnv = parseObject(runtimeConfig.env);
+          const remoteTemp = await prepareHeartbeatRemoteRunTemp({
+            native: agent.adapterType === "paperclip_runner",
+            runId: run.id,
+            target: executionTarget,
+            env: existingRuntimeEnv,
+          });
+          if (remoteTemp) {
+            remoteRunTempLocation = remoteTemp.cleanupLocation;
+            runtimeConfig = {
+              ...runtimeConfig,
+              env: { ...existingRuntimeEnv, ...remoteTemp.env },
+            };
+            context.paperclipScratch = remoteTemp.scratchContext;
+          }
+        } catch (remoteTempError) {
+          logger.warn(
+            { err: remoteTempError, runId: run.id, agentId: agent.id },
+            "failed to prepare the remote run temp directory; continuing without it",
+          );
+        }
       }
       const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
         target: executionTarget,
@@ -26034,6 +26264,13 @@ export function heartbeatService(
             message: event.message,
             payload: event.payload,
           });
+          try {
+            await acknowledgeAdapterSteering(run.id, event);
+          } catch (err) {
+            // The message reached the agent; its comment stays queued, so the
+            // worst case is a duplicate delivery on the next wake.
+            logger.warn({ err, runId: run.id }, "failed to settle steered comment");
+          }
         };
 
         const adapter = getServerAdapter(agent.adapterType);
@@ -27479,6 +27716,7 @@ export function heartbeatService(
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
+                  remoteProviderStopped = false;
                   return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
                     getFreshSessionHandoff,
                     runId: run.id,
@@ -27512,7 +27750,10 @@ export function heartbeatService(
                         issueId,
                       );
                     },
-                    onProviderStopped: collectStoppedInstructions,
+                    onProviderStopped: async () => {
+                      remoteProviderStopped = true;
+                      await collectStoppedInstructions();
+                    },
                     onDispatch: markDispatchStarted,
                     signal: executionControl.controller.signal,
                     ...(executionTarget?.kind === "remote" && executionTarget.transport === "sandbox" ? {
@@ -27535,6 +27776,7 @@ export function heartbeatService(
                         }
                       },
                     } : {}),
+                    onSteeringReady: (handle) => setAdapterSteeringHandle(run.id, handle),
                     onCancellationReady: async () => {
                       await registerAdapterExecutionControl(run.id, executionControl);
                       const current = await getRun(run.id);
@@ -29297,6 +29539,35 @@ export function heartbeatService(
               },
             );
           }
+          if (
+            remoteRunTempLocation &&
+            latestRun &&
+            isHeartbeatRunTerminalStatus(latestRun.status)
+          ) {
+            // Without proof that the remote process stopped, the directory
+            // stays for the SSH run directory reaper; a sandbox keeps it until
+            // the sandbox goes away. No dispatched adapter means no process.
+            const remoteTempCleanup = await cleanupHeartbeatRemoteRunTemp({
+              location: remoteRunTempLocation,
+              stopProven:
+                remoteProviderStopped ||
+                !(legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld),
+            }).catch((err) => {
+              logger.warn(
+                { err, runId: run.id },
+                "failed to remove the remote run temp directory",
+              );
+              return null;
+            });
+            if (remoteTempCleanup === "stop_unproven" || remoteTempCleanup === "symlink") {
+              logger.warn(
+                { runId: run.id, reason: remoteTempCleanup },
+                remoteTempCleanup === "symlink"
+                  ? "kept the remote run temp directory: a link or a file replaced a directory in its path"
+                  : "kept the remote run temp directory: nothing proves the remote process stopped",
+              );
+            }
+          }
           // A retained or unverified process stays above this release boundary.
           // If no stopped-copy capture occurred, preserve an explicit loss report.
           const uncapturedInstructions = await instructionCopies.reportUnavailable(run.companyId, run.id);
@@ -29403,6 +29674,7 @@ export function heartbeatService(
         if (adapterExecutionControls.get(run.id) === executionControl) {
           adapterExecutionControls.delete(run.id);
         }
+        clearAdapterSteering(run.id);
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.

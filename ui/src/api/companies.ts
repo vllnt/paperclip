@@ -1,3 +1,4 @@
+import type { CompanyRunTiers } from "@paperclipai/shared";
 import type {
   Company,
   CompanyPortabilityExportRequest,
@@ -80,6 +81,7 @@ export interface CompanyImportJobStatus {
 }
 
 export const companiesApi = {
+  runTiers: (companyId: string) => api.get<CompanyRunTiers>(`/companies/${companyId}/run-tiers`),
   list: () => api.get<Company[]>(COMPANIES_LIST_PATH),
   directory: () => api.get<Company[]>(COMPANIES_DIRECTORY_PATH),
   detachInflightDirectory: () => detachInflightGet(COMPANIES_DIRECTORY_PATH),

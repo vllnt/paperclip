@@ -1,5 +1,18 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
 export {
+  DEFAULT_RUN_TIER,
+  RUN_TARGET_SOURCES,
+  companyRunTiersSchema,
+  issueRunProfileFromOverrides,
+  resolveRunProfile,
+  runProfileSchema,
+  type CompanyRunTiers,
+  type ResolvedRunTarget,
+  type RunProfile,
+  type RunProfileResolution,
+  type RunTargetSource,
+} from "./run-profile.js";
+export {
   HARNESS_FALLBACK_ADAPTER_TYPES,
   HARNESS_ALLOWED_MODEL_VENDORS,
   MAX_AGENT_FALLBACKS,
@@ -2293,6 +2306,10 @@ export {
   updateToolProfileWithEntriesSchema,
   upsertToolCatalogEntrySchema,
   createRoutineSchema,
+  listRoutinesQuerySchema,
+  parseListRoutinesQuery,
+  ROUTINE_LIST_QUERY_MAX_LENGTH,
+  ROUTINE_LIST_TRIGGER_FILTERS,
   updateRoutineSchema,
   createRoutineTriggerSchema,
   updateRoutineTriggerSchema,
@@ -2362,6 +2379,8 @@ export {
   type UnbindToolProfileBinding,
   type UpsertToolCatalogEntry,
   type CreateRoutine,
+  type ListRoutinesQuery,
+  type RoutineListTriggerFilter,
   type UpdateRoutine,
   type CreateRoutineTrigger,
   type UpdateRoutineTrigger,

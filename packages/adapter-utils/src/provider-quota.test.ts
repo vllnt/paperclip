@@ -33,6 +33,11 @@ describe("isProviderQuotaMessage", () => {
       "429 rate_limit_error anthropic-ratelimit-unified-status: rejected anthropic-ratelimit-unified-reset: 1791514800",
     ],
     ["an OpenAI insufficient_quota", '{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}'],
+    [
+      "an xAI team out of credits",
+      "403 Forbidden: Your team 1a2b3c has either used all available credits or reached its monthly spending limit. To continue making API requests, please purchase more credits or raise your spending limit.",
+    ],
+    ["an xAI personal team spending block", '{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits"}'],
   ])("recognises %s", (_label, text) => {
     expect(isProviderQuotaMessage(text)).toBe(true);
   });

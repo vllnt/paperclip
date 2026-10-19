@@ -2129,13 +2129,6 @@
       "when": 1792430335310,
       "tag": "0305_absurd_power_pack",
       "breakpoints": true
-    },
-    {
-      "idx": 306,
-      "version": "7",
-      "when": 1792430464446,
-      "tag": "0306_cold_warbound",
-      "breakpoints": true
     }
   ]
 }
