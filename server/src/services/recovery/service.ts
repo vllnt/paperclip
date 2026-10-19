@@ -1,6 +1,7 @@
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
+import { selectInCommentBatches } from "../comment-id-batches.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import {
@@ -90,6 +91,7 @@ import { budgetService } from "../budgets.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import {
+  LEGACY_RECOVERY_CAUSE,
   legacyExecutionNeedsReconciliationWithEvidence,
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
@@ -518,8 +520,10 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   // process starts. Known transient preflight failures use dedicated bounded
   // retry paths instead of generic issue continuation recovery.
   "setup_failed",
-  // Setup owns the shared durable retry budget for temporary Git scans.
-  // Generic continuation must not retry permanent failures or reset that budget.
+  // Setup owns the shared durable retry budget for temporary Git scans and
+  // unreachable remote targets. Generic continuation must not retry permanent
+  // failures or reset that budget.
+  "remote_preflight_unavailable",
   "workspace_git_scan_timeout",
   "workspace_git_scan_saturated",
   "workspace_git_scan_cancelled",
@@ -1403,20 +1407,22 @@ export function recoveryService(
     )
       return false;
     const commentIds = ids as string[];
-    const sources = await db
-      .select({ id: issueComments.id })
-      .from(issueComments)
-      .where(
-        and(
-          eq(issueComments.companyId, binding.companyId),
-          eq(issueComments.issueId, binding.issueId),
-          inArray(issueComments.id, commentIds),
-          isNull(issueComments.createdByRunId),
-          isNull(issueComments.deletedAt),
-          sql`${issueComments.updatedAt} = ${issueComments.createdAt}`,
-          sql`${issueComments.createdAt} <= (select started_at from heartbeat_runs where id = ${binding.runId})`,
+    const sources = await selectInCommentBatches(commentIds, (batch) =>
+      db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(
+          and(
+            eq(issueComments.companyId, binding.companyId),
+            eq(issueComments.issueId, binding.issueId),
+            inArray(issueComments.id, batch),
+            isNull(issueComments.createdByRunId),
+            isNull(issueComments.deletedAt),
+            sql`${issueComments.updatedAt} = ${issueComments.createdAt}`,
+            sql`${issueComments.createdAt} <= (select started_at from heartbeat_runs where id = ${binding.runId})`,
+          ),
         ),
-      );
+    );
     if (sources.length !== commentIds.length) return false;
     const [newer, pendingInteraction, pendingApproval] = await Promise.all([
       db
@@ -1724,30 +1730,32 @@ export function recoveryService(
           ].filter((id): id is string => id !== null),
         ),
       ];
-      const comments = await tx
+      // The named ids and the "changed since finalization" window are separate
+      // lookups so the id list can be batched.
+      const inIssue = and(
+        eq(issueComments.companyId, current.companyId),
+        eq(issueComments.issueId, current.id),
+      );
+      const named = await selectInCommentBatches(commentIds, (batch) =>
+        tx.select().from(issueComments).where(and(inIssue, inArray(issueComments.id, batch))),
+      );
+      const changedSince = await tx
         .select()
         .from(issueComments)
         .where(
           and(
-            eq(issueComments.companyId, current.companyId),
-            eq(issueComments.issueId, current.id),
+            inIssue,
             or(
-              commentIds.length
-                ? inArray(issueComments.id, commentIds)
-                : sql`false`,
-              and(
-                or(
-                  isNull(issueComments.createdByRunId),
-                  not(eq(issueComments.createdByRunId, source.id)),
-                ),
-                or(
-                  gt(issueComments.createdAt, proof.finalizedAt),
-                  gt(issueComments.updatedAt, proof.finalizedAt),
-                ),
-              ),
+              isNull(issueComments.createdByRunId),
+              not(eq(issueComments.createdByRunId, source.id)),
+            ),
+            or(
+              gt(issueComments.createdAt, proof.finalizedAt),
+              gt(issueComments.updatedAt, proof.finalizedAt),
             ),
           ),
         );
+      const comments = [...new Map([...named, ...changedSince].map((comment) => [comment.id, comment])).values()];
       if (
         comments.some(
           (comment) =>
@@ -3590,6 +3598,36 @@ export function recoveryService(
     return Boolean(run || wake);
   }
 
+  /**
+   * Why a legacy reconciliation hold no longer applies, or null while it does.
+   * It applies while the issue is in progress (or in review for the reviewer
+   * whose run was lost) and no run other than the lost one is live. Reuses the
+   * resolution notes that the done and live-path exits already write.
+   */
+  async function legacyHoldExitNote(
+    action: typeof issueRecoveryActions.$inferSelect,
+    issue: typeof issues.$inferSelect,
+  ): Promise<string | null> {
+    const reviewerHold =
+      issue.status === "in_review" &&
+      typeof action.evidence.reviewParticipantAgentId === "string";
+    if (issue.status !== "in_progress" && !reviewerHold) return "source_terminal";
+    const lostRunId = typeof action.evidence.runId === "string" ? action.evidence.runId : null;
+    const [liveRun] = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, action.companyId),
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId') = ${action.sourceIssueId}`,
+          lostRunId ? not(eq(heartbeatRuns.id, lostRunId)) : sql`true`,
+        ),
+      )
+      .limit(1);
+    return liveRun ? "new_source_execution_path" : null;
+  }
+
   async function reconcileActiveRecoveryActions() {
     const rows = await db
       .select({ action: issueRecoveryActions, issue: issues })
@@ -3635,6 +3673,29 @@ export function recoveryService(
           result.issueIds.push(issue.id);
         }
         continue;
+      }
+
+      // A legacy hold stays only while its premise holds: the lost run is the
+      // issue's last word, the issue is still in the state that run held, and no
+      // live run has taken over. Otherwise it ends through the same resolution
+      // as a done or cancelled issue, so it cannot outlive its cause.
+      if (action.cause === LEGACY_RECOVERY_CAUSE) {
+        const exitNote = await legacyHoldExitNote(action, issue);
+        if (exitNote) {
+          const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            actionId: action.id,
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote: exitNote,
+          });
+          if (resolved) {
+            result.resolved += 1;
+            result.issueIds.push(issue.id);
+          }
+          continue;
+        }
       }
 
       // A queued comment or healthy child cannot establish what the stopped
