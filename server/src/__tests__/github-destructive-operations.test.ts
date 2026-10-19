@@ -64,8 +64,8 @@ const remote = "https://github.com/acme/site.git";
     ["a webhook DELETE", { program: "gh", args: ["api", "--method", "DELETE", "repos/acme/site/hooks/7"], remote: null }, "(DELETE repos/{owner}/{repo}/hooks)"],
     ["an inactive deployment status", { program: "gh", args: ["api", "repos/acme/site/deployments/9/statuses", "-f", "state=inactive"], remote: null }, "statuses with state inactive)"],
     ["GraphQL deleteRef", { program: "gh", args: ["api", "graphql", "-f", 'query=mutation{deleteRef(input:{refId:"F"}){clientMutationId}}'], remote }, "(graphql deleteRef"],
-    ["git push --delete main", { program: "git", args: ["push", "origin", "--delete", "main"], remote, pushUrls: [remote], currentBranch: "feature" }, "(git push deleting refs/heads/main)"],
-    ["git push +HEAD:main", { program: "git", args: ["push", "origin", "+HEAD:main"], remote, pushUrls: [remote], currentBranch: "feature", touchesWorkflows: false }, "(git push force-pushing refs/heads/main)"],
+    ["git push --delete main", { program: "git", args: ["push", "origin", "--delete", "main"], remote, pushUrls: [remote], currentBranch: "feature" }, "(git push deleting refs/heads/main)"], // paperclip:allow-git-push: test input: the classifier must refuse this push
+    ["git push +HEAD:main", { program: "git", args: ["push", "origin", "+HEAD:main"], remote, pushUrls: [remote], currentBranch: "feature", touchesWorkflows: false }, "(git push force-pushing refs/heads/main)"], // paperclip:allow-git-push: test input: the classifier must refuse this push
   ])("refuses %s for an agent run: no token, an activity record with the route and the agent", async (_name, operation, route) => {
     const run = await seed();
     const result = await resolveGitHubOperationCredentials(db, run, operation);

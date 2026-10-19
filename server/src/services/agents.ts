@@ -1,7 +1,7 @@
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
 import { createHash, randomBytes } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, gte, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -451,6 +451,45 @@ export function agentService(db: Db) {
     }));
   }
 
+  // Derived for display: an agent with no live run but at least one active
+  // wait (a future issue monitor on its own open issue) is "waiting", not idle.
+  // The stored status is unchanged so invocation rules stay the same.
+  async function getAgentWaitStates(companyId: string, agentIds: string[]) {
+    const rows = await db
+      .select({
+        agentId: issues.assigneeAgentId,
+        activeWaitCount: sql<number>`count(*)::int`,
+        nextCheckAt: sql<string>`min(${issues.monitorNextCheckAt})`,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          inArray(issues.assigneeAgentId, agentIds),
+          isNull(issues.assigneeUserId),
+          inArray(issues.status, ["in_progress", "in_review"]),
+          gt(issues.monitorNextCheckAt, new Date()),
+        ),
+      )
+      .groupBy(issues.assigneeAgentId);
+    return new Map(
+      rows.map((row) => [
+        row.agentId,
+        {
+          activeWaitCount: Number(row.activeWaitCount),
+          nextCheckAt: row.nextCheckAt ? new Date(row.nextCheckAt).toISOString() : null,
+        },
+      ]),
+    );
+  }
+
+  async function withAgentWaitState<T extends { id: string; companyId: string }>(rows: T[]) {
+    const companyId = rows[0]?.companyId;
+    if (!companyId) return rows.map((row) => ({ ...row, waitState: null }));
+    const waitStates = await getAgentWaitStates(companyId, rows.map((row) => row.id));
+    return rows.map((row) => ({ ...row, waitState: waitStates.get(row.id) ?? null }));
+  }
+
   async function getById(id: string) {
     const row = await db
       .select()
@@ -462,7 +501,8 @@ export function agentService(db: Db) {
       listCompanyAgentRows(row.companyId),
       hydrateAgentSpend([row]).then((rows) => rows[0]!),
     ]);
-    return normalizeAgentRow(hydrated, companyRows);
+    const [withWaitState] = await withAgentWaitState([normalizeAgentRow(hydrated, companyRows)]);
+    return withWaitState!;
   }
 
   async function requireGetById(id: string) {
@@ -910,7 +950,7 @@ export function agentService(db: Db) {
         listCompanyAgentRows(companyId),
       ]);
       const hydrated = await hydrateAgentSpend(rows);
-      return normalizeAgentRows(hydrated, allCompanyRows);
+      return withAgentWaitState(normalizeAgentRows(hydrated, allCompanyRows));
     },
 
     getById,
