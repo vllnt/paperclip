@@ -113,6 +113,7 @@ import {
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
 import {
+  LIVE_HEARTBEAT_RUN_STATUSES,
   ROUTINE_STEP_ACTOR_ID,
   assertRoutineStepReferences,
   createRoutineRunIssues,
@@ -166,7 +167,6 @@ function rootHasCancelledStep() {
   );
 }
 const APPEND_MODE_STEPS_MESSAGE = "Steps are not supported with append issue mode";
-const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
