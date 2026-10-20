@@ -27763,6 +27763,45 @@ export function heartbeatService(
                       },
                     } : {}),
                     onSteeringReady: (handle) => setAdapterSteeringHandle(run.id, handle),
+                    // A run that ends before it returns (for example on a server restart)
+                    // still leaves its session for the retry. The final write below replaces it.
+                    onSessionCheckpoint: async (checkpoint) => {
+                      try {
+                        const next = resolveNextSessionState({
+                          adapterType: agent.adapterType,
+                          codec: sessionCodec,
+                          adapterResult: { exitCode: null, signal: null, timedOut: false, ...checkpoint },
+                          outcome: "succeeded",
+                          previousParams: previousSessionParams,
+                          previousDisplayId: runtimeForAdapter.sessionDisplayId,
+                          previousLegacySessionId: runtimeForAdapter.sessionId,
+                        });
+                        const sessionIdAfter = next.displayId ?? next.legacySessionId;
+                        if (!sessionIdAfter) return;
+                        const [stored] = await db
+                          .update(heartbeatRuns)
+                          .set({ sessionIdAfter, updatedAt: new Date() })
+                          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+                          .returning({ id: heartbeatRuns.id });
+                        if (!stored || !taskKey) return;
+                        await upsertTaskSession({
+                          companyId: agent.companyId,
+                          agentId: agent.id,
+                          adapterType: agent.adapterType,
+                          taskKey,
+                          sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+                            next.params,
+                            configuredModel,
+                            sessionConfigMetadata,
+                          ),
+                          sessionDisplayId: next.displayId,
+                          lastRunId: run.id,
+                          lastError: null,
+                        });
+                      } catch (err) {
+                        logger.warn({ err, runId: run.id }, "failed to store the early session checkpoint");
+                      }
+                    },
                     onCancellationReady: async () => {
                       await registerAdapterExecutionControl(run.id, executionControl);
                       const current = await getRun(run.id);
