@@ -101,7 +101,7 @@ No new trigger kind. The existing `event` trigger does the work: `eventMatch`, t
 1. Fast path: if the company has no enabled event trigger on its built-in source, it returns at once. No source is created and no delivery row is written, so ordinary task creation is unchanged.
 2. The delivery key is derived from the source, the event type and the task id, so the same task never starts twice.
 3. If the steps were attached, the root wake is skipped (the steps without predecessors are woken after commit) and the 201 response carries the re-read task.
-4. It never throws into the create request. A failure is logged and recorded on the delivery, and the task gets its normal wake.
+4. It never throws into the create request. A failure is logged and recorded on the delivery, and the task gets its normal wake. When the task has open routine steps anyway (a manual run attached them first, so this event's attach was refused), the publish reports the steps as attached and the assignee stays asleep.
 
 The delivery outcome is `issue_created` with `issueId` the task, the `runId`, and note `steps_attached`. A task refused by a guard below is `failed_permanent` with the guard's message.
 

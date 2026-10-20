@@ -197,6 +197,23 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
       expect(children.map((child) => child.title)).toContain(`Build ${task.identifier}: Quarterly figures`);
     });
 
+    it("keeps the assignee asleep when a manual run attached its steps to the task first", async () => {
+      const s = await seed();
+      const listening = await s.createRoutine();
+      await s.listen(listening);
+      const manual = await s.createRoutine({ title: "Hand check" });
+      const task = await s.newTask();
+      await s.fx.routinesSvc.runRoutine(manual.id, { source: "manual", targetIssueId: task.id });
+
+      const result = await s.publish(task.id);
+
+      expect(result.stepsAttached).toBe(true);
+      expect(await s.childrenOf(task.id)).toHaveLength(2);
+      const [refused] = await s.runsOf(listening.id);
+      expect(refused).toMatchObject({ status: "failed" });
+      expect(refused!.failureReason).toContain("routine steps in progress");
+    });
+
     it("leaves a task nobody owns in its status", async () => {
       const s = await seed();
       const routine = await s.createRoutine();

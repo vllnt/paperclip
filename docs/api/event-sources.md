@@ -418,6 +418,7 @@ No event is published for a hidden task, a task of origin `routine_execution`, `
 - A task owned by an agent becomes `blocked`; the task of a person keeps its status and only gains blocker edges. The refusals and what happens on failure are in [Start the steps on a task](routines.md#start-the-steps-on-a-task).
 - If nothing matches, or the company has no enabled `event_issue` trigger, nothing changes. In the second case Paperclip does not even create the source or a delivery row.
 - Publishing never fails the create request. If it fails, the failure is logged and recorded on the delivery, and the task gets its normal wake.
+- If the task already has open routine steps when the event is processed (a manual run on it got there first), the event's attach is refused, but the assignee is not woken: the task waits for those steps.
 - Publishing is idempotent per task: the delivery key is derived from the task id, so the same task never starts twice.
 
 **Outcome.** The delivery outcome for a routine is `issue_created` with `issueId` the task, the `runId`, and `note: "steps_attached"`. A task refused by a guard is `failed_permanent` with the guard's message (for example, a task already in progress). A spent budget is `storm_folded` (see [Storm breaker](#storm-breaker)). The run appears in the routine's run history with the task as its linked issue.

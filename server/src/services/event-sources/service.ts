@@ -1259,10 +1259,13 @@ export function eventSourceService(
         claim = attempt;
         const { outcomes } = await processDelivery(source, event, attempt, startedAt);
         const settled = Object.values(outcomes);
+        const attachedHere = settled.some(
+          (outcome) => outcome.status === "issue_created" && outcome.issueId === input.issueId && outcome.note === "steps_attached",
+        );
         return {
-          stepsAttached: settled.some(
-            (outcome) => outcome.status === "issue_created" && outcome.issueId === input.issueId && outcome.note === "steps_attached",
-          ),
+          // A manual run on the task may have attached its steps first and so refused this event's;
+          // the assignee must stay asleep all the same.
+          stepsAttached: attachedHere || (await hasOpenRoutineSteps(db, companyId, input.issueId)),
           routineRunIds: settled.flatMap((outcome) => outcome.runId ?? []),
         };
       } catch (err) {
