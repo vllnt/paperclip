@@ -380,6 +380,13 @@ describe("openapi routes", () => {
       expect(steps.items.properties.after.maxItems).toBe(MAX_ROUTINE_STEPS);
       expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["403", "404", "409", "422"]));
     }
+    for (const operation of [
+      res.body.paths["/api/routines/{id}/run"].post,
+      res.body.paths["/api/routines/{id}/triggers"].post,
+      res.body.paths["/api/routine-triggers/{id}"].patch,
+    ]) {
+      expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["404", "409", "422"]));
+    }
     expect(res.body.paths["/api/companies"].get.responses["403"]).toBeDefined();
     expect(res.body.paths["/api/companies"].get.responses["400"]).toBeDefined();
     expect(
