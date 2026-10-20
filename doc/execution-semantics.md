@@ -282,6 +282,42 @@ Never instruct a low-trust delegate to comment on the parent issue. That instruc
 
 The direct-parent report comment intentionally does not open lateral comment access: no writes into sibling subtrees or other agents' boundaries. The sanctioned lateral channel is the **courier pattern**: create a new issue assigned to the target agent that carries the complete instructions and context in its description (company-scoped issue-CREATE is permitted from any run). The courier issue wakes the target agent through normal assignment, keeps the coordination auditable, and avoids widening comment access into another agent's boundary. Because the target agent's run may not be able to read your issues, the courier description must be self-contained — do not rely on links back into your own subtree for essential instructions.
 
+### Routine Steps (a generated sub-issue graph)
+
+A routine may define `steps`. Each run then builds the parent/sub-issue and blocker structure above for you, instead of an agent creating the children by hand. Nothing new is added to the execution model: steps are ordinary issues linked by `parentId` and `blockedByIssueIds`, and the existing wakes run them.
+
+```
+run issue (blocked, no wake)
+  |-- implement   todo        <- woken at dispatch (no predecessors)
+  |-- review      blocked by implement
+  |-- lint        blocked by review
+  |-- types       blocked by review
+  `-- ship        blocked by lint, types   (join)
+```
+
+- **Dispatch.** The run issue and all step issues are created in one savepoint, before any wake. A failure leaves no issue behind and records a `failed` run. Step issues use `originKind = routine_step`, never `routine_execution`, so parallel steps do not collide on the open-routine-execution unique index and are never mistaken for the routine's live run.
+- **The run issue is `blocked` and not woken.** It is blocked by its steps. When the last step is done the existing `issue_blockers_resolved` wake reaches its assignee once, to wrap up.
+- **Wakes.** Only steps with no predecessors are woken at dispatch, after the transaction commits. A step with predecessors is woken by `issue_blockers_resolved` when every one of them is `done`. A cancelled step does not satisfy a dependency (see Blockers), so a human cancel never silently cascades; downstream steps stay visibly blocked.
+- **Concurrency.** The blocked run issue has no live heartbeat, so for a routine with steps an open, visible run issue of an earlier run counts as live. `skip_if_active` and `coalesce_if_active` act on it; `always_enqueue` is unchanged.
+- **Sweeps.** The stranded sweep scans `todo`, `in_progress` and `in_review` only, so it re-dispatches a `todo` step whose wake was lost. The orphan-blocker sweep does not match a step because every step has an agent. The dependency backstop covers blocked steps and the run issue.
+- **Workspaces.** The run issue never runs, so a step has no workspace to inherit from it. Just before a step first runs, it reuses the execution workspace of its earliest predecessor in the same project, so a reviewer sees the implementer's checkout.
+- **Env and secrets.** Routine env and secrets resolve for the `routine_execution` run issue only. Steps do not inherit them.
+- **Self-contained runs.** The run's trigger payload records `routineSteps: { steps, stepIssueIds }`. Editing the routine never changes a run in flight.
+- **Event triggers.** An event-triggered routine attaches its steps to the issue of a *new* event group. Repeat, recovery and append events never attach steps.
+
+#### Review loops
+
+To implement, review, fix and re-review, put the review on the step being reviewed as an `executionPolicy` review stage. Do not model it as a separate step.
+
+- The loop stays on one issue. The reviewer and the implementer alternate on it until the reviewer approves or `maxReviewRounds` is reached.
+- Sessions are stored per agent, adapter and issue (`agent_task_sessions`, unique on company, agent, adapter and task key; the task key is the issue id). `execution_review_requested` and `execution_changes_requested` wakes do **not** reset the session (`shouldResetTaskSessionForWake`), so the reviewer and the implementer each resume their own session between rounds.
+- A separate review step is a different issue, so it starts a fresh session and cannot send work back to an earlier step. Use separate steps for one-shot reviews or for parallel lens reviews that a later step joins.
+
+Caveats:
+
+- `issue_assigned` and `execution_approval_requested` wakes start a fresh session, so an approval stage does not resume.
+- Session resume works only on adapters with a session codec (claude, codex, cursor, gemini, grok, hermes, kimi, opencode and pi). Other adapters start fresh on every wake.
+
 ## 7. Accepted-Plan Execution and Optional Decomposition
 
 An accepted plan confirmation authorizes execution of one specific accepted plan revision. Acceptance does not choose the issue topology. A `planning` source transitions atomically to `standard`; a source that is already `standard` stays `standard`. The continuation starts a fresh default-execution session on that same issue and carries the accepted document id, revision id/number, and approved Markdown.

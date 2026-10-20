@@ -497,6 +497,20 @@ The current implementation includes additional V1-control-plane tables beyond th
 - Plugins and routines: `plugins`, plugin config/state/entities/jobs/logs/webhooks, plugin database namespaces/migrations, plugin company settings, `routines`, `routine_revisions`, `routine_triggers`, and `routine_runs`.
 - Access and operations: company memberships, instance roles, principal permission grants, invites, join requests, board API keys, CLI auth challenges, budget policies/incidents, feedback exports/votes, company skills, sidebar preferences, and company logos.
 
+Routine steps add one column and one origin kind rather than new tables. `routines.steps` is `jsonb not null default '[]'` and is included in routine revision snapshots. Issues created for a step use `origin_kind = 'routine_step'`. A routine with an empty `steps` list dispatches exactly as before.
+
+Contract for a routine with steps:
+
+- Each step has a unique `key`, a `title`, optional issue fields (`description`, `assigneeAgentId`, `priority`, `labelIds`, `executionPolicy`, `acceptanceCriteria`) and `after`, the keys of the steps it waits for. At most 25 steps, no cycles, no unknown keys, and every step resolves to an agent (its own or the routine's). Agents and labels must belong to the routine's company.
+- A dispatch creates the run's issue in status `blocked`, then one child issue per step in dependency order (`parentId` is the run's issue, `blockedByIssueIds` come from `after`, status `todo` without `after` and `blocked` otherwise, idempotency key `routine-run:{runId}:{stepKey}`, `origin_run_id` is the run). The root and the steps are created inside one savepoint: any failure leaves no issue behind and the run is recorded as `failed`.
+- Only steps without predecessors are woken, after the dispatch commits. Existing blocker wakes run the rest. The run's issue is blocked by its steps and is woken by the existing blockers-resolved wake after the last one.
+- The run keeps `{ steps, stepIssueIds }` under `routine_runs.trigger_payload.routineSteps`. Later edits to the routine do not change a run.
+- For a routine with steps, an open, visible run issue of an earlier run counts as live for `skip_if_active` and `coalesce_if_active`.
+- Routine env and secrets resolve for the run's issue (`routine_execution`) only. Step issues do not inherit them.
+- Event-triggered routines attach steps to the issue of a new event group only. Repeat, recovery and append events never attach steps.
+- A step without its own execution workspace reuses the one of its earliest predecessor in the same project, when it first runs.
+- Writing steps needs the task-assignment permission; an agent can only assign steps to itself. Every mutation writes an activity entry.
+
 Decision-desk triage uses company-scoped sidecars rather than adding queue fields to every attention source:
 
 - `decision_queues` stores durable named queues, optional retention overrides, server-derived creator/run provenance, and data-backed seed rules.

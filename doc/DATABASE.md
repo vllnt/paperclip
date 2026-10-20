@@ -256,6 +256,18 @@ WHERE indexrelid IN ('heartbeat_runs_company_issue_or_task_idx'::regclass, 'hear
 
 Never run a concurrent build while the server starts. The migration can then wait for the build while the build waits for the migration, and PostgreSQL cancels one of them as a deadlock.
 
+## Routine steps (migration 0315)
+
+`0315_aberrant_valeria_richards.sql` adds one column and no index:
+
+```sql
+ALTER TABLE "routines" ADD COLUMN "steps" jsonb DEFAULT '[]'::jsonb NOT NULL;
+```
+
+The change is additive and cheap: PostgreSQL stores the constant default in the catalog, so it does not rewrite the table. Rolling back to the previous image keeps working, because older code ignores the column. `[]` means a routine without steps, which dispatches exactly as before. The steps are also captured in `routine_revisions.snapshot` (`routine.steps`). Issues created for a step use `issues.origin_kind = 'routine_step'`, which is a new value of an existing text column, so it needs no migration.
+
+If another migration takes number 0315 first, renumber this one and run `pnpm db:generate` again, as the migration checklist above says.
+
 ## Cloud runtime identity singleton
 
 The private `instance_settings` row whose singleton key is
