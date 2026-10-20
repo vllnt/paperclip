@@ -100,7 +100,24 @@ function integerOption(value, fallback, name, min) {
   return parsed;
 }
 
-function request(base, path, { key, acceptEncoding, ifNoneMatch, timeoutMs = 60_000 }) {
+/** True for a host that only this machine can reach. */
+function isLoopbackHost(hostname) {
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return host === "localhost" || host === "::1" || /^127(\.\d{1,3}){3}$/.test(host);
+}
+
+/** Refuse a target that would send the key in clear text or hammer a remote host. */
+function checkTarget(base, gapMs) {
+  let url;
+  try { url = new URL(base); } catch { throw new Error("PAPERCLIP_API_URL is not a valid URL"); }
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("PAPERCLIP_API_URL must start with http: or https:");
+  const loopback = isLoopbackHost(url.hostname);
+  if (url.protocol === "http:" && !loopback) throw new Error("PAPERCLIP_API_URL uses http: and the key would go in clear text; use https: unless the host is loopback");
+  if (gapMs === 0 && !loopback) throw new Error("--gap-ms 0 sends requests back to back; use it only on a loopback host");
+}
+
+// `idleTimeoutMs` is an idle timeout (no data on the socket for that long), not a limit on the whole request.
+function request(base, path, { key, acceptEncoding, ifNoneMatch, idleTimeoutMs = 60_000 }) {
   const url = new URL(path, base);
   const transport = url.protocol === "https:" ? https : http;
   return new Promise((resolve) => {
@@ -111,7 +128,7 @@ function request(base, path, { key, acceptEncoding, ifNoneMatch, timeoutMs = 60_
     const headers = { Authorization: `Bearer ${key}`, Accept: "application/json", "Accept-Encoding": acceptEncoding };
     if (ifNoneMatch) headers["If-None-Match"] = ifNoneMatch;
     // A new connection per request, like a first browser request: no keep-alive reuse.
-    const req = transport.request(url, { method: "GET", headers, agent: false, timeout: timeoutMs }, (res) => {
+    const req = transport.request(url, { method: "GET", headers, agent: false, timeout: idleTimeoutMs }, (res) => {
       tFirst = performance.now();
       const chunks = [];
       res.on("data", (chunk) => chunks.push(chunk));
@@ -183,6 +200,7 @@ async function run(values) {
   if (!companyId) throw new Error("--company-id is required");
   const n = integerOption(values.n, 30, "--n", 1);
   const gapMs = integerOption(values["gap-ms"], 250, "--gap-ms", 0);
+  checkTarget(base, gapMs);
   const acceptEncoding = values["accept-encoding"] ?? "gzip";
   const only = values.only ? new Set(String(values.only).split(",")) : null;
   const issue = values.issue ?? null;

@@ -106,6 +106,18 @@ describe("run", () => {
     }
   });
 
+  it("refuses http: with a key on a host that is not loopback, and --gap-ms 0 on a remote host, before it sends anything", async () => {
+    const count = seen.length;
+    const env = { PAPERCLIP_API_KEY: "k" };
+    const clear = await cli(["run", "--company-id", "c"], { ...env, PAPERCLIP_API_URL: "http://192.0.2.1:3100" });
+    assert.notEqual(clear.code, 0);
+    assert.match(clear.stderr, /clear text/);
+    const fast = await cli(["run", "--company-id", "c", "--gap-ms", "0"], { ...env, PAPERCLIP_API_URL: "https://192.0.2.1" });
+    assert.notEqual(fast.code, 0);
+    assert.match(fast.stderr, /--gap-ms 0 .* loopback host/);
+    assert.equal(seen.length, count);
+  });
+
   it("rejects a bad --n before it sends anything", async () => {
     const count = seen.length;
     const { code, stderr } = await cli(["run", "--company-id", "c", "--n", "abc"], { PAPERCLIP_API_URL: base, PAPERCLIP_API_KEY: "k" });
