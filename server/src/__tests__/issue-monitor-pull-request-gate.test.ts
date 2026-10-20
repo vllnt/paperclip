@@ -365,6 +365,13 @@ describeEmbeddedPostgres("issue monitor: unchanged pull request gate", () => {
       state.statusState = "failure";
       state.statuses = [{ context: "ci/build", state: "failure" }];
     }],
+    // A re-run on the same head commit gets a new id and can end as the run before it did.
+    ["a CI re-run that ends with the same result", (state: ReturnType<typeof createFakeGitHubPullRequestApi>["state"]) => {
+      state.checkRuns = state.checkRuns.map((run) => ({ ...run, id: (run.id ?? 0) + 1 }));
+    }],
+    ["a commit status posted again with the same state", (state: ReturnType<typeof createFakeGitHubPullRequestApi>["state"]) => {
+      state.statuses = state.statuses.map((entry) => ({ ...entry, id: (entry.id ?? 0) + 1 }));
+    }],
   ])("wakes the agent after %s", async (_label, change) => {
     const fixture = await seed();
     change(fixture.github.state);
@@ -600,6 +607,63 @@ describeEmbeddedPostgres("issue monitor: unchanged pull request gate", () => {
     expect(callsAfterFirst).toBeGreaterThan(0);
     expect(second).toMatchObject({ ok: false, reason: "github_backoff" });
     expect(calls).toBe(callsAfterFirst);
+  });
+
+  // The scope of each remaining failure: a rate limit, a low quota or a timeout is about the
+  // company's credential or GitHub as a whole, so the company's other repositories wait too; a
+  // network error or a refused redirect is about one repository.
+  const hangs = (() =>
+    ((_url: string, init?: RequestInit) =>
+      new Promise<Response>((_, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      })) as unknown as typeof fetch);
+  it.each([
+    ["429 with retry-after", "github_rate_limited", "company", () => (async () =>
+      new Response("{}", { status: 429, headers: { "retry-after": "60" } })) as typeof fetch],
+    ["403 with retry-after (secondary rate limit)", "github_rate_limited", "company", () => (async () =>
+      new Response("{}", { status: 403, headers: { "retry-after": "60" } })) as typeof fetch],
+    ["403 with no requests left", "github_rate_limited", "company", () => (async () =>
+      new Response("{}", { status: 403, headers: { "x-ratelimit-remaining": "0" } })) as typeof fetch],
+    ["a low rate limit", "github_rate_limit_low", "company", () => (async () =>
+      new Response("{}", { status: 200, headers: { "x-ratelimit-remaining": "5" } })) as typeof fetch],
+    ["a timeout", "github_timeout", "company", hangs],
+    ["a network error", "github_request_failed", "repo", () => (async () => {
+      throw new TypeError("fetch failed");
+    }) as typeof fetch],
+    ["a refused redirect", "github_request_failed", "repo", () => (async () => {
+      throw new TypeError("fetch failed", { cause: new Error("unexpected redirect") });
+    }) as typeof fetch],
+  ])("backs off with the scope that %s calls for", async (_label, reason, scope, makeFetch) => {
+    const fixture = await seed({ baseline: "none" });
+    const answer = makeFetch();
+    let calls = 0;
+    const deps = {
+      ...fixture.gateDeps,
+      fetch: ((...args: Parameters<typeof fetch>) => {
+        calls += 1;
+        return answer(...args);
+      }) as typeof fetch,
+      ...(reason === "github_timeout" ? { budgetMs: 200 } : {}),
+    };
+    const input = { companyId: fixture.companyId, issueId: fixture.issueId, agentId: fixture.agentId, pullRequest: PULL_REQUEST_TARGET };
+
+    const first = await computeIssuePullRequestFingerprint(db, input, deps);
+    const callsAfterFirst = calls;
+    const otherRepository = await computeIssuePullRequestFingerprint(
+      db,
+      { ...input, pullRequest: OTHER_REPOSITORY_TARGET },
+      deps,
+    );
+
+    expect(first).toMatchObject({ ok: false, reason });
+    expect(callsAfterFirst).toBeGreaterThan(0);
+    if (scope === "company") {
+      expect(otherRepository).toMatchObject({ ok: false, reason: "github_backoff" });
+      expect(calls).toBe(callsAfterFirst);
+    } else {
+      expect(otherRepository).toMatchObject({ ok: false, reason });
+      expect(calls).toBeGreaterThan(callsAfterFirst);
+    }
   });
 
   // How long each failure holds the gate off. A fake clock steps to one second

@@ -40,7 +40,7 @@ export const PULL_REQUEST_GATE_TICK_BUDGET_MS = 20_000;
 /** A larger GitHub answer means "wake": the gate never buffers an unbounded body. */
 export const MAX_GITHUB_RESPONSE_BYTES = 2 * 1024 * 1024;
 
-const FINGERPRINT_VERSION = 1;
+const FINGERPRINT_VERSION = 2;
 /** Below this many remaining GitHub requests, leave the quota to the agents. */
 const RATE_LIMIT_FLOOR = 100;
 /** Backoff after a timeout, or a rate limit that names no wait. */
@@ -83,8 +83,15 @@ export type PullRequestFingerprintEntry = {
   latestReviewId: number | null;
   checks: PullRequestCheckRollup;
   failingChecks: string[];
+  /**
+   * The newest check run id. A re-run gets a new id, so a re-run that ends as the run before it
+   * did still changes the fingerprint.
+   */
+  latestCheckRunId: number | null;
   status: string;
   failingStatuses: string[];
+  /** The newest commit status id. A status posted again gets a new id, also with the same state. */
+  latestStatusId: number | null;
 };
 
 export type IssuePullRequestFingerprint = {
@@ -396,6 +403,10 @@ async function readPullRequestEntry(input: {
   const reviewIds = reviews.body
     .map((review) => readCount(readRecord(review).id))
     .filter((id): id is number => id !== null);
+  const latestId = (records: Record<string, unknown>[]) => {
+    const ids = records.map((record) => readCount(record.id)).filter((id): id is number => id !== null);
+    return ids.length > 0 ? Math.max(...ids) : null;
+  };
 
   return {
     repo: `${pullRequest.owner}/${pullRequest.repo}`.toLowerCase(),
@@ -414,9 +425,11 @@ async function readPullRequestEntry(input: {
     latestReviewId: reviewIds.length > 0 ? Math.max(...reviewIds) : null,
     checks,
     failingChecks,
+    latestCheckRunId: latestId(runs),
     // GitHub reports "pending" for a commit with no statuses at all.
     status: statusCount === 0 ? "none" : statusBody.state,
     failingStatuses,
+    latestStatusId: latestId(statuses),
   };
 }
 

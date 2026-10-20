@@ -14,9 +14,9 @@ export type FakePullRequestState = {
   reviewIds: number[];
   /** Answer the review list with a `rel="next"` link, as GitHub does past one page. */
   reviewsHaveNextPage?: boolean;
-  checkRuns: Array<{ name: string; status: string; conclusion: string | null }>;
+  checkRuns: Array<{ id?: number; name: string; status: string; conclusion: string | null }>;
   statusState: string;
-  statuses: Array<{ context: string; state: string }>;
+  statuses: Array<{ id?: number; context: string; state: string }>;
   /** Answer every request with this HTTP status instead. */
   failWithStatus?: number;
   /** Never answer; resolve only when the caller aborts. */
@@ -44,9 +44,9 @@ export function defaultFakePullRequestState(): FakePullRequestState {
     comments: 2,
     reviewComments: 1,
     reviewIds: [101],
-    checkRuns: [{ name: "test", status: "in_progress", conclusion: null }],
+    checkRuns: [{ id: 5001, name: "test", status: "in_progress", conclusion: null }],
     statusState: "pending",
-    statuses: [{ context: "ci/build", state: "pending" }],
+    statuses: [{ id: 7001, context: "ci/build", state: "pending" }],
   };
 }
 
