@@ -400,6 +400,41 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       expect(issue).toEqual({ status: "blocked", executionRunId: null });
     });
 
+    it("queues no review recovery run when the reviewer's run overflows", async () => {
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId, name: "Paperclip", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId, companyId, name: "Overflow Reviewer", role: "engineer", status: "idle", adapterType: CONTEXT_OVERFLOW_TEST_ADAPTER,
+        adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId, companyId, title: "Overflow review fixture", status: "in_review", assigneeAgentId: agentId,
+        executionState: {
+          status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review",
+          currentParticipant: { type: "agent", agentId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        },
+      });
+
+      const run = await heartbeat.wakeup(agentId, {
+        source: "automation", triggerDetail: "system", reason: "execution_review_requested",
+        payload: { issueId }, contextSnapshot: { issueId, source: "issue.execution_review" },
+      });
+      const failed = await waitForRunToFinish(heartbeat, run!.id);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      expect(failed?.errorCode).toBe("context_window_exceeded");
+      // A review recovery run would resume the same session and overflow again.
+      expect(await agentRuns(agentId)).toEqual([{ id: run!.id, status: "failed" }]);
+      const [issue] = await db.select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues).where(eq(issues.id, issueId));
+      expect(issue).toEqual({ status: "blocked", executionRunId: null });
+    });
+
     it("records a thrown overflow the same way", async () => {
       const failed = await failedThrownRun(CONTEXT_OVERFLOW_THROW_TEST_ADAPTER);
       await drainHeartbeatRunsToQuiescence(db, heartbeat);

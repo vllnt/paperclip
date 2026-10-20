@@ -151,6 +151,10 @@ describe("isContextWindowExceededMessage", () => {
       "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.",
       "ValidationException: Input is too long for requested model.",
       "The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).",
+      // A typographic apostrophe and numbers with thousands separators.
+      "Codex ran out of room in the model’s context window.",
+      "This model's maximum context length is 128,000 tokens.",
+      "The input token count (1,100,000) exceeds the maximum number of tokens allowed (1,048,576).",
     ]) {
       expect(isContextWindowExceededMessage(message), message).toBe(true);
     }

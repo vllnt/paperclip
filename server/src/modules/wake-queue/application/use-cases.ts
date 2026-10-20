@@ -674,12 +674,24 @@ async function runReleaseRecoveryTail(
         })
       : false;
 
+  // A recovery run for the review participant resumes the same session, so a
+  // failure that repeats on every attempt blocks the issue instead.
+  const reviewParticipantFailureIsNonRetryable =
+    reviewParticipantApplies &&
+    UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.has(run.status)
+      ? await transaction.isFinishingRunFailureNonRetryable({
+          companyId: run.companyId,
+          runId: run.id,
+        })
+      : false;
+
   const decision = decideReleaseRecovery({
     suppressImmediateRecovery,
     reviewParticipant: {
       applies: reviewParticipantApplies,
       isExecutionReviewParticipantRecoveryRun:
         isExecutionReviewParticipantRecoveryRun(run),
+      failureIsNonRetryable: reviewParticipantFailureIsNonRetryable,
     },
     immediate: {
       applies: immediateApplies,

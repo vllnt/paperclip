@@ -38,10 +38,10 @@ const CONTEXT_WINDOW_EXCEEDED_RULES: readonly RegExp[] = [
   /\bcontext[_ ]length[_ ]exceeded\b/i,
   /\bcontext window (?:limit )?exceeded\b/i,
   /\bexceeds the context window\b/i,
-  /\bran out of room in the model'?s context window\b/i,
-  /\bmaximum context length is \d+ tokens\b/i,
+  /\bran out of room in the model['’]?s context window\b/i,
+  /\bmaximum context length is \d[\d,]* tokens\b/i,
   /\binput is too long for (?:the )?requested model\b/i,
-  /\binput token count \(?\d+\)? exceeds the maximum number of tokens allowed\b/i,
+  /\binput token count \(?\d[\d,]*\)? exceeds the maximum number of tokens allowed\b/i,
 ];
 const CONTEXT_WINDOW_SCAN_CHARS = 4000;
 /** A provider error is one short line; a longer line is more likely model output that quotes it. */

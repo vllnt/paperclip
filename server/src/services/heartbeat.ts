@@ -16781,13 +16781,19 @@ export function heartbeatService(
   /** Says in the run log why a context overflow gets no automatic retry. */
   async function recordContextWindowExceededNotRetried(run: typeof heartbeatRuns.$inferSelect) {
     if (run.errorCode !== CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) return;
-    await appendRunEvent(run, {
-      eventType: "lifecycle",
-      stream: "system",
-      level: "warn",
-      message: CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE,
-      payload: { errorCode: CONTEXT_WINDOW_EXCEEDED_ERROR_CODE },
-    });
+    // The event only explains the outcome; a write failure must not skip the
+    // retry and release steps that follow it.
+    try {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE,
+        payload: { errorCode: CONTEXT_WINDOW_EXCEEDED_ERROR_CODE },
+      });
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to record why a context overflow is not retried");
+    }
   }
 
   async function scheduleBoundedRetryForRun(
