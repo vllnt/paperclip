@@ -2,7 +2,7 @@ import { and, desc, eq, inArray, isNull, isNotNull, or, sql } from "drizzle-orm"
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issueRecoveryActions, issues, workspaceOperations } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
-import { isUniqueViolation } from "../db-errors.js";
+import { isUniqueViolation, readForeignKeyViolation } from "../db-errors.js";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -15,6 +15,7 @@ import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operat
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
+const SOURCE_ISSUE_FOREIGN_KEY = "issue_recovery_actions_source_issue_id_issues_id_fk";
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -123,6 +124,20 @@ const ACTIVE_RECOVERY_ACTION_UNIQUE_INDEXES = [
  */
 export function isUniqueRecoveryActionConflict(error: unknown): boolean {
   return ACTIVE_RECOVERY_ACTION_UNIQUE_INDEXES.some((index) => isUniqueViolation(error, index));
+}
+
+/**
+ * The source issue was deleted before a new recovery action could reference it,
+ * for example a routine issue removed after its wake failed. Raised instead of
+ * a foreign-key violation, so a recovery sweep can skip the issue. Inside a
+ * caller's transaction it is raised before any failing SQL, so that
+ * transaction stays usable.
+ */
+export class IssueRecoverySourceMissingError extends Error {
+  constructor(readonly sourceIssueId: string) {
+    super(`Recovery source issue ${sourceIssueId} no longer exists`);
+    this.name = "IssueRecoverySourceMissingError";
+  }
 }
 
 export function issueRecoveryActionService(db: Db) {
@@ -348,6 +363,38 @@ export function issueRecoveryActionService(db: Db) {
     };
   }
 
+  // Locks the source issue (key share) before the insert. A concurrent delete
+  // that is still open makes the lock wait, and once it commits the issue is
+  // reported missing. In a transaction the lock holds until commit, so a later
+  // delete waits for this insert. On a plain connection the lock ends with its
+  // statement, so a delete can still win before the insert; that one statement
+  // then fails alone, and its FK violation is reported the same way.
+  async function insertForLiveSource(
+    executor: DbOrTransaction,
+    input: UpsertIssueRecoveryActionInput,
+    ownerType: IssueRecoveryActionOwnerType,
+    now: Date,
+  ) {
+    const [source] = await executor
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.id, input.sourceIssueId))
+      .for("key share");
+    if (!source) throw new IssueRecoverySourceMissingError(input.sourceIssueId);
+    try {
+      const [row] = await executor
+        .insert(issueRecoveryActions)
+        .values(buildInsertValues(input, ownerType, now))
+        .returning();
+      return row!;
+    } catch (error) {
+      if (readForeignKeyViolation(error)?.constraint === SOURCE_ISSUE_FOREIGN_KEY) {
+        throw new IssueRecoverySourceMissingError(input.sourceIssueId);
+      }
+      throw error;
+    }
+  }
+
   // Resolve the prior active action, then insert a new one in one transaction.
   // The prior identity stays as a cancelled record and the new failure gets a
   // fresh action row with its own id. The partial unique index on the active
@@ -380,11 +427,7 @@ export function issueRecoveryActionService(db: Db) {
         // Another writer resolved the prior action first. Abort and retry the
         // whole upsert so the retry reads the current active state.
         if (!superseded) return null;
-        const [row] = await tx
-          .insert(issueRecoveryActions)
-          .values(buildInsertValues(input, ownerType, now))
-          .returning();
-        return row ?? null;
+        return insertForLiveSource(tx, input, ownerType, now);
       });
       if (!created) return retryUpsertSourceScoped(input, retryCount);
       return toReadModel(created);
@@ -555,11 +598,7 @@ export function issueRecoveryActionService(db: Db) {
     }
 
     try {
-      const [created] = await db
-        .insert(issueRecoveryActions)
-        .values(buildInsertValues(input, ownerType, now))
-        .returning();
-      return toReadModel(created!);
+      return toReadModel(await insertForLiveSource(db, input, ownerType, now));
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;
       return retryUpsertSourceScoped(input, retryCount, error);

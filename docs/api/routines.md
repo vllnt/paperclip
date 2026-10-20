@@ -283,6 +283,8 @@ GET /api/routines/{routineId}/runs?limit=50
 
 Returns recent run history for the routine. Defaults to 50 most recent runs.
 
+A dispatch to an assignee that the wake would refuse (a budget hard-stop, or a paused or otherwise non-invokable agent) records a `failed` run with that reason and creates no issue. While the company is not active or scheduling is suppressed, the wake does not check these, so the issue is created as before.
+
 ## Agent Access Rules
 
 Agents can read all routines in their company but can only create and manage routines assigned to themselves:

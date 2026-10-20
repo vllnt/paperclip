@@ -57,9 +57,11 @@ server/src/__tests__/external-objects-service.test.ts
 server/src/__tests__/github-commit-details.test.ts
 server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
+server/src/__tests__/issue-recovery-source-deleted.test.ts
 server/src/__tests__/openapi-routes.test.ts
 server/src/__tests__/paperclip-temp-sweeper.test.ts
 server/src/__tests__/periodic-heartbeat-recovery.test.ts
+server/src/__tests__/routine-dispatch-non-invokable.test.ts
 server/src/__tests__/run-log-chunk-compactor.test.ts
 server/src/__tests__/run-log-redaction-policy.test.ts
 server/src/__tests__/ssh-remote-process-stop-events.test.ts

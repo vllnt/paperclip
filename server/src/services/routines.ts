@@ -89,11 +89,13 @@ import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { budgetService } from "./budgets.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
 import { getSecretProvider } from "../secrets/provider-registry.js";
 import { parseCron, validateCron } from "./cron.js";
-import { heartbeatService } from "./heartbeat.js";
+import { heartbeatService, resolveHeartbeatSchedulingSuppression } from "./heartbeat.js";
 import {
   instanceSettingsService,
   isTruthyRuntimeEnvValue,
@@ -2510,6 +2512,10 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        // So that no issue is committed only to be deleted; a refusal is recorded below exactly
+        // like the same wake failure.
+        await assertWakeAdmitsAssignee(txDb, input.routine.companyId, assigneeAgentId, projectId);
+
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -2605,6 +2611,9 @@ export function routineService(
         return updated ?? createdRun;
       } catch (error) {
         if (createdIssue) {
+          // The issue is committed outside this transaction because the wake reads and updates it
+          // on its own connections, so it is deleted rather than rolled back. Its recovery actions
+          // cascade, and a recovery sweep that read it earlier skips it once it is gone.
           await txDb.delete(issues).where(eq(issues.id, createdIssue.id));
         }
         const failureReason = error instanceof Error ? error.message : String(error);
@@ -2628,6 +2637,39 @@ export function routineService(
     await recordDispatchOutcome(input.routine, run, reusedExistingRun, gated !== null);
     if (run.status === "gating" && !reusedExistingRun && !gated) kickGate(run.id);
     return withoutGateInternals(run);
+  }
+
+  /**
+   * Throws the refusal the assignment wake (heartbeat `wakeup`) would raise for this assignee, with
+   * the wake's rules in the wake's order: a budget hard-stop, then an agent it cannot invoke (a
+   * paused agent is assignable but not invokable). The wake skips both checks, and the issue
+   * stays, while scheduling is suppressed or the company is not active; so this returns then.
+   * Suppression is read from the environment only: a worktree run override can make this return
+   * where the wake would check, which just keeps the previous create-then-wake path.
+   */
+  async function assertWakeAdmitsAssignee(executor: Db, companyId: string, agentId: string, projectId: string | null) {
+    const suppression = resolveHeartbeatSchedulingSuppression(runtimeEnv);
+    if (suppression.suppressed && suppression.reason !== "task_drain") return;
+    const company = await executor
+      .select({ status: companies.status })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0] ?? null);
+    if (company?.status !== "active") return;
+
+    const budgetBlock = await budgetService(executor).getInvocationBlock(companyId, agentId, { projectId });
+    if (budgetBlock) {
+      throw conflict(budgetBlock.reason, { scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId });
+    }
+    const agent = await executor
+      .select()
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    const invokability = await evaluateAgentInvokabilityFromDb(executor, agent);
+    if (!invokability.invokable) {
+      throw conflict(invokability.message, { reason: invokability.reason, ...invokability.details });
+    }
   }
 
   /**
