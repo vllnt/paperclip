@@ -41,6 +41,11 @@ describe("activity formatting", () => {
       .toBe("stopped provider capacity retries on");
   });
 
+  it("names the daily cap dispatch hold", () => {
+    expect(formatActivityVerb("heartbeat.daily_cap_dispatch_held"))
+      .toBe("held dispatch until the daily cap resets for");
+  });
+
   it("formats blocker activity using linked issue identifiers", () => {
     const details = {
       addedBlockedByIssues: [

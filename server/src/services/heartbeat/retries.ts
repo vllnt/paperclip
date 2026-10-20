@@ -83,7 +83,7 @@ import {
 } from "../harness-fallback.js";
 import type { NativeRuntimeResolution } from "../native-runtime/runtime-mode.js";
 import { readContinuationAttempt } from "../recovery/index.js";
-import { PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS } from "../recovery/service.js";
+import { PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS, type DailyCapDispatchHold } from "../recovery/service.js";
 import { withRecoveryContext } from "../recovery/status-only-context.js";
 import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
@@ -466,6 +466,7 @@ const PROVIDER_QUOTA_RETRY_JITTER_RATIO = 0.2;
 const PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION =
   "heartbeat.provider_quota_cap_exemption_exhausted";
 const PROVIDER_QUOTA_EXHAUSTED_ACTION = "heartbeat.provider_quota_exhausted";
+const DAILY_CAP_DISPATCH_HELD_ACTION = "heartbeat.daily_cap_dispatch_held";
 
 export interface ProviderQuotaRetryPolicy {
   /** False restores the default transient retry budget and charges every quota failure. */
@@ -1008,6 +1009,41 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     for (const publication of postCommit.publications) publishActivity(publication);
     await executeIssuePostCommitActions(db, postCommit.actions);
     return recorded;
+  }
+
+  // One entry per agent and cap window, however many sweeps or issues the
+  // cap holds back; the next window writes its own entry.
+  async function recordDailyCapDispatchHold(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    block: DailyCapDispatchHold;
+  }) {
+    const { companyId, agentId, issueId, block } = input;
+    const windowStart = block.windowStart.toISOString();
+    await logActivityOnce({
+      lockKey: `daily-cap-dispatch-hold:${agentId}:${windowStart}`,
+      alreadyRecorded: and(
+        eq(activityLog.entityType, "agent"),
+        eq(activityLog.entityId, agentId),
+        sql`${activityLog.details} ->> 'windowStart' = ${windowStart}`,
+      ),
+      companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      agentId,
+      action: DAILY_CAP_DISPATCH_HELD_ACTION,
+      entityType: "agent",
+      entityId: agentId,
+      details: {
+        reason: block.reason,
+        observed: block.observed ?? null,
+        limit: block.limit ?? null,
+        windowStart,
+        resetsAt: block.resetsAt.toISOString(),
+        firstHeldIssueId: issueId,
+      },
+    });
   }
 
   /**
@@ -3110,6 +3146,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     recordProviderQuotaWait,
     recordProviderQuotaCapExemptionExhausted,
     handleProviderQuotaFailure,
+    recordDailyCapDispatchHold,
 
     scheduleBoundedRetry: async (
       runId: string,

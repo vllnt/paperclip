@@ -993,9 +993,10 @@ export function heartbeatService(
       const agent = await getAgent(agentId);
       if (!agent) return null;
       const policy = parseHeartbeatPolicy(agent);
-      if (!policy.wakeOnDemand) return "heartbeat.wakeOnDemand.disabled";
-      return (await getHeartbeatDailyCapBlock(agent, policy))?.reason ?? null;
+      if (!policy.wakeOnDemand) return { reason: "heartbeat.wakeOnDemand.disabled" };
+      return getHeartbeatDailyCapBlock(agent, policy);
     },
+    recordDailyCapDispatchHold: (input) => recordDailyCapDispatchHold(input),
     // The same slot count as the deferred-wake sweep: running runs against
     // the agent's limit. Queued work waits its turn and does not starve
     // stranded issues behind a standing queue.
@@ -1025,6 +1026,7 @@ export function heartbeatService(
     recordProviderQuotaWait,
     recordProviderQuotaCapExemptionExhausted,
     handleProviderQuotaFailure,
+    recordDailyCapDispatchHold,
   } = createHeartbeatRetries(db, {
     appendRunEvent,
     escalatePlanApprovalResumeFailureNeedsAttention,

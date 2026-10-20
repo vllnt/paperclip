@@ -640,6 +640,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           reason: "heartbeat.daily_run_limit",
           observed,
           limit: policy.maxDailyRuns,
+          windowStart: start,
+          resetsAt: end,
         };
       }
     }
@@ -664,6 +666,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           reason: "heartbeat.daily_cost_limit",
           observed,
           limit: policy.maxDailyCostCents,
+          windowStart: start,
+          resetsAt: end,
         };
       }
     }
