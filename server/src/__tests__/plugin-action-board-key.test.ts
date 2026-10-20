@@ -478,7 +478,8 @@ describeEmbeddedPostgres("plugin actions called with a board API key", () => {
 
   it("rejects a revoked board key", async () => {
     const { company, adminKey } = await seed(db);
-    await boardAuthService(db).revokeBoardApiKey(adminKey.id);
+    // Upstream's revoke now takes the owning user and the revocation path, and checks the key belongs to that user.
+    await boardAuthService(db).revokeBoardApiKey(adminKey.id, { userId: "admin-user", revokedVia: "board_api_key_lifecycle" });
     const call = vi.fn();
 
     const res = await postAction(db, call, adminKey.token, "write-identity.get", { companyId: company.id, params: {} });

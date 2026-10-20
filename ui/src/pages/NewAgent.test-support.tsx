@@ -50,8 +50,9 @@ vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: settings }));
 vi.mock("@/api/secrets", () => ({ secretsApi: secrets }));
 const adapterApi = vi.hoisted(() => ({ list: vi.fn() }));
 vi.mock("@/api/adapters", () => ({ adaptersApi: adapterApi }));
+// The fork's AiConnectionField reads the company list for the company prefix, which the real context always provides.
 vi.mock("@/context/CompanyContext", () => ({
-  useCompany: () => ({ selectedCompanyId: "company-1" }),
+  useCompany: () => ({ selectedCompanyId: "company-1", companies: [] }),
 }));
 vi.mock("../context/BreadcrumbContext", () => ({
   useBreadcrumbs: () => ({ setBreadcrumbs: vi.fn() }),

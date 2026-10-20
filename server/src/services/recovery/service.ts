@@ -98,7 +98,10 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
-import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import {
+  IssueRecoverySourceMissingError,
+  issueRecoveryActionService,
+} from "../issue-recovery-actions.js";
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../native-runtime/native-workspace-finalization-recovery-state.js";
 import {
   LEGACY_RECOVERY_CAUSE,
@@ -6010,6 +6013,15 @@ export function recoveryService(
       try {
         await reconcileCandidate(issue);
       } catch (err) {
+        // The issue was deleted after this sweep read it: nothing is left to recover.
+        if (err instanceof IssueRecoverySourceMissingError) {
+          result.skipped += 1;
+          logger.debug(
+            { companyId: issue.companyId, issueId: issue.id },
+            "stranded issue recovery skipped an issue deleted during the sweep",
+          );
+          continue;
+        }
         result.failed += 1;
         logger.error(
           { err, companyId: issue.companyId, issueId: issue.id },

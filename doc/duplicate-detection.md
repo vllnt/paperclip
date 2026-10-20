@@ -102,13 +102,12 @@ child creation (`POST /issues/:id/children`), accepted-plan decomposition, and i
 watchdogs, chat, email and the runtime. A create that resolves to an existing issue does not. The check
 runs after the create returns, never inside it.
 
-Three paths write issues without the issue service and are **deliberately not checked**:
+Two paths write issues without the issue service and are **deliberately not checked**:
 
 | Path | Why it is exempt |
 |---|---|
 | Company import (`issueService.importIssues`) | Bulk-restores issues exported from a company; they are not new work. |
 | `paperclipai worktree:merge-history --apply` | Mirrors issues that already exist in another instance's database, keeping their ids and timestamps. It runs in the CLI process, where no check runs. Run the `similar` API by hand if you want a check. |
-| Pipeline case `open-conversation` (`POST /cases/:caseId/open-conversation`) | Creates the single discussion thread of a pipeline case (one active per case). It is a conversation, not a work item, and a check would flag each reopened thread against its predecessor. |
 
 A test (`server/src/__tests__/issue-insert-paths.test.ts`) lists every direct insert into `issues` in the
 codebase and fails if a new one appears that is neither the issue service's create path nor one of these
@@ -185,7 +184,7 @@ content sent to an external model provider** (Vercel AI Gateway, then TypeSafe).
 
 ## Limits
 
-- Company import, `worktree:merge-history --apply` and pipeline `open-conversation` are not checked (see the
+- Company import and `worktree:merge-history --apply` are not checked (see the
   table above). Everything that inserts through the issue service is. That includes system-made issues (routines, watchdogs), so expect more checks and, in `comment` mode,
   the occasional comment on a system issue. The bounded queue and the daily cap limit the load.
 - An issue created inside a transaction that is still open is retried at 1, 5 and 20 seconds until it is

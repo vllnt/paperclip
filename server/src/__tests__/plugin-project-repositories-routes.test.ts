@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { companies, createDb, plugins, activityLog } from "@paperclipai/db";
+import { companies, companyMemberships, createDb, plugins, activityLog } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { projectRoutes } from "../routes/projects.js";
@@ -19,6 +19,8 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     temp = await startEmbeddedPostgresTestDatabase("paperclip-plugin-project-repositories-"); db = createDb(temp.connectionString);
     const [company] = await db.insert(companies).values({ name: "Plugin repository test", issuePrefix: "PRT" }).returning(); companyId = company.id;
+    // Upstream's project read/write checks resolve membership from the database, as a real session would.
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "alice", membershipRole: "admin" });
     await db.insert(plugins).values({ pluginKey: manifest.id, packageName: "test", version: "1.0.0", manifestJson: manifest, status: "ready" });
   }, 20_000);
   afterAll(async () => { await temp?.cleanup(); });
