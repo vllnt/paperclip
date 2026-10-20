@@ -121,6 +121,80 @@ const JSON_ESCAPED_SECRET_FIELD_RE = new RegExp(
   "gi",
 );
 
+// An HTTP-header-style secret with an unquoted value, as a CLI prints it to
+// stderr: `x-api-key: <value>`, `x-auth-key=<value>`, `Authorization: token
+// <value>`. The name must start a word and either be an `x-…-key` header or
+// end in a secret word; it is narrower than the field-name pattern, so
+// plain-text labels such as `Login URL:` stay visible. An optional auth scheme
+// word is redacted with the value, so `token <value>` never keeps the value
+// visible.
+const HEADER_SECRET_NAME_PATTERN = String.raw`(?:x-[A-Za-z0-9-]+-key|[A-Za-z0-9_-]*(?:api[-_]?key|token|secrets?|password|passwd|credentials?|authorization|private[-_]?key|jwt))`;
+const HEADER_AUTH_SCHEME_PATTERN = String.raw`(?:basic|bearer|digest|token)[ \t]+`;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+interface HeaderSecretRules {
+  header: RegExp;
+  cookie: RegExp;
+}
+
+// One pair of rules per marker. The marker is part of the rules: a value that
+// an earlier rule already masked, with or without its auth scheme word, is left
+// alone, so the rules are idempotent whatever marker the caller picks.
+const headerSecretRulesByMarker = new Map<string, HeaderSecretRules>();
+
+function headerSecretRules(redactedValue: string): HeaderSecretRules {
+  const cached = headerSecretRulesByMarker.get(redactedValue);
+  if (cached) return cached;
+  const marker = escapeRegExp(redactedValue);
+  const rules: HeaderSecretRules = {
+    header: new RegExp(
+      String.raw`((?:^|[\s{,;(])${HEADER_SECRET_NAME_PATTERN}[ \t]*[:=][ \t]*)` +
+        String.raw`(?!["'\\]|(?:${HEADER_AUTH_SCHEME_PATTERN})?${marker})(?:${HEADER_AUTH_SCHEME_PATTERN})?[^\s"'` +
+        "`" +
+        String.raw`,;}\])]+`,
+      "gim",
+    ),
+    // A cookie header holds several `name=value` pairs split by `;` and spaces
+    // (`Cookie: a=S1; b=S2`, `Set-Cookie: id=S1; Path=/`), so the rule above would
+    // stop after the first pair. A cookie value is redacted to the end of the
+    // line. It also matches a value an earlier rule already masked, so a masked
+    // first pair never hides the pairs after it. The replacement equals the match
+    // for an already redacted line, so the rule is idempotent.
+    cookie: new RegExp(
+      String.raw`((?:^|[\s{,;(])[A-Za-z0-9_-]*cookie[ \t]*[:=][ \t]*)(?!["'\\])[^\r\n]+`,
+      "gim",
+    ),
+  };
+  headerSecretRulesByMarker.set(redactedValue, rules);
+  return rules;
+}
+
+/**
+ * Redact the secrets that HTTP headers carry in plain text: `x-api-key: <value>`,
+ * `x-auth-key=<value>`, `Authorization: Basic <value>`, and the whole value of a `Cookie` or
+ * `Set-Cookie` header. A diagnostic that quotes a CLI's stderr can hold these forms, and no
+ * shell-style rule recognizes them. Redaction needs the header name next to its value, so a caller
+ * that cuts a text must run this before the cut.
+ *
+ * @param text - A diagnostic text.
+ * @param redactedValue - The marker that replaces each secret value.
+ * @returns The text with each header secret replaced by the marker.
+ * @example
+ * redactHeaderSecretText("x-api-key: abc123"); // "x-api-key: ***REDACTED***"
+ */
+export function redactHeaderSecretText(
+  text: string,
+  redactedValue = REDACTED_COMMAND_TEXT_VALUE,
+): string {
+  const rules = headerSecretRules(redactedValue);
+  return text
+    .replace(rules.cookie, `$1${redactedValue}`)
+    .replace(rules.header, `$1${redactedValue}`);
+}
+
 /**
  * Redact secrets from an untrusted diagnostic string.
  *
@@ -128,14 +202,21 @@ const JSON_ESCAPED_SECRET_FIELD_RE = new RegExp(
  * shell `KEY=value` assignments, CLI secret options, bearer headers, and common
  * token shapes. The function then redacts JSON and escaped-JSON secret fields,
  * because a sandbox diagnostic can carry a serialized JSON error such as
- * `{"token":"opaque-value"}`. The caller must still bound the length after this
- * step.
+ * `{"token":"opaque-value"}`. The function last redacts header forms such as
+ * `x-api-key: <value>` and `Cookie: <pairs>` (see {@link redactHeaderSecretText}). The caller must
+ * still bound the length after this step, and it must bound it after this function, because a cut
+ * can separate a secret's name from its value. The rules cost much more than linear time on a long
+ * unbroken run of letters, digits, `-` and `_`, so a caller with megabytes of text may also bound
+ * the input first, but only at a line start, as `describeProcessExit` does.
  */
 export function redactDiagnosticText(
   text: string,
   redactedValue = REDACTED_COMMAND_TEXT_VALUE,
 ): string {
-  return redactCommandText(text, redactedValue)
-    .replace(JSON_ESCAPED_SECRET_FIELD_RE, `$1${redactedValue}$2`)
-    .replace(JSON_SECRET_FIELD_RE, `$1${redactedValue}$2`);
+  return redactHeaderSecretText(
+    redactCommandText(text, redactedValue)
+      .replace(JSON_ESCAPED_SECRET_FIELD_RE, `$1${redactedValue}$2`)
+      .replace(JSON_SECRET_FIELD_RE, `$1${redactedValue}$2`),
+    redactedValue,
+  );
 }

@@ -542,6 +542,18 @@ describeEmbeddedPostgres("routine steps", () => {
       expect(detail?.activeIssue?.id).toBe(run.linkedIssueId);
     });
 
+    it("reports the open root in the routine list next to a routine without steps", async () => {
+      const fx = await seed();
+      const routine = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));
+      const run = await fx.svc.runRoutine(routine.id, { source: "manual" });
+      await fx.svc.runRoutine(fx.routine.id, { source: "manual" });
+
+      const listed = await fx.svc.list(fx.companyId);
+
+      expect(listed.find((item) => item.id === routine.id)?.activeIssue?.id).toBe(run.linkedIssueId);
+      expect(listed.find((item) => item.id === fx.routine.id)?.activeIssue).toBeNull();
+    });
+
     it("does not mark a run failed while its blocked root waits for open steps", async () => {
       const fx = await seed();
       const routine = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));

@@ -1336,7 +1336,9 @@ export function routineService(
     return map;
   }
 
-  async function listLiveIssueByRoutineIds(companyId: string, routineIds: string[]) {
+  // stepRoutineIds: the listed routines that have steps. Only their runs can stay live through an open step
+  // root, so routines without steps never pay for the step-root lookups.
+  async function listLiveIssueByRoutineIds(companyId: string, routineIds: string[], stepRoutineIds: ReadonlySet<string>) {
     if (routineIds.length === 0) return new Map<string, RoutineListItem["activeIssue"]>();
     const executionBoundRows = await db
       .selectDistinctOn([issues.originId], {
@@ -1411,7 +1413,9 @@ export function routineService(
       }
     }
 
-    const stillMissingRoutineIds = routineIds.filter((routineId) => !rowsByOriginId.has(routineId));
+    const stillMissingRoutineIds = routineIds.filter(
+      (routineId) => stepRoutineIds.has(routineId) && !rowsByOriginId.has(routineId),
+    );
     if (stillMissingRoutineIds.length > 0) {
       const stepRootColumns = {
         originId: issues.originId,
@@ -3109,7 +3113,11 @@ export function routineService(
       const [triggersByRoutine, latestRunByRoutine, activeIssueByRoutine, managedByRoutine] = await Promise.all([
         listTriggersForRoutineIds(companyId, routineIds),
         listLatestRunByRoutineIds(companyId, routineIds),
-        listLiveIssueByRoutineIds(companyId, routineIds),
+        listLiveIssueByRoutineIds(
+          companyId,
+          routineIds,
+          new Set(rows.filter((row) => row.steps.length > 0).map((row) => row.id)),
+        ),
         listManagedRoutineMetadata(routineIds),
       ]);
       return rows.map((row) => ({
