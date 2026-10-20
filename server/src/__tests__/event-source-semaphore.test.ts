@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createSemaphore } from "../services/event-sources/semaphore.ts";
+import { SEMAPHORE_FIRST_IN_A_ROW, createSemaphore } from "../services/event-sources/semaphore.ts";
 
 function deferred() {
   let resolve!: () => void;
@@ -66,6 +66,32 @@ describe("event dispatch semaphore", () => {
     await Promise.all(tasks);
     expect(started).toEqual(["busy", "first-a", "first-b", "queued"]);
     expect(semaphore.active).toBe(0);
+  });
+
+  it("lets one other waiting task start after a run of first tasks, so first tasks cannot starve it", async () => {
+    const semaphore = createSemaphore(1);
+    const busy = deferred();
+    const started: string[] = [];
+    const run = (name: string, first = false) =>
+      semaphore.run(async () => {
+        started.push(name);
+        if (name === "busy") await busy.promise;
+      }, { first });
+    const tasks = [run("busy"), run("other-1"), run("other-2")];
+    for (let index = 1; index <= SEMAPHORE_FIRST_IN_A_ROW + 2; index += 1) tasks.push(run(`first-${index}`, true));
+
+    busy.resolve();
+    await Promise.all(tasks);
+
+    const firsts = Array.from({ length: SEMAPHORE_FIRST_IN_A_ROW }, (_, index) => `first-${index + 1}`);
+    expect(started).toEqual([
+      "busy",
+      ...firsts,
+      "other-1",
+      `first-${SEMAPHORE_FIRST_IN_A_ROW + 1}`,
+      `first-${SEMAPHORE_FIRST_IN_A_ROW + 2}`,
+      "other-2",
+    ]);
   });
 
   it("frees its slot when a task throws", async () => {

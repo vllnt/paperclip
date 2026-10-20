@@ -759,8 +759,8 @@ export function eventSourceService(
         // A re-claimed delivery only dispatches the routines that have no success yet.
         if (isSuccessfulOutcome(outcomes[subscriber.routine.id])) continue;
         // The built-in source dispatches inside a task create request, so it goes ahead of queued
-        // external deliveries instead of waiting out a burst of them. It keeps the shared cap, which
-        // bounds the pooled connections.
+        // external deliveries instead of waiting out a burst of them; the semaphore still lets one of
+        // those start after a few in a row. It keeps the shared cap, which bounds the pooled connections.
         const outcome = await dispatchGate.run(
           () =>
             routinesSvc.dispatchEvent({
