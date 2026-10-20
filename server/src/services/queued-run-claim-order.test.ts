@@ -114,6 +114,16 @@ describe("orderQueuedRunsForClaim", () => {
       ])).toEqual(["critical", "retry-low"]);
     });
 
+    it("lines up a promoted scheduled retry from when it became due, not from its creation", () => {
+      // The retry was created 110 minutes ago and became due 10 minutes ago.
+      // The other run was queued 12 minutes ago, so it has waited longer.
+      const dueTenMinutesAgo = new Date(NOW.getTime() - 10 * MINUTE);
+      expect(order([
+        run("retry", 110 * MINUTE, { priority: "medium" }, dueTenMinutesAgo),
+        run("waited-longer", 12 * MINUTE, { priority: "medium" }),
+      ])).toEqual(["waited-longer", "retry"]);
+    });
+
     it("bounds the wait of a low run behind a steady stream of critical runs", () => {
       // A new critical run arrives every 10 minutes and one run starts every
       // 10 minutes. Without aging the low run would never start.

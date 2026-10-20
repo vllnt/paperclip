@@ -6,7 +6,7 @@ import { ISSUE_PRIORITIES, type IssuePriority } from "@paperclipai/shared";
 /**
  * How long a queued run waits before it ranks one issue priority higher. It
  * bounds starvation: a low run ranks as critical after three steps, and from
- * then on only runs created before it start first.
+ * then on only runs that have waited longer start first.
  */
 export const QUEUED_RUN_PRIORITY_AGING_STEP_MS = 30 * 60 * 1000;
 
@@ -65,6 +65,7 @@ function rank(run: QueuedRunTiming, issue: QueuedRunIssueFacts | null, now: Date
     level: Math.max(0, baseLevel - agingSteps),
     aged: agingSteps > 0,
     inProgress: issue?.inProgress ?? false,
+    queuedSince,
   };
 }
 
@@ -74,7 +75,7 @@ function rank(run: QueuedRunTiming, issue: QueuedRunIssueFacts | null, now: Date
  * 2. higher effective priority first (issue priority, raised one level per aging step);
  * 3. at equal effective priority, a run that has aged starts before a fresh one,
  *    and fresh runs of in-progress issues start before other fresh runs;
- * 4. then the oldest run (by creation time) first.
+ * 4. then the run that has waited longest first, measured like aging.
  */
 export function orderQueuedRunsForClaim<T extends QueuedRunTiming>(
   runs: readonly T[],
@@ -88,7 +89,7 @@ export function orderQueuedRunsForClaim<T extends QueuedRunTiming>(
       a.rank.level - b.rank.level ||
       Number(b.rank.aged) - Number(a.rank.aged) ||
       (a.rank.aged ? 0 : Number(b.rank.inProgress) - Number(a.rank.inProgress)) ||
-      a.run.createdAt.getTime() - b.run.createdAt.getTime() ||
+      a.rank.queuedSince - b.rank.queuedSince ||
       (a.run.id < b.run.id ? -1 : a.run.id > b.run.id ? 1 : 0))
     .map(({ run }) => run);
 }
