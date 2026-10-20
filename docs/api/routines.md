@@ -216,6 +216,7 @@ What happens to the task:
 - **Owned by an agent:** it becomes `blocked`, so that agent does not start on it while the steps run. The existing blockers-resolved wake returns it to the agent after the last step.
 - **Owned by a person, or by nobody:** its status does not change. It only gains the blocker edges, so it shows what it waits for.
 - **A step fails to create:** the steps created for this run are removed and the status goes back. The task itself is never deleted.
+- **Activity:** the task's status change and each step's creation are recorded with the system as actor, so the routine activity gate ignores them. For a manual run, `details.requestedBy` (`actorType`, `actorId`, `runId`) names the caller.
 
 The steps are sub-tasks of the task, so they take its project and execution workspace like any sub-task. When the task has an execution workspace, every step of its project works in it, also two steps that run at the same time. When it has none, the steps hand their workspaces on as on any run. This is deliberate: the steps check or finish the task's own work.
 

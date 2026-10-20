@@ -124,6 +124,7 @@ import {
   routineStartingStepAgentIds,
   startAttachedRoutineSteps,
   type AttachedRoutineSteps,
+  type RoutineStepsRequester,
 } from "./routine-steps.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
@@ -334,6 +335,13 @@ async function resolveRoutineResponsibleUserId(db: Db, companyId: string, actorU
 }
 
 type Actor = { agentId?: string | null; userId?: string | null; runId?: string | null };
+
+/** The caller of a run as its step activity rows name it, or null when no one is known. */
+function stepsRequester(actor: Actor | undefined): RoutineStepsRequester | null {
+  if (actor?.agentId) return { actorType: "agent", actorId: actor.agentId, runId: actor.runId ?? null };
+  if (actor?.userId) return { actorType: "user", actorId: actor.userId, runId: actor.runId ?? null };
+  return null;
+}
 type RoutineRow = typeof routines.$inferSelect;
 type RoutineTriggerRow = typeof routineTriggers.$inferSelect;
 
@@ -3153,6 +3161,7 @@ export function routineService(
         variables: allVariables,
         assertCanStart: (task, executor) =>
           assertStartingStepAgentsAdmitted(executor, routine, defaultAssigneeAgentId, task.projectId),
+        requestedBy: stepsRequester(input.actor),
       });
       stepsToStart.push(attached);
       const updated = await finalizeRun(createdRun.id, { status: "issue_created", linkedIssueId: root.id }, txDb);

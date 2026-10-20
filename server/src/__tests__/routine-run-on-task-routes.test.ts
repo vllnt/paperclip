@@ -188,6 +188,19 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
         .from(activityLog)
         .where(and(eq(activityLog.action, "routine.run_triggered"), eq(activityLog.entityId, run!.id)));
       expect(entry?.details).toMatchObject({ routineId: routine.id, status: "issue_created", targetIssueId: task.id });
+      // The step rows keep the system as their actor, so the activity gate leaves them out, and name the caller.
+      const requestedBy = { actorType: "user", actorId: "board-user", runId: null };
+      const [blocked] = await db
+        .select()
+        .from(activityLog)
+        .where(and(eq(activityLog.action, "issue.updated"), eq(activityLog.entityId, task.id)));
+      expect(blocked).toMatchObject({ actorType: "system", details: { status: "blocked", requestedBy } });
+      const stepRows = await db
+        .select()
+        .from(activityLog)
+        .where(and(eq(activityLog.action, "issue.child_created"), eq(activityLog.companyId, s.companyId)));
+      expect(stepRows).toHaveLength(2);
+      for (const row of stepRows) expect(row).toMatchObject({ actorType: "system", details: { parentId: task.id, requestedBy } });
     });
 
     it("leaves a task nobody owns in its status", async () => {

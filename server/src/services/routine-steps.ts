@@ -211,6 +211,16 @@ export interface RoutineRunRoot {
   responsibleUserId: string | null;
 }
 
+/**
+ * Who asked for a run. The activity rows of its steps keep the system as their actor, so the activity
+ * gate still leaves them out, and name the requester in `details.requestedBy`.
+ */
+export interface RoutineStepsRequester {
+  actorType: "agent" | "user";
+  actorId: string;
+  runId: string | null;
+}
+
 export interface CreateRoutineRunIssuesInput<TRoot extends RoutineRunRoot> {
   /** The dispatch transaction; the root and the steps are created in one savepoint of it. */
   tx: Db;
@@ -228,6 +238,8 @@ export interface CreateRoutineRunIssuesInput<TRoot extends RoutineRunRoot> {
    * for values that come from it.
    */
   variables: Record<string, unknown> | ((root: TRoot) => Record<string, unknown>);
+  /** Recorded on the steps' activity rows when set. */
+  requestedBy?: RoutineStepsRequester | null;
 }
 
 export interface AttachedRoutineSteps {
@@ -330,6 +342,7 @@ export async function createRoutineRunIssues<TRoot extends RoutineRunRoot>(
             stepKey: step.key,
             blockedByIssueIds: predecessorIds,
             parentBlockerAdded: true,
+            ...(input.requestedBy ? { requestedBy: input.requestedBy } : {}),
           },
         },
         activityPublications,
@@ -375,6 +388,8 @@ export interface AttachRoutineStepsToIssueInput {
    * `executor`, the savepoint the attach runs in.
    */
   assertCanStart?: (issue: RoutineStepTargetIssue, executor: Db) => Promise<void>;
+  /** Recorded on the activity rows of the task and of the steps when set; an event start has none. */
+  requestedBy?: RoutineStepsRequester | null;
 }
 
 /** Whether a heartbeat run that has not finished is working on the task. */
@@ -417,6 +432,7 @@ export async function attachRoutineStepsToIssue(
   const created = await createRoutineRunIssues({
     tx,
     issueSvc: input.issueSvc,
+    requestedBy: input.requestedBy,
     run,
     routine,
     steps,
@@ -495,6 +511,7 @@ export async function attachRoutineStepsToIssue(
             _previous: { status: locked.status },
             routineId: routine.id,
             routineRunId: run.id,
+            ...(input.requestedBy ? { requestedBy: input.requestedBy } : {}),
           },
         },
         rootPublications,
