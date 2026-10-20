@@ -1229,6 +1229,43 @@ export function buildIssueMonitorRescheduledPatch(input: {
 }
 
 /**
+ * A due monitor check that found nothing new: it counts the attempt and records
+ * the check time like a trigger, then keeps the same monitor armed for
+ * `nextCheckAt`, as if the assignee had woken and armed the same wait again.
+ * Null when no monitor is set.
+ */
+export function buildIssueMonitorRecheckedPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  checkedAt: Date;
+  nextCheckAt: Date;
+}) {
+  const monitor = input.policy?.monitor;
+  if (!input.policy || !monitor) return null;
+  const nextMonitor = { ...monitor, nextCheckAt: input.nextCheckAt.toISOString() };
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const triggeredState = buildTriggeredMonitorState({
+    previous: derivePersistedMonitorState({
+      issue: input.issue,
+      state: existingState,
+      policy: input.policy,
+    }),
+    triggeredAt: input.checkedAt,
+  });
+  return {
+    executionPolicy: { ...input.policy, monitor: nextMonitor } as Record<string, unknown>,
+    executionState: executionStateWithMonitor(
+      existingState,
+      buildScheduledMonitorState(triggeredState, nextMonitor),
+    ) as Record<string, unknown> | null,
+    monitorNextCheckAt: input.nextCheckAt,
+    monitorWakeRequestedAt: null,
+    monitorLastTriggeredAt: input.checkedAt,
+    monitorAttemptCount: triggeredState.attemptCount,
+  };
+}
+
+/**
  * True when an issue update took an armed monitor away because the assignee
  * agent changed. The persisted clear reason is the readable `invalid_assignee`;
  * activity details use this to say "reassigned".

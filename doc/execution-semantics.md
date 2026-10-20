@@ -613,6 +613,33 @@ Monitor policy lives under `executionPolicy.monitor` and includes:
 
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
+#### Unchanged pull request checks
+
+A scheduled monitor often re-checks a GitHub pull request that has not changed. Before Paperclip queues the `issue_monitor_due` wake, it compares the pull requests linked to the issue with the state that the assignee's last run started from. If nothing changed, Paperclip does not start the agent.
+
+- **Link source.** Paperclip uses the issue's `pull_request` work products from GitHub. It ignores pull requests that a person unlinked. If the issue links no pull request, or more than three, the wake runs as before.
+- **Fingerprint.** For each pull request, Paperclip reads the head commit, the state (open, closed or merged), the draft flag and the last update time. It also reads the issue-comment and review-comment counts, the review count and the latest review id. Then it reads a check-run rollup (none, pending, success or failure, plus the names of failing checks) and the combined commit status. Paperclip stores a digest of these values as `pullRequestFingerprint` in the context of the run that the wake starts.
+- **Skip rule.** Paperclip skips the wake only when all of these are true:
+  - the assignee's latest run on the issue succeeded
+  - that run started from the same digest
+  - the digest was read before that run started
+  - that run finished less than 4 hours ago (`PULL_REQUEST_UNCHANGED_MAX_QUIET_MS`)
+- **Record of a skip.** Paperclip writes a skipped wake request with reason `heartbeat.pull_request_unchanged`. Its `payload.heartbeatSkip` holds `outcome: "no_change"`, the baseline run and the pull request summary. Paperclip also writes an `issue.monitor_pull_request_unchanged` activity entry on the issue. The issue wake diagnostics show the reason. Paperclip creates no heartbeat run and does not invoke the adapter.
+- **Re-arm.** Paperclip re-arms the monitor for the same wait that the agent chose, within 1 minute to 24 hours. It counts the check as an attempt and records the check time, so `maxAttempts` and `timeoutAt` apply as before.
+- **Always wakes.** These wakes are never skipped:
+  - a manual "check now"
+  - a monitor that the board scheduled
+  - a server-owned monitor (provider quota, background-task re-check)
+  - the last attempt that a re-arm allows
+  - any wake that is not a scheduled monitor wake, including every comment wake
+- **Fail open.** Paperclip reads GitHub with the company's own credential: the managed GitHub connection, else a `GITHUB_TOKEN`/`GH_TOKEN`/`PAPERCLIP_GITHUB_TOKEN` company secret. It never uses the server-environment token. Any of the following means the agent wakes as before, and Paperclip logs the reason with the company and issue ids:
+  - there is no credential
+  - GitHub answers with an error, or with a rate limit
+  - fewer than 100 requests remain in the rate limit
+  - the response is incomplete or paginated
+  - the check takes longer than 5 seconds (`PULL_REQUEST_GATE_BUDGET_MS`)
+- **Backoff.** After a rate limit or a timeout, Paperclip stops calling GitHub for that company for a short time and the company's agents wake as before. One scheduler tick spends at most 20 seconds on these checks. When that budget runs out, the tick's remaining due monitors wake without a check.
+
 The task's waiting banner and composer countdown also display automatic retries
 while their run is `scheduled_retry`. Once a retry is `queued` or `running`, its
 retained `scheduledRetryAt` is historical and must not produce a waiting or overdue

@@ -1440,6 +1440,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "process_lost_retry",
   "run_liveness_continuation",
   "heartbeat.disabled",
+  "heartbeat.pull_request_unchanged",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
 ]);

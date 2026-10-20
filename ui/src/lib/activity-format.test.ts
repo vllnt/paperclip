@@ -106,6 +106,12 @@ describe("activity formatting", () => {
     expect(formatIssueActivityAction("issue.monitor_triggered")).toBe("triggered a monitor");
     expect(formatIssueActivityAction("issue.monitor_cleared")).toBe("cleared a monitor");
     expect(formatIssueActivityAction("issue.monitor_recovery_issue_created")).toBe("created a monitor recovery issue");
+    expect(formatActivityVerb("issue.monitor_pull_request_unchanged")).toBe(
+      "found the pull request unchanged and re-armed the monitor on",
+    );
+    expect(formatIssueActivityAction("issue.monitor_pull_request_unchanged")).toBe(
+      "found the pull request unchanged and re-armed the monitor",
+    );
   });
 
   it("labels each queued-comment queue mutation", () => {
