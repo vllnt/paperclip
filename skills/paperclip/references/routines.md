@@ -283,3 +283,70 @@ GET /api/routines/{routineId}/event-groups?open=true
 The list takes optional filters that combine with AND: `q` (case-insensitive text in the title or the description), `assigneeAgentId`, `projectId`, `folderId` (`none` for routines in no folder), `status` (`active`, `paused` or `archived`) and `trigger` (`schedule`, `webhook`, `api`, `event`, or `manual` for a routine with no trigger). For example, `GET /api/companies/{companyId}/routines?assigneeAgentId={agentId}&status=active` lists one agent's active routines. The CLI takes the same filters: `paperclipai routine list --agent-id <id> --status active`.
 
 Use the generic API endpoint tables in `api-reference.md` when you need a full cross-domain reference. Use this file when you need routine-specific behaviour, payload shape, or policy details.
+
+## Routine steps
+
+Use `steps` when the same multi-stage work repeats (for example implement, review, two checks in parallel, then a release check). Do not describe the sequence in the routine prompt and create the sub-tasks by hand: put it in `steps` and each run builds the task graph for you. A routine with no `steps` (the default `[]`) behaves as before.
+
+**Shape.** `steps` is an ordered array on routine create and update (`PATCH /api/routines/{routineId}`), and it is returned on routine get:
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `key` | yes | Lowercase slug (letters, digits, `-`, `_`; at most 40), unique in the routine |
+| `title` | yes | Task title (at most 200). `{{variables}}` are filled in at run time |
+| `description` | no | Task instructions in Markdown. `{{variables}}` and `skill://` mentions work |
+| `assigneeAgentId` | no | Agent for the step. Defaults to the routine's agent. Every step needs an agent, so validation fails when it has neither |
+| `after` | no | Keys of the steps it waits for. Empty means it starts with the run |
+| `executionPolicy` | no | Review or approval stages for this step, as on any task |
+| `labelIds` | no | Labels of the company |
+| `priority` | no | Defaults to the routine's priority |
+| `acceptanceCriteria` | no | Checklist lines. `{{variables}}` work here too |
+
+**What a run creates**, atomically (if anything fails the run is recorded as `failed` and no task is left behind):
+
+- The run's task, in status `blocked` and not woken at the start.
+- One child task per step (origin kind `routine_step`), `todo` when it has no `after` and `blocked` by its predecessors otherwise.
+- Only the steps with no predecessors are woken. Each step that finishes wakes the steps that were waiting for it. The run's task is woken once, after the last step is done, to wrap up.
+- The run records `routineSteps` (`steps` and `stepIssueIds`) in its trigger payload, so editing the routine never changes a run in flight. Cancel the run's task to stop the whole tree.
+
+**Fork and join.** Several steps with the same `after` run in parallel. A step that lists several keys in `after` starts only after all of them are done.
+
+**Variables.** `{{name}}` in a step title, description or acceptance criteria uses the routine's variables. A variable that appears only in a step is added to the routine's variables, so manual runs ask for it.
+
+**Skills.** A step description can mention a company skill with a Markdown link whose target is `skill://<skillId>` (the editor inserts it). The step's agent gets that skill for the run. Mentions apply on adapters that sync skills and on `paperclip_runner`; they are ignored on `cursor_cloud`, `openclaw_gateway`, `http` and `process`.
+
+**Review loops.** To implement, review, fix and re-review, put the review on the step being reviewed as an `executionPolicy` review stage. Do not add a separate review step. The loop stays on one task, bounded by `maxReviewRounds` (default 3). Sessions are stored per agent, adapter and task, and `execution_review_requested` and `execution_changes_requested` wakes do not reset the session, so the reviewer and the implementer each resume their own session between rounds. Caveats: `execution_approval_requested` and `issue_assigned` wakes start a fresh session, session resume only works on adapters with a session codec (claude, codex, cursor, gemini, grok, hermes, kimi, opencode, pi), and a separate review step cannot send work back to an earlier step, so use separate steps for one-shot or parallel lens reviews.
+
+**Example.** Implement, review on the same task, two parallel checks, then a join:
+
+```json
+{
+  "steps": [
+    {
+      "key": "implement",
+      "title": "Implement {{target}}",
+      "description": "Make the change and open a pull request.",
+      "assigneeAgentId": "<implementerAgentId>",
+      "executionPolicy": {
+        "stages": [{ "type": "review", "participants": [{ "type": "agent", "agentId": "<reviewerAgentId>" }] }],
+        "maxReviewRounds": 3
+      }
+    },
+    { "key": "lint", "title": "Lint {{target}}", "after": ["implement"] },
+    { "key": "types", "title": "Type check {{target}}", "after": ["implement"] },
+    { "key": "ship", "title": "Release check for {{target}}", "after": ["lint", "types"] }
+  ]
+}
+```
+
+With the CLI, keep the array in a file and pass it with `paperclipai routine create ... --steps-file steps.json` or `paperclipai routine update <id> --steps-file steps.json`. The flag is refused when `--payload-json` also contains `steps`.
+
+**Limits.**
+
+- At most 25 steps. Keys must be unique, `after` must name other steps, and there can be no cycles.
+- Every step needs an agent, and agents and labels must belong to the company.
+- You need permission to assign tasks to write steps, and an agent can only assign steps to itself.
+- Routine environment variables and secrets apply to the run's task only. Step agents do not inherit them.
+- `after` takes plain step keys. Conditions (`{ "step", "when" }`) are not supported yet and are rejected.
+- A new step with no own workspace reuses the workspace of the earliest step it waited for, so a reviewer sees the implementer's checkout.
+- While a run's task is open, `skip_if_active` and `coalesce_if_active` treat the routine as active.
