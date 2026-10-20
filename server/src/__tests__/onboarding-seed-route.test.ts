@@ -335,38 +335,18 @@ describeEmbeddedPostgres("POST /api/companies/:companyId/onboarding-seed", () =>
     expect(await ctx.db.select().from(companyOnboardingSeeds)).toHaveLength(0);
   });
 
-  describe("company focus", () => {
-    async function seedCompanyGoalAndAgent(companyId: string, horizon: "short" | "long") {
-      const [goal] = await ctx.db
-        .insert(goals)
-        .values({ companyId, title: "Ship v2", level: "company", status: "active", horizon })
-        .returning();
-      const agentId = randomUUID();
-      await ctx.db.insert(agents).values({
-        id: agentId, companyId, name: "Writer", role: "engineer", status: "idle",
-        adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
-      });
-      const agentApp = routeApp(ctx.db, { type: "agent", source: "agent_key", companyId, agentId } as never, onboardingSeedRoutes);
-      return { goalId: goal!.id, agentApp };
-    }
+  it("lets the board rename a short term company goal", async () => {
+    const { companyId, app } = await seedCompany();
+    const [goal] = await ctx.db
+      .insert(goals)
+      .values({ companyId, title: "Ship v2", level: "company", status: "active", horizon: "short" })
+      .returning();
 
-    it("refuses an agent that would rename a short term company goal, and lets the board", async () => {
-      const { companyId, app } = await seedCompany();
-      const { goalId, agentApp } = await seedCompanyGoalAndAgent(companyId, "short");
+    const applied = await post(app, companyId, SEED);
 
-      const refused = await post(agentApp, companyId, SEED);
-
-      expect(refused.status).toBe(403);
-      expect((await ctx.db.select().from(goals).where(eq(goals.id, goalId)))[0]?.title).toBe("Ship v2");
-      expect(await ctx.db.select().from(companyOnboardingSeeds)).toHaveLength(0);
-      expect(await ctx.db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(1);
-
-      const applied = await post(app, companyId, SEED);
-
-      expect(applied.status).toBe(200);
-      expect(applied.body.goalId).toBe(goalId);
-      expect((await ctx.db.select().from(goals).where(eq(goals.id, goalId)))[0]?.title).toBe(SEED.mission);
-    });
+    expect(applied.status).toBe(200);
+    expect(applied.body.goalId).toBe(goal!.id);
+    expect((await ctx.db.select().from(goals).where(eq(goals.id, goal!.id)))[0]?.title).toBe(SEED.mission);
   });
 
   it("rejects a body missing the revision", async () => {

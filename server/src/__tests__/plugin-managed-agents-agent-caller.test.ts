@@ -15,7 +15,7 @@ import {
   plugins,
   principalPermissionGrants,
 } from "@paperclipai/db";
-import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { LOW_TRUST_REVIEW_PRESET, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -463,5 +463,43 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
       updateAgentPolicy(services, companyId, managedAgentId));
     expect(granted.policy).toEqual(POLICY);
     expect(await deniedActivity(managedAgentId)).toHaveLength(0);
+  });
+
+  it("refuses an agent without agents:configure removing a stored policy, and keeps it", async () => {
+    const { companyId, services, managedAgentId, peerId } = await seed();
+    const stored = { trustPreset: LOW_TRUST_REVIEW_PRESET };
+    await db.update(agents).set({ permissions: { authorizationPolicy: stored } }).where(eq(agents.id, managedAgentId));
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+        services.authorization.updatePolicy({ companyId, resourceType: "agent", resourceId: managedAgentId, policy: null })),
+    ).rejects.toMatchObject({ status: 403 });
+
+    expect((await readAgent(managedAgentId)).permissions).toMatchObject({ authorizationPolicy: stored });
+  });
+
+  it.each([
+    { label: "a company-wide agents:configure grant", scope: null, allowed: false },
+    { label: "an agents:configure grant that names the agent", scope: "self", allowed: true },
+  ])("for the agent updating its own policy, $label decides: allowed=$allowed", async ({ scope, allowed }) => {
+    const { companyId, services, managedAgentId } = await seed();
+    await db.insert(principalPermissionGrants).values({
+      companyId,
+      principalType: "agent",
+      principalId: managedAgentId,
+      permissionKey: "agents:configure",
+      scope: scope === "self" ? { agentIds: [managedAgentId] } : null,
+      grantedByUserId: null,
+    });
+
+    const attempt = runWithPluginHostCallAgent({ agentId: managedAgentId, runId: null, companyId }, () =>
+      updateAgentPolicy(services, companyId, managedAgentId));
+
+    if (allowed) {
+      expect((await attempt).policy).toEqual(POLICY);
+    } else {
+      await expect(attempt).rejects.toMatchObject({ status: 403 });
+      expect((await readAgent(managedAgentId)).permissions).not.toHaveProperty("authorizationPolicy");
+    }
   });
 });

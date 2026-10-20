@@ -79,7 +79,10 @@ import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
-import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
+import {
+  assertAgentProtectedChangeGranted,
+  type AgentProtectedChangeSurface,
+} from "./agent-protected-change-guard.js";
 import { collectAgentPermissionChanges } from "./agent-self-config-authz.js";
 import { currentPluginHostCallAgent } from "./plugin-host-call-actor.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
@@ -728,7 +731,7 @@ export function buildHostServices(
   async function assertAgentCallerMayChangeProtectedFields(
     agent: { id: string; companyId: string },
     fields: string[],
-    surface: "plugin_status_change" | "plugin_policy_update",
+    surface: Extract<AgentProtectedChangeSurface, `plugin_${string}`>,
     details: Record<string, unknown> = {},
   ) {
     const caller = currentPluginHostCallAgent();
