@@ -82,11 +82,14 @@ const REQUESTS: Array<{
   { name: "issue comments", actor: "operator", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 7, rows: 12 }, // 6
   { name: "routines", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/routines`, budget: 7, rows: 3 }, // 6
   // Equal to the count, not above it. Each list request imports the bundled
-  // skills again from disk, and each skill ensures its bundled category folder
-  // in its own folder-lock transaction: 12 statements per skill (8 listed here,
-  // 27 + 12 * 8 = 123). The budget follows the number of bundled skills and
-  // keeps the count per skill from growing; it is not a target.
-  { name: "skills", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 27, perRow: 12 }, // 123
+  // skills again from disk. Per listed skill (8 here), it reads the skill's row by
+  // key and its folder path (getByKey and enrichFolderPath): 3 statements. The
+  // fixed part (36) includes ensuring each bundled category folder once, in a
+  // folder-lock transaction, and one company_skill_versions read for each release
+  // in skills-releases/paperclip/releases.json (2 here), so adding a release is a
+  // deliberate budget bump. 36 + 3 * 8 = 60. The budget follows the number of
+  // bundled skills and keeps the count per skill from growing; it is not a target.
+  { name: "skills", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 36, perRow: 3 }, // 60
   { name: "plugins", actor: "operator", path: () => "/api/plugins", budget: 2, rows: 0 }, // 1
   { name: "heartbeat runs", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 3, rows: 30 }, // 2
   { name: "dashboard", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/dashboard`, budget: 9 }, // 8
@@ -112,10 +115,16 @@ describeEmbeddedPostgres("statements per board request", () => {
     const db = createDb(tempDb.connectionString);
     // postgres.js calls `options.debug` for each statement it sends, on every
     // connection of the pool.
+    let driverTypeFetches = 0;
     db.$client.options.debug = (_connection, statement) => {
-      if (statement.replace(/\s+/g, " ").trim() !== DRIVER_TYPE_FETCH) recording?.push(statement);
+      if (statement.replace(/\s+/g, " ").trim() === DRIVER_TYPE_FETCH) driverTypeFetches += 1;
+      else recording?.push(statement);
     };
     seeded = await seed(db);
+    // The seed opened a connection, so the driver sent its type fetch. If none
+    // matched, the driver changed that statement's text, and the counts would
+    // vary with the connections a request opens.
+    expect(driverTypeFetches, "no statement matched DRIVER_TYPE_FETCH").toBeGreaterThan(0);
     apps = {
       operator: createApp(db, {
         type: "board",

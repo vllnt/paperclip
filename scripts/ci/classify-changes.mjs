@@ -32,13 +32,20 @@ const SENTRY_PATTERNS = [
 ];
 
 // The code the query plan, migration and statement budget guards exercise: the
-// server, the schema and migrations, shared types, the dependency versions (the
-// driver and the ORM shape every statement), the Vitest setup, and this workflow.
+// server, the schema and migrations, shared types, the bundled skills and skill
+// releases (listing skills imports them), the dependency versions (the driver
+// and the ORM shape every statement), the workspace setup and scripts the job
+// runs, the Vitest setup, and this workflow.
 const PERF_GUARD_PATTERNS = [
   /^server\//,
   /^packages\/db\//,
   /^packages\/shared\//,
+  /^skills(-releases)?\//,
+  /^package\.json$/,
   /^pnpm-lock\.yaml$/,
+  /^pnpm-workspace\.yaml$/,
+  /^scripts\/ensure-workspace-package-links\.ts$/,
+  /^scripts\/ensure-plugin-build-deps\.mjs$/,
   /^vitest\.config\.ts$/,
   /^scripts\/ci\/assert-vitest-ran\.mjs$/,
   /^\.github\/workflows\/ci\.yml$/,
