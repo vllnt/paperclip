@@ -31,15 +31,15 @@ Stages: plan (optional) → implement → review per routed lens at head H → v
 - **Repairs reopen the implement child.** The lead comments the findings with `"reopen": true`. The implementer resumes its session on that issue. Reopen the review child for the new head the same way.
 - **Merge belongs to the merge child.** If the instance turned on git status automation (off by default), a merged PR can also close a linked task. It ignores stacked merges and holds back on gated issues [`doc/ISSUE-GIT-LINKS.md`]. A lane does not depend on it.
 
-**Worked example (Acme, `web-app`).**
+**Worked example (`web-app`).**
 
-1. Intake creates ACME-210 "PR #412: add rate limiter" under lane parent ACME-200, with the PR URL in the description. Lead: Lane Lead. Goal and project set.
-2. Lane Lead links PR #412 on ACME-210 as a `pull_request` work product. It creates ACME-211 "Implement #412" for Coder, then blocks ACME-210 on ACME-211.
-3. Coder links PR #412 on ACME-211, pushes, and ends its turn with `npx paperclipai issue wait ACME-211 --in 10m --reason "CI on PR #412 head 3f9c2e1"`. CI passes. Coder comments "Ready at 3f9c2e1" and marks ACME-211 `done`.
-4. The blocker wake brings Lane Lead back to ACME-210, in the session it already has for that issue. The diff touches login code. Security Reviewer runs at low trust, so the lens gets its own child: ACME-212 "Security review of PR #412 at 3f9c2e1". Lane Lead blocks ACME-210 on it.
-5. Security Reviewer finds a missing permission check, posts the verdict on ACME-212, and marks it `done`.
-6. Lane Lead reopens ACME-211 with the finding. Coder fixes it at head 8a01b77 and marks it `done`. Lane Lead reopens ACME-212 with "Re-review at 8a01b77". The verdict is clean.
-7. Lane Lead creates ACME-213 "Verify #412" for QA, then ACME-214 "Merge #412 at 8a01b77" for Merger, one after the other. After the merge, Lane Lead marks ACME-210 `done`.
+1. Intake creates EX-210 "PR #412: add rate limiter" under lane parent EX-200, with the PR URL in the description. Lead: Lane Lead. Goal and project set.
+2. Lane Lead links PR #412 on EX-210 as a `pull_request` work product. It creates EX-211 "Implement #412" for Coder, then blocks EX-210 on EX-211.
+3. Coder links PR #412 on EX-211, pushes, and ends its turn with `npx paperclipai issue wait EX-211 --in 10m --reason "CI on PR #412 head 3f9c2e1"`. CI passes. Coder comments "Ready at 3f9c2e1" and marks EX-211 `done`.
+4. The blocker wake brings Lane Lead back to EX-210, in the session it already has for that issue. The diff touches login code. Security Reviewer runs at low trust, so the lens gets its own child: EX-212 "Security review of PR #412 at 3f9c2e1". Lane Lead blocks EX-210 on it.
+5. Security Reviewer finds a missing permission check, posts the verdict on EX-212, and marks it `done`.
+6. Lane Lead reopens EX-211 with the finding. Coder fixes it at head 8a01b77 and marks it `done`. Lane Lead reopens EX-212 with "Re-review at 8a01b77". The verdict is clean.
+7. Lane Lead creates EX-213 "Verify #412" for QA, then EX-214 "Merge #412 at 8a01b77" for Merger, one after the other. After the merge, Lane Lead marks EX-210 `done`.
 
 ## Docs lane
 
@@ -56,7 +56,7 @@ Stages: change check → draft → accuracy review → publish.
 - The reviewer checks the draft revision it was given. A new draft revision needs a new verdict, as in the code lane.
 - Put the source revision that the page now matches in the publish comment. The next change check compares against it.
 
-**Worked example (Acme, `docs-site`).** A watch run finds that the `web-app` CLI added a `--dry-run` flag. It creates ACME-240 "CLI reference: document --dry-run" under the docs lane parent ACME-201. Docs Lead creates ACME-241 for Writer (draft, preview attached), then ACME-242 for Docs Reviewer ("check against `web-app` at 5d2b7a0"), then ACME-243 for Publisher. Each child is created after the previous one is `done`. Docs Lead marks ACME-240 `done` with the published URL.
+**Worked example (`docs-site`).** A watch run finds that the `web-app` CLI added a `--dry-run` flag. It creates EX-240 "CLI reference: document --dry-run" under the docs lane parent EX-201. Docs Lead creates EX-241 for Writer (draft, preview attached), then EX-242 for Docs Reviewer ("check against `web-app` at 5d2b7a0"), then EX-243 for Publisher. Each child is created after the previous one is `done`. Docs Lead marks EX-240 `done` with the published URL.
 
 ## Process or skill change lane
 
@@ -73,7 +73,7 @@ Stages: draft → review → apply → verify live.
 - **Live evidence needs real runs.** The apply child is the implementer, so it may end its turn with `issue wait` (for example `--in 24h --reason "first day of runs after the change"`). On the wake, it records before and after numbers from the [lane metrics](lane-metrics.md) and closes. The verifier then reads the same data independently.
 - Name the metric that must move, and its current value, in the draft. A process change without a number to check cannot be verified live.
 
-**Worked example (Acme).** Two database migrations were merged last week without a data review. ACME-260 "Add a data lens to the code lane" is created under the process lane parent ACME-202. Author drafts the change to the lane lead's review-routing instructions (ACME-261). Reviewer approves it (ACME-262). The apply child ACME-263 belongs to the agent allowed to change those instructions. That agent applies the change, waits 24 h with `issue wait`, and records "work items with a migration and no data review: 2 last week, 0 since the change". Verifier confirms the count from the code lane's issue tree (ACME-264).
+**Worked example.** Two database migrations were merged last week without a data review. EX-260 "Add a data lens to the code lane" is created under the process lane parent EX-202. Author drafts the change to the lane lead's review-routing instructions (EX-261). Reviewer approves it (EX-262). The apply child EX-263 belongs to the agent allowed to change those instructions. That agent applies the change, waits 24 h with `issue wait`, and records "work items with a migration and no data review: 2 last week, 0 since the change". Verifier confirms the count from the code lane's issue tree (EX-264).
 
 ## Watch lane
 
@@ -94,7 +94,7 @@ A watch lane looks at something outside Paperclip on a schedule. Its job is to f
 - **Run a cross-lane watcher at standard trust.** A standard-trust agent can create an issue for another agent [paperclip § Delegating review tasks, courier pattern] and write to any issue it can see [`doc/SPEC-implementation.md` § 9.3.1]. A low-trust run can assign new issues only to itself or to agents inside its boundary [`doc/LOW-TRUST-PRESETS.md`], so it cannot hand a finding to another lane's lead.
 - For alerts from an event source, repeats and recoveries arrive as comments on the same issue, not as new issues [`references/routines.md` § Event Triggers].
 
-**Worked example (Acme).** A routine "Dependency advisories for `web-app`" runs every hour. Its gate script lists open advisories and exits 1 when there are none. One hour, it prints `GHSA-xxxx-yyyy in parser@2.1.0`. The routine creates a run issue and wakes Watcher. Watcher creates ACME-270 "Upgrade parser for GHSA-xxxx-yyyy" under the code lane parent ACME-200 with `idempotencyKey: "advisory:web-app:GHSA-xxxx-yyyy"`, then closes the run issue with "Filed ACME-270". The next hour prints the same line, so the gate skips the run.
+**Worked example.** A routine "Dependency advisories for `web-app`" runs every hour. Its gate script lists open advisories and exits 1 when there are none. One hour, it prints `GHSA-xxxx-yyyy in parser@2.1.0`. The routine creates a run issue and wakes Watcher. Watcher creates EX-270 "Upgrade parser for GHSA-xxxx-yyyy" under the code lane parent EX-200 with `idempotencyKey: "advisory:web-app:GHSA-xxxx-yyyy"`, then closes the run issue with "Filed EX-270". The next hour prints the same line, so the gate skips the run.
 
 ## Intake and planning lane
 
@@ -108,7 +108,7 @@ Intake turns requests into work items. It does not do the work.
 - **Start or park on purpose.** A work item that is assigned and `todo` starts automatically. Create work that must not start yet as `backlog`. Create it `blocked` with `blockedByIssueIds` when it waits for another issue [paperclip § Status Quick Guide, `doc/execution-semantics.md` § 8 Agent-assigned `todo` and Agent-assigned `backlog`].
 - One-off plans go through `paperclip-converting-plans-to-tasks`. Intake handles the recurring stream.
 
-**Worked example (Acme).** Three bug reports arrive from the support inbox. Two describe the same crash. Intake creates ACME-280 "Crash on empty cart" with `idempotencyKey: "support:ticket-5521"`. For the second report, `issues/similar` finds ACME-280, so Intake comments the extra report there instead. It creates ACME-281 for the third report. Both work items go under the code lane parent ACME-200 with the "Checkout reliability" goal and the `web-app` project.
+**Worked example.** Three bug reports arrive from the support inbox. Two describe the same crash. Intake creates EX-280 "Crash on empty cart" with `idempotencyKey: "support:ticket-5521"`. For the second report, `issues/similar` finds EX-280, so Intake comments the extra report there instead. It creates EX-281 for the third report. Both work items go under the code lane parent EX-200 with the "Checkout reliability" goal and the `web-app` project.
 
 ## Optional post-merge Clean lane
 
@@ -127,4 +127,4 @@ Stages: merge the whole change behind a flag → review and refactor on main →
 - Create the release child only after the clean children are `done`. Code that is merged but not cleaned must not turn on.
 - The cost: `main` carries unreviewed code behind a flag. Do not use this lane for security or data-migration changes.
 
-**Worked example (Acme).** Work item ACME-290 "New search page". Coder merges it dark in PR #430 on ACME-291 (flag `search_v2` off). Reviewer's clean review ACME-292 finds two problems. Coder fixes them in PR #433 on ACME-293. Release Agent's ACME-294 "Release search_v2" requests board approval. When it is approved, Release Agent turns the flag on and Lane Lead closes ACME-290.
+**Worked example.** Work item EX-290 "New search page". Coder merges it dark in PR #430 on EX-291 (flag `search_v2` off). Reviewer's clean review EX-292 finds two problems. Coder fixes them in PR #433 on EX-293. Release Agent's EX-294 "Release search_v2" requests board approval. When it is approved, Release Agent turns the flag on and Lane Lead closes EX-290.

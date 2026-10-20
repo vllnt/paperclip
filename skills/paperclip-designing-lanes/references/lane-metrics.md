@@ -2,7 +2,7 @@
 
 Five numbers tell you whether a lane runs efficiently and reliably. Read them before you change a lane, and again after a day of real runs. This file names where each number lives in Paperclip today. Where no page or command shows a number directly, it says how to derive it from existing endpoints.
 
-All REST paths are under `/api` and need the normal authentication. CLI commands are `paperclipai` subcommands; add `--json` for machine-readable output. UI paths start with the company prefix, for example `/ACME/...`.
+All REST paths are under `/api` and need the normal authentication. CLI commands are `paperclipai` subcommands; add `--json` for machine-readable output. UI paths start with the company prefix, for example `/EX/...`.
 
 ## 1. Fresh vs resumed sessions per day
 
@@ -17,7 +17,7 @@ A resumed session reuses the context the agent already built on that issue. A la
 
 **Derive it.** For each run, read `usageJson.freshSession` and `usageJson.sessionReused` (`usageJson.sessionRotated` marks a planned rotation). Group by the day of `createdAt`. Keep only lane runs by matching `contextSnapshot.issueId` to the lane parent and its work items. When `usageJson` is null (the adapter reported no usage), count a run as resumed when `sessionIdBefore` is set.
 
-**Token proxy.** `paperclipai observability usage -C <companyId> --group-by day` (REST `GET /api/companies/{companyId}/observability/usage?groupBy=day`) splits uncached input tokens from cache reads. Add `--issue-id <issueUuid>` to look at one lane issue; this filter takes the issue UUID, not an identifier such as `ACME-210`. Many cold starts show as a high share of uncached input.
+**Token proxy.** `paperclipai observability usage -C <companyId> --group-by day` (REST `GET /api/companies/{companyId}/observability/usage?groupBy=day`) splits uncached input tokens from cache reads. Add `--issue-id <issueUuid>` to look at one lane issue; this filter takes the issue UUID, not an identifier such as `EX-210`. Many cold starts show as a high share of uncached input.
 
 ## 2. Issues created by no-op ticks
 
