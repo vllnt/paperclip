@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   createDb,
@@ -16,6 +16,28 @@ import {
 import type { RoutineStep } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture } from "./helpers/event-source-fixture.js";
+
+// Lets a test make the routine dispatch throw after the delivery is claimed, before or after the run.
+const dispatchFault = vi.hoisted(() => ({ when: null as "before_run" | "after_run" | null }));
+
+vi.mock("../services/routines.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/routines.js")>();
+  return {
+    ...actual,
+    routineService: (...args: Parameters<typeof actual.routineService>) => {
+      const svc = actual.routineService(...args);
+      return {
+        ...svc,
+        dispatchEvent: async (...input: Parameters<typeof svc.dispatchEvent>) => {
+          if (dispatchFault.when === "before_run") throw new Error("dispatch broke before the run");
+          const outcome = await svc.dispatchEvent(...input);
+          if (dispatchFault.when === "after_run") throw new Error("dispatch broke after the run");
+          return outcome;
+        },
+      };
+    },
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -363,6 +385,45 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
       expect(delivery).toMatchObject({ status: "failed" });
       const [after] = await db.select().from(issues).where(eq(issues.id, task.id));
       expect(after!.status).toBe("todo");
+    });
+  });
+
+  describe("a publish that breaks after the delivery is claimed", () => {
+    afterEach(() => {
+      dispatchFault.when = null;
+    });
+
+    it("records the failure on the delivery and reports no steps, so the caller wakes the assignee", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      await s.listen(routine);
+      const task = await s.newTask();
+      dispatchFault.when = "before_run";
+
+      const result = await s.publish(task.id);
+
+      expect(result).toEqual({ stepsAttached: false, routineRunIds: [] });
+      const [delivery] = await s.deliveries();
+      expect(delivery).toMatchObject({ status: "failed" });
+      expect(delivery!.error).toContain("dispatch broke before the run");
+      const [after] = await db.select().from(issues).where(eq(issues.id, task.id));
+      expect(after!.status).toBe("todo");
+      expect(await s.childrenOf(task.id)).toHaveLength(0);
+    });
+
+    it("still reports the steps when they were attached before the failure, so the assignee stays asleep", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      await s.listen(routine);
+      const task = await s.newTask();
+      dispatchFault.when = "after_run";
+
+      const result = await s.publish(task.id);
+
+      expect(result.stepsAttached).toBe(true);
+      const [delivery] = await s.deliveries();
+      expect(delivery).toMatchObject({ status: "failed" });
+      expect(await s.childrenOf(task.id)).toHaveLength(2);
     });
   });
 
