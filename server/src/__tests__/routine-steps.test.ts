@@ -15,7 +15,7 @@ import {
   routineRevisions,
   routines,
 } from "@paperclipai/db";
-import { readRoutineStepsRunPayload, type RoutineStep } from "@paperclipai/shared";
+import { readRoutineStepsRunPayload, type EventGrouping, type RoutineStep } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture, wireEvent } from "./helpers/event-source-fixture.js";
 import { inheritRoutineStepWorkspace } from "../services/routine-steps.ts";
@@ -507,7 +507,7 @@ describeEmbeddedPostgres("routine steps", () => {
   });
 
   describe("event-triggered routines", () => {
-    async function setupEventRoutine() {
+    async function setupEventRoutine(grouping: Partial<EventGrouping> = {}) {
       const fx = await seedEventFixture(db);
       const leadId = await fx.createAgent("Lead");
       const builderId = await fx.createAgent("Builder");
@@ -518,8 +518,12 @@ describeEmbeddedPostgres("routine steps", () => {
         {},
       );
       const { source, secret } = await fx.createSource();
-      await fx.subscribe(routine.id, source.id, { grouping: { repeatCommentCooldownSec: 600 } });
+      await fx.subscribe(routine.id, source.id, { grouping: { repeatCommentCooldownSec: 600, ...grouping } });
       return { fx, routine, leadId, builderId, source, secret };
+    }
+
+    function outcomeOf(response: { body: Record<string, unknown> }) {
+      return (response.body.outcomes as Array<{ status: string; issueId?: string | null }>)[0]!;
     }
 
     it("gives a new group its steps and wakes only the starting step, and a repeat adds none", async () => {
@@ -555,6 +559,79 @@ describeEmbeddedPostgres("routine steps", () => {
 
       expect(await stepIssuesOf(routine.id)).toHaveLength(2);
       expect(await db.select().from(issues).where(eq(issues.parentId, root!.id))).toHaveLength(2);
+    });
+
+    it.each(["ignore", "comment_only", "comment_and_wake"] as const)(
+      "adds no steps when a recovery event reaches an open group (onRecovery=%s)",
+      async (onRecovery) => {
+        const { fx, routine, source, secret } = await setupEventRoutine({ onRecovery });
+        const first = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e1" })));
+        expect(first.status).toBe("issue_created");
+        const wakesBefore = fx.wakeups.length;
+
+        fx.advance(60_000);
+        const recovery = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e2", state: "recovery", severity: "info" })));
+        expect(recovery.status).toBe(onRecovery === "ignore" ? "recovery_ignored" : "recovered");
+        expect(recovery.issueId).toBe(first.issueId);
+
+        expect(await stepIssuesOf(routine.id)).toHaveLength(2);
+        expect(await db.select().from(issues).where(eq(issues.parentId, first.issueId!))).toHaveLength(2);
+        const [root] = await db.select().from(issues).where(eq(issues.id, first.issueId!));
+        expect(root!.status).toBe("blocked");
+        const stepWakes = fx.wakeups.slice(wakesBefore).filter((wake) => wake.opts.reason === "issue_assigned");
+        expect(stepWakes).toEqual([]);
+      },
+    );
+
+    it("creates no issue and no steps for a recovery event without an open group", async () => {
+      const { fx, routine, source, secret } = await setupEventRoutine();
+
+      const recovery = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e1", state: "recovery", severity: "info" })));
+
+      expect(recovery.status).toBe("recovery_without_issue");
+      expect(await fx.issuesFor(routine.id)).toHaveLength(0);
+      expect(fx.wakeups).toHaveLength(0);
+    });
+
+    it("adds no steps when events are appended to an existing issue", async () => {
+      const fx = await seedEventFixture(db);
+      const leadId = await fx.createAgent("Lead");
+      const routine = await fx.createRoutine({ assigneeAgentId: leadId });
+      await fx.routinesSvc.update(routine.id, { steps: [step("triage"), step("fix", ["triage"])] }, {});
+      const { source, secret } = await fx.createSource();
+      const target = await fx.issueSvc.create(fx.companyId, {
+        projectId: fx.projectId,
+        title: "ongoing",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: leadId,
+      } as never);
+      await fx.subscribe(routine.id, source.id, {
+        grouping: { issueMode: { appendToIssueId: target.id }, repeatCommentCooldownSec: 600 },
+      });
+
+      const outcome = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e1" })));
+
+      expect(outcome).toMatchObject({ status: "grouped", issueId: target.id });
+      expect(await stepIssuesOf(routine.id)).toHaveLength(0);
+      expect(await fx.issuesFor(routine.id)).toHaveLength(0);
+      const [appended] = await db.select().from(issues).where(eq(issues.id, target.id));
+      expect(appended!.status).toBe("todo");
+    });
+
+    it("opens a fresh group with its own steps once the first group's root is closed", async () => {
+      const { fx, routine, source, secret } = await setupEventRoutine();
+      const first = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e1" })));
+      await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, first.issueId!));
+
+      fx.advance(60_000);
+      const second = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e2" })));
+
+      expect(second.status).toBe("issue_created");
+      expect(second.issueId).not.toBe(first.issueId);
+      expect(await stepIssuesOf(routine.id)).toHaveLength(4);
+      expect(await db.select().from(issues).where(eq(issues.parentId, second.issueId!))).toHaveLength(2);
+      expect(fx.wakeups.filter((wake) => wake.opts.reason === "issue_assigned")).toHaveLength(2);
     });
 
     it("keeps a routine without steps on a single todo group issue", async () => {

@@ -60,6 +60,7 @@ describe("routineStepsSchema", () => {
   });
 
   it("rejects conditional after entries until conditions are supported", () => {
+    expect(ROUTINE_STEP_CONDITIONS_UNSUPPORTED_MESSAGE).toBe("Step conditions (when) are not supported yet");
     expect(issueMessages([step("a"), step("b", [{ step: "a", when: "done" }])])).toContain(
       ROUTINE_STEP_CONDITIONS_UNSUPPORTED_MESSAGE,
     );
