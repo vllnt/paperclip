@@ -231,12 +231,12 @@ When authoring migrations or one-time backfills:
 
 ## Run issue indexes (migrations 0313 and 0314)
 
-Two migrations build indexes on `heartbeat_runs` inside the startup migration transaction:
+Two migrations build indexes on `heartbeat_runs`:
 
 - `0313_lowly_phil_sheldon.sql` builds `heartbeat_runs_company_issue_or_task_idx`: the runs of an issue.
 - `0314_clear_manta.sql` builds `heartbeat_runs_company_agent_no_issue_created_idx`: an agent's runs without an issue.
 
-While an index builds, inserts and updates of `heartbeat_runs` wait. Each build reads every run's `context_snapshot`, so its time grows with that table's size:
+At startup on an existing instance, the migration runner applies each pending migration in its own transaction and commits it before it starts the next one. Each build holds a SHARE lock on `heartbeat_runs` until its migration commits: reads continue, but inserts and updates of runs wait. When both migrations are pending, writers wait for the 0313 build and then for the 0314 build. Each build reads every run's `context_snapshot`, so its time grows with that table's size:
 
 ```sql
 SELECT pg_size_pretty(pg_total_relation_size('heartbeat_runs'));
