@@ -702,24 +702,6 @@ export function recordWorkerProviderSpan(
   });
 }
 
-/**
- * The grants `next` would add, remove, or rescope for a principal that holds
- * `stored`, as `grants.<permissionKey>` paths for the protected-change guard.
- */
-function changedGrantFields(
-  stored: Array<{ permissionKey: string; scope: unknown }>,
-  next: Array<{ permissionKey: string; scope: unknown }>,
-): string[] {
-  const describe = (grants: Array<{ permissionKey: string; scope: unknown }>) =>
-    new Map(grants.map((grant) => [`${grant.permissionKey}:${JSON.stringify(grant.scope ?? null)}`, grant.permissionKey]));
-  const before = describe(stored);
-  const after = describe(next);
-  const changed = new Set<string>();
-  for (const [key, permissionKey] of before) if (!after.has(key)) changed.add(permissionKey);
-  for (const [key, permissionKey] of after) if (!before.has(key)) changed.add(permissionKey);
-  return [...changed].sort().map((permissionKey) => `grants.${permissionKey}`);
-}
-
 export function buildHostServices(
   db: Db,
   pluginId: string,
@@ -776,6 +758,34 @@ export function buildHostServices(
       surface,
       details: { sourcePluginKey: pluginKey, ...details },
     });
+  }
+
+  /**
+   * Refuses a plugin call an agent started and records the refusal. For changes
+   * the routes keep to the board, and for changes that have no per-agent grant to
+   * check the agent against: board, user, and system calls keep their access.
+   * Call it before any lookup, so the answer does not reveal what exists.
+   */
+  async function assertNoAgentBehindCall(input: {
+    companyId: string;
+    action: string;
+    entityType: string;
+    entityId: string;
+  }) {
+    const caller = currentPluginHostCallAgent();
+    if (!caller) return;
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: caller.agentId,
+      agentId: caller.agentId,
+      runId: caller.runId,
+      action: input.action,
+      entityType: input.entityType,
+      entityId: input.entityId,
+      details: { sourcePluginKey: pluginKey, reason: "board_only" },
+    });
+    throw forbidden("Board access required");
   }
 
   const managedAgents = pluginManagedAgentService(db, {
@@ -3228,26 +3238,26 @@ export function buildHostServices(
       async setGrants(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
+        // Setting grants is board-only on the routes: the member routes
+        // (`PATCH /companies/:companyId/members/:memberId/permissions` and
+        // `/role-and-grants`) refuse every non-board actor in
+        // `assertCanManageCompanyMember`, and the agent routes grant only
+        // `tasks:assign`. So a call an agent started cannot set grants, even an
+        // agent that holds `agents:configure`: that agent could hand out keys it
+        // does not hold. Refuse before any lookup, so the answer does not reveal
+        // who is a member or which agents exist.
+        await assertNoAgentBehindCall({
+          companyId,
+          action: "authorization.grants_update_denied",
+          entityType: "principal_permission_grants",
+          entityId: `${params.principalType}:${params.principalId}`,
+        });
         if (params.principalType !== "agent" && params.principalType !== "user") {
           throw new Error("principalType must be 'agent' or 'user'");
         }
-        const nextGrants = params.grants.map((grant) => ({
-          permissionKey: grant.permissionKey as PermissionKey,
-          scope: grant.scope ? sanitizeRecord(grant.scope) : null,
-        }));
         if (params.principalType === "agent") {
-          const target = requireInCompany("Agent", await agents.getById(params.principalId), companyId);
-          const stored = await access.listPrincipalGrants(companyId, "agent", params.principalId);
-          await assertAgentCallerMayChangeProtectedFields(
-            target,
-            changedGrantFields(stored, nextGrants),
-            "plugin_grants_update",
-          );
+          requireInCompany("Agent", await agents.getById(params.principalId), companyId);
         } else {
-          // Member grant routes (`PATCH /companies/:companyId/members/:memberId/permissions`
-          // and `/role-and-grants`) refuse every non-board actor in `assertCanManageCompanyMember`.
-          // Refuse first, so an agent-started call cannot learn who is a member.
-          if (currentPluginHostCallAgent()) throw forbidden("Board access required");
           const membership = await access.getMembership(companyId, params.principalType as PrincipalType, params.principalId);
           if (!membership) throw new Error("Principal is not a member of this company");
         }
@@ -3255,7 +3265,10 @@ export function buildHostServices(
           companyId,
           params.principalType as PrincipalType,
           params.principalId,
-          nextGrants,
+          params.grants.map((grant) => ({
+            permissionKey: grant.permissionKey as PermissionKey,
+            scope: grant.scope ? sanitizeRecord(grant.scope) : null,
+          })),
           params.grantedByUserId ?? null,
         );
         await logPluginActivity({
@@ -3264,7 +3277,6 @@ export function buildHostServices(
           entityType: "principal_permission_grants",
           entityId: `${params.principalType}:${params.principalId}`,
           details: { grantCount: params.grants.length },
-          actor: callerActivityActor(),
         });
         return access
           .listPrincipalGrants(companyId, params.principalType as PrincipalType, params.principalId)
@@ -3298,6 +3310,18 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const policy = params.policy ? sanitizeRecord(params.policy) : null;
+        // An agent's policy follows the `agents:configure` rule below. A project's
+        // and an issue's policy carry the trust boundary of their runs and have no
+        // per-agent grant to check the caller against, so a call an agent started
+        // is refused.
+        if (params.resourceType === "project" || params.resourceType === "issue") {
+          await assertNoAgentBehindCall({
+            companyId,
+            action: "authorization.policy_update_denied",
+            entityType: params.resourceType,
+            entityId: params.resourceId,
+          });
+        }
         if (params.resourceType === "agent") {
           const agent = requireInCompany("Agent", await agents.getById(params.resourceId), companyId);
           const permissions = agent.permissions && typeof agent.permissions === "object"

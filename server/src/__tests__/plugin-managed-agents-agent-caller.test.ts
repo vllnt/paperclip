@@ -9,11 +9,13 @@ import {
   companies,
   companyMemberships,
   createDb,
+  issues,
   pluginCompanySettings,
   pluginEntities,
   pluginManagedResources,
   plugins,
   principalPermissionGrants,
+  projects,
 } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
@@ -83,6 +85,8 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
     await db.delete(pluginCompanySettings);
     await db.delete(approvals);
     await db.delete(principalPermissionGrants);
+    await db.delete(issues);
+    await db.delete(projects);
     await db.delete(companyMemberships);
     await db.delete(agents);
     await db.delete(plugins);
@@ -525,29 +529,72 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
     });
   }
 
+  async function deniedGrantActivity(companyId: string, principalType: "agent" | "user", principalId: string) {
+    return pluginAudit(companyId, "authorization.grants_update_denied", `${principalType}:${principalId}`);
+  }
+
+  type Seeded = Awaited<ReturnType<typeof seed>>;
+
+  /** Gives the peer agent `agents:configure`: none, company-wide, or scoped to the managed agent. */
+  async function givePeerConfigure(seeded: Seeded, scope: "none" | "company" | "target") {
+    if (scope === "none") return;
+    await db.insert(principalPermissionGrants).values({
+      companyId: seeded.companyId,
+      principalType: "agent",
+      principalId: seeded.peerId,
+      permissionKey: "agents:configure",
+      scope: scope === "target" ? { agentIds: [seeded.managedAgentId] } : null,
+      grantedByUserId: null,
+    });
+  }
+
   it.each([
-    { label: "another agent", target: "managed" as const },
-    { label: "itself", target: "peer" as const },
-  ])("refuses a grant update for $label started by an agent without agents:configure, and logs it", async ({ target }) => {
-    const { companyId, services, managedAgentId, peerId } = await seed();
-    const targetId = target === "peer" ? peerId : managedAgentId;
+    { label: "without agents:configure", scope: "none" as const },
+    { label: "holding a company-wide agents:configure grant", scope: "company" as const },
+    { label: "holding agents:configure scoped to the target", scope: "target" as const },
+  ])("refuses a grant update for another agent started by an agent $label, and logs it", async ({ scope }) => {
+    const seeded = await seed();
+    const { companyId, services, managedAgentId, peerId } = seeded;
+    await givePeerConfigure(seeded, scope);
+    const grantsBefore = await grantKeys(companyId, managedAgentId);
 
     await expect(
       runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
-        setGrants(services, companyId, "agent", targetId)),
-    ).rejects.toMatchObject({
-      status: 403,
-      details: { code: "agent_self_protected_config_change", fields: ["grants.agents:configure"] },
-    });
+        setGrants(services, companyId, "agent", managedAgentId)),
+    ).rejects.toMatchObject({ status: 403, message: "Board access required" });
 
-    expect(await grantKeys(companyId, targetId)).toEqual([]);
-    expect((await deniedActivity(targetId))[0]).toMatchObject({
+    expect(await grantKeys(companyId, managedAgentId)).toEqual(grantsBefore);
+    expect(await pluginAudit(companyId, "authorization.grants_updated_by_plugin", `agent:${managedAgentId}`)).toHaveLength(0);
+    const [denied, ...rest] = await deniedGrantActivity(companyId, "agent", managedAgentId);
+    expect(rest).toHaveLength(0);
+    expect(denied).toMatchObject({
+      actorType: "agent",
       actorId: peerId,
-      details: { surface: "plugin_grants_update", sourcePluginKey: MANIFEST.id },
+      agentId: peerId,
+      details: { sourcePluginKey: MANIFEST.id, reason: "board_only" },
     });
   });
 
-  it("refuses a grant update for a user member started by an agent", async () => {
+  it("refuses an agent holding a company-wide agents:configure grant setting grants for itself", async () => {
+    const seeded = await seed();
+    const { companyId, services, peerId } = seeded;
+    await givePeerConfigure(seeded, "company");
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+        services.authorization.setGrants({
+          companyId,
+          principalType: "agent",
+          principalId: peerId,
+          grants: [{ permissionKey: "agents:configure" }, { permissionKey: "users:manage_permissions" }],
+        })),
+    ).rejects.toMatchObject({ status: 403 });
+
+    expect(await grantKeys(companyId, peerId)).toEqual(["agents:configure"]);
+    expect(await deniedGrantActivity(companyId, "agent", peerId)).toHaveLength(1);
+  });
+
+  it("refuses a grant update for a user member started by an agent, and logs it", async () => {
     const { companyId, services, peerId } = await seed();
     const userId = `user-${randomUUID()}`;
     await db.insert(companyMemberships).values({
@@ -560,22 +607,26 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
     ).rejects.toMatchObject({ status: 403 });
 
     expect(await grantKeys(companyId, userId)).toEqual([]);
+    expect(await deniedGrantActivity(companyId, "user", userId)).toHaveLength(1);
   });
 
-  it("refuses an agent-started grant update for a non-member with the same 403, so the answer does not reveal who is a member", async () => {
+  it("refuses an agent-started grant update for a non-member or an unknown agent with the same 403, so the answer does not reveal what exists", async () => {
     const { companyId, services, peerId } = await seed();
     const strangerId = `user-${randomUUID()}`;
+    const unknownAgentId = randomUUID();
+    const asPeer = <T>(fn: () => Promise<T>) => runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, fn);
 
-    await expect(
-      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
-        setGrants(services, companyId, "user", strangerId)),
-    ).rejects.toMatchObject({ status: 403 });
+    await expect(asPeer(() => setGrants(services, companyId, "user", strangerId)))
+      .rejects.toMatchObject({ status: 403, message: "Board access required" });
+    await expect(asPeer(() => setGrants(services, companyId, "agent", unknownAgentId)))
+      .rejects.toMatchObject({ status: 403, message: "Board access required" });
 
     await expect(setGrants(services, companyId, "user", strangerId)).rejects.toThrow("Principal is not a member of this company");
+    await expect(setGrants(services, companyId, "agent", unknownAgentId)).rejects.toThrow("Agent not found");
   });
 
-  it("still sets grants for a call that no agent started, and for an agent holding company-wide agents:configure on another agent", async () => {
-    const { companyId, services, managedAgentId, peerId } = await seed();
+  it("still sets grants for a call that no agent started", async () => {
+    const { companyId, services, managedAgentId } = await seed();
     const userId = `user-${randomUUID()}`;
     await db.insert(companyMemberships).values({
       companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "operator",
@@ -585,34 +636,10 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
     await setGrants(services, companyId, "agent", managedAgentId);
     expect(await grantKeys(companyId, userId)).toEqual(["agents:configure"]);
     expect(await grantKeys(companyId, managedAgentId)).toEqual(["agents:configure"]);
-    await services.authorization.setGrants({ companyId, principalType: "agent", principalId: managedAgentId, grants: [] });
 
-    await db.insert(principalPermissionGrants).values({
-      companyId, principalType: "agent", principalId: peerId, permissionKey: "agents:configure", scope: null, grantedByUserId: null,
-    });
-    await runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
-      setGrants(services, companyId, "agent", managedAgentId));
-    expect(await grantKeys(companyId, managedAgentId)).toEqual(["agents:configure"]);
-    expect(await deniedActivity(managedAgentId)).toHaveLength(0);
-  });
-
-  it("refuses an agent with only a company-wide agents:configure grant adding a grant to itself", async () => {
-    const { companyId, services, peerId } = await seed();
-    await db.insert(principalPermissionGrants).values({
-      companyId, principalType: "agent", principalId: peerId, permissionKey: "agents:configure", scope: null, grantedByUserId: null,
-    });
-
-    await expect(
-      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
-        services.authorization.setGrants({
-          companyId,
-          principalType: "agent",
-          principalId: peerId,
-          grants: [{ permissionKey: "agents:configure" }, { permissionKey: "users:manage_permissions" }],
-        })),
-    ).rejects.toMatchObject({ status: 403, details: { fields: ["grants.users:manage_permissions"] } });
-
-    expect(await grantKeys(companyId, peerId)).toEqual(["agents:configure"]);
+    const [entry] = await pluginAudit(companyId, "authorization.grants_updated_by_plugin", `agent:${managedAgentId}`);
+    expect(entry).toMatchObject({ actorType: "plugin", agentId: null });
+    expect(await deniedGrantActivity(companyId, "agent", managedAgentId)).toHaveLength(0);
   });
 
   it("refuses a policy or grant update started by an agent of another company, even one that holds agents:configure there", async () => {
@@ -642,15 +669,75 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
     await expect(asOutsider(() => updateAgentPolicy(services, companyId, managedAgentId)))
       .rejects.toMatchObject({ status: 403, details: { code: "agent_self_protected_config_change" } });
     await expect(asOutsider(() => setGrants(services, companyId, "agent", managedAgentId)))
-      .rejects.toMatchObject({ status: 403, details: { code: "agent_self_protected_config_change" } });
+      .rejects.toMatchObject({ status: 403, message: "Board access required" });
 
     expect((await readAgent(managedAgentId)).permissions).toEqual(before.permissions);
     expect(await grantKeys(companyId, managedAgentId)).toEqual([]);
     expect((await deniedActivity(managedAgentId)).map((entry) => entry.details)).toEqual([
       expect.objectContaining({ surface: "plugin_policy_update" }),
-      expect.objectContaining({ surface: "plugin_grants_update" }),
     ]);
+    expect(await deniedGrantActivity(companyId, "agent", managedAgentId)).toHaveLength(1);
   });
+
+  it.each(["project", "issue"] as const)(
+    "refuses a %s policy update started by an agent, logs it, and keeps the stored policy",
+    async (resourceType) => {
+      const seeded = await seed();
+      const { companyId, services, peerId } = seeded;
+      const resourceId = await seedPolicyResource(companyId, resourceType);
+      await givePeerConfigure(seeded, "company");
+
+      await expect(
+        runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+          services.authorization.updatePolicy({ companyId, resourceType, resourceId, policy: null })),
+      ).rejects.toMatchObject({ status: 403, message: "Board access required" });
+
+      expect((await services.authorization.getPolicy({ companyId, resourceType, resourceId }))?.policy)
+        .toEqual(STORED_RESOURCE_POLICY);
+      const denied = await pluginAudit(companyId, "authorization.policy_update_denied", resourceId);
+      expect(denied).toHaveLength(1);
+      expect(denied[0]).toMatchObject({
+        actorType: "agent",
+        actorId: peerId,
+        entityType: resourceType,
+        details: { sourcePluginKey: MANIFEST.id, reason: "board_only" },
+      });
+    },
+  );
+
+  it.each(["project", "issue"] as const)("still updates a %s policy for a call that no agent started", async (resourceType) => {
+    const { companyId, services } = await seed();
+    const resourceId = await seedPolicyResource(companyId, resourceType);
+
+    const updated = await services.authorization.updatePolicy({ companyId, resourceType, resourceId, policy: POLICY });
+
+    expect(updated.policy).toEqual(POLICY);
+    expect(await pluginAudit(companyId, "authorization.policy_update_denied", resourceId)).toHaveLength(0);
+  });
+
+  const STORED_RESOURCE_POLICY = { trustPreset: LOW_TRUST_REVIEW_PRESET };
+
+  /** Seeds a project or an issue that carries a stored authorization policy. */
+  async function seedPolicyResource(companyId: string, resourceType: "project" | "issue") {
+    if (resourceType === "project") {
+      const [project] = await db
+        .insert(projects)
+        .values({ companyId, name: "Policy target", executionWorkspacePolicy: { authorizationPolicy: STORED_RESOURCE_POLICY } })
+        .returning();
+      return project!.id;
+    }
+    const [issue] = await db
+      .insert(issues)
+      .values({
+        companyId,
+        title: "Policy target",
+        status: "todo",
+        priority: "medium",
+        executionPolicy: { authorizationPolicy: STORED_RESOURCE_POLICY },
+      })
+      .returning();
+    return issue!.id;
+  }
 
   async function pluginAudit(companyId: string, action: string, entityId: string) {
     return db
@@ -659,26 +746,20 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, action), eq(activityLog.entityId, entityId)));
   }
 
-  it("names the agent behind an allowed policy or grant update in the activity log, and no agent for a call that none started", async () => {
-    const { companyId, services, managedAgentId, peerId } = await seed();
-    await db.insert(principalPermissionGrants).values({
-      companyId, principalType: "agent", principalId: peerId, permissionKey: "agents:configure", scope: null, grantedByUserId: null,
-    });
+  it("names the agent behind an allowed policy update in the activity log, and no agent for a call that none started", async () => {
+    const seeded = await seed();
+    const { companyId, services, managedAgentId, peerId } = seeded;
+    await givePeerConfigure(seeded, "company");
 
-    await runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, async () => {
-      await updateAgentPolicy(services, companyId, managedAgentId);
-      await setGrants(services, companyId, "agent", managedAgentId);
-    });
+    await runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+      updateAgentPolicy(services, companyId, managedAgentId));
 
     const [policyEntry] = await pluginAudit(companyId, "authorization.policy_updated_by_plugin", managedAgentId);
-    const [grantEntry] = await pluginAudit(companyId, "authorization.grants_updated_by_plugin", `agent:${managedAgentId}`);
-    for (const entry of [policyEntry, grantEntry]) {
-      expect(entry).toMatchObject({
-        actorType: "plugin",
-        agentId: peerId,
-        details: { sourcePluginKey: MANIFEST.id, initiatingActorType: "agent", initiatingAgentId: peerId },
-      });
-    }
+    expect(policyEntry).toMatchObject({
+      actorType: "plugin",
+      agentId: peerId,
+      details: { sourcePluginKey: MANIFEST.id, initiatingActorType: "agent", initiatingAgentId: peerId },
+    });
 
     await services.authorization.updatePolicy({ companyId, resourceType: "agent", resourceId: managedAgentId, policy: null });
     const entries = await pluginAudit(companyId, "authorization.policy_updated_by_plugin", managedAgentId);
