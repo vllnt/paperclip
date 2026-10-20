@@ -2994,6 +2994,9 @@ export function routineService(
           .limit(1)
           .then((rows) => rows[0] ?? null);
         if (existing) {
+          if (existing.triggerPayload?.targetIssueId !== input.targetIssueId) {
+            throw conflict("This idempotency key was already used for a run of this routine on another task, or for a run without a task");
+          }
           reusedExistingRun = true;
           return existing;
         }
@@ -4238,14 +4241,24 @@ export function routineService(
       const routine = await getRoutineById(id);
       if (!routine) throw notFound("Routine not found");
       if (routine.status === "archived") throw conflict("Routine is archived");
+      if (input.targetIssueId) {
+        if (input.triggerId) throw unprocessable("A run on a task cannot name a trigger");
+        if (
+          input.projectId
+          || input.projectWorkspaceId
+          || input.executionWorkspaceId
+          || input.executionWorkspacePreference
+          || input.executionWorkspaceSettings
+        ) {
+          throw unprocessable(
+            "A run on a task cannot take projectId, projectWorkspaceId or execution workspace fields: its steps go under the task",
+          );
+        }
+      }
       await assertProject(routine.companyId, input.projectId ?? null);
       const assigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
       await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
-      const trigger = input.triggerId ? await getTriggerById(input.triggerId) : null;
-      if (trigger && trigger.routineId !== routine.id) throw forbidden("Trigger does not belong to routine");
-      if (trigger && !trigger.enabled) throw conflict("Routine trigger is not active");
       if (input.targetIssueId) {
-        if (input.triggerId) throw unprocessable("A run on a task cannot name a trigger");
         return runRoutineOnIssue({
           routine,
           targetIssueId: input.targetIssueId,
@@ -4257,6 +4270,9 @@ export function routineService(
           actor,
         });
       }
+      const trigger = input.triggerId ? await getTriggerById(input.triggerId) : null;
+      if (trigger && trigger.routineId !== routine.id) throw forbidden("Trigger does not belong to routine");
+      if (trigger && !trigger.enabled) throw conflict("Routine trigger is not active");
       return dispatchRoutineRun({
         routine,
         trigger,

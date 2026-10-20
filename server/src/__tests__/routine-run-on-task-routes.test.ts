@@ -332,24 +332,93 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
       expect(after?.status).toBe("todo");
     });
 
-    it("answers 422 for a run that names a trigger, whether or not the trigger exists", async () => {
+    it("answers 422 for a run that names a trigger, whatever the trigger is", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const otherRoutine = await s.createRoutine();
+      const task = await s.newTask();
+      const svc = routineService(db, { heartbeat: { wakeup: async () => null } });
+      const schedule = { kind: "schedule", label: "daily", cronExpression: "0 0 * * *", timezone: "UTC" } as const;
+      const { trigger } = await svc.createTrigger(routine.id, schedule, {});
+      const { trigger: switchedOff } = await svc.createTrigger(routine.id, { ...schedule, enabled: false }, {});
+      const { trigger: foreign } = await svc.createTrigger(otherRoutine.id, schedule, {});
+      const app = appFor(boardActor(s.companyId));
+
+      for (const triggerId of [trigger.id, switchedOff.id, foreign.id, randomUUID()]) {
+        const response = await request(app).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: task.id, triggerId });
+        expect(response.status, triggerId).toBe(422);
+      }
+      expect(await s.childrenOf(task.id)).toEqual([]);
+      expect(await s.runsOf(routine.id)).toEqual([]);
+    });
+
+    it("answers 422 for a run that also names a project or a workspace", async () => {
       const s = await seed();
       const routine = await s.createRoutine();
       const task = await s.newTask();
-      const { trigger } = await routineService(db, { heartbeat: { wakeup: async () => null } }).createTrigger(
-        routine.id,
-        { kind: "schedule", label: "daily", cronExpression: "0 0 * * *", timezone: "UTC" },
-        {},
-      );
       const app = appFor(boardActor(s.companyId));
 
-      const real = await request(app).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: task.id, triggerId: trigger.id });
-      const unknown = await request(app).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: task.id, triggerId: randomUUID() });
+      const withProject = await request(app)
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: task.id, projectId: s.projectId });
+      const withWorkspace = await request(app)
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: task.id, executionWorkspacePreference: "shared_workspace" });
 
-      expect(real.status).toBe(422);
-      expect(unknown.status).toBe(422);
+      expect(withProject.status).toBe(422);
+      expect(withWorkspace.status).toBe(422);
       expect(await s.childrenOf(task.id)).toEqual([]);
-      expect(await s.runsOf(routine.id)).toEqual([]);
+    });
+
+    it("answers 404 for a hidden task, to the board and to an agent", async () => {
+      const s = await seed();
+      const outsideProjectId = await s.newProject("Elsewhere");
+      const guardedId = await s.newAgent("Guarded", {
+        permissions: {
+          authorizationPolicy: {
+            trustPreset: LOW_TRUST_REVIEW_PRESET,
+            trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, companyId: s.companyId, projectIds: [s.projectId] },
+          },
+        },
+      });
+      const routine = await s.createRoutine();
+      const guardedRoutine = await s.createRoutine({ assigneeAgentId: guardedId });
+      const task = await s.newTask();
+      const outside = await s.newTask({ projectId: outsideProjectId, assigneeAgentId: null });
+      await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, task.id));
+      await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, outside.id));
+
+      const asBoard = await request(appFor(boardActor(s.companyId)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: task.id });
+      const asAgent = await request(appFor(agentActor(s.companyId, s.leadId)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: task.id });
+      const asAgentOutsideItsBoundary = await request(appFor(agentActor(s.companyId, guardedId)))
+        .post(`/api/routines/${guardedRoutine.id}/run`)
+        .send({ targetIssueId: outside.id });
+
+      expect(asBoard.status).toBe(404);
+      expect(asAgent.status).toBe(404);
+      expect(asAgentOutsideItsBoundary.status).toBe(404);
+      expect(await s.childrenOf(task.id)).toEqual([]);
+      expect(await s.childrenOf(outside.id)).toEqual([]);
+    });
+
+    it("answers 409 for an idempotency key already used on another task, and starts nothing there", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const first = await s.newTask();
+      const second = await s.newTask({ title: "Fix logout" });
+      const app = appFor(boardActor(s.companyId));
+
+      const onFirst = await request(app).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: first.id, idempotencyKey: "k-1" });
+      const onSecond = await request(app).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: second.id, idempotencyKey: "k-1" });
+
+      expect(onFirst.status).toBe(202);
+      expect(onSecond.status).toBe(409);
+      expect(await s.childrenOf(second.id)).toEqual([]);
+      expect(await s.runsOf(routine.id)).toHaveLength(1);
     });
   });
 
@@ -388,6 +457,32 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
 
       expect(response.status).toBe(403);
       expect(await s.childrenOf(outside.id)).toEqual([]);
+      expect(await s.runsOf(routine.id)).toEqual([]);
+    });
+
+    it("is refused when the steps may not be assigned under the task, and the task is left alone", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const task = await s.newTask();
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            authorizationPolicy: {
+              assignmentPolicy: { mode: "protected" },
+              protectedAgent: { blockAssignment: true, blockReason: "Release owner only" },
+              managedBy: "permissions-extension",
+            },
+          } as never,
+        })
+        .where(eq(issues.id, task.id));
+
+      const response = await request(appFor(agentActor(s.companyId, s.leadId)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: task.id });
+
+      expect(response.status).toBe(403);
+      expect(await s.childrenOf(task.id)).toEqual([]);
       expect(await s.runsOf(routine.id)).toEqual([]);
     });
 

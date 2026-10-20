@@ -27,6 +27,7 @@ import {
   routineService,
 } from "../services/index.js";
 import { agentTrustService } from "../services/agent-trust.js";
+import { authorizationDeniedDetails } from "../services/authorization.js";
 import { routineStepWarnings } from "../services/routine-steps.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, notFound, unauthorized, unsupportedMediaType } from "../errors.js";
@@ -208,14 +209,21 @@ export function routineRoutes(
 
   /**
    * A run that starts steps on an existing task changes that task (it gains subtasks and blockers, and
-   * an agent-owned one becomes blocked), so the caller needs the right the issue routes ask before they
-   * create a subtask: the access decision for `issue:mutate`. Board users hold it through their
-   * company membership, which the routine check already covered.
-   * @throws HttpError 404 when the task is not in the routine's company, 403 when an agent may not change it.
+   * an agent-owned one becomes blocked) and creates a subtask for each step. An agent therefore needs
+   * what the issue routes ask before it changes a task and adds a subtask to it: the `issue:mutate`
+   * decision on the task, and the `tasks:assign` decision under the task for each agent the steps go to.
+   * Board users are covered by the routine route's company-level `tasks:assign` check.
+   * @throws HttpError 404 when the task is missing, hidden or in another company; 403 when an agent may
+   * not change it or may not assign the steps under it.
    */
-  async function assertCanStartStepsOnTask(req: Request, companyId: string, taskId: string) {
+  async function assertCanStartStepsOnTask(
+    req: Request,
+    routine: { companyId: string; assigneeAgentId: string | null; steps?: RoutineStep[] | null },
+    taskId: string,
+    runAssigneeAgentId: string | null,
+  ) {
     const task = await issues.getById(taskId);
-    if (!task || task.companyId !== companyId) throw notFound("Task not found");
+    if (!task || task.companyId !== routine.companyId || task.hiddenAt) throw notFound("Task not found");
     if (req.actor.type !== "agent") return;
     const decision = await access.decide({
       actor: req.actor,
@@ -239,6 +247,18 @@ export function routineRoutes(
       },
     });
     if (!decision.allowed) throw forbidden("This agent may not change the task", { issueId: task.id });
+    const defaultAgentId = runAssigneeAgentId ?? routine.assigneeAgentId;
+    const stepAgentIds = new Set((routine.steps ?? []).map((step) => step.assigneeAgentId ?? defaultAgentId));
+    for (const assigneeAgentId of stepAgentIds) {
+      const scope = { projectId: task.projectId, parentIssueId: task.id, assigneeAgentId, assigneeUserId: null };
+      const assign = await access.decide({
+        actor: req.actor,
+        action: "tasks:assign",
+        resource: { type: "issue", companyId: task.companyId, issueId: null, ...scope },
+        scope,
+      });
+      if (!assign.allowed) throw forbidden(assign.explanation, authorizationDeniedDetails(assign));
+    }
   }
 
   async function logRoutineRevisionCreated(req: Request, input: {
@@ -772,7 +792,7 @@ export function routineRoutes(
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
     const targetIssueId: string | null = req.body.targetIssueId ?? null;
-    if (targetIssueId) await assertCanStartStepsOnTask(req, routine.companyId, targetIssueId);
+    if (targetIssueId) await assertCanStartStepsOnTask(req, routine, targetIssueId, req.body.assigneeAgentId ?? null);
     const run = await svc.runRoutine(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
