@@ -164,6 +164,7 @@ async function run(values) {
   try { commit = JSON.parse(health.body.toString("utf8")).commit ?? null; } catch { /* keep null */ }
 
   // The client's own load inflates TTFB when it is busy, so it is recorded next to the host's.
+  const startedAt = new Date().toISOString();
   const clientLoad = [loadavg()[0]];
   const hostSamples = [];
   const sampleHost = async () => { const s = await hostSample(base, key); if (s) hostSamples.push(s); };
@@ -229,7 +230,8 @@ async function run(values) {
   }
   const report = {
     label: values.label ?? "run",
-    startedAt: new Date().toISOString(),
+    startedAt,
+    endedAt: new Date().toISOString(),
     node: process.version,
     commit,
     n,

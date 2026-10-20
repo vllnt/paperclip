@@ -1,7 +1,7 @@
 # Backend on Effect 4: one runtime for time, failure, cleanup and resources, sized for hundreds of agents, measured before and after
 
 Date: 2026-10-10
-Status: Plan only (docs). No Effect code, no install and no measurement run is part of this pull request.
+Status: Plan only (docs). No Effect code, no install and no measurement run is part of this pull request. A first B0 on production (read-only) was added on 2026-10-20 (section 4.7).
 Branch: `docs/backend-effect-plan`
 Anchors: `origin/main` `d9804ac4f`. Effect facts come from the published `effect@4.0.0` type files and the official migration guides. They were read from the package registry and a CDN. Nothing was installed.
 
@@ -185,6 +185,75 @@ Location: `tests/perf/backend/`, next to the existing perf directories.
 ### 4.6 Cost, and the gate
 
 **Conditions for a B0 run.** A new worktree off `origin/main`, with `pnpm install --offline --frozen-lockfile` only (B0 adds no dependency), and only when at least 9,000 MiB is free both before and after. The server uses the embedded Postgres that the code starts when `DATABASE_URL` is unset, on a local port, with no outside network calls, and it is stopped when the run ends. The worktree is removed when B0 is done. The raw numbers go in the harness pull request body. **Cost, observed:** an install into a new worktree used about 225 MB; the full fixture (1,000 issues, 10,000 runs) took about 160 s to seed; a calibration took about 5 minutes per mix; and one round of the steady scenario took about 7 minutes (a start of about 60 s, 20 s idle, 30 s warm-up, 300 s steady, and the shutdown). **Estimate:** five rounds of one mix are about 35 minutes. The whole of B0 (three mixes, calibration, the A/A pairs, F1 to F4, the cold starts and the restart test) is an estimated 6 to 8 hours of machine time, not counting the wait for a load of 6 or less. One gate (two arms, 7 minutes a round) is an estimated 2.3 hours per mix at the least number of pairs (10) and 7 hours at the most (30). Gate 1 uses three mixes, so 7 to 21 hours, plus M7, M11, F1 and F4, plus the wait for a load of 6 or less (the normal load of the host is 6 to 7). B0 is never run on another machine for comparison with a slice measured here. The code pull request for E0b needs its own, separate go: it adds a dependency, so it needs an online install.
+
+### 4.7 B0 on production, read-only (2026-10-20)
+
+**What this is.** The maintainers asked for a first B0 on the production instance, read-only, before any code of the perf track or of this plan. This section records it. It does not replace the harness of sections 4.4 to 4.6. Rule 2 of section 4.1 still holds: a gate compares a slice with its parent commit on one machine, interleaved. This B0 is the trend baseline and the "before" for the perf track. It is not the base of a gate.
+
+**Method.**
+
+- Tool: `tests/perf/backend/prod-readonly.mjs` (README next to it). It sends only `GET` requests with a board key, one at a time, on a new connection each time. Each round sends one request to each of 18 routes in a fixed order. There are 30 rounds per run.
+- Two runs of the same commit, A and B, one after the other: 18:40 to 18:49 and 18:50 to 18:57 UTC. The commit was `bd955e435`. The client ran Node 24.19.0.
+- `work` is the time to the first response byte, minus the p50 of `GET /api/health` (the floor: 61 ms in A, 43 ms in B). It still holds the client's share of the time. With 30 samples, p95 is the 29th value and the maximum is the 30th.
+- The company is a mid-size company of the instance. The list routes return 500 issues. An issue read uses one of its issues. Part of the agent traffic of the instance was paused during both runs, so the load was lower than on a normal day.
+- Host: 4 vCPU. The 1-minute load was 3.3 to 6.1 in A and 4.1 to 6.4 in B. The free memory of the host was 20 to 727 MiB of 7,940 MiB. The client's own 1-minute load was 62 at the start of B and 16 at its end (other work on the same client). Round A did not record it.
+
+**Latency per route (ms of work, run A / run B).**
+
+| Route | Work p50 A / B | Work p95 A / B | Max A / B | Body (plain → sent) | `If-None-Match` → 304 |
+| --- | --- | --- | --- | --- | --- |
+| `/api/health` | 0 / 0 | 106 / 219 | 113 / 353 | 814 B → 814 B | yes |
+| `/api/instance/settings/experimental` | 0 / 0 | 106 / 69 | 117 / 74 | 1 KB → 519 B gzip | yes |
+| `/api/auth/get-session` | 0 / 0 | 152 / 12 | 262 / 96 | 331 B → 331 B | yes |
+| `/api/cli-auth/me` | 0 / 0 | 71 / 54 | 123 / 69 | 542 B → 542 B | yes |
+| `/api/adapters` | 0 / 0 | 51 / 82 | 66 / 97 | 5 KB → 683 B gzip | yes |
+| `/api/plugins/ui-contributions` | 0 / 0 | 123 / 38 | 186 / 44 | 2 KB → 743 B gzip | yes |
+| `/api/companies/:id/dashboard` | 976 / 859 | 1,914 / 1,351 | 1,971 / 1,378 | 2 KB → 640 B gzip | yes |
+| `/api/companies/:id/sidebar-badges` | 9 / 2 | 140 / 118 | 223 / 164 | 57 B → 57 B | yes |
+| `/api/companies/:id/live-runs` | 0 / 0 | 88 / 74 | 93 / 229 | 2 B → 2 B | yes |
+| `/api/companies/:id/activity` | 97 / 102 | 227 / 226 | 229 / 460 | 174 KB → 26 KB gzip | when unchanged |
+| `/api/companies/:id/heartbeat-runs?limit=200` | 235 / 223 | 489 / 482 | 750 / 543 | 535 KB → 59 KB gzip | yes |
+| `/api/companies/:id/agents` | 14 / 0 | 138 / 89 | 254 / 97 | 152 KB → 11 KB gzip | yes |
+| `/api/companies/:id/skills` | 339 / 124 | 1,029 / 1,180 | 1,158 / 1,321 | 77 KB → 10 KB gzip | yes |
+| `/api/companies/:id/attention` | 1,141 / 804 | 1,529 / 1,849 | 2,417 / 2,608 | 125 KB → 12 KB gzip | no (body changes) |
+| `/api/companies/:id/issues` (500 rows) | 2,691 / 2,328 | 3,350 / 3,436 | 4,153 / 3,672 | 1.98 MB → 331 KB gzip | yes |
+| `/api/companies/:id/issues?view=compact&limit=100` | 2,657 / 2,288 | 3,247 / 3,231 | 3,732 / 3,237 | 315 KB → 65 KB gzip | yes |
+| `/api/issues/:id` | 82 / 16 | 483 / 160 | 895 / 188 | 8 KB → 3 KB gzip | yes |
+| `/api/instance/resource-capacity` | 6 / 0 | 96 / 115 | 97 / 177 | 4 KB → 1 KB gzip | no (body changes) |
+
+- Every JSON body above 1 KB is sent with gzip and `Vary: Accept-Encoding`. No route sends brotli.
+- A 304 still runs the whole handler. It saves bytes, not server time.
+- `GET /api/companies/:id/heartbeat-runs` without `limit` returned every run of the company: 85 MB before compression, 4 MB sent, about 5.2 s of work (one smoke request). The CLI sends it without a limit in `run list` (when `--limit` is not given) and in the poll loop of `heartbeat-run` (per agent).
+
+**Noise (the A/A pair).** `prod-readonly.mjs compare` on A and B, same commit: the p50 of run B was 13% lower for both issue lists and the dashboard, 30% lower for attention and 61% lower for skills. Several of these intervals exclude 0, so the two runs drifted; the samples are not independent. The p95 rows were inconclusive for every heavy route. **Consequence for the perf track:** on production, before and after cannot be interleaved (the deploy changes the code). A before-and-after on production therefore shows only a large effect. A claim of a smaller gain, or a "no regression" row against the thresholds of section 8, needs the paired local measurement of rule 2.
+
+**Process and database.**
+
+| Item | Value |
+| --- | --- |
+| Application container (limit 4 CPU, 3 GiB) | 72% and 240% CPU in two reads two minutes apart; 2.20 to 2.26 GiB |
+| Database container (limit 3 CPU, 1.5 GiB) | 107% and 180% CPU; 1.19 to 1.24 GiB |
+| Transactions | 354 per second (two `pg_stat_database` reads, 60 s apart) |
+| Rows returned | 130,000 per second |
+| Index scans per second, busiest tables | `chat_conversations` 578 (the table has 0 rows), `issues` 519, `issue_recovery_actions` 484, `activity_log` 334, `issue_comments` 280, `heartbeat_runs` 225, `agents` 76, `agent_wakeup_requests` 50 |
+| Sequential scans per second, busiest tables | `companies` 45, `plugins` 17, `chat_actions` 16, `labels` 11, `agents` 7.6, `projects` 6.8 (all small tables) |
+| Rows read by sequential scans per second | `activity_log` 17,900, `agent_wakeup_requests` 17,700, `issue_recovery_actions` 7,900, `heartbeat_runs` 5,000, `issues` 4,500 |
+| Connections | 9 idle, 2 active, 5 background; `max_connections` 100 |
+| `pg_stat_statements` | Not enabled, so there is no time per statement on production |
+
+**Statements per request.** Production has no count per route. The guard `server/src/__tests__/request-query-budgets.test.ts` counts the statements of one warm request on a small seed. At `bd955e435`, for the local operator: health 3, companies 2, agents 4, issue list 24, issue detail 30, issue comments 6, routines 6, skills 63 (8 skills), plugins 1, heartbeat runs 2, dashboard 8, sidebar badges 4. For a company member: agents 16, issue list 26, issue detail 32, issue comments 8, heartbeat runs 4, sidebar badges 6. On the seed each of these tests (a warm-up request and the counted request) ends in under 0.25 s. So on production the time goes into a few slow statements, not into the number of statements.
+
+**What matters most.** This order is for the perf track. It comes from the work time above.
+
+1. **The issue list:** about 2.3 to 2.7 s at p50 and 3.2 to 3.4 s at p95. The cost does not depend on the page size: 100 compact rows cost the same as 500 full rows. The lead is in the default order. It sorts by `GREATEST(updated_at, latest comment, latest activity)`, with two correlated `MAX` subqueries, and the filter has a correlated subquery on `chat_conversations`. Both run for each issue of the company before the `LIMIT`. This fits the index-scan rates of `chat_conversations`, `activity_log` and `issue_comments` above. `EXPLAIN (ANALYZE, BUFFERS)` on production confirms or refutes it before a fix.
+2. **Attention:** 0.8 to 1.1 s at p50, up to 2.6 s.
+3. **The dashboard:** 0.9 to 1.0 s at p50, up to 2.0 s. Slices E0a and E0b of this plan change the retry around four of its queries.
+4. **Skills:** 0.1 to 0.3 s at p50 but over 1 s at p95.
+5. **Unbounded run lists**, see above.
+
+The bytes on the wire are already small after gzip, except the full issue list (331 KB). In one local test on that body, brotli at quality 4 gave 239 KB and gzip at its default level gave 332 KB, and brotli used less CPU. The perf track measures this again in its own pull request.
+
+**Not covered here.** The rows M2 to M14 of section 4.2 (they need the local harness), writes, the wake delivery, the actor lookup of the cloud-tenant mode (production does not use that mode), agent routes with a run token, the WebSocket path, and the browser. Rows M1 for the mixes of section 4.5 are measured locally, as rule 4 says.
 
 ## 5. Where Effect pays off, with anchors
 
