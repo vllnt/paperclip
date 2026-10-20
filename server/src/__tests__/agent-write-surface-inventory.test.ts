@@ -39,8 +39,10 @@ const SURFACES: Record<string, Surface> = {
   "routes/costs.ts": { kind: "board-only", how: "agent budget and budget policy routes call assertBoard" },
   "routes/issues.ts": { kind: "read-only", how: "reads agents for assignment checks" },
   "routes/llms.ts": { kind: "read-only", how: "reads agents for the llms listing" },
+  "routes/routines.ts": { kind: "read-only", how: "hands the agent service to the trust check, which only reads the assignee" },
   "routes/teams-catalog.ts": { kind: "read-only", how: "reads agents; installs go through the portability service" },
-  "services/agents.ts": { kind: "owner", how: "the agent service; every caller is classified in this table" },
+  "services/agent-trust.ts": { kind: "read-only", how: "takes only getById from the agent service to read the assignee's trust" },
+  "services/agents.ts":{ kind: "owner", how: "the agent service; every caller is classified in this table" },
   "services/approvals.ts": { kind: "board-only", how: "approve and reject routes call assertBoard and apply a payload the board reviewed" },
   "services/built-in-agents.ts": {
     kind: "guarded",
