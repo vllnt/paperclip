@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getTableName, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
@@ -64,7 +64,24 @@ function fixture(failures: Error[] = [], options: {
   return { service: dashboardService(db), reads, companyParameters, parameters, select, execute };
 }
 
+/** Settles `promise` under fake timers, so the retry sleeps take no wall time. */
+async function withFakeTimers<T>(promise: Promise<T>): Promise<T> {
+  const settled = promise.then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+  await vi.runAllTimersAsync();
+  const outcome = await settled;
+  if ("error" in outcome) throw outcome.error;
+  return outcome.value;
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 beforeEach(() => {
+  vi.useFakeTimers();
   overview.mockReset().mockResolvedValue({
     activeIncidents: [], pendingApprovalCount: 0, pausedAgentCount: 0, pausedProjectCount: 0,
   });
@@ -74,7 +91,7 @@ describe("dashboard read connection recovery", () => {
   it.each(["CONNECT_TIMEOUT", "CONNECTION_CLOSED", "CONNECTION_ENDED", "CONNECTION_DESTROYED"])(
     "rebuilds the scoped company read after a nested %s cause", async (code) => {
       const test = fixture([disconnected(code)]);
-      await expect(test.service.summary(companyId)).resolves.toMatchObject({
+      await expect(withFakeTimers(test.service.summary(companyId))).resolves.toMatchObject({
         companyId,
         agents: { active: 2 },
         tasks: { inProgress: 1 },
@@ -90,16 +107,16 @@ describe("dashboard read connection recovery", () => {
 
   it("can replace two stale pooled connections within the existing retry budget", async () => {
     const test = fixture([disconnected(), disconnected()]);
-    await expect(test.service.summary(companyId)).resolves.toMatchObject({ companyId });
+    await expect(withFakeTimers(test.service.summary(companyId))).resolves.toMatchObject({ companyId });
     expect(test.companyParameters).toEqual([[companyId], [companyId], [companyId]]);
     expect(overview).toHaveBeenCalledTimes(1);
   });
 
-  it("propagates the final failure after three attempts without starting later work", async () => {
-    const failures = [disconnected(), disconnected(), disconnected()];
+  it("propagates the final failure after six attempts without starting later work", async () => {
+    const failures = Array.from({ length: 6 }, () => disconnected());
     const test = fixture(failures);
-    await expect(test.service.summary(companyId)).rejects.toBe(failures[2]);
-    expect(test.reads).toEqual(["companies", "companies", "companies"]);
+    await expect(withFakeTimers(test.service.summary(companyId))).rejects.toBe(failures[5]);
+    expect(test.reads).toEqual(Array(6).fill("companies"));
     expect(test.execute).not.toHaveBeenCalled();
     expect(overview).not.toHaveBeenCalled();
   });
@@ -107,7 +124,7 @@ describe("dashboard read connection recovery", () => {
   it.each([new Error("write CONNECTION_CLOSED"), disconnected("28P01"), disconnected("23505")])(
     "does not retry message-only, authentication, or constraint errors", async (error) => {
       const test = fixture([error]);
-      await expect(test.service.summary(companyId)).rejects.toBe(error);
+      await expect(withFakeTimers(test.service.summary(companyId))).rejects.toBe(error);
       expect(test.reads).toEqual(["companies"]);
       expect(test.execute).not.toHaveBeenCalled();
       expect(overview).not.toHaveBeenCalled();
@@ -116,7 +133,7 @@ describe("dashboard read connection recovery", () => {
 
   it("retains the missing-company error without retrying", async () => {
     const test = fixture([], { missingCompany: true });
-    await expect(test.service.summary(companyId)).rejects.toMatchObject({ status: 404 });
+    await expect(withFakeTimers(test.service.summary(companyId))).rejects.toMatchObject({ status: 404 });
     expect(test.reads).toEqual(["companies"]);
     expect(overview).not.toHaveBeenCalled();
   });
@@ -124,7 +141,7 @@ describe("dashboard read connection recovery", () => {
   it("does not replay later summary reads when they lose a connection", async () => {
     const error = disconnected();
     const test = fixture([], { laterError: error });
-    await expect(test.service.summary(companyId)).rejects.toBe(error);
+    await expect(withFakeTimers(test.service.summary(companyId))).rejects.toBe(error);
     expect(test.reads).toEqual(["companies", "agents"]);
     expect(overview).not.toHaveBeenCalled();
   });
@@ -133,7 +150,7 @@ describe("dashboard read connection recovery", () => {
     const error = disconnected();
     overview.mockRejectedValue(error);
     const test = fixture();
-    await expect(test.service.summary(companyId)).rejects.toBe(error);
+    await expect(withFakeTimers(test.service.summary(companyId))).rejects.toBe(error);
     expect(test.companyParameters).toEqual([[companyId]]);
     expect(overview).toHaveBeenCalledTimes(1);
   });
@@ -141,7 +158,7 @@ describe("dashboard read connection recovery", () => {
   const tables = ["companies", "agents", "issues", "approvals", "cost_events"];
   it.each(["issues", "approvals", "cost_events"])("retries only the failed %s read", async (table) => {
     const test = fixture([], { readFailures: { [table]: [disconnected()] } });
-    await expect(test.service.summary(companyId)).resolves.toMatchObject({ companyId });
+    await expect(withFakeTimers(test.service.summary(companyId))).resolves.toMatchObject({ companyId });
     const prefix = tables.slice(0, tables.indexOf(table) + 1);
     const suffix = tables.slice(tables.indexOf(table) + 1);
     expect(test.reads).toEqual([...prefix, table, ...suffix]);
@@ -153,12 +170,12 @@ describe("dashboard read connection recovery", () => {
     expect(overview).toHaveBeenCalledExactlyOnceWith(companyId);
   });
 
-  it.each(["issues", "approvals", "cost_events"])("stops after the %s read exhausts its budget", async (table) => {
-    const failures = [disconnected(), disconnected(), disconnected()];
+  it.each(["issues", "approvals", "cost_events"])("stops after the %s read exhausts its retries", async (table) => {
+    const failures = Array.from({ length: 6 }, () => disconnected());
     const test = fixture([], { readFailures: { [table]: failures } });
-    await expect(test.service.summary(companyId)).rejects.toBe(failures[2]);
+    await expect(withFakeTimers(test.service.summary(companyId))).rejects.toBe(failures[5]);
     const prefix = tables.slice(0, tables.indexOf(table));
-    expect(test.reads).toEqual([...prefix, table, table, table]);
+    expect(test.reads).toEqual([...prefix, ...Array(6).fill(table)]);
     expect(test.execute).not.toHaveBeenCalled();
     expect(overview).not.toHaveBeenCalled();
   });

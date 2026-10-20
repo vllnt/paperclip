@@ -90,12 +90,19 @@ describe("issue assignment wakeup delivery", () => {
     expect(wakeup).toHaveBeenCalledTimes(1);
   });
 
-  it("stops after three attempts when the failure stays transient", async () => {
-    const error = wrapped(pgError("40001"));
-    const wakeup = vi.fn().mockRejectedValue(error);
+  it("stops after six attempts when the failure stays transient", async () => {
+    vi.useFakeTimers();
+    try {
+      const error = wrapped(pgError("40001"));
+      const wakeup = vi.fn().mockRejectedValue(error);
 
-    await expect(assign(wakeup, { assigneeAgentId: "agent-a", assignmentGeneration: 9 })).rejects.toBe(error);
-    expect(wakeup).toHaveBeenCalledTimes(3);
+      const assertion = expect(assign(wakeup, { assigneeAgentId: "agent-a", assignmentGeneration: 9 })).rejects.toBe(error);
+      await vi.runAllTimersAsync();
+      await assertion;
+      expect(wakeup).toHaveBeenCalledTimes(6);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("derives the assignment generation only from the server issue snapshot", async () => {

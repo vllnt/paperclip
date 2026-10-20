@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   isTransientDbConnectionError,
@@ -70,14 +70,20 @@ describe("retryOnTransientDbConnectionError", () => {
     expect(calls).toBe(1);
   });
 
-  it.each(["CONNECT_TIMEOUT", "CONNECTION_CLOSED"])("propagates %s once the replay budget is spent", async (code) => {
-    let calls = 0;
-    await expect(
-      retryOnTransientDbConnectionError(async () => {
+  it.each(["CONNECT_TIMEOUT", "CONNECTION_CLOSED"])("propagates %s after five retries", async (code) => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const outcome = retryOnTransientDbConnectionError(async () => {
         calls += 1;
         throw driverConnectionError(code);
-      }),
-    ).rejects.toThrow("Failed query");
-    expect(calls).toBe(3);
+      });
+      const assertion = expect(outcome).rejects.toThrow("Failed query");
+      await vi.runAllTimersAsync();
+      await assertion;
+      expect(calls).toBe(6);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
