@@ -7842,6 +7842,13 @@ export function mergeCoalescedContextSnapshot(
   // admitted proof, but must never accept a new marker from an incoming wake.
   delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
   delete merged[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY];
+  // The routine-session claim names the target run and only
+  // claimRoutineTaskSession mints it. Keep the target's claim; an incoming
+  // wake context may carry another run's copy of it, which must not replace it.
+  for (const key of [ROUTINE_TASK_SESSION_CLAIM_KEY, ROUTINE_TASK_SESSION_CLAIM_RUN_KEY]) {
+    if (existing[key] === undefined) delete merged[key];
+    else merged[key] = existing[key];
+  }
   const mergedAttachmentOmissions = mergeExternalAttachmentOmissions(
     existing,
     incoming,
@@ -13492,6 +13499,12 @@ export function heartbeatService(
     sessionDisplayId: string | null;
     lastRunId: string | null;
     lastError: string | null;
+    /**
+     * When set, an existing row is written only while its lastRunId is one of
+     * these. Any other value means a later run saved the row, and this write
+     * would put an older session back.
+     */
+    onlyIfLastRunIdIn?: ReadonlyArray<string | null>;
   }) {
     return db.transaction(async (tx) => {
       // A task key that is not an issue id locks nothing, as `id::text = taskKey` matched nothing.
@@ -13504,6 +13517,8 @@ export function heartbeatService(
       }
     const existing = await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey))).then((rows) => rows[0] ?? null);
     if (existing) {
+      const guard = input.onlyIfLastRunIdIn;
+      if (guard && !guard.includes(existing.lastRunId)) return null;
       return tx
         .update(agentTaskSessions)
         .set({
@@ -13513,7 +13528,15 @@ export function heartbeatService(
           lastError: input.lastError,
           updatedAt: new Date(),
         })
-        .where(eq(agentTaskSessions.id, existing.id))
+        .where(and(
+          eq(agentTaskSessions.id, existing.id),
+          // Under READ COMMITTED this re-checks the row a concurrent save just changed.
+          ...(guard
+            ? [existing.lastRunId === null
+                ? isNull(agentTaskSessions.lastRunId)
+                : eq(agentTaskSessions.lastRunId, existing.lastRunId)]
+            : []),
+        ))
         .returning()
         .then((rows) => rows[0] ?? null);
     }
@@ -29288,6 +29311,10 @@ export function heartbeatService(
                 previousSessionDisplayId,
               lastRunId: failedRun.id,
               lastError: message,
+              // This only re-saves the session the run started with. The release
+              // above may have started the next run on the same key, and a save
+              // by that run (or any run since this one began) is newer.
+              onlyIfLastRunIdIn: [taskSession?.lastRunId ?? null, failedRun.id],
             });
           }
         }

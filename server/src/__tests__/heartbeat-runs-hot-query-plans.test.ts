@@ -56,7 +56,7 @@ const QUERY_2_BUFFER_BOUND = 1_000;
  * Query 3 reads one agent's runs through its index (about 230 here, about 235
  * buffers) and the claim key of only its running runs' contexts.
  */
-const CLAIM_BUFFER_BOUND = 1_000;
+const CLAIM_BUFFER_BOUND = 400;
 
 type Captured = { query: string; params: unknown[] };
 type PlanNode = { "Node Type": string; "Relation Name"?: string; "Index Name"?: string; Plans?: PlanNode[] } & Record<string, unknown>;

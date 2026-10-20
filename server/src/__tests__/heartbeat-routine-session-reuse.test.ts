@@ -368,6 +368,55 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
     expect(invocations[1]!.sessionId).toBe(session);
   });
 
+  it("a failed run does not put its older session back over a save a later run made meanwhile", async () => {
+    const { companyId, agentId, routine } = await seed();
+    await tick(routine.id);
+    const [started] = await routineSessionRows(companyId, routine.id);
+
+    // The second tick starts from the session row above and then fails with an
+    // adapter exception. Another run saves the row while it is still running; the
+    // same save can also land in the gap after its release starts a wake that was
+    // deferred behind it, before it re-saves.
+    const [laterRun] = await db.insert(heartbeatRuns).values({
+      companyId, agentId, invocationSource: "automation", status: "succeeded", finishedAt: new Date(),
+    }).returning();
+    gate = async () => {
+      if (invocations.length !== 2) return;
+      await db.update(agentTaskSessions).set({
+        sessionDisplayId: "saved-by-a-later-run",
+        sessionParamsJson: { sessionId: "saved-by-a-later-run" },
+        lastRunId: laterRun!.id,
+        lastError: null,
+      }).where(eq(agentTaskSessions.id, started!.id));
+      throw new Error("adapter process crashed");
+    };
+    await tick(routine.id);
+
+    const failedRun = invocations[1]!;
+    const [row] = await routineSessionRows(companyId, routine.id);
+    expect(row?.lastRunId, `the failed run ${failedRun.runId} re-saved over the later run`).toBe(laterRun!.id);
+    expect(row?.sessionDisplayId).toBe("saved-by-a-later-run");
+    expect(row?.lastError).toBeNull();
+  });
+
+  it("a failed run still re-saves the session it started with when no other run saved it", async () => {
+    const { companyId, routine } = await seed();
+    await tick(routine.id);
+    const [started] = await routineSessionRows(companyId, routine.id);
+    gate = async () => {
+      if (invocations.length === 2) throw new Error("adapter process crashed");
+    };
+    const second = await tick(routine.id);
+
+    const [row] = await routineSessionRows(companyId, routine.id);
+    const [failedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, invocations[1]!.runId));
+    expect(failedRun?.status).toBe("failed");
+    expect(second.id).toBe(invocations[1]!.issueId);
+    expect(row?.lastRunId).toBe(invocations[1]!.runId);
+    expect(row?.sessionDisplayId).toBe(started!.sessionDisplayId);
+    expect(row?.lastError).toContain("adapter process crashed");
+  });
+
   it("rotation still happens once the session passes the token threshold", async () => {
     const { routine } = await seed();
     await tick(routine.id);
