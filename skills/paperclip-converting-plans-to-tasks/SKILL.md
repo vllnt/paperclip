@@ -55,3 +55,4 @@ Start from one end-to-end task and add issues only for the qualifying boundaries
 - Not a plan template. Use any format — prose, outline, table, RACI, Gantt, whatever fits.
 - Not software-development–specific. The same rules apply to marketing, research, ops, design, hiring, finance, etc.
 - Not a replacement for the `paperclip` skill's planning mechanics. Use both.
+- Not for recurring workflows. To design a standing process that runs many times (a lane), use `paperclip-designing-lanes` if it is installed.

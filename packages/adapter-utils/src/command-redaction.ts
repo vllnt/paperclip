@@ -204,8 +204,10 @@ export function redactHeaderSecretText(
  * because a sandbox diagnostic can carry a serialized JSON error such as
  * `{"token":"opaque-value"}`. The function last redacts header forms such as
  * `x-api-key: <value>` and `Cookie: <pairs>` (see {@link redactHeaderSecretText}). The caller must
- * still bound the length after this step, and it must bound it after this function, never before,
- * because a cut can separate a secret's name from its value.
+ * still bound the length after this step, and it must bound it after this function, because a cut
+ * can separate a secret's name from its value. The rules cost much more than linear time on a long
+ * unbroken run of letters, digits, `-` and `_`, so a caller with megabytes of text may also bound
+ * the input first, but only at a line start, as `describeProcessExit` does.
  */
 export function redactDiagnosticText(
   text: string,

@@ -47,12 +47,17 @@ Prompts that quote a run error, and the "Failure summary" row of a stranded-run
 notice, get the short one-line message (prompts cap it at 500 characters). The
 run page and the Inbox show the full stored error.
 
-The helper redacts before it cuts. It masks secret-shaped text (API keys,
-bearer tokens, `key=value` secrets, JSON secret fields, URL passwords, PEM
-blocks) and the header forms `x-api-key: <value>`, `x-auth-key=<value>` and
-`Authorization: Basic <value>`. It masks the whole value of a `Cookie` or
-`Set-Cookie` header, up to the end of its line. No cut separates the name of a
-secret from its value, because the tail starts at the start of a line.
+The helper redacts before it cuts the tail, and it bounds the text it redacts.
+It masks secret-shaped text (API keys, bearer tokens, `key=value` secrets, JSON
+secret fields, URL passwords, PEM blocks) and the header forms
+`x-api-key: <value>`, `x-auth-key=<value>` and `Authorization: Basic <value>`.
+It masks the whole value of a `Cookie` or `Set-Cookie` header, up to the end of
+its line. Stderr can hold megabytes, and the redaction rules are slow on a long
+unbroken run of letters, digits, `-` and `_`. So the helper redacts only the end
+of stderr: the last whole lines that fit in 8 KiB (an over-long last line keeps
+its start), and the first 8 KiB of the result error. No cut separates the name of
+a secret from its value, because the text starts at the start of a line. A PEM
+block that starts before that end is left out through its END marker.
 
 The server redacts the stored error message of every adapter again, before it
 stores it, with the same header rules from

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   EXIT_CAUSE_LAST_LINE_MAX_CHARS,
   EXIT_CAUSE_RESULT_ERROR_MAX_CHARS,
+  EXIT_CAUSE_SCAN_WINDOW_CHARS,
   EXIT_CAUSE_STDERR_MAX_CHARS,
   EXIT_CAUSE_STDERR_MAX_LINES,
   describeProcessExit,
@@ -14,6 +15,10 @@ const pemMarker = (edge: "BEGIN" | "END") => `${"-".repeat(5)}${edge} PRIVATE KE
 // Built at runtime so the source holds no secret-shaped literal.
 const FAKE_HEADER_VALUE = ["opaque", "Header", "Value", "8f3k2m9q7z"].join("");
 const TAIL_HEADER = "\nLast lines of stderr:\n";
+// Far above a normal run (tens of milliseconds) and far below the unbounded cost (minutes).
+const SCAN_BUDGET_MS = 2000;
+const pemBody = (lines: number) =>
+  Array.from({ length: lines }, (_, i) => `MIIEvQIBADANBgkqhkiG9w0BAQEFAASC${String(i).padStart(3, "0")}`);
 const LONE_SURROGATE_RE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
 describe("describeProcessExit", () => {
@@ -124,6 +129,88 @@ describe("describeProcessExit", () => {
     expect(message.endsWith(`${TAIL_HEADER}${a}\n${b}`)).toBe(true);
   });
 
+  it("keeps the whole multi-line secret redacted when it is longer than the tail but inside the window", () => {
+    const stderr = [pemMarker("BEGIN"), ...pemBody(120), pemMarker("END"), "Error: bad key"].join("\n");
+
+    const message = describeProcessExit("Agent", { ...failed, stderr });
+
+    expect(stderr.length).toBeGreaterThan(EXIT_CAUSE_STDERR_MAX_CHARS);
+    expect(stderr.length).toBeLessThan(EXIT_CAUSE_SCAN_WINDOW_CHARS);
+    expect(message).toBe(`Agent exited with code 1: Error: bad key${TAIL_HEADER}***REDACTED***\nError: bad key`);
+  });
+
+  it("never shows the body of a multi-line secret, whatever its size next to the window edge", () => {
+    for (let lines = 200; lines <= 280; lines += 1) {
+      const stderr = [pemMarker("BEGIN"), ...pemBody(lines), pemMarker("END"), "Error: bad key"].join("\n");
+
+      const message = describeProcessExit("Agent", { ...failed, stderr });
+
+      expect(message, `body of ${lines} lines`).not.toContain("MIIEvQ");
+      expect(message, `body of ${lines} lines`).toMatch(/^Agent exited with code 1: Error: bad key\n/);
+      expect(message, `body of ${lines} lines`).toMatch(/Error: bad key$/);
+    }
+  });
+
+  it("leaves out the body of a multi-line secret that starts before the window", () => {
+    const stderr = ["Error: before", pemMarker("BEGIN"), ...pemBody(400), pemMarker("END"), "Error: bad key"].join("\n");
+
+    const message = describeProcessExit("Agent", { ...failed, stderr });
+
+    expect(stderr.length).toBeGreaterThan(EXIT_CAUSE_SCAN_WINDOW_CHARS);
+    expect(message).toBe(`Agent exited with code 1: Error: bad key${TAIL_HEADER}…Error: bad key`);
+  });
+
+  it("marks the lines that the window left out, even when the kept line is short", () => {
+    const stderr = `${"x".repeat(EXIT_CAUSE_SCAN_WINDOW_CHARS + 1)}\nError: boom\n`;
+
+    expect(describeProcessExit("Agent", { ...failed, stderr })).toBe(
+      `Agent exited with code 1: Error: boom${TAIL_HEADER}…Error: boom`,
+    );
+  });
+
+  it("keeps the start of a last line that is over the window, and marks the lines before it", () => {
+    const stderr = `Error: older\nError: ${"y".repeat(EXIT_CAUSE_SCAN_WINDOW_CHARS * 2)}`;
+
+    const [first, header, tail] = describeProcessExit("Agent", { ...failed, stderr }).split("\n");
+
+    expect(first!.startsWith("Agent exited with code 1: Error: yyy")).toBe(true);
+    expect(header).toBe("Last lines of stderr:");
+    expect(tail!.startsWith("…Error: yyy")).toBe(true);
+    expect(tail!.length).toBeLessThanOrEqual(EXIT_CAUSE_STDERR_MAX_CHARS + 1);
+  });
+
+  // The redaction rules are not linear on a long unbroken run, and stderr can hold megabytes
+  // (the capture cap is 4 MiB). The cost must follow the window, not the size of stderr.
+  describe.each([
+    ["hyphen-joined words", "abc-def-ghi_jkl-"],
+    ["a keyword and hyphens", "token-"],
+    ["a header name and hyphens", "x-api-key-"],
+    ["a single-letter pattern", "a-b-"],
+  ])("with a 256 KiB run of %s", (_name, unit) => {
+    it("finishes within the budget and still shows the end of stderr", () => {
+      const run = unit.repeat(Math.ceil((256 * 1024) / unit.length));
+      const started = performance.now();
+
+      const message = describeProcessExit("Agent", { ...failed, stderr: `Error: first.\n${run}\nError: last` });
+      const elapsed = performance.now() - started;
+
+      expect(elapsed).toBeLessThan(SCAN_BUDGET_MS);
+      expect(message.startsWith("Agent exited with code 1: Error: last\n")).toBe(true);
+    });
+
+    it("finishes within the budget when the run is the last line", () => {
+      const run = unit.repeat(Math.ceil((256 * 1024) / unit.length));
+      const started = performance.now();
+
+      const message = describeProcessExit("Agent", { ...failed, stderr: `Error: first.\n${run}` }, { resultError: `Run failed. ${run}` });
+      const elapsed = performance.now() - started;
+
+      expect(elapsed).toBeLessThan(SCAN_BUDGET_MS);
+      expect(message.startsWith("Run failed. ")).toBe(true);
+      expect(message.length).toBeLessThan(EXIT_CAUSE_RESULT_ERROR_MAX_CHARS + 2 * EXIT_CAUSE_STDERR_MAX_CHARS + 500);
+    });
+  });
+
   it("cuts the result error and keeps its start", () => {
     const resultError = `Run failed: ${"e".repeat(10_000)}`;
 
@@ -144,6 +231,17 @@ describe("describeProcessExit", () => {
     ["a Basic authorization header", `Authorization: Basic ${FAKE_HEADER_VALUE}`],
     ["a cookie header", `Cookie: sid=${FAKE_HEADER_VALUE}; theme=dark`],
   ])("with %s next to the stderr cut", (_name, header) => {
+    it("redacts the value at the start of a last line that is over the window", () => {
+      const stderr = `Error: older\n${header} ${"f".repeat(EXIT_CAUSE_SCAN_WINDOW_CHARS * 2)}`;
+
+      const message = describeProcessExit("Agent", { ...failed, stderr });
+
+      expect(message).toContain("***REDACTED***");
+      for (let at = 0; at + 6 <= FAKE_HEADER_VALUE.length; at += 1) {
+        expect(message).not.toContain(FAKE_HEADER_VALUE.slice(at, at + 6));
+      }
+    });
+
     it("never keeps any part of the value", () => {
       for (let fill = EXIT_CAUSE_STDERR_MAX_CHARS - 150; fill <= EXIT_CAUSE_STDERR_MAX_CHARS + 50; fill += 1) {
         const message = describeProcessExit("Agent", { ...failed, stderr: `${header}\n${"f".repeat(fill)}\n` });
