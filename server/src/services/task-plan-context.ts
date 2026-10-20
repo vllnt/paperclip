@@ -7,7 +7,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { redactQuarantinedBodyForHigherTrust } from "./source-trust.js";
-import { cutText } from "./continuation-window.js";
+import { cutText } from "@paperclipai/shared";
 
 /** Characters of the plan body that a wake's task brief carries. */
 export const TASK_PLAN_BODY_MAX_CHARS = 32_000;
@@ -15,7 +15,8 @@ export const TASK_PLAN_BODY_MAX_CHARS = 32_000;
 /**
  * Read the task's durable plan before constructing any provider's assignment.
  * The body is cut at {@link TASK_PLAN_BODY_MAX_CHARS}, with a line that says
- * where the full revision is.
+ * where the full revision is: the latest revision through the document read,
+ * an older approved one through the revision list.
  */
 export async function getTaskPlanContext(input: {
   db: Db;
@@ -32,6 +33,7 @@ export async function getTaskPlanContext(input: {
       revisionNumber: documentRevisions.revisionNumber,
       body: documentRevisions.body,
       sourceTrust: documents.sourceTrust,
+      latestRevisionId: documents.latestRevisionId,
     })
     .from(issueDocuments)
     .innerJoin(issues, eq(issues.id, issueDocuments.issueId))
@@ -57,17 +59,11 @@ export async function getTaskPlanContext(input: {
       ),
     )
     .then((rows) => rows[0] ?? null);
-  const visible = plan && !input.exposeLowTrustRaw
-    ? redactQuarantinedBodyForHigherTrust(plan)
-    : plan;
-  return visible
-    ? {
-        ...visible,
-        body: cutText(
-          visible.body,
-          TASK_PLAN_BODY_MAX_CHARS,
-          `read revision ${visible.revisionNumber} with GET /api/issues/${issueId}/documents/plan/revisions`,
-        ),
-      }
-    : visible;
+  if (!plan) return null;
+  const { latestRevisionId, ...row } = plan;
+  const visible = input.exposeLowTrustRaw ? row : redactQuarantinedBodyForHigherTrust(row);
+  const readHint = latestRevisionId === row.revisionId
+    ? `read it with GET /api/issues/${issueId}/documents/plan (CLI: paperclipai issue document:get ${issueId} plan)`
+    : `revision ${row.revisionNumber} is not the latest; GET /api/issues/${issueId}/documents/plan/revisions returns every revision in full`;
+  return { ...visible, body: cutText(visible.body, TASK_PLAN_BODY_MAX_CHARS, readHint) };
 }

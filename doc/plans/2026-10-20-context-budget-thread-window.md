@@ -35,20 +35,20 @@ Example: a 134-comment thread makes a 296,000-character wake prompt. The first m
 
 All of the change is in `buildExecutionContinuation` and the shared renderer. It does not touch `server/src/services/heartbeat.ts`.
 
-- **Pinned messages.** The window always holds the comments that woke the run (`originCommentIds`) and the latest human request (the objective). Each is cut at 16,000 characters. They count toward the 48,000-character total, newest first. When the total is used up, each further pinned comment keeps 200 characters.
+- **Pinned messages.** The window always holds the latest human request and the comments that woke the run (`originCommentIds`). Each is cut at 16,000 characters. They count toward the 48,000-character total: the latest request first, then the wake comments, newest first. When the total is used up, each further pinned comment keeps 200 characters.
 - **Newest comments.** Then come the newest other comments, up to 20, each cut at 4,000 characters, until all message bodies reach 48,000 characters. A cut body ends with `[truncated: N more characters; read comment <id>]`.
 - **Older comments.** Each older comment gets an entry in `olderMessages`: id, author type, author id, created time, length and a 120-character one-line preview. At most 50 entries are kept (the newest of the older comments). After that, the window holds only a count.
-- **Documents.** `documents` is an index of the issue documents: key, title, revision, updated time and length. The plan body in the task brief is cut at 32,000 characters, with a pointer to its revision in `GET /api/issues/{id}/documents/plan/revisions` (the brief can carry an approved revision that is not the latest).
-- **Objective and summary.** The objective and `completedWork` are cut at 16,000 characters each.
-- **Coverage.** `coverage.kind` is `bounded_task_history` when something was left out, with the counts and `oldestIncludedCommentId`. A thread that fits stays `full_task_history`, so it is unchanged.
-- **Final guard.** If the serialized envelope is still above 160,000 characters (about 74K tokens), the guard removes content until it fits:
+- **Documents.** `documents` is an index of the issue documents without system documents: key, title, revision, updated time and length. The plan body in the task brief is cut at 32,000 characters, with a pointer to `GET /api/issues/{id}/documents/plan` when the brief carries the latest revision. An approved older revision points to `GET /api/issues/{id}/documents/plan/revisions`, which returns every revision in full.
+- **Objective and summary.** The envelope keeps the whole objective, because server checks read it. A prompt shows at most 16,000 characters of it. `completedWork` is cut at 16,000 characters.
+- **Coverage.** `coverage.kind` is `bounded_task_history` when something was left out, with the counts and `oldestIncludedCommentId`. A thread that fits stays `full_task_history`, so its history is unchanged.
+- **Final guard.** If the serialized envelope (with the objective at its shown size) is still above 160,000 characters (about 74K tokens), the guard removes content until it fits:
   1. index entries
   2. the oldest unpinned messages
   3. the oldest completed actions and interaction outcomes (the outcome of the triggering interaction stays; human responses are never removed)
-  4. as a last step, it cuts the summary, the pinned messages and the objective to 2,000 characters
+  4. as a last step, it cuts the summary and the pinned messages to 2,000 characters
 
-  So the history part of a wake cannot overflow a 200K context.
-- **Resumed sessions.** A resumed session gets `resumeDelta`: the messages of the window that the previous run did not deliver. So a resumed wake stays a delta, as it is today.
+  So the comment history of a wake cannot overflow a 200K context. Human responses and recovery outcomes are never removed, so they alone can keep an envelope above the ceiling.
+- **Resumed sessions.** A resumed session gets `resumeDelta`: the messages of the window that are new or edited since the previous run. New or edited comments outside the window are listed by preview (at most 50, with a count of the rest), and the prompt says to read them. A native-runtime resume then falls back to the full prompt. So a resumed wake stays a bounded delta, and every new comment is either in it or counted.
 - **Prompt text.** The renderer replaces "History is complete" with a bounded-window note. The note tells the agent how to read older comments only when it needs them:
   - one comment: `GET /api/issues/{id}/comments/{commentId}`, or `paperclipai issue comment:get`
   - older pages: `GET /api/issues/{id}/comments?order=desc&after={oldestIncludedCommentId}&limit=20`, or `paperclipai issue comments --order desc --after-comment-id … --limit 20`
@@ -73,7 +73,7 @@ The agent-side reads (9.1%) fall only if agents stop reading the full thread. Th
 ### (B) Replay limits (issue, then agent, then company, then the instance default)
 
 - Extend the existing run-context policy (`packages/shared/src/run-context.ts`) with a `threadWindow` group: `maxComments`, `maxCommentChars`, `maxTotalChars`, `maxIndexEntries`. The schema bounds each value. The final 160,000-character guard stays fixed.
-- **Levels**, from least to most specific: instance default (`instance_settings.general.runContext`), company (`companies.run_context_policy`), agent (`runtimeConfig.runContext`), routine (existing), issue (new nullable `issues.run_context_policy` jsonb; one migration). The most specific set field wins. The brief's order (issue, agent, company, instance) holds, and the routine level keeps its place below the issue.
+- **Levels**, from least to most specific: instance default (`instance_settings.general.runContext`), company (`companies.run_context_policy`), agent (`runtimeConfig.runContext`), routine (existing), issue (new nullable `issues.run_context_policy` jsonb; one migration). The most specific set field wins. The requested order (issue, agent, company, instance) holds, and the routine level keeps its place below the issue.
 - **Surfaces:**
   - REST: `PATCH /api/issues/:id` takes `runContextPolicy`, and the instance general settings take `runContext`. Both are in OpenAPI.
   - CLI: `paperclipai issue update --run-context-policy <json|->`, and the existing `paperclipai instance settings:general:update` for the instance. The company and agent commands already take the policy.
@@ -86,17 +86,17 @@ The agent-side reads (9.1%) fall only if agents stop reading the full thread. Th
 - The model context limit is the setting `contextLimitTokens` in the same policy. The default is 200,000, because the repo has no table of model context windows. The ratio `warnAtRatio` defaults to 0.8.
 - The issue page shows a warning when the replay estimate reaches the ratio. It shows a note when the full thread alone is larger than the limit.
 - At run start, when the replay reaches the ratio, the run log gets a `lifecycle` event at level `warn`, written through `appendHeartbeatRunEvent`. A `lifecycle` event does not count as agent activity.
-- The `paperclip dispatch` session owns detecting a context overflow after a failure and never retrying it. (C) is a check before the run. It does not parse errors and does not change retries.
+- Detecting a context overflow after a failure, and never retrying it, is separate work. (C) is a check before the run. It does not parse errors and does not change retries.
 
 ## Before and after
 
 - **Before:** the numbers above.
 - **After, local and repeatable:** a test builds the wake prompt for a 300-comment `[qa-test]` style thread and checks the prompt size and the window counts. A test also covers the guard.
-- **After, production:** a `[qa-test]` issue in the platform company with a long thread (about 150 comments of 2,000 characters). It gets one woken run before the deploy and one after, in a short resume window that the admin session grants. We compare the prompt characters, the first-call tokens, the tokens per run and the replay share. We record the numbers on the Work issue, then clean up the test data.
+- **After, production:** a `[qa-test]` issue in a test company with a long thread (about 150 comments of 2,000 characters). It gets one woken run before the deploy and one after, in a short window that an admin grants. We compare the prompt characters, the first-call tokens, the tokens per run and the replay share. We record the numbers on the tracking issue, then clean up the test data.
 
 ## Risks
 
 - An agent that needs an old comment must read it. The index and the read commands make this cheap. The pinned messages keep the current request whole up to 16,000 characters.
 - A resumed session from before the deploy holds the full history. Its next delta comes from the window, so it does not grow again.
-- Native and recovery callers of `buildExecutionContinuation` get the same window. Origin comments and the latest request stay pinned, so the request and authority checks are unchanged. The checks still read all comment rows.
+- Native and recovery callers of `buildExecutionContinuation` get the same window. Origin comments and the latest request stay pinned, and the objective stays whole, so the request and authority checks are unchanged. The checks still read all comment rows.
 - The token estimate is a fit from one company's prompts. The issue page and the API label it as an estimate.

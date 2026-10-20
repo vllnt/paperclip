@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { THREAD_WINDOW_DEFAULTS, type ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import {
+  THREAD_WINDOW_DEFAULTS,
+  cutText,
+  sameCutText,
+  type ExecutionContinuationEnvelope,
+} from "@paperclipai/shared";
 import {
   CONTINUATION_ENVELOPE_MAX_CHARS,
   CONTINUATION_PINNED_COMMENT_MAX_CHARS,
   applyContinuationWindow,
-  cutText,
   selectThreadWindow,
+  toIndexEntry,
   type WindowedContinuation,
 } from "./continuation-window.js";
 
@@ -56,13 +61,30 @@ describe("cutText", () => {
   });
 });
 
+describe("sameCutText", () => {
+  it("matches one body cut at different lengths and rejects a different body", () => {
+    const body = "y".repeat(10_000);
+    expect(sameCutText(cutText(body, 16_000, "read comment c1"), cutText(body, 4_000, "read comment c1"))).toBe(true);
+    expect(sameCutText(body, cutText(body, 4_000, "read comment c1"))).toBe(true);
+    expect(sameCutText("one body", "another body")).toBe(false);
+    expect(sameCutText(cutText(`a${body}`, 4_000, "read comment c1"), cutText(`b${body}`, 4_000, "read comment c1"))).toBe(false);
+  });
+});
+
+describe("toIndexEntry", () => {
+  it("never ends a preview inside a surrogate pair, so the entry stays valid jsonb", () => {
+    const entry = toIndexEntry(message(1, `${"a".repeat(119)}😀 and more text after the emoji`));
+    expect(entry.preview).toBe(`${"a".repeat(119)}…`);
+    expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(entry.preview)).toBe(false);
+  });
+});
+
 describe("selectThreadWindow", () => {
   it("keeps the newest comments up to the count, indexes the newest older ones and counts the rest", () => {
     const messages = thread(300, 2_000);
     const result = selectThreadWindow(messages, { pinnedIds: new Set(), limits: THREAD_WINDOW_DEFAULTS });
     expect(result.messages.map((entry) => entry.id)).toEqual(messages.slice(-20).map((entry) => entry.id));
     expect(result.olderMessages.map((entry) => entry.id)).toEqual(messages.slice(230, 280).map((entry) => entry.id));
-    expect(result.unindexedMessages).toBe(230);
     expect(result.olderMessages[0]).toMatchObject({
       id: "comment-0230",
       authorType: "agent",
@@ -95,6 +117,22 @@ describe("selectThreadWindow", () => {
     expect(result.messages).toHaveLength(20);
     expect(result.messages.slice(1).map((entry) => entry.id)).toEqual(messages.slice(-19).map((entry) => entry.id));
     expect(result.olderMessages.some((entry) => entry.id === "comment-0003")).toBe(false);
+  });
+
+  it("gives the latest request its pinned budget before newer pinned wake comments", () => {
+    const messages = thread(10, 100);
+    messages[1] = message(1, "R".repeat(20_000));
+    for (const index of [6, 7, 8]) messages[index] = message(index, "W".repeat(16_000));
+    const result = selectThreadWindow(messages, {
+      pinnedIds: new Set(["comment-0001", "comment-0006", "comment-0007", "comment-0008"]),
+      requestId: "comment-0001",
+      limits: THREAD_WINDOW_DEFAULTS,
+    });
+    const kept = new Map(result.messages.map((entry) => [entry.id, entry.body]));
+    expect(kept.get("comment-0001")!.startsWith("R".repeat(CONTINUATION_PINNED_COMMENT_MAX_CHARS))).toBe(true);
+    expect(kept.get("comment-0008")).toBe("W".repeat(16_000));
+    expect(kept.get("comment-0007")).toBe("W".repeat(16_000));
+    expect(kept.get("comment-0006")).toMatch(/^W{200}\n\[truncated: 15800 more characters; read comment comment-0006\]$/);
   });
 });
 
@@ -133,14 +171,25 @@ describe("applyContinuationWindow", () => {
     expect(JSON.stringify(input).length).toBeGreaterThan(600_000);
   });
 
-  it("cuts the objective and the completed-work summary", () => {
+  it("keeps the objective whole for server checks and cuts the completed-work summary", () => {
+    const objective = "o".repeat(20_000);
     const result = applyContinuationWindow(
-      envelope(thread(2, 100), { objective: "o".repeat(20_000), completedWork: "w".repeat(20_000) }),
+      envelope(thread(2, 100), { objective, completedWork: "w".repeat(20_000) }),
       { pinnedIds: new Set() },
     );
     expect(result.coverage.kind).toBe("bounded_task_history");
-    expect(result.objective).toContain("[truncated: 4000 more characters; read the issue and its latest comment]");
+    expect(result.objective).toBe(objective);
     expect(result.completedWork).toContain("[truncated: 4000 more characters; read the issue continuation summary document]");
+    const fits = envelope(thread(2, 100), { objective });
+    expect(applyContinuationWindow(fits, { pinnedIds: new Set() })).toEqual(fits);
+  });
+
+  it("counts a huge objective at its rendered size, so it does not push history out", () => {
+    const objective = "o".repeat(500_000);
+    const result = applyContinuationWindow(envelope(thread(10, 1_000), { objective }), { pinnedIds: new Set() });
+    expect(result.messages).toHaveLength(10);
+    expect(result.objective).toBe(objective);
+    expect(JSON.stringify({ ...result, objective: cutText(objective, 16_000, "x") }).length).toBeLessThanOrEqual(CONTINUATION_ENVELOPE_MAX_CHARS);
   });
 
   it("holds the envelope ceiling with 50 long pinned comments, a long summary and many evidence entries", () => {

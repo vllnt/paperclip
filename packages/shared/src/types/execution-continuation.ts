@@ -9,6 +9,7 @@ export interface ExecutionContinuationEnvelope {
     sourceRunId: string | null;
   };
   originCommentIds: string[];
+  /** Whole, because server checks read it. A prompt shows at most `CONTINUATION_OBJECTIVE_MAX_CHARS` of it. */
   objective: string;
   objectiveSource?: {
     kind: "comment" | "description" | "title";
@@ -45,9 +46,16 @@ export interface ExecutionContinuationEnvelope {
   /** Only valid when resuming the provider session associated with this run. */
   resumeDelta?: {
     baseRunId: string;
+    /** Comments of the current window that are new or edited since the named run. */
     messages: ExecutionContinuationEnvelope["messages"];
-    /** Older-index entries that the named run did not deliver. */
+    /**
+     * The newest of the new or edited comments outside the current window,
+     * listed with a one-line preview only, oldest first. Their bodies must be read.
+     * An edit is seen only for a comment that the named run had in `messages`.
+     */
     olderMessages?: ExecutionContinuationEnvelope["olderMessages"];
+    /** New or edited comments outside the current window that `olderMessages` does not list. */
+    unlistedMessages?: number;
   };
   recoveryOutcomes?: Array<{ recoveryActionId: string; decision: unknown }>;
   completedWork: string | null;
@@ -76,7 +84,7 @@ export interface ExecutionContinuationEnvelope {
     preview: string;
     sourceTrust: unknown;
   }>;
-  /** Index of the issue documents. Bodies are read with the documents API. */
+  /** Index of the issue documents, without system documents. Bodies are read with the documents API. */
   documents?: Array<{
     key: string;
     title: string | null;
@@ -92,7 +100,11 @@ export interface ExecutionContinuationEnvelope {
     indexedMessages: number;
     /** Older comments that are neither in `messages` nor in `olderMessages`. */
     unindexedMessages: number;
-    /** Oldest comment in `messages`; page further back from here. */
+    /**
+     * Oldest comment of the unbroken run of newest comments in `messages`;
+     * page further back from here. Older pinned comments can come before it.
+     * Null when the newest comment of the issue is not in `messages`.
+     */
     oldestIncludedCommentId: string | null;
     /** Entries the size guard removed from the evidence lists. */
     droppedEvidenceEntries: number;

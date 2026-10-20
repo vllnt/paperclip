@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   agentWakeupRequests,
@@ -12,9 +12,14 @@ import {
   issues,
   type Db,
 } from "@paperclipai/db";
-import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
+import {
+  SYSTEM_ISSUE_DOCUMENT_KEYS,
+  THREAD_WINDOW_DEFAULTS,
+  sameCutText,
+  type ExecutionContinuationEnvelope,
+} from "@paperclipai/shared";
 import { isLowTrustQuarantined, sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
-import { applyContinuationWindow, CONTINUATION_DOCUMENT_INDEX_MAX_ENTRIES } from "./continuation-window.js";
+import { applyContinuationWindow, CONTINUATION_DOCUMENT_INDEX_MAX_ENTRIES, toIndexEntry } from "./continuation-window.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
@@ -290,30 +295,35 @@ export async function buildExecutionContinuation(input: {
     [...(deliveredMessages ?? []), ...(Array.isArray(priorEnvelope.olderMessages) ? priorEnvelope.olderMessages.map(object) : [])]
       .flatMap((entry) => (typeof entry.id === "string" ? [entry.id] : [])),
   );
+  const unchangedSince = (message: ExecutionContinuationEnvelope["messages"][number]) =>
+    (deliveredMessages ?? []).some(
+      (prior) =>
+        prior.id === message.id &&
+        prior.updatedAt === message.updatedAt &&
+        typeof prior.body === "string" &&
+        sameCutText(prior.body, message.body) &&
+        prior.deleted === message.deleted &&
+        prior.authorId === message.authorId &&
+        (prior.createdByRunId ?? null) === message.createdByRunId &&
+        JSON.stringify(prior.sourceTrust) === JSON.stringify(message.sourceTrust),
+    );
   // The delta is taken from the bounded window, so a resumed wake stays bounded too.
-  const resumeDeltaFor = (bounded: Pick<ExecutionContinuationEnvelope, "messages" | "olderMessages">) => {
-    const newOlder = (bounded.olderMessages ?? []).filter((entry) => !deliveredIds.has(entry.id));
-    return deliveredMessages && input.previousContextRunId
-      ? {
-          baseRunId: input.previousContextRunId,
-          ...(newOlder.length > 0 ? { olderMessages: newOlder } : {}),
-          messages: bounded.messages.filter(
-            (message) =>
-              originCommentIds.includes(message.id) ||
-              !deliveredMessages.some(
-                (prior) =>
-                  prior.id === message.id &&
-                  prior.updatedAt === message.updatedAt &&
-                  prior.body === message.body &&
-                  prior.deleted === message.deleted &&
-                  prior.authorId === message.authorId &&
-                  (prior.createdByRunId ?? null) === message.createdByRunId &&
-                  JSON.stringify(prior.sourceTrust) ===
-                    JSON.stringify(message.sourceTrust),
-              ),
-          ),
-        }
-      : undefined;
+  // New or edited comments outside the window are listed by preview, so none is silently lost.
+  const resumeDeltaFor = (bounded: Pick<ExecutionContinuationEnvelope, "messages">) => {
+    if (!deliveredMessages || !input.previousContextRunId) return undefined;
+    const windowIds = new Set(bounded.messages.map((message) => message.id));
+    const lastDeliveredIndex = messages.findLastIndex((message) => deliveredIds.has(message.id));
+    const deliveredById = new Map(deliveredMessages.map((prior) => [prior.id, prior]));
+    const outside = messages.filter((message, index) =>
+      !windowIds.has(message.id) &&
+      (index > lastDeliveredIndex || (deliveredById.has(message.id) && !unchangedSince(message))));
+    const listed = outside.slice(-THREAD_WINDOW_DEFAULTS.maxIndexEntries);
+    return {
+      baseRunId: input.previousContextRunId,
+      ...(listed.length > 0 ? { olderMessages: listed.map(toIndexEntry) } : {}),
+      ...(outside.length > listed.length ? { unlistedMessages: outside.length - listed.length } : {}),
+      messages: bounded.messages.filter((message) => originCommentIds.includes(message.id) || !unchangedSince(message)),
+    };
   };
   const latestRequest = messages.findLast(
     (row) =>
@@ -433,7 +443,11 @@ export async function buildExecutionContinuation(input: {
     })
     .from(issueDocuments)
     .innerJoin(documents, and(eq(documents.id, issueDocuments.documentId), eq(documents.companyId, companyId)))
-    .where(and(eq(issueDocuments.companyId, companyId), eq(issueDocuments.issueId, issueId)))
+    .where(and(
+      eq(issueDocuments.companyId, companyId),
+      eq(issueDocuments.issueId, issueId),
+      notInArray(issueDocuments.key, [...SYSTEM_ISSUE_DOCUMENT_KEYS]),
+    ))
     .orderBy(desc(documents.updatedAt), asc(issueDocuments.key))
     .limit(CONTINUATION_DOCUMENT_INDEX_MAX_ENTRIES);
   // Comments that woke the run and the latest human request stay in the window.
@@ -495,7 +509,7 @@ export async function buildExecutionContinuation(input: {
       throughCommentId: messages.at(-1)?.id ?? null,
       summaryThroughCommentId: null,
     },
-  }, { pinnedIds });
+  }, { pinnedIds, requestId: latestRequest?.id ?? null });
   const resumeDelta = resumeDeltaFor(bounded);
   return {
     ...(interruptedRunId ? { interruptedRunId } : {}),
