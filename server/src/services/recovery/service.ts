@@ -926,6 +926,20 @@ function isRepeatedProductiveContinuationRecovery(
   );
 }
 
+/**
+ * Why an on-demand wake for an agent would be a skipped receipt now. A daily
+ * run or cost cap also carries the UTC day window its check counted in.
+ */
+export interface OnDemandWakePolicyBlock {
+  reason: string;
+  observed?: number;
+  limit?: number;
+  /** Start of the cap window the check counted in; set for a daily cap only. */
+  windowStart?: Date;
+  /** End of that window, when the cap resets; set for a daily cap only. */
+  resetsAt?: Date;
+}
+
 export function recoveryService(
   db: Db,
   deps: {
@@ -950,7 +964,19 @@ export function recoveryService(
      * cap) that would make an on-demand wake for this agent a skipped
      * receipt, or null when the agent can be woken now.
      */
-    getOnDemandWakePolicyBlock?: (agentId: string) => Promise<string | null>;
+    getOnDemandWakePolicyBlock?: (
+      agentId: string,
+    ) => Promise<OnDemandWakePolicyBlock | null>;
+    /**
+     * Records that dispatch to an agent is held by its daily cap until the
+     * block's `resetsAt`. Writes at most one entry per agent and cap window.
+     */
+    recordDailyCapDispatchHold?: (input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      block: OnDemandWakePolicyBlock & { windowStart: Date; resetsAt: Date };
+    }) => Promise<void>;
     /**
      * Run slots the agent has free now (its concurrency limit minus its
      * running runs), or null when unknown. Stranded-issue dispatch stays
@@ -964,6 +990,9 @@ export function recoveryService(
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
+  // Per agent, the start of the cap window its dispatch hold was last recorded
+  // for, so a held agent costs one record per window instead of one per sweep.
+  const recordedDailyCapHolds = new Map<string, string>();
 
   async function getAgent(agentId: string) {
     return db
@@ -2305,6 +2334,35 @@ export function recoveryService(
       },
     );
     return Boolean(budgetBlock);
+  }
+
+  /** Best effort: a failed record is retried on the next sweep. */
+  async function recordDailyCapDispatchHold(
+    issue: typeof issues.$inferSelect,
+    agentId: string,
+    block: OnDemandWakePolicyBlock & { windowStart: Date; resetsAt: Date },
+  ) {
+    const windowKey = block.windowStart.toISOString();
+    if (
+      !deps.recordDailyCapDispatchHold ||
+      recordedDailyCapHolds.get(agentId) === windowKey
+    ) {
+      return;
+    }
+    try {
+      await deps.recordDailyCapDispatchHold({
+        companyId: issue.companyId,
+        agentId,
+        issueId: issue.id,
+        block,
+      });
+      recordedDailyCapHolds.set(agentId, windowKey);
+    } catch (err) {
+      logger.warn(
+        { err, companyId: issue.companyId, agentId, issueId: issue.id },
+        "failed to record a daily cap dispatch hold",
+      );
+    }
   }
 
   async function reconcileUnassignedBlockingIssues() {
@@ -4607,6 +4665,7 @@ export function recoveryService(
 
     const result = {
       assignmentDispatched: 0,
+      assignmentDispatchDeferred: 0,
       dispatchRequeued: 0,
       continuationRequeued: 0,
       dispositionRepairRequeued: 0,
@@ -4670,6 +4729,41 @@ export function recoveryService(
     function releaseAgentRunSlot(agentId: string) {
       const free = freeRunSlots.get(agentId);
       if (free !== undefined) freeRunSlots.set(agentId, free + 1);
+    }
+
+    // On-demand policy blocks per agent for this sweep: read once, so an agent
+    // at its daily cap costs one indexed run count per sweep, not one per issue.
+    const onDemandWakePolicyBlocks = new Map<
+      string,
+      Promise<OnDemandWakePolicyBlock | null>
+    >();
+    /**
+     * Whether the agent's own heartbeat policy (wakeOnDemand off, daily run or
+     * cost cap reached) would turn a dispatch into a skipped receipt. The
+     * dispatch stays pending with no receipt; a daily cap is recorded once per
+     * agent and window, and the first sweep after the window resets dispatches.
+     */
+    async function isOnDemandDispatchHeld(
+      issue: typeof issues.$inferSelect,
+      agentId: string,
+    ) {
+      if (!deps.getOnDemandWakePolicyBlock) return false;
+      let pending = onDemandWakePolicyBlocks.get(agentId);
+      if (!pending) {
+        pending = deps.getOnDemandWakePolicyBlock(agentId);
+        onDemandWakePolicyBlocks.set(agentId, pending);
+      }
+      const block = await pending;
+      if (block == null) return false;
+      const { windowStart, resetsAt } = block;
+      if (windowStart && resetsAt) {
+        await recordDailyCapDispatchHold(issue, agentId, {
+          ...block,
+          windowStart,
+          resetsAt,
+        });
+      }
+      return true;
     }
 
     const reconcileCandidate = async (issue: (typeof candidates)[number]) => {
@@ -5231,7 +5325,7 @@ export function recoveryService(
             result.skipped += 1;
           } else if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
             result.skipped += 1;
-          } else if (await deps.getOnDemandWakePolicyBlock?.(participantAgentId)) {
+          } else if (await isOnDemandDispatchHeld(issue, participantAgentId)) {
             // The reviewer's own policy (wakeOnDemand off, daily cap reached)
             // would turn this wake into a skipped receipt on every sweep.
             // Leave the dispatch pending, with no receipt, until it changes.
@@ -5453,6 +5547,14 @@ export function recoveryService(
             return;
           }
 
+          // Same policy gate as the other no-run dispatch lanes: an agent at
+          // its daily cap would skip this wake on every sweep until the cap
+          // window resets, so hold it, assigned, until the first sweep after.
+          if (await isOnDemandDispatchHeld(issue, agentId)) {
+            result.assignmentDispatchDeferred += 1;
+            return;
+          }
+
           const queued = await enqueueInitialAssignedTodoDispatch(
             issue,
             agentId,
@@ -5575,7 +5677,7 @@ export function recoveryService(
           result.skipped += 1;
           return;
         }
-        if (await deps.getOnDemandWakePolicyBlock?.(agentId)) {
+        if (await isOnDemandDispatchHeld(issue, agentId)) {
           result.skipped += 1;
           return;
         }
