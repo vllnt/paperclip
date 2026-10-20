@@ -11,6 +11,7 @@ import {
   updateDocumentAnnotationThreadSchema,
   updateRoutineSchema,
   updateRoutineTriggerSchema,
+  type RoutineStep,
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
@@ -106,6 +107,24 @@ export function routineRoutes(
     }
   }
 
+  /**
+   * Steps hand work to agents, so writing them is an assignment: a board user needs
+   * `tasks:assign`, and an agent may only give steps to itself, as it may only own its routines.
+   */
+  async function assertCanAssignRoutineSteps(
+    req: Request,
+    companyId: string,
+    steps: RoutineStep[] | undefined,
+  ) {
+    if (!steps?.length) return;
+    await assertBoardCanAssignTasks(req, companyId);
+    if (req.actor.type !== "agent") return;
+    const actorAgentId = req.actor.agentId;
+    if (steps.some((step) => step.assigneeAgentId != null && step.assigneeAgentId !== actorAgentId)) {
+      throw forbidden("Agents can only assign routine steps to themselves");
+    }
+  }
+
   async function assertCanManageExistingRoutine(req: Request, routineId: string) {
     const routine = await svc.get(routineId);
     if (!routine || !hasCompanyAccess(req, routine.companyId)) return null;
@@ -158,6 +177,7 @@ export function routineRoutes(
     const companyId = req.params.companyId as string;
     await assertBoardCanAssignTasks(req, companyId);
     assertCanManageCompanyRoutine(req, companyId, req.body.assigneeAgentId);
+    await assertCanAssignRoutineSteps(req, companyId, req.body.steps);
     const created = await svc.create(companyId, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
@@ -386,6 +406,7 @@ export function routineRoutes(
     ) {
       throw forbidden("Agents can only assign routines to themselves");
     }
+    await assertCanAssignRoutineSteps(req, routine.companyId, req.body.steps);
     const updated = await svc.update(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,

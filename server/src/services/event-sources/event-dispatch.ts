@@ -17,6 +17,7 @@ import { HttpError, conflict } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import type { issueService } from "../issues.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../issue-assignment-wakeup.js";
+import { attachRoutineSteps, startAttachedRoutineSteps, type AttachedRoutineSteps } from "../routine-steps.js";
 import {
   renderGateDecisionBlock,
   type GateDecision,
@@ -94,7 +95,12 @@ export interface EventDispatchDeps {
    * dispatch needs. Throws a classified error (permanent for a terminated agent,
    * a plugin-managed routine, required variables without defaults).
    */
-  prepareRoutine(routine: RoutineRow): Promise<{ assigneeAgentId: string; routineDescription: string | null }>;
+  prepareRoutine(routine: RoutineRow): Promise<{
+    assigneeAgentId: string;
+    routineDescription: string | null;
+    /** Values for `{{variable}}` placeholders in the routine's text and steps. */
+    variables: Record<string, unknown>;
+  }>;
   resolveResponsibleUserId(executor: Db, routine: RoutineRow): Promise<string | null>;
   /** Whether the routine has a gate script that applies to event triggers. */
   gateApplies?(routine: RoutineRow): boolean;
@@ -373,6 +379,8 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
     let parkedRunId: string | null = null;
     // Set when a committing run hit a transient failure: its row stays `gating` and the worker retries the claim.
     let retryError: unknown = null;
+    // Steps a new group issue got; their first agents are woken after the transaction commits.
+    const stepsToStart: AttachedRoutineSteps[] = [];
     const now = input.now ?? new Date();
     const prepared = await deps.prepareRoutine(routine);
     const grouping = parseGrouping(trigger.eventGrouping);
@@ -659,6 +667,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
       const withGateBlock = (body: string) => (gateBlock ? `${body}\n\n${gateBlock}` : body);
 
       let createdIssueId: string | null = null;
+      let attachedSteps: AttachedRoutineSteps | null = null;
       try {
         // A repeat that earns a comment, or a recovery: post to the open group issue.
         if (open && (decision.kind === "comment" || decision.kind === "recovery_comment")) {
@@ -753,8 +762,10 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           note = "append_target_unavailable";
         }
 
-        // No open group issue: open one and wake its assignee.
-        const created = await issueSvc.create(routine.companyId, {
+        // No open group issue: open one and wake its assignee. A storm digest stays a single issue; a normal
+        // group of a routine with steps opens blocked and gets its steps, whose first agents wake after commit.
+        const steps = storm ? [] : (routine.steps ?? []);
+        const groupIssueInput = {
           projectId: routine.projectId,
           goalId: routine.goalId,
           parentId: routine.parentIssueId,
@@ -764,7 +775,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
               ? renderStormIssueDescription(prepared.routineDescription, event.source, event)
               : renderEventIssueDescription(prepared.routineDescription, event),
           ),
-          status: "todo",
+          status: steps.length > 0 ? "blocked" : "todo",
           priority: routine.priority,
           assigneeAgentId: prepared.assigneeAgentId,
           responsibleUserId: await resolveResponsible(),
@@ -773,8 +784,30 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           originId: routine.id,
           originRunId: createdRun.id,
           originFingerprint: fingerprint,
-        });
-        createdIssueId = created.id;
+        };
+        let created: Awaited<ReturnType<typeof issueSvc.create>>;
+        if (steps.length > 0) {
+          // The group issue and its steps are one unit in a savepoint of this transaction.
+          const withSteps = await txDb.transaction(async (savepoint) => {
+            const root = await issueSvc.create(routine.companyId, groupIssueInput, savepoint);
+            const attached = await attachRoutineSteps({
+              tx: savepoint as unknown as Db,
+              issueSvc,
+              root,
+              run: createdRun,
+              routine,
+              steps,
+              defaultAssigneeAgentId: prepared.assigneeAgentId,
+              variables: prepared.variables,
+            });
+            return { root, attached };
+          });
+          created = withSteps.root;
+          attachedSteps = withSteps.attached;
+        } else {
+          created = await issueSvc.create(routine.companyId, groupIssueInput);
+          createdIssueId = created.id;
+        }
         await txDb.insert(routineEventGroups).values({
           companyId: routine.companyId,
           routineId: routine.id,
@@ -787,17 +820,21 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           lastSeverity: event.severity,
           lastState: event.state,
         });
-        // Keep the routine lock until the issue is linked to a queued heartbeat run.
-        await queueIssueAssignmentWakeup({
-          heartbeat,
-          assignmentEvent: true,
-          issue: created,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "routine.event",
-          requestedByActorType: "system",
-          rethrowOnError: true,
-        });
+        if (attachedSteps) {
+          stepsToStart.push(attachedSteps);
+        } else {
+          // Keep the routine lock until the issue is linked to a queued heartbeat run.
+          await queueIssueAssignmentWakeup({
+            heartbeat,
+            assignmentEvent: true,
+            issue: created,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "routine.event",
+            requestedByActorType: "system",
+            rethrowOnError: true,
+          });
+        }
         await deps.finalizeRun(createdRun.id, { status: "issue_created", linkedIssueId: created.id, ...gateRecord }, txDb);
         await deps.updateRoutineTouchedState(
           { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "issue_created", issueId: created.id },
@@ -805,6 +842,9 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         );
         return stampOutcome({ status: storm ? "storm_folded" : "issue_created", runId: createdRun.id, issueId: created.id });
       } catch (err) {
+        // The group issue and its steps belong to this transaction: a failure after they were created
+        // rolls all of it back instead of recording a failed run beside committed issues.
+        if (attachedSteps) throw err;
         if (createdIssueId) {
           // The group row cascades with the issue.
           await txDb.delete(issues).where(eq(issues.id, createdIssueId));
@@ -814,6 +854,13 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
     });
     if (retryError) throw retryError;
     if (parkedRunId) deps.onGating?.(parkedRunId);
+    for (const attached of stepsToStart) {
+      await startAttachedRoutineSteps(attached, {
+        heartbeat,
+        contextSource: "routine.event",
+        requestedByActorType: "system",
+      });
+    }
     return outcome;
   }
 

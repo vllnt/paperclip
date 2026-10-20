@@ -9356,18 +9356,29 @@ export function issueService(db: Db) {
       };
     },
 
-    createChild: async (parentIssueId: string, data: IssueChildCreateInput) => {
-      const parent = await db
+    /**
+     * Creates a child issue and, with `blockParentUntilDone`, makes the parent wait for it.
+     * Pass `dbOrTx` to run every read and write on a caller-owned transaction, for example
+     * to create a parent and its children atomically; by default it uses its own.
+     */
+    createChild: async (
+      parentIssueId: string,
+      data: IssueChildCreateInput,
+      dbOrTx: Db | DbTransaction = db,
+    ) => {
+      // A transaction exposes the same query builder as the client; helpers type their reader as Db.
+      const executor = dbOrTx as unknown as Db;
+      const parent = await executor
         .select()
         .from(issues)
         .where(eq(issues.id, parentIssueId))
         .then((rows) => rows[0] ?? null);
       if (!parent) throw notFound("Parent issue not found");
-      await assertExecutionTaskParent(db, parent.companyId, parent.id);
+      await assertExecutionTaskParent(executor, parent.companyId, parent.id);
 
       const idempotencyKey = data.idempotencyKey?.trim();
       if (idempotencyKey) {
-        const existingChild = await db
+        const existingChild = await executor
           .select({ issue: issues })
           .from(issueCreateIdempotencyKeys)
           .innerJoin(issues, eq(issueCreateIdempotencyKeys.issueId, issues.id))
@@ -9387,11 +9398,11 @@ export function issueService(db: Db) {
           }
           await data.assertCanReuseIssue?.(existingChild);
           data.onDeduplicated?.("idempotency_key");
-          const [enriched] = await withIssueLabels(db, [existingChild]);
+          const [enriched] = await withIssueLabels(executor, [existingChild]);
           const [withRelations] = await withIssueRelationSummaries(
             parent.companyId,
             [enriched],
-            db,
+            executor,
           );
           return {
             issue: withRelations,
@@ -9400,7 +9411,7 @@ export function issueService(db: Db) {
         }
       }
 
-      const [{ childCount }] = await db
+      const [{ childCount }] = await executor
         .select({ childCount: sql<number>`count(*)::int` })
         .from(issues)
         .where(
@@ -9473,10 +9484,10 @@ export function issueService(db: Db) {
         ...(inheritStrategyOnly
           ? { skipExecutionWorkspaceInheritance: true }
           : { inheritExecutionWorkspaceFromIssueId: parent.id }),
-      });
+      }, dbOrTx);
 
       if (blockParentUntilDone) {
-        const existingBlockers = await db
+        const existingBlockers = await executor
           .select({ blockerIssueId: issueRelations.issueId })
           .from(issueRelations)
           .where(
@@ -9496,11 +9507,12 @@ export function issueService(db: Db) {
             ]),
           ],
           { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+          dbOrTx,
         );
         [child] = await withIssueRelationSummaries(
           parent.companyId,
           [child],
-          db,
+          executor,
         );
       }
 

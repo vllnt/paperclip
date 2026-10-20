@@ -366,6 +366,10 @@ describe("openapi routes", () => {
       required: false,
       schema: { type: "string", enum: ["schedule", "webhook", "api", "event", "manual"] },
     });
+    const routineBodyProperties = (operation: { requestBody: { content: Record<string, { schema: { properties: Record<string, unknown> } }> } }) =>
+      Object.keys(operation.requestBody.content["application/json"]!.schema.properties);
+    expect(routineBodyProperties(res.body.paths["/api/companies/{companyId}/routines"].post)).toContain("steps");
+    expect(routineBodyProperties(res.body.paths["/api/routines/{id}"].patch)).toContain("steps");
     expect(res.body.paths["/api/companies"].get.responses["403"]).toBeDefined();
     expect(res.body.paths["/api/companies"].get.responses["400"]).toBeDefined();
     expect(

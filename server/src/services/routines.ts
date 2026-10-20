@@ -76,6 +76,8 @@ import {
   isValidRoutineDateString,
   normalizeAgentUrlKey,
   pluginOperationIssueOriginKind,
+  readRoutineStepsRunPayload,
+  routineStepTemplateTexts,
   routineGateAppliesToSource,
   routineGatesEqual,
   routineRevisionSnapshotSchema,
@@ -104,6 +106,14 @@ import {
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
+import {
+  ROUTINE_STEP_ACTOR_ID,
+  assertRoutineStepReferences,
+  attachRoutineSteps,
+  routineStartingStepAgentIds,
+  startAttachedRoutineSteps,
+  type AttachedRoutineSteps,
+} from "./routine-steps.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
 import { createEventRoutineDispatcher, EventDispatchError } from "./event-sources/event-dispatch.js";
@@ -659,7 +669,8 @@ function readManagedRoutineIssueTemplate(defaultsJson: Record<string, unknown> |
 
 function routineUsesWorkspaceBranch(routine: typeof routines.$inferSelect) {
   return (routine.variables ?? []).some((variable) => variable.name === WORKSPACE_BRANCH_ROUTINE_VARIABLE)
-    || extractRoutineVariableNames([routine.title, routine.description]).includes(WORKSPACE_BRANCH_ROUTINE_VARIABLE);
+    || extractRoutineVariableNames([routine.title, routine.description, ...routineStepTemplateTexts(routine.steps)])
+      .includes(WORKSPACE_BRANCH_ROUTINE_VARIABLE);
 }
 
 function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSnapshotV1["routine"] {
@@ -684,6 +695,8 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     responsibleUserId: routine.responsibleUserId ?? null,
     // Only gated routines carry it, so snapshots of every other routine keep their stored shape.
     ...(routine.gate ? { gate: routine.gate } : {}),
+    // Only routines with steps carry it, so snapshots of every other routine keep their stored shape.
+    ...(routine.steps?.length ? { steps: routine.steps } : {}),
   };
 }
 
@@ -1350,6 +1363,38 @@ export function routineService(
       }
     }
 
+    // A routine with steps keeps its root blocked and idle while the steps work: the open root is its live issue.
+    const stillMissingRoutineIds = routineIds.filter((routineId) => !rowsByOriginId.has(routineId));
+    if (stillMissingRoutineIds.length > 0) {
+      const stepRootRows = await db
+        .selectDistinctOn([issues.originId], {
+          originId: issues.originId,
+          id: issues.id,
+          identifier: issues.identifier,
+          title: issues.title,
+          status: issues.status,
+          priority: issues.priority,
+          updatedAt: issues.updatedAt,
+        })
+        .from(issues)
+        .innerJoin(routines, sql`${routines.id}::text = ${issues.originId}`)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.originKind, "routine_execution"),
+            inArray(issues.originId, stillMissingRoutineIds),
+            inArray(issues.status, OPEN_ISSUE_STATUSES),
+            sql`jsonb_array_length(${routines.steps}) > 0`,
+            visibleIssueCondition(),
+          ),
+        )
+        .orderBy(issues.originId, desc(issues.updatedAt), desc(issues.createdAt));
+      for (const row of stepRootRows) {
+        if (!row.originId) continue;
+        rowsByOriginId.set(row.originId, row);
+      }
+    }
+
     const map = new Map<string, RoutineListItem["activeIssue"]>();
     for (const row of rowsByOriginId.values()) {
       if (!row.originId) continue;
@@ -1497,7 +1542,7 @@ export function routineService(
           lte(activityLog.createdAt, now),
           sql`${activityLog.action} not in (${sql.join(ACTIVITY_GATE_IGNORED_ACTIONS.map((action) => sql`${action}`), sql`, `)})`,
           sql`not (
-            ${activityLog.actorId} in ('routine-scheduler', ${ROUTINE_GATE_ACTOR_ID})
+            ${activityLog.actorId} in ('routine-scheduler', ${ROUTINE_GATE_ACTOR_ID}, ${ROUTINE_STEP_ACTOR_ID})
             and (
               (${activityLog.details} ->> 'routineId') = ${routine.id}
               or (${activityLog.entityType} = 'routine' and ${activityLog.entityId} = ${routine.id})
@@ -1531,7 +1576,7 @@ export function routineService(
               and own_issue.id::text = own_run.context_snapshot ->> 'issueId'
             where own_run.company_id = ${routine.companyId}
               and own_run.id = ${activityLog.runId}
-              and own_issue.origin_kind = 'routine_execution'
+              and own_issue.origin_kind in ('routine_execution', 'routine_step')
               and own_issue.origin_id = ${routine.id}
           )`,
           projectScopeCondition,
@@ -1696,7 +1741,7 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
     if (executionBoundIssue) return executionBoundIssue;
 
-    return executor
+    const heartbeatBoundIssue = await executor
       .select()
       .from(issues)
       .innerJoin(
@@ -1720,6 +1765,26 @@ export function routineService(
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
+    if (heartbeatBoundIssue || !routine.steps?.length) return heartbeatBoundIssue;
+
+    // A run with steps keeps its root blocked and idle while the steps work, so no heartbeat run is
+    // bound to it. For such a routine the open root itself is the live work.
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, originKind),
+          eq(issues.originId, originId),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          visibleIssueCondition(),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -1958,6 +2023,7 @@ export function routineService(
     return {
       assigneeAgentId,
       routineDescription: interpolateRoutineTemplate(routine.description, variables),
+      variables,
     };
   }
 
@@ -2243,6 +2309,11 @@ export function routineService(
           return false;
         });
     let reusedExistingRun = false;
+    // Plugin-managed routines keep their single-issue shape; steps are not supported on them.
+    const steps = managedRoutineBinding ? [] : (input.routine.steps ?? []);
+    const hasSteps = steps.length > 0;
+    // Set inside the transaction, acted on only after it commits.
+    const stepsToStart: AttachedRoutineSteps[] = [];
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -2356,6 +2427,7 @@ export function routineService(
         : {};
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
+      let attachedSteps: AttachedRoutineSteps | null = null;
       try {
         if (gated && gated.decision.action !== "wake") {
           // Exit 1 (skip) or a transport fault on a schedule: no issue, no wake, no tokens.
@@ -2514,32 +2586,62 @@ export function routineService(
 
         // So that no issue is committed only to be deleted; a refusal is recorded below exactly
         // like the same wake failure.
-        await assertWakeAdmitsAssignee(txDb, input.routine.companyId, assigneeAgentId, projectId);
+        // Only the agents woken now are checked: with steps that is each starting step's agent, and the
+        // root's agent is woken later by the blocker wake.
+        const woken = hasSteps ? routineStartingStepAgentIds(steps, assigneeAgentId) : [assigneeAgentId];
+        for (const wokenAgentId of woken) {
+          await assertWakeAdmitsAssignee(txDb, input.routine.companyId, wokenAgentId, projectId);
+        }
+
+        const rootInput = {
+          projectId,
+          projectWorkspaceId,
+          goalId: input.routine.goalId,
+          parentId: input.routine.parentIssueId,
+          title,
+          description: issueDescription,
+          // A run with steps waits on them, so its root starts blocked and is never woken directly.
+          status: hasSteps ? "blocked" : "todo",
+          priority: input.routine.priority,
+          assigneeAgentId,
+          createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
+          createdByUserId: manualRunnerUserId,
+          responsibleUserId,
+          trustExplicitResponsibleUserId: true,
+          originKind: issueOriginKind,
+          originId: issueOriginId,
+          originRunId: createdRun.id,
+          originFingerprint: dispatchFingerprint,
+          billingCode: issueBillingCode,
+          executionWorkspaceId: input.executionWorkspaceId ?? null,
+          executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+          executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        };
 
         try {
-          createdIssue = await issueSvc.create(input.routine.companyId, {
-            projectId,
-            projectWorkspaceId,
-            goalId: input.routine.goalId,
-            parentId: input.routine.parentIssueId,
-            title,
-            description: issueDescription,
-            status: "todo",
-            priority: input.routine.priority,
-            assigneeAgentId,
-            createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
-            createdByUserId: manualRunnerUserId,
-            responsibleUserId,
-            trustExplicitResponsibleUserId: true,
-            originKind: issueOriginKind,
-            originId: issueOriginId,
-            originRunId: createdRun.id,
-            originFingerprint: dispatchFingerprint,
-            billingCode: issueBillingCode,
-            executionWorkspaceId: input.executionWorkspaceId ?? null,
-            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-            executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
-          });
+          if (hasSteps) {
+            // The root and its steps are one unit in a savepoint of this transaction: nothing is visible
+            // before commit, and a failure leaves no root behind to delete.
+            const created = await txDb.transaction(async (savepoint) => {
+              const savepointDb = savepoint as unknown as Db;
+              const root = await issueSvc.create(input.routine.companyId, rootInput, savepoint);
+              const attached = await attachRoutineSteps({
+                tx: savepointDb,
+                issueSvc,
+                root,
+                run: createdRun,
+                routine: input.routine,
+                steps,
+                defaultAssigneeAgentId: assigneeAgentId,
+                variables: allVariables,
+              });
+              return { root, attached };
+            });
+            createdIssue = created.root;
+            attachedSteps = created.attached;
+          } else {
+            createdIssue = await issueSvc.create(input.routine.companyId, rootInput);
+          }
         } catch (error) {
           const isOpenExecutionConflict =
             !!error &&
@@ -2584,17 +2686,22 @@ export function routineService(
           return updated ?? createdRun;
         }
 
-        // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
-        await queueIssueAssignmentWakeup({
-          heartbeat,
-          assignmentEvent: true,
-          issue: createdIssue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "routine.dispatch",
-          requestedByActorType: input.source === "schedule" ? "system" : undefined,
-          rethrowOnError: true,
-        });
+        if (attachedSteps) {
+          // The steps are not committed yet: their agents are woken once this transaction commits.
+          stepsToStart.push(attachedSteps);
+        } else {
+          // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
+          await queueIssueAssignmentWakeup({
+            heartbeat,
+            assignmentEvent: true,
+            issue: createdIssue,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "routine.dispatch",
+            requestedByActorType: input.source === "schedule" ? "system" : undefined,
+            rethrowOnError: true,
+          });
+        }
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,
@@ -2610,6 +2717,9 @@ export function routineService(
         }, txDb);
         return updated ?? createdRun;
       } catch (error) {
+        // The root and steps belong to this transaction, so a failure after they were created has to
+        // roll all of it back; there is nothing to delete and no failed run row to keep.
+        if (attachedSteps) throw error;
         if (createdIssue) {
           // The issue is committed outside this transaction because the wake reads and updates it
           // on its own connections, so it is deleted rather than rolled back. Its recovery actions
@@ -2634,6 +2744,13 @@ export function routineService(
       }
     });
 
+    for (const attached of stepsToStart) {
+      await startAttachedRoutineSteps(attached, {
+        heartbeat,
+        contextSource: "routine.dispatch",
+        requestedByActorType: input.source === "schedule" ? "system" : undefined,
+      });
+    }
     await recordDispatchOutcome(input.routine, run, reusedExistingRun, gated !== null);
     if (run.status === "gating" && !reusedExistingRun && !gated) kickGate(run.id);
     return withoutGateInternals(run);
@@ -3004,11 +3121,13 @@ export function routineService(
             strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
             fieldPath: "env",
           });
+      const steps = input.steps ?? [];
       const variables = syncRoutineVariablesWithTemplate(
-        [input.title, input.description],
+        [input.title, input.description, ...routineStepTemplateTexts(steps)],
         sanitizeRoutineVariableInputs(input.variables),
       );
       assertRoutineVariableDefinitions(variables);
+      await assertRoutineStepReferences(db, companyId, steps, input.assigneeAgentId ?? null);
       const gate = input.gate ?? null;
       if (gate) {
         assertCanChangeGate(actor);
@@ -3040,6 +3159,7 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             transientRetryPolicy: input.transientRetryPolicy ?? {},
             variables,
+            steps,
             env,
             gate,
             automationWakeSettings: input.automationWakeSettings ?? {},
@@ -3091,8 +3211,9 @@ export function routineService(
       const nextStatus = patch.assigneeAgentId === undefined
         ? requestedStatus
         : normalizeDraftRoutineStatus(requestedStatus, nextAssigneeAgentId);
+      const nextSteps = patch.steps === undefined ? existing.steps : patch.steps;
       const nextVariables = syncRoutineVariablesWithTemplate(
-        [nextTitle, nextDescription],
+        [nextTitle, nextDescription, ...routineStepTemplateTexts(nextSteps)],
         patch.variables === undefined ? existing.variables : sanitizeRoutineVariableInputs(patch.variables),
       );
       if (patch.projectId !== undefined) await assertProject(existing.companyId, nextProjectId);
@@ -3103,6 +3224,13 @@ export function routineService(
       if (patch.goalId) await assertGoal(existing.companyId, patch.goalId);
       if (patch.parentIssueId) await assertParentIssue(existing.companyId, patch.parentIssueId);
       assertRoutineVariableDefinitions(nextVariables);
+      // Re-checked when the steps or the default agent changed: an unrelated edit must not fail on steps that predate it.
+      if (patch.steps !== undefined || patch.assigneeAgentId !== undefined) {
+        await assertRoutineStepReferences(db, existing.companyId, nextSteps, nextAssigneeAgentId);
+      }
+      if (patch.steps?.length && (await getManagedRoutineBinding(existing))) {
+        throw unprocessable("Steps are not supported on plugin-managed routines");
+      }
       const nextGate = patch.gate === undefined ? existing.gate : patch.gate;
       // Re-checked only when the pin changed: an unrelated edit must not fail on a gate that predates it.
       if (!routineGatesEqual(existing.gate, nextGate)) {
@@ -3215,6 +3343,7 @@ export function routineService(
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
           transientRetryPolicy: patch.transientRetryPolicy ?? locked.transientRetryPolicy,
           variables: nextVariables,
+          steps: nextSteps,
           env: nextEnv,
           gate: nextGate ?? null,
           runContextPolicy: patch.runContextPolicy === undefined ? locked.runContextPolicy : patch.runContextPolicy,
@@ -3294,6 +3423,7 @@ export function routineService(
             activityGateScope: candidate.activityGateScope,
             transientRetryPolicy: candidate.transientRetryPolicy,
             variables: candidate.variables,
+            steps: candidate.steps,
             env: candidate.env,
             gate: candidate.gate,
             runContextPolicy: candidate.runContextPolicy,
@@ -3617,6 +3747,7 @@ export function routineService(
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      await assertRoutineStepReferences(db, existingRoutine.companyId, routineSnapshot.steps ?? [], routineSnapshot.assigneeAgentId);
       if (!routineGatesEqual(existingRoutine.gate, routineSnapshot.gate ?? null)) {
         assertCanChangeGate(actor);
         if (routineSnapshot.gate) {
@@ -3688,6 +3819,7 @@ export function routineService(
             activityGatePolicy: routineSnapshot.activityGatePolicy,
             activityGateScope: routineSnapshot.activityGateScope,
             variables: routineSnapshot.variables,
+            steps: routineSnapshot.steps ?? [],
             env: routineSnapshot.env,
             gate: routineSnapshot.gate ?? null,
             runContextPolicy: routineSnapshot.runContextPolicy ?? null,
@@ -4292,6 +4424,22 @@ export function routineService(
             }
             : {}),
         });
+      }
+      if (issue.status === "blocked" && readRoutineStepsRunPayload(run.triggerPayload)) {
+        // The root of a run with steps is blocked by design while its steps are open; that is not a failure.
+        const openStep = await db
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.parentId, issue.id),
+              eq(issues.originKind, "routine_step"),
+              inArray(issues.status, OPEN_ISSUE_STATUSES),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (openStep) return null;
       }
       if (issue.status === "blocked" || issue.status === "cancelled") {
         const failureReason = executionIssueTransientFailureReason(issue.status);
