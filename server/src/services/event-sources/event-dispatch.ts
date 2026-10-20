@@ -17,7 +17,12 @@ import { HttpError, conflict } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import type { issueService } from "../issues.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../issue-assignment-wakeup.js";
-import { createRoutineRunIssues, startAttachedRoutineSteps, type AttachedRoutineSteps } from "../routine-steps.js";
+import {
+  createRoutineRunIssues,
+  hasOpenRoutineSteps,
+  startAttachedRoutineSteps,
+  type AttachedRoutineSteps,
+} from "../routine-steps.js";
 import {
   renderGateDecisionBlock,
   type GateDecision,
@@ -262,8 +267,18 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
     return !!row && row.hiddenAt === null && OPEN_GROUP_ISSUE_STATUSES.includes(row.status);
   }
 
-  /** Wakes the issue's current agent assignee for a new comment. */
-  async function wakeForComment(issueId: string, commentId: string, current: { status: string; assigneeAgentId: string | null }) {
+  /**
+   * Wakes the issue's current agent assignee for a new comment. The comment is already posted. While the
+   * issue is a routine run's root with steps still open, the assignee stays asleep: it is woken when the
+   * last step finishes and finds the comment then, so an event never starts it ahead of its steps.
+   */
+  async function wakeForComment(
+    scope: { executor: Db; companyId: string },
+    issueId: string,
+    commentId: string,
+    current: { status: string; assigneeAgentId: string | null },
+  ) {
+    if (await hasOpenRoutineSteps(scope.executor, scope.companyId, issueId)) return;
     await queueIssueAssignmentWakeup({
       heartbeat,
       assignmentEvent: false,
@@ -521,6 +536,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         }
         return failRun(run, err, extra);
       };
+      const commentWakeScope = { executor: txDb, companyId: routine.companyId };
       /** Remembers a committed comment on the run, so a retry after a failed wake does not post it again. */
       const recordPostedComment = async (run: RoutineRunRow, posted: PostedComment) => {
         await txDb
@@ -539,7 +555,9 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         const run = await startRun(posted.fingerprint, { postedComment: posted, resumedWake: true });
         try {
           const current = await currentIssue(txDb, posted.issueId);
-          if (posted.wake && current && isOpenIssue(current)) await wakeForComment(posted.issueId, posted.commentId, current);
+          if (posted.wake && current && isOpenIssue(current)) {
+            await wakeForComment(commentWakeScope, posted.issueId, posted.commentId, current);
+          }
           const status = posted.kind === "recovery" ? "recovered" : "grouped";
           await completeRun(run, status, posted.issueId);
           return { status: posted.storm ? "storm_folded" : status, runId: run.id, issueId: posted.issueId };
@@ -703,7 +721,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
                 lastState: event.state,
               })
               .where(eq(routineEventGroups.id, open.group.id));
-            if (wake && current) await wakeForComment(open.group.issueId, comment.id, current);
+            if (wake && current) await wakeForComment(commentWakeScope, open.group.issueId, comment.id, current);
             const status = decision.kind === "comment" ? "grouped" : "recovered";
             await completeRun(createdRun, status, open.group.issueId);
             return stampOutcome({
@@ -755,7 +773,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
               lastSeverity: event.severity,
               lastState: event.state,
             });
-            if (current) await wakeForComment(appendTarget.id, comment.id, current);
+            if (current) await wakeForComment(commentWakeScope, appendTarget.id, comment.id, current);
             await completeRun(createdRun, "grouped", appendTarget.id);
             return stampOutcome({ status: "grouped", runId: createdRun.id, issueId: appendTarget.id });
           }

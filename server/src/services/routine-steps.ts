@@ -110,6 +110,29 @@ export async function assertRoutineStepReferences(
   }
 }
 
+const OPEN_STEP_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
+
+/**
+ * Whether a routine run's root still has a step that has not finished. A blocked step counts: it is
+ * waiting for its predecessors, not done. Callers hold the root back while this is true.
+ * @param executor The connection to read on; pass the open transaction to see its own writes.
+ */
+export async function hasOpenRoutineSteps(executor: Db, companyId: string, rootIssueId: string): Promise<boolean> {
+  const rows = await executor
+    .select({ id: issues.id })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        eq(issues.parentId, rootIssueId),
+        eq(issues.originKind, "routine_step"),
+        inArray(issues.status, OPEN_STEP_STATUSES),
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
+}
+
 /** The agents that must be able to start now: those of the steps with nothing to wait for. */
 export function routineStartingStepAgentIds(steps: RoutineStep[], defaultAssigneeAgentId: string | null): string[] {
   const ids = routineStartingSteps(steps).flatMap((step) => {

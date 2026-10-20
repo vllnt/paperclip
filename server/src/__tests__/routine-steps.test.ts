@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  issueComments,
   issueRelations,
   issues,
   labels,
@@ -895,6 +896,78 @@ describeEmbeddedPostgres("routine steps", () => {
         expect(stepWakes).toEqual([]);
       },
     );
+
+    describe("a repeat or recovery reaching an open group", () => {
+      const commentWakes = (fx: Awaited<ReturnType<typeof setupEventRoutine>>["fx"], from: number) =>
+        fx.wakeups.slice(from).filter((wake) => wake.opts.reason === "issue_commented");
+
+      async function commentsOn(issueId: string) {
+        return db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      }
+
+      it("posts the comment but leaves the lead asleep while a step is still open", async () => {
+        const { fx, source, secret } = await setupEventRoutine();
+        const first = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e1" })));
+        const wakesBefore = fx.wakeups.length;
+
+        fx.advance(600_000);
+        const repeat = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e2" })));
+
+        expect(repeat).toMatchObject({ status: "grouped", issueId: first.issueId });
+        expect(await commentsOn(first.issueId!)).toHaveLength(1);
+        expect(fx.wakeups.slice(wakesBefore)).toEqual([]);
+      });
+
+      it("posts a recovery comment but leaves the lead asleep while a step is still open", async () => {
+        const { fx, source, secret } = await setupEventRoutine({ onRecovery: "comment_and_wake" });
+        const first = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e1" })));
+        const wakesBefore = fx.wakeups.length;
+
+        fx.advance(60_000);
+        const recovery = outcomeOf(
+          await fx.send(source, secret, wireEvent({ eventId: "e2", state: "recovery", severity: "info" })),
+        );
+
+        expect(recovery).toMatchObject({ status: "recovered", issueId: first.issueId });
+        expect(await commentsOn(first.issueId!)).toHaveLength(1);
+        expect(fx.wakeups.slice(wakesBefore)).toEqual([]);
+      });
+
+      it("wakes the lead for a repeat once every step is closed", async () => {
+        const { fx, leadId, routine, source, secret } = await setupEventRoutine();
+        const first = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e1" })));
+        await db
+          .update(issues)
+          .set({ status: "done", completedAt: new Date() })
+          .where(and(eq(issues.originId, routine.id), eq(issues.originKind, "routine_step")));
+        const wakesBefore = fx.wakeups.length;
+
+        fx.advance(600_000);
+        const repeat = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e2" })));
+
+        expect(repeat).toMatchObject({ status: "grouped", issueId: first.issueId });
+        const woken = commentWakes(fx, wakesBefore);
+        expect(woken).toHaveLength(1);
+        expect(woken[0]).toMatchObject({ agentId: leadId });
+      });
+
+      it("still wakes the assignee of a routine without steps", async () => {
+        const fx = await seedEventFixture(db);
+        const leadId = await fx.createAgent("Lead");
+        const routine = await fx.createRoutine({ assigneeAgentId: leadId });
+        const { source, secret } = await fx.createSource();
+        await fx.subscribe(routine.id, source.id, { grouping: { repeatCommentCooldownSec: 600 } });
+        await fx.send(source, secret, wireEvent({ eventId: "e1" }));
+        const wakesBefore = fx.wakeups.length;
+
+        fx.advance(600_000);
+        await fx.send(source, secret, wireEvent({ eventId: "e2" }));
+
+        const woken = commentWakes(fx, wakesBefore);
+        expect(woken).toHaveLength(1);
+        expect(woken[0]).toMatchObject({ agentId: leadId });
+      });
+    });
 
     it("creates no issue and no steps for a recovery event without an open group", async () => {
       const { fx, routine, source, secret } = await setupEventRoutine();

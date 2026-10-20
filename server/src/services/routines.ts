@@ -114,6 +114,7 @@ import {
   ROUTINE_STEP_ACTOR_ID,
   assertRoutineStepReferences,
   createRoutineRunIssues,
+  hasOpenRoutineSteps,
   routineStartingStepAgentIds,
   startAttachedRoutineSteps,
   type AttachedRoutineSteps,
@@ -4474,20 +4475,7 @@ export function routineService(
         });
       }
       if (issue.status === "blocked" && run.triggerPayload && ROUTINE_STEPS_RUN_PAYLOAD_KEY in run.triggerPayload) {
-        const openStep = await db
-          .select({ id: issues.id })
-          .from(issues)
-          .where(
-            and(
-              eq(issues.companyId, issue.companyId),
-              eq(issues.parentId, issue.id),
-              eq(issues.originKind, "routine_step"),
-              inArray(issues.status, OPEN_ISSUE_STATUSES),
-            ),
-          )
-          .limit(1)
-          .then((rows) => rows[0] ?? null);
-        if (openStep) return null;
+        if (await hasOpenRoutineSteps(db, issue.companyId, issue.id)) return null;
         const readiness = await issueSvc.getDependencyReadiness(issue.id);
         if (readiness.allBlockersDone) return null;
       }
