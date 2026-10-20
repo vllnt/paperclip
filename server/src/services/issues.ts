@@ -96,6 +96,7 @@ import type {
   SuccessfulRunHandoffState,
 } from "@paperclipai/shared";
 import {
+  ROUTINE_RUN_ISSUE_ORIGIN_KINDS,
   clampIssueRequestDepth,
   extractAgentMentionIds,
   extractProjectMentionIds,
@@ -6206,6 +6207,11 @@ function assertValidAssigneeAgentFilter(
   }
 }
 
+/** Keeps out the roots and the steps of routine runs: what "hide routine runs" means in a list. */
+function notRoutineRunIssueCondition() {
+  return notInArray(issues.originKind, [...ROUTINE_RUN_ISSUE_ORIGIN_KINDS]);
+}
+
 async function blockedInboxIssueConditions(
   dbOrTx: any,
   companyId: string,
@@ -6331,7 +6337,7 @@ async function blockedInboxIssueConditions(
     !filters?.originKind &&
     !filters?.originId
   ) {
-    conditions.push(ne(issues.originKind, "routine_execution"));
+    conditions.push(notRoutineRunIssueCondition());
   }
 
   return { conditions, contextUserId };
@@ -8135,7 +8141,7 @@ export function issueService(db: Db) {
         !filters?.originKind &&
         !filters?.originId
       ) {
-        conditions.push(ne(issues.originKind, "routine_execution"));
+        conditions.push(notRoutineRunIssueCondition());
       }
       const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
       const searchOrder = sql<number>`-task_search.score`;
