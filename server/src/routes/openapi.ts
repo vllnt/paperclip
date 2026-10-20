@@ -147,6 +147,17 @@ import {
   resolveBudgetIncidentSchema,
   // Sidebar
   upsertSidebarOrderPreferenceSchema,
+  createPersonalAgentSkillSchema,
+  personalAgentInstructionRevisionSchema,
+  personalAgentInstructionRevisionSummarySchema,
+  personalAgentSchema,
+  personalAgentSkillSchema,
+  personalAgentToolDefinitionSchema,
+  putPersonalAgentInstructionsSchema,
+  updatePersonalAgentSchema,
+  updatePersonalAgentSkillSchema,
+  userAuditEntrySchema,
+  userAuditQuerySchema,
   // Announcements
   announcementIdSchema,
   announcementSchema,
@@ -1361,6 +1372,7 @@ const PUBLIC_OPERATIONS = new Set([
 
 const BOARD_ONLY_PREFIXES = [
   "/api/announcements/",
+  "/api/personal-agent",
   "/api/auth/",
   "/api/admin/",
   "/api/plugins",
@@ -6688,6 +6700,124 @@ registry.registerPath({
     body: jsonBody(upsertSidebarOrderPreferenceSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+// ─── Personal agent ──────────────────────────────────────────────────────────
+// User-scoped: only the signed-in user's session or own board key. Agent keys
+// and the implicit local board are refused.
+
+const personalAgentErrors = { 401: r.unauthorized, 403: r.forbidden };
+const personalAgentSkillParams = z.object({ skillId: z.string().uuid() });
+
+registry.registerPath({
+  method: "get",
+  path: "/api/personal-agent",
+  tags: ["personal-agent"],
+  summary: "Get your personal agent, creating it with defaults on first use",
+  responses: { 200: r.ok(personalAgentSchema), ...personalAgentErrors },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/personal-agent",
+  tags: ["personal-agent"],
+  summary: "Update your personal agent's name or tool policy",
+  request: { body: jsonBody(updatePersonalAgentSchema) },
+  responses: { 200: r.ok(personalAgentSchema), 400: r.badRequest, ...personalAgentErrors },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/personal-agent/instructions",
+  tags: ["personal-agent"],
+  summary: "Save your personal agent's instructions as a new revision",
+  request: { body: jsonBody(putPersonalAgentInstructionsSchema) },
+  responses: { 200: r.ok(personalAgentSchema), 400: r.badRequest, ...personalAgentErrors, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/personal-agent/instructions/revisions",
+  tags: ["personal-agent"],
+  summary: "List your personal agent's instruction revisions, newest first",
+  responses: { 200: r.ok(z.array(personalAgentInstructionRevisionSummarySchema)), ...personalAgentErrors },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/personal-agent/instructions/revisions/{revision}",
+  tags: ["personal-agent"],
+  summary: "Get one instruction revision of your personal agent",
+  request: { params: z.object({ revision: z.coerce.number().int().min(1) }) },
+  responses: { 200: r.ok(personalAgentInstructionRevisionSchema), ...personalAgentErrors, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/personal-agent/skills",
+  tags: ["personal-agent"],
+  summary: "List your personal agent's skills",
+  responses: { 200: r.ok(z.array(personalAgentSkillSchema)), ...personalAgentErrors },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/personal-agent/skills",
+  tags: ["personal-agent"],
+  summary: "Add a custom skill, or copy a markdown-only skill from the app catalog",
+  request: { body: jsonBody(createPersonalAgentSkillSchema) },
+  responses: {
+    201: r.ok(personalAgentSkillSchema),
+    400: r.badRequest,
+    ...personalAgentErrors,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/personal-agent/skills/{skillId}",
+  tags: ["personal-agent"],
+  summary: "Get one of your personal agent's skills",
+  request: { params: personalAgentSkillParams },
+  responses: { 200: r.ok(personalAgentSkillSchema), ...personalAgentErrors, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/personal-agent/skills/{skillId}",
+  tags: ["personal-agent"],
+  summary: "Edit one of your personal agent's skills",
+  request: { params: personalAgentSkillParams, body: jsonBody(updatePersonalAgentSkillSchema) },
+  responses: { 200: r.ok(personalAgentSkillSchema), 400: r.badRequest, ...personalAgentErrors, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/personal-agent/skills/{skillId}",
+  tags: ["personal-agent"],
+  summary: "Remove a skill from your personal agent",
+  request: { params: personalAgentSkillParams },
+  responses: { 204: r.noContent, ...personalAgentErrors, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/personal-agent/tools",
+  tags: ["personal-agent"],
+  summary: "List the tools a personal-agent tool policy can allow, with their risk",
+  responses: { 200: r.ok(z.array(personalAgentToolDefinitionSchema)), ...personalAgentErrors },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/personal-agent/audit-log",
+  tags: ["personal-agent"],
+  summary: "Read your append-only audit log, newest first",
+  request: { query: userAuditQuerySchema },
+  responses: { 200: r.ok(z.array(userAuditEntrySchema)), 400: r.badRequest, ...personalAgentErrors },
 });
 
 // ─── Announcements ───────────────────────────────────────────────────────────

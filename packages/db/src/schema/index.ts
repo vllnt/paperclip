@@ -229,3 +229,5 @@ export * from "./company_skill_sources.js";
 
 export { issueDuplicatePairs } from "./issue_duplicate_pairs.js";
 export { judgeUsageDaily } from "./judge_usage_daily.js";
+export { personalAgents, personalAgentInstructionRevisions, personalAgentSkills } from "./personal_agents.js";
+export { userAuditLog } from "./user_audit_log.js";

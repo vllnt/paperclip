@@ -2915,3 +2915,4 @@ export * from "./event-sources.js";
 export * from "./run-context.js";
 export * from "./transient-retry-policy.js";
 export * from "./issue-git.js";
+export * from "./personal-agent.js";
