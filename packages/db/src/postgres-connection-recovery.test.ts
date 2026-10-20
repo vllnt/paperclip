@@ -21,7 +21,7 @@ describe.skipIf(!support.supported)("postgres connection recovery", () => {
   afterAll(async () => { await database?.cleanup(); });
 
   for (const format of ["esm", "cjs"]) {
-    for (const scenario of ["transaction", "transaction-closed", "savepoint", "reserve", "transaction-queue", "reserve-queue"]) {
+    for (const scenario of ["transaction", "transaction-closed", "savepoint", "reserve", "transaction-queue", "reserve-queue", "type-fetch-reset", "type-fetch-fatal"]) {
       it(`${format}: rejects disconnected ${scenario} work and recovers the pool`, async () => {
         // A driver timer used to crash the whole process. A child also detects
         // hangs without leaving broken connections in the Vitest worker.
