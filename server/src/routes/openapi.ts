@@ -5123,6 +5123,8 @@ registry.registerPath({
   path: "/api/routines/{id}/runs",
   tags: ["routines"],
   summary: "List runs for a routine",
+  description:
+    "`linkedIssue` is `null` for an agent that may not read the run's task; `linkedIssueId` stays. The same applies to `recentRuns` of the routine and to `lastRun` in the routine list.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });

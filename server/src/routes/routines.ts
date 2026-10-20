@@ -13,6 +13,7 @@ import {
   updateDocumentAnnotationThreadSchema,
   updateRoutineSchema,
   updateRoutineTriggerSchema,
+  type RoutineRunSummary,
   type RoutineStep,
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
@@ -207,27 +208,23 @@ export function routineRoutes(
     return routineStepWarnings(db, routine.companyId, routine.steps ?? [], routine.assigneeAgentId);
   }
 
-  /**
-   * A run that starts steps on an existing task changes that task (it gains subtasks and blockers, and
-   * an agent-owned one becomes blocked) and creates a subtask for each step. An agent therefore needs
-   * what the issue routes ask before it changes a task and adds a subtask to it: the `issue:mutate`
-   * decision on the task, and the `tasks:assign` decision under the task for each agent the steps go to.
-   * Board users are covered by the routine route's company-level `tasks:assign` check.
-   * @throws HttpError 404 when the task is missing, hidden or in another company; 403 when an agent may
-   * not change it or may not assign the steps under it.
-   */
-  async function assertCanStartStepsOnTask(
+  /** The access decision on a task, asked as the issue routes ask it. */
+  function decideOnTask(
     req: Request,
-    routine: { companyId: string; assigneeAgentId: string | null; steps?: RoutineStep[] | null },
-    taskId: string,
-    runAssigneeAgentId: string | null,
+    action: "issue:read" | "issue:mutate",
+    task: {
+      id: string;
+      companyId: string;
+      projectId: string | null;
+      parentId: string | null;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+      status: string;
+    },
   ) {
-    const task = await issues.getById(taskId);
-    if (!task || task.companyId !== routine.companyId || task.hiddenAt) throw notFound("Task not found");
-    if (req.actor.type !== "agent") return;
-    const decision = await access.decide({
+    return access.decide({
       actor: req.actor,
-      action: "issue:mutate",
+      action,
       resource: {
         type: "issue",
         companyId: task.companyId,
@@ -246,6 +243,48 @@ export function routineRoutes(
         assigneeUserId: task.assigneeUserId,
       },
     });
+  }
+
+  /**
+   * A run on a task links a task that the routine did not create, and a run summary shows that task's
+   * title and status. So an agent sees the linked task of a run only when it may read that task; the
+   * run keeps its `linkedIssueId`. Board users with access to the company read every task of it.
+   */
+  async function withReadableLinkedIssues(
+    req: Request,
+    companyId: string,
+    runs: Array<RoutineRunSummary | null>,
+  ): Promise<Array<RoutineRunSummary | null>> {
+    if (req.actor.type !== "agent") return runs;
+    const ids = [...new Set(runs.flatMap((run) => (run?.linkedIssue ? [run.linkedIssue.id] : [])))];
+    const readable = new Set<string>();
+    await Promise.all(
+      (await issues.listAccessFields(companyId, ids)).map(async (task) => {
+        if ((await decideOnTask(req, "issue:read", task)).allowed) readable.add(task.id);
+      }),
+    );
+    return runs.map((run) => (run?.linkedIssue && !readable.has(run.linkedIssue.id) ? { ...run, linkedIssue: null } : run));
+  }
+
+  /**
+   * A run that starts steps on an existing task changes that task (it gains subtasks and blockers, and
+   * an agent-owned one becomes blocked) and creates a subtask for each step. An agent therefore needs
+   * what the issue routes ask before it changes a task and adds a subtask to it: the `issue:mutate`
+   * decision on the task, and the `tasks:assign` decision under the task for each agent the steps go to.
+   * Board users are covered by the routine route's company-level `tasks:assign` check.
+   * @throws HttpError 404 when the task is missing, hidden or in another company; 403 when an agent may
+   * not change it or may not assign the steps under it.
+   */
+  async function assertCanStartStepsOnTask(
+    req: Request,
+    routine: { companyId: string; assigneeAgentId: string | null; steps?: RoutineStep[] | null },
+    taskId: string,
+    runAssigneeAgentId: string | null,
+  ) {
+    const task = await issues.getById(taskId);
+    if (!task || task.companyId !== routine.companyId || task.hiddenAt) throw notFound("Task not found");
+    if (req.actor.type !== "agent") return;
+    const decision = await decideOnTask(req, "issue:mutate", task);
     if (!decision.allowed) throw forbidden("This agent may not change the task", { issueId: task.id });
     const defaultAgentId = runAssigneeAgentId ?? routine.assigneeAgentId;
     const stepAgentIds = new Set((routine.steps ?? []).map((step) => step.assigneeAgentId ?? defaultAgentId));
@@ -294,7 +333,8 @@ export function routineRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const result = await svc.list(companyId, parseListRoutinesQuery(req.query));
-    res.json(result);
+    const lastRuns = await withReadableLinkedIssues(req, companyId, result.map((routine) => routine.lastRun));
+    res.json(result.map((routine, index) => ({ ...routine, lastRun: lastRuns[index] ?? null })));
   });
 
   router.post("/companies/:companyId/routines", validate(createRoutineSchema), async (req, res) => {
@@ -339,7 +379,7 @@ export function routineRoutes(
   router.get("/routines/:id", async (req, res) => {
     const detail = await getAccessibleResource(req, res, svc.getDetail(req.params.id as string), "Routine not found");
     if (!detail) return;
-    res.json(detail);
+    res.json({ ...detail, recentRuns: await withReadableLinkedIssues(req, detail.companyId, detail.recentRuns) });
   });
 
   router.get("/routines/:id/revisions", async (req, res) => {
@@ -616,7 +656,7 @@ export function routineRoutes(
     if (!routine) return;
     const limit = Number(req.query.limit ?? 50);
     const result = await svc.listRuns(routine.id, Number.isFinite(limit) ? limit : 50);
-    res.json(result);
+    res.json(await withReadableLinkedIssues(req, routine.companyId, result));
   });
 
   router.post("/routines/:id/triggers", validate(createRoutineTriggerSchema), async (req, res) => {

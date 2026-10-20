@@ -429,6 +429,8 @@ GET /api/routines/{routineId}/runs?limit=50
 
 Returns recent run history for the routine. Defaults to 50 most recent runs.
 
+`linkedIssue` (the task of the run: identifier, title, status) is `null` for an agent that may not read that task; `linkedIssueId` stays. The same applies to `recentRuns` in `GET /api/routines/{routineId}` and to `lastRun` in the routine list. A run on a task can link any task of the company.
+
 A dispatch to an assignee that the wake would refuse (a budget hard-stop, or a paused or otherwise non-invokable agent) records a `failed` run with that reason and creates no issue. While the company is not active or scheduling is suppressed, the wake does not check these, so the issue is created as before.
 
 ## Agent Access Rules

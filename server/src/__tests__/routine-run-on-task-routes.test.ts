@@ -530,6 +530,36 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
       expect(asBoard.status).toBe(201);
     });
 
+    it("sees the task of a run only when it may read the task", async () => {
+      const s = await seed();
+      const outsideProjectId = await s.newProject("Elsewhere");
+      const guardedId = await s.newAgent("Guarded", { permissions: lowTrustPermissions(s.companyId, [s.projectId]) });
+      const routine = await s.createRoutine();
+      const outside = await s.newTask({ title: "Quarterly figures", projectId: outsideProjectId, assigneeAgentId: null });
+      const run = await request(appFor(boardActor(s.companyId)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: outside.id });
+      expect(run.status).toBe(202);
+      const read = async (agentId: string) => {
+        const app = appFor(agentActor(s.companyId, agentId));
+        const [runs, detail, list] = await Promise.all([
+          request(app).get(`/api/routines/${routine.id}/runs`),
+          request(app).get(`/api/routines/${routine.id}`),
+          request(app).get(`/api/companies/${s.companyId}/routines`),
+        ]);
+        expect([runs.status, detail.status, list.status]).toEqual([200, 200, 200]);
+        const listed = list.body.find((item: { id: string }) => item.id === routine.id);
+        return { bodies: JSON.stringify([runs.body, detail.body, list.body]), shown: [runs.body[0], detail.body.recentRuns[0], listed.lastRun] };
+      };
+
+      const guarded = await read(guardedId);
+      const lead = await read(s.leadId);
+
+      expect(guarded.bodies).not.toContain("Quarterly figures");
+      for (const shown of guarded.shown) expect(shown).toMatchObject({ linkedIssueId: outside.id, linkedIssue: null });
+      for (const shown of lead.shown) expect(shown.linkedIssue).toMatchObject({ id: outside.id, title: "Quarterly figures" });
+    });
+
     it("cannot run a routine assigned to another agent", async () => {
       const s = await seed();
       const routine = await s.createRoutine();
