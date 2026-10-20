@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { Command } from "commander";
 import {
   addCommonClientOptions,
@@ -16,6 +17,10 @@ interface CompanyOptions extends BaseClientOptions {
 interface JsonOptions extends CompanyOptions {
   payloadJson?: string;
   limit?: string;
+}
+
+interface RoutineWriteOptions extends JsonOptions {
+  stepsFile?: string;
 }
 
 interface RoutineListOptions extends CompanyOptions {
@@ -68,9 +73,9 @@ export function registerRoutineApiCommands(program: Command): void {
       }),
     { includeCompany: false },
   );
-  addCompanyPost(routine, "create", "Create a routine", "routines");
+  addRoutineCreate(routine);
   addIdGet(routine, "get", "Get a routine", "routines");
-  addIdPatch(routine, "update", "Update a routine (payload may set runContextPolicy)", "routines");
+  addRoutineUpdate(routine);
   addIdGet(routine, "revisions", "List routine revisions", "routines", "revisions");
   addCommonClientOptions(
     routine
@@ -125,15 +130,59 @@ export function registerRoutineApiCommands(program: Command): void {
   );
 }
 
-function addCompanyPost(parent: Command, name: string, description: string, path: string): void {
-  addCommonClientOptions(parent.command(name).description(description).option("-C, --company-id <id>", "Company ID").requiredOption("--payload-json <json>", "JSON payload").action(async (opts: JsonOptions) => {
-    try {
-      const ctx = resolveCommandContext(opts, { requireCompany: true });
-      printOutput(await ctx.api.post(`${apiPath`/api/companies/${ctx.companyId}`}/${path}`, parseJson(opts.payloadJson ?? "{}")), { json: ctx.json });
-    } catch (err) {
-      handleCommandError(err);
-    }
-  }), { includeCompany: false });
+const STEPS_FILE_DESCRIPTION = "Read the routine steps (a JSON array) from a file; replaces steps in the payload";
+
+/**
+ * Builds the create or update payload. `--steps-file` supplies `steps` from a file so a long
+ * step list does not have to be quoted inside `--payload-json`; the server validates the steps.
+ */
+async function routineWritePayload(opts: RoutineWriteOptions): Promise<unknown> {
+  const payload = parseJson(opts.payloadJson ?? "{}");
+  if (!opts.stepsFile) return payload;
+  if (!isJsonObject(payload)) throw new Error("--payload-json must be a JSON object when --steps-file is used.");
+  if ("steps" in payload) throw new Error("Pass steps either in --payload-json or with --steps-file, not both.");
+  const steps = parseJson(await readFile(opts.stepsFile, "utf8"));
+  if (!Array.isArray(steps)) throw new Error(`${opts.stepsFile} must contain a JSON array of steps.`);
+  return { ...payload, steps };
+}
+
+function addRoutineCreate(parent: Command): void {
+  addCommonClientOptions(
+    parent
+      .command("create")
+      .description("Create a routine (payload may set steps)")
+      .option("-C, --company-id <id>", "Company ID")
+      .requiredOption("--payload-json <json>", "JSON payload")
+      .option("--steps-file <path>", STEPS_FILE_DESCRIPTION)
+      .action(async (opts: RoutineWriteOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          printOutput(await ctx.api.post(apiPath`/api/companies/${ctx.companyId}/routines`, await routineWritePayload(opts)), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+}
+
+function addRoutineUpdate(parent: Command): void {
+  addCommonClientOptions(
+    parent
+      .command("update")
+      .description("Update a routine (payload may set runContextPolicy and steps; steps [] clears them)")
+      .argument("<id>", "ID")
+      .option("--payload-json <json>", "JSON payload", "{}")
+      .option("--steps-file <path>", STEPS_FILE_DESCRIPTION)
+      .action(async (id: string, opts: RoutineWriteOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          printOutput(await ctx.api.patch(apiPath`/api/routines/${id}`, await routineWritePayload(opts)), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
 }
 
 function addIdGet(parent: Command, name: string, description: string, resource: string, suffix?: string): void {
@@ -182,4 +231,8 @@ function addIdDelete(parent: Command, name: string, description: string, resourc
 
 function parseJson(value: string): unknown {
   return JSON.parse(value) as unknown;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
