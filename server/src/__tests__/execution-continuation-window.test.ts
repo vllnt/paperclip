@@ -163,4 +163,48 @@ const bodyFor = (index: number) => `marker-${String(index).padStart(4, "0")} `.p
     expect(prompt).not.toContain("marker-0299 lorem");
     expect(prompt.length).toBeLessThan(60_000);
   });
+
+  it("holds the envelope ceiling with a huge plan document and 50 long comments that woke the run", async () => {
+    const heavyIssueId = randomUUID();
+    await db.insert(issues).values({ id: heavyIssueId, companyId, title: "Plan-heavy task", status: "in_progress", assigneeAgentId: agentId });
+    const wakeIds = Array.from({ length: 50 }, () => randomUUID());
+    await db.insert(issueComments).values(wakeIds.map((id, index) => ({
+      id,
+      companyId,
+      issueId: heavyIssueId,
+      authorType: "user",
+      authorUserId: "board-user",
+      body: `heavy-${String(index).padStart(2, "0")} `.padEnd(20_000, "detail "),
+      createdAt: new Date(Date.UTC(2026, 9, 2, 0, 0, index)),
+    })));
+    const planId = randomUUID();
+    const planRevisionId = randomUUID();
+    const planBody = "plan line\n".repeat(50_000);
+    await db.insert(documents).values({ id: planId, companyId, title: "Plan", latestBody: planBody, latestRevisionId: planRevisionId, latestRevisionNumber: 1 });
+    await db.insert(documentRevisions).values({ id: planRevisionId, companyId, documentId: planId, revisionNumber: 1, body: planBody });
+    await db.insert(issueDocuments).values({ companyId, issueId: heavyIssueId, documentId: planId, key: "plan" });
+
+    const envelope = await buildExecutionContinuation({
+      db,
+      companyId,
+      issueId: heavyIssueId,
+      agentId,
+      context: { issueId: heavyIssueId, wakeReason: "issue_commented", wakeCommentIds: wakeIds },
+      summary: null,
+      exposeLowTrustRaw: false,
+    });
+    const plan = await getTaskPlanContext({ db, companyId, issueId: heavyIssueId });
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_commented",
+      issue: { id: heavyIssueId, identifier: "WIN-2", title: "Plan-heavy task", status: "in_progress" },
+      executionContinuation: envelope,
+    });
+    expect(envelope.messages.map((message) => message.id)).toEqual(wakeIds);
+    expect(envelope.window).toMatchObject({ totalMessages: 50, includedMessages: 50, truncatedMessages: 50 });
+    expect(envelope.messages.every((message) => message.body.includes(`read comment ${message.id}`))).toBe(true);
+    expect(JSON.stringify(envelope).length).toBeLessThanOrEqual(CONTINUATION_ENVELOPE_MAX_CHARS);
+    expect(plan!.body.length).toBeLessThan(TASK_PLAN_BODY_MAX_CHARS + 200);
+    // The thread and the plan hold 1.5M characters; the history and the plan brief stay far below a 200K-token context.
+    expect(prompt.length + plan!.body.length).toBeLessThan(CONTINUATION_ENVELOPE_MAX_CHARS + TASK_PLAN_BODY_MAX_CHARS);
+  });
 });

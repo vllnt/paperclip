@@ -426,7 +426,7 @@ New interactions exclude known comments from other tasks when recording their or
 
 A wake of the issue's assignee carries the task history in its continuation context (`executionContinuation`). The history is a bounded window, so a long-lived issue cannot make a prompt that is larger than the model context.
 
-- **Pinned comments.** The comments that woke the run, and the latest human request, are always in `messages`. Each is cut at 16,000 characters.
+- **Pinned comments.** The comments that woke the run, and the latest human request, are always in `messages`. Each is cut at 16,000 characters. They count toward the 48,000-character total, newest first. When the total is used up, each further pinned comment keeps 200 characters.
 - **Newest comments.** Then come the newest other comments, up to 20. Each is cut at 4,000 characters, until all bodies together reach 48,000 characters. The window stops at the first comment that does not fit, so the recent part has no gaps.
 - **Cut marker.** A cut body ends with `[truncated: N more characters; read comment <id>]`.
 - **Older comments.** `olderMessages` lists each older comment with its id, author, time, length and a one-line preview of 120 characters. It lists at most the 50 newest of them, and `window` counts the rest.

@@ -35,7 +35,7 @@ Example: a 134-comment thread makes a 296,000-character wake prompt. The first m
 
 All of the change is in `buildExecutionContinuation` and the shared renderer. It does not touch `server/src/services/heartbeat.ts`.
 
-- **Pinned messages.** The window always holds the comments that woke the run (`originCommentIds`) and the latest human request (the objective). Each is cut at 16,000 characters.
+- **Pinned messages.** The window always holds the comments that woke the run (`originCommentIds`) and the latest human request (the objective). Each is cut at 16,000 characters. They count toward the 48,000-character total, newest first. When the total is used up, each further pinned comment keeps 200 characters.
 - **Newest comments.** Then come the newest other comments, up to 20, each cut at 4,000 characters, until all message bodies reach 48,000 characters. A cut body ends with `[truncated: N more characters; read comment <id>]`.
 - **Older comments.** Each older comment gets an entry in `olderMessages`: id, author type, author id, created time, length and a 120-character one-line preview. At most 50 entries are kept (the newest of the older comments). After that, the window holds only a count.
 - **Documents.** `documents` is an index of the issue documents: key, title, revision, updated time and length. The plan body in the task brief is cut at 32,000 characters, with a pointer to its revision in `GET /api/issues/{id}/documents/plan/revisions` (the brief can carry an approved revision that is not the latest).
