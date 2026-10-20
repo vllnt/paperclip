@@ -6,7 +6,6 @@ import { createDb, eventDeliveries, issues } from "@paperclipai/db";
 import type { RoutineStep } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture } from "./helpers/event-source-fixture.js";
-import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
@@ -89,7 +88,12 @@ describeEmbeddedPostgres("creating a task while a routine listens for new tasks"
 
     const app = express();
     app.use(express.json());
-    app.use(actorMiddleware(db, { deploymentMode: "local_trusted" }));
+    app.use((req, _res, next) => {
+      Object.assign(req, {
+        actor: { type: "board", userId: "local-board", isInstanceAdmin: true, source: "local_implicit" },
+      });
+      next();
+    });
     app.use("/api", issueRoutes(db, {} as never, { eventSources: fx.sources }));
     app.use(errorHandler);
 
