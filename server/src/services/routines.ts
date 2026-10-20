@@ -90,6 +90,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { budgetService } from "./budgets.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -2660,7 +2661,8 @@ export function routineService(
   /**
    * Throws the refusal the assignment wake (heartbeat `wakeup`) would raise for this assignee, with
    * the wake's rules in the wake's order: a budget hard-stop, then an agent it cannot invoke (a
-   * paused agent is assignable but not invokable). The wake skips both checks, and the issue
+   * paused agent is assignable but not invokable). Like the wake, it judges an agent that is still
+   * being set up as idle: setup delays the run but keeps the work. The wake skips both checks, and the issue
    * stays, while scheduling is suppressed or the company is not active; so this returns then.
    * Suppression is read from the environment only: a worktree run override can make this return
    * where the wake would check, which just keeps the previous create-then-wake path.
@@ -2675,7 +2677,10 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
     if (company?.status !== "active") return;
 
-    const budgetBlock = await budgetService(executor).getInvocationBlock(companyId, agentId, { projectId });
+    // The budget check reconciles the scope under the company's accounting lock and then delivers
+    // enforcement, both on their own root connections, exactly as the wake does. Run inside this
+    // transaction it would fail ("Lifecycle commands require the root database connection").
+    const budgetBlock = await budgetService(db).getInvocationBlock(companyId, agentId, { projectId });
     if (budgetBlock) {
       throw conflict(budgetBlock.reason, { scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId });
     }
@@ -2684,7 +2689,10 @@ export function routineService(
       .from(agents)
       .where(eq(agents.id, agentId))
       .then((rows) => rows[0] ?? null);
-    const invokability = await evaluateAgentInvokabilityFromDb(executor, agent);
+    const invokability = await evaluateAgentInvokabilityFromDb(
+      executor,
+      agent && isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent,
+    );
     if (!invokability.invokable) {
       throw conflict(invokability.message, { reason: invokability.reason, ...invokability.details });
     }

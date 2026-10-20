@@ -12,6 +12,8 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
+  approvals,
+  budgetIncidents,
   budgetPolicies,
   companies,
   costEvents,
@@ -92,6 +94,8 @@ describeEmbeddedPostgres("routine dispatch to an assignee that cannot be invoked
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(costEvents);
+    await db.delete(budgetIncidents);
+    await db.delete(approvals);
     await db.delete(budgetPolicies);
     await db.delete(routines);
     await db.delete(projects);
@@ -237,7 +241,8 @@ describeEmbeddedPostgres("routine dispatch to an assignee that cannot be invoked
       occurredAt: new Date(),
     });
 
-    await expectScheduledDispatchFailsWithoutIssue(fixture, "Agent cannot start because its budget hard-stop is still exceeded.");
+    // The wake's own refusal for this assignee (budgetService.getInvocationBlock).
+    await expectScheduledDispatchFailsWithoutIssue(fixture, "Agent is paused because its budget hard-stop was reached.");
   });
 
   // The wake skips its budget and invokability checks, and keeps the issue, for an inactive
@@ -258,6 +263,20 @@ describeEmbeddedPostgres("routine dispatch to an assignee that cannot be invoked
     } finally {
       delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
     }
+
+    expect(run).toMatchObject({ status: "issue_created", failureReason: null });
+    expect(wakeAttempts).toHaveLength(1);
+    expect(await db.select({ id: issues.id }).from(issues).where(eq(issues.companyId, companyId)))
+      .toEqual([{ id: run.linkedIssueId }]);
+  });
+
+  // An agent that is still being set up is paused until setup completes. The wake judges it idle
+  // and keeps the work queued for it, so the dispatch must create the issue too.
+  it("keeps the created issue, as the wake does, when the assignee is still being set up", async () => {
+    const { companyId, agentId, routine, svc, wakeAttempts } = await seed("paused");
+    await db.update(agents).set({ lifecycleState: "preparing", lifecycleHolds: [] }).where(eq(agents.id, agentId));
+
+    const run = await svc.runRoutine(routine.id, { source: "manual" });
 
     expect(run).toMatchObject({ status: "issue_created", failureReason: null });
     expect(wakeAttempts).toHaveLength(1);
