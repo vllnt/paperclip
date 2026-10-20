@@ -509,7 +509,6 @@ import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
   orderQueuedRunsForClaim,
-  QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY,
   selectAgentQueuedRuns,
 } from "./queued-run-claim-order.js";
 import {
@@ -652,6 +651,7 @@ import {
   sweepPromotionBudget,
   COALESCIBLE_PARKED_WAKE_REASONS,
   decideDeferredWakeDisposition,
+  QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
   type OrphanedDeferredWakeRow,
@@ -21964,9 +21964,11 @@ export function heartbeatService(
 
   /**
    * Closes an orphaned parked wake the sweep must not run (expired or
-   * superseded) and records why on its issue, in one transaction.
+   * superseded) and records why on its issue, in one transaction under the
+   * issue row lock, which serializes it with admission.
    *
-   * @returns Whether this call closed the wake; `false` when another writer moved it first.
+   * @returns Whether this call closed the wake; `false` when another writer moved
+   * or touched it first, or a superseded wake's agent holds the issue again.
    */
   async function closeParkedWake(
     wake: OrphanedDeferredWakeRow,
@@ -21980,9 +21982,16 @@ export function heartbeatService(
     const closed = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       const now = new Date();
-      if (!(await wakeQueue.closeDeferredWake({ companyId: wake.companyId, wakeId: wake.wakeId, error, now }, txDb))) {
-        return false;
-      }
+      const closedWake = await wakeQueue.closeDeferredWake({
+        companyId: wake.companyId,
+        wakeId: wake.wakeId,
+        issueId: wake.issueId,
+        observedUpdatedAt: wake.observedUpdatedAt,
+        ...(disposition === "superseded" ? { supersededAgentId: wake.agentId } : {}),
+        error,
+        now,
+      }, txDb);
+      if (!closedWake) return false;
       await logActivity(txDb, {
         companyId: wake.companyId,
         actorType: "system",
@@ -22221,6 +22230,8 @@ export function heartbeatService(
           heldReasons.set(candidate.wakeId, { reason: "budget_stop", blocker: null });
           continue;
         }
+        // Only wakes requested before the promotion started may be folded into its run.
+        const promotionStartedAt = new Date();
         const { outcome, runId } = await redeliverDeferredWake(candidate);
         result[outcome] += 1;
         counters[outcome] += 1;
@@ -22238,6 +22249,7 @@ export function heartbeatService(
             issueId: candidate.issueId,
             runId,
             reasons: COALESCIBLE_PARKED_WAKE_REASONS,
+            requestedAtLte: promotionStartedAt,
             now: new Date(),
           });
           result.coalesced += folded.length;

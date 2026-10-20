@@ -50,7 +50,9 @@ export interface InstanceGeneralSettings {
   gitStatusAutomation?: boolean;
   /**
    * Hours a parked (deferred) wake may wait before the deferred-wake sweep
-   * expires it instead of starting a run, 1 to 720. Absent = 24.
+   * expires it instead of starting a run, 1 to 720. Absent = 24. A wake whose
+   * close could lose work (saved input, a merged wake, an issue the stranded
+   * recovery would not dispatch again) never expires.
    */
   deferredWakeMaxAgeHours?: number;
 }

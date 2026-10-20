@@ -177,6 +177,7 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
     triggerDetail: row.triggerDetail,
     requestedByActorType: toRequestedByActorType(row.requestedByActorType),
     requestedByActorId: row.requestedByActorId,
+    requestedAt: row.requestedAt,
     payload,
     queuedCommentIds,
     preservesIndependentContinuation,

@@ -199,13 +199,17 @@ describe("decideDeferredWakeDisposition", () => {
     hoursAgo: number;
     wakeReason?: string | null;
     assignee?: string | null;
+    issueStatus?: string;
     carriesSavedInput?: boolean;
+    mergedWakeCount?: number;
   }) => ({
     agentId: "agent-a",
     requestedAt: new Date(now.getTime() - input.hoursAgo * hour),
     wakeReason: input.wakeReason === undefined ? "issue_assigned" : input.wakeReason,
     issueAssigneeAgentId: input.assignee === undefined ? "agent-a" : input.assignee,
+    issueStatus: input.issueStatus ?? "todo",
     carriesSavedInput: input.carriesSavedInput ?? false,
+    mergedWakeCount: input.mergedWakeCount ?? 0,
   });
 
   it("promotes a fresh wake for the current assignee", () => {
@@ -235,6 +239,25 @@ describe("decideDeferredWakeDisposition", () => {
         maxAgeMs: 24 * hour,
       }),
     ).toBe("superseded");
+  });
+
+  it("expires an old wake only on an issue that stranded-issue recovery dispatches again", () => {
+    for (const issueStatus of ["todo", "in_progress", "in_review"]) {
+      expect(decideDeferredWakeDisposition(facts({ hoursAgo: 200, issueStatus }), { now, maxAgeMs: 24 * hour })).toBe(
+        "expired",
+      );
+    }
+    for (const issueStatus of ["blocked", "backlog"]) {
+      expect(decideDeferredWakeDisposition(facts({ hoursAgo: 200, issueStatus }), { now, maxAgeMs: 24 * hour })).toBe(
+        "promote",
+      );
+    }
+  });
+
+  it("never expires a wake that later wakes were merged into, since the merged signal may be fresh", () => {
+    expect(
+      decideDeferredWakeDisposition(facts({ hoursAgo: 200, mergedWakeCount: 1 }), { now, maxAgeMs: 24 * hour }),
+    ).toBe("promote");
   });
 
   it("keeps a wake exactly at the max age", () => {

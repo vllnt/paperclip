@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY } from "../modules/wake-queue/domain/deferred-wake-sweep.js";
 import {
   orderQueuedRunsForClaim,
   QUEUED_RUN_PRIORITY_AGING_STEP_MS,
-  QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY,
   type QueuedRunIssueFacts,
 } from "./queued-run-claim-order.js";
 

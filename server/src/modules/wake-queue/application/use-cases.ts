@@ -1,5 +1,6 @@
 import { enrichPromotedWakeContext } from "../domain/context.js";
 import { AUTOMATION_WAKE_REASON_SET } from "../domain/automation-wake-coalesce.js";
+import { QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY } from "../domain/deferred-wake-sweep.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -505,7 +506,12 @@ async function promoteDeferredWake(
   delete promotedPayload["_paperclipWakeContext"];
   delete promotedPayload["queuedCommentInterrupt"];
 
-  const promotedContextSeed: Record<string, unknown> = { ...workingCandidate.deferredContextSeed };
+  // The promoted run waits in the agent's queue from the wake's request, so
+  // time spent parked behind the issue's run counts as time in line.
+  const promotedContextSeed: Record<string, unknown> = {
+    ...workingCandidate.deferredContextSeed,
+    [QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY]: workingCandidate.requestedAt.toISOString(),
+  };
   if (pauseHold.activePauseHold) {
     promotedContextSeed.treeHoldInteraction = true;
     promotedContextSeed.activeTreeHold = {

@@ -72,6 +72,8 @@ export type DeferredWakeCandidate = {
   triggerDetail: string | null;
   requestedByActorType: "user" | "agent" | "system" | null;
   requestedByActorId: string | null;
+  /** When the wake was requested; the promoted run's queue wait counts from then. */
+  requestedAt: Date;
   payload: Record<string, unknown>;
   /** The queued comment ids the wake's queued-comment context carries, already extracted from the payload. */
   queuedCommentIds: string[];

@@ -2,6 +2,7 @@ import { and, eq, gte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import { ISSUE_PRIORITIES, type IssuePriority } from "@paperclipai/shared";
+import { QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY } from "../modules/wake-queue/domain/deferred-wake-sweep.js";
 
 /**
  * How long a queued run waits before it ranks one issue priority higher. It
@@ -21,13 +22,6 @@ export type QueuedRunIssueFacts = {
   inProgress: boolean;
   dependencyReady: boolean;
 };
-
-/**
- * Context key a re-delivered parked wake's run carries: when that wake was
- * first requested. The queue measures the run's wait from then, so a wake that
- * sat parked keeps its place instead of starting at the back of the queue.
- */
-export const QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY = "parkedWakeRequestedAt";
 
 type QueuedRunTiming = {
   id: string;

@@ -77,6 +77,7 @@ export {
   compareDeferredWakes,
   decideDeferredWakeDisposition,
   issuePriorityRank,
+  QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY,
   selectDeferredWakesToPromote,
   sweepPromotionBudget,
 } from "./domain/deferred-wake-sweep.js";

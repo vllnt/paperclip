@@ -9,6 +9,13 @@
 // orders and budgets them; the caller reads the database and applies the hold
 // checks.
 
+/**
+ * Context key the run of a promoted parked wake carries: when that wake was
+ * first requested. The agent's queue measures the run's wait from then, so a
+ * wake that sat parked keeps its place instead of starting at the back.
+ */
+export const QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY = "parkedWakeRequestedAt";
+
 /** A deferred wake must be parked this long before the periodic sweep touches it. */
 export const DEFERRED_WAKE_SWEEP_MIN_AGE_MS = 2 * 60 * 1000;
 /** A wake the sweep already examined is not examined again within this window. */
@@ -48,16 +55,26 @@ const ASSIGNEE_WAKE_REASONS: ReadonlySet<string> = new Set([
 /**
  * Wake reasons that only signal "look at this issue again". When one wake of
  * an agent on an issue is promoted, the agent's other parked wakes on that
- * issue with one of these reasons (and no queued comments) add nothing the
+ * issue with one of these reasons (and no saved input) add nothing the
  * promoted run will not see, so they are folded into its run.
+ * `issue_children_completed` is not here: it names the completed child and
+ * its summary, which the promoted run's context would not carry.
  */
 export const COALESCIBLE_PARKED_WAKE_REASONS: readonly string[] = [
   "issue_assigned",
   "issue_continuation_needed",
   "issue_status_changed",
-  "issue_children_completed",
   "issue_blockers_resolved",
 ];
+
+/**
+ * Issue statuses whose assigned work the stranded-issue recovery dispatches
+ * again when no run serves it. Only a wake on such an issue may expire: if the
+ * work is still needed, that recovery starts it with the issue as it is now.
+ * A wake on any other issue (blocked, backlog) may be the only thing that
+ * would move it, so it never expires.
+ */
+const EXPIRABLE_ISSUE_STATUSES: ReadonlySet<string> = new Set(["todo", "in_progress", "in_review"]);
 
 export type DeferredWakeDisposition =
   /** Re-deliver it through ordinary admission. */
@@ -73,17 +90,27 @@ export type DeferredWakeDispositionFacts = {
   /** The reason the wake was requested for (the parked context's `wakeReason`, else the row's reason). */
   wakeReason: string | null;
   issueAssigneeAgentId: string | null;
-  /** The wake delivers saved input: comments, or a message held for execution recovery. */
+  issueStatus: string;
+  /**
+   * The wake delivers saved input: something a person asked for or decided,
+   * a comment, an answer, an approval, a completed child, or a message held
+   * for execution recovery.
+   */
   carriesSavedInput: boolean;
+  /** How many later wakes were merged into this one while it was parked; its age then says nothing about them. */
+  mergedWakeCount: number;
 };
 
 /**
  * Decides whether an orphaned parked wake may still run. An old backlog must
  * not start stale work after a deploy, so a wake parked longer than
  * `maxAgeMs` expires and an assignee wake whose agent lost the issue is
- * superseded. Both are closed with their reason instead of started. A wake
- * that carries saved input never expires: dropping it would lose a message
- * the sender was told is saved.
+ * superseded. Both are closed with their reason instead of started.
+ *
+ * A wake never expires when closing it could lose work: it carries saved
+ * input (dropping it would lose what the sender was told is saved), a later
+ * wake was merged into it (the merged signal may be fresh), or its issue is
+ * not one the stranded-issue recovery would dispatch again.
  */
 export function decideDeferredWakeDisposition(
   wake: DeferredWakeDispositionFacts,
@@ -96,7 +123,9 @@ export function decideDeferredWakeDisposition(
   ) {
     return "superseded";
   }
-  if (!wake.carriesSavedInput && input.now.getTime() - wake.requestedAt.getTime() > input.maxAgeMs) return "expired";
+  const expirable =
+    !wake.carriesSavedInput && wake.mergedWakeCount === 0 && EXPIRABLE_ISSUE_STATUSES.has(wake.issueStatus);
+  if (expirable && input.now.getTime() - wake.requestedAt.getTime() > input.maxAgeMs) return "expired";
   return "promote";
 }
 

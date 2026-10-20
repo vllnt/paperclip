@@ -30,6 +30,7 @@ const ACTIVITY_ROW_VERBS: Record<string, string> = {
   "issue.checked_out": "checked out",
   "issue.released": "released",
   "heartbeat.deferred_wake_held": "is holding a deferred wake on",
+  "heartbeat.deferred_wake_closed": "closed a deferred wake on",
   "issue.comment_added": "commented on",
   "issue.comment_cancelled": "cancelled a queued comment on",
   "issue.queued_comment_edited": "edited a queued comment on",
@@ -480,6 +481,11 @@ export function formatActivityVerb(
   if (action === "issue.updated") {
     const issueUpdatedVerb = formatIssueUpdatedVerb(details);
     if (issueUpdatedVerb) return issueUpdatedVerb;
+  }
+
+  if (action === "heartbeat.deferred_wake_closed") {
+    if (details?.reason === "expired") return "closed an expired deferred wake on";
+    if (details?.reason === "superseded") return "closed a superseded deferred wake on";
   }
 
   if (action === "issue.stalled_review_decided") {
