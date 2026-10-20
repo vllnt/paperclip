@@ -74,6 +74,7 @@ server/src/__tests__/run-log-redaction-policy.test.ts
 server/src/__tests__/run-read-redaction-text.test.ts
 server/src/__tests__/ssh-run-directory-reaper-settings.test.ts
 server/src/services/heartbeat-remote-run-temp.test.ts
+server/src/services/queued-run-claim-order.test.ts
 server/src/shutdown-budget.test.ts
 ui/src/components/ActiveAgentsPanel.test.tsx
 ui/src/components/AgentCharacterRuntime.test.ts
