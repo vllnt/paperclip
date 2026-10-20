@@ -131,6 +131,7 @@ describeEmbeddedPostgres("creating a task while a routine listens for new tasks"
       );
       const [stored] = await db.select().from(issues).where(eq(issues.id, response.body.id));
       expect(stored).toMatchObject({ status: "blocked", assigneeAgentId: s.leadId });
+      expect(response.body.statusVersion).toBe(stored!.statusVersion);
       expect(s.routeWakesFor(response.body.id)).toHaveLength(0);
       expect(s.fx.wakeups.map((wake) => wake.agentId)).toEqual([s.builderId]);
     });

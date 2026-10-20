@@ -3643,13 +3643,15 @@ export function issueRoutes(
    * that listen to it, so the caller knows whether a routine attached its steps. Then the assignee must
    * stay asleep: the steps' own agents are woken instead, and the task is `blocked` until they finish.
    * It never throws, and costs one query when no event trigger listens.
-   * @returns the task as the response should show it (its status and blockers changed when steps were attached).
+   * @returns the task as the response should show it (its status, status version and blockers changed when
+   * steps were attached).
    */
   const publishCreatedTask = async <
     T extends {
       id: string;
       companyId: string;
       status: string;
+      statusVersion: number;
       updatedAt: Date;
       blockedBy: unknown;
       blocks: unknown;
@@ -3664,7 +3666,14 @@ export function issueRoutes(
       const [fresh, relations] = await Promise.all([svc.getById(issue.id), svc.getRelationSummaries(issue.id)]);
       if (!fresh) return { issue, stepsAttached };
       return {
-        issue: { ...issue, status: fresh.status, updatedAt: fresh.updatedAt, blockedBy: relations.blockedBy, blocks: relations.blocks },
+        issue: {
+          ...issue,
+          status: fresh.status,
+          statusVersion: fresh.statusVersion,
+          updatedAt: fresh.updatedAt,
+          blockedBy: relations.blockedBy,
+          blocks: relations.blocks,
+        },
         stepsAttached,
       };
     } catch (err) {
