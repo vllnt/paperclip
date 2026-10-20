@@ -93,7 +93,14 @@ import {
   clearAdapterSteering,
   setAdapterSteeringHandle,
 } from "./adapter-steering.js";
-import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
+import {
+  executionFailureRetryCount,
+  executionRetryAttemptCount,
+  accountingForScheduledRetry,
+  PLANNED_RESTART_RESUME_MAX_ATTEMPTS,
+  PLANNED_RESTART_RESUME_RETRY_REASON,
+  PLANNED_RESTART_RESUME_WAKE_REASON,
+} from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
@@ -715,7 +722,7 @@ import {
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
-import { remoteProcessStopRunEvent } from "./ssh-run-process-stop.js";
+import { remoteProcessStopRunEvent, remoteRunProcessesProvenStopped } from "./ssh-run-process-stop.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
   clearHeartbeatRunRuntimeStatus,
@@ -976,6 +983,15 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
+// Recorded on a restart-interrupted run whose remote stop has no stored proof.
+const RESTART_RESUME_SKIPPED_EVENT = {
+  eventType: "lifecycle",
+  stream: "system",
+  level: "warn",
+  message:
+    "Restart resume skipped: the remote processes of this run are not proven stopped; the ordinary bounded retry applies",
+  payload: { reason: "remote_stop_unproven" },
+} as const;
 function isTransientWorkspaceGitScanCode(code: string | null | undefined): boolean {
   return code === WORKSPACE_GIT_SCAN_ERROR_CODES.timeout || code === WORKSPACE_GIT_SCAN_ERROR_CODES.saturated;
 }
@@ -15274,10 +15290,19 @@ export function heartbeatService(
     return { outcome: "retry_exhausted" as const, queuedRun: null };
   }
 
+  /**
+   * `resumeAfterRestart` is for a run that a server restart cut short and whose
+   * remote processes are proven stopped (`remoteRunProcessesProvenStopped`).
+   * Its retry is due now, resumes the same session and spends no failure retry.
+   * After three such resumes in a row, the ordinary bounded retry applies.
+   * A spent failure budget stays spent: such a run gets no resume, so a restart
+   * never opens new attempts for an incident that is already escalating.
+   */
   async function enqueueProcessLossRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     now: Date,
+    opts: { resumeAfterRestart?: boolean } = {},
   ) {
     // Completion deliveries own their durable bounded retry and reply identity.
     // A second process-loss retry would compete for the same outbox input.
@@ -15288,6 +15313,22 @@ export function heartbeatService(
     // transient retries; process loss must not open a second retry budget.
     if (run.runtimeMode === "native" || await legacyExecutionNeedsReconciliationWithEvidence(db, run))
       return null;
+    if (
+      opts.resumeAfterRestart &&
+      executionRetryAttemptCount(run, BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON) <
+        BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS
+    ) {
+      const resumed = await scheduleBoundedRetryForRun(run, agent, {
+        now,
+        retryReason: PLANNED_RESTART_RESUME_RETRY_REASON,
+        wakeReason: PLANNED_RESTART_RESUME_WAKE_REASON,
+        maxAttempts: PLANNED_RESTART_RESUME_MAX_ATTEMPTS,
+        delayMs: 0,
+      });
+      if (resumed.outcome === "scheduled") return resumed.run;
+      // Only a used-up resume lane falls back. Any other refusal also binds the ordinary retry.
+      if (resumed.outcome !== "retry_exhausted") return null;
+    }
     const scheduled = await scheduleBoundedRetryForRun(run, agent, { now });
     return scheduled.outcome === "scheduled" ? scheduled.run : null;
   }
@@ -16200,7 +16241,15 @@ export function heartbeatService(
       failureReason: interrupted.error ?? undefined,
     });
 
-    const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+    // The drain already stopped the local child. The resume needs proof that the
+    // remote side is stopped too: two processes must never share one session.
+    const resumeAfterRestart = await remoteRunProcessesProvenStopped(
+      db,
+      interrupted.companyId,
+      interrupted.id,
+    );
+    if (!resumeAfterRestart) await appendRunEvent(interrupted, RESTART_RESUME_SKIPPED_EVENT);
+    const retry = await enqueueProcessLossRetry(interrupted, agent, now, { resumeAfterRestart });
     if (!retry) {
       await releaseIssueExecutionAndPromote(interrupted);
     }
@@ -16999,7 +17048,15 @@ export function heartbeatService(
       }
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
-    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    // A retry row skips enqueueWakeup, so a resume writes the session override
+    // that enqueueWakeup would have: the interrupted run's own session.
+    const isRestartResume = retryReason === PLANNED_RESTART_RESUME_RETRY_REASON;
+    const restartResumeSession = isRestartResume
+      ? await resolveExplicitResumeSessionOverride(agent, { resumeFromRunId: run.id }, taskKey)
+      : null;
+    const sessionBefore =
+      restartResumeSession?.sessionDisplayId ??
+      (await resolveSessionBeforeForWakeup(agent, taskKey));
     const interactionContinuationPayload =
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
         ? {
@@ -17039,6 +17096,17 @@ export function heartbeatService(
           : {}),
         ...(retryReason === AI_CONNECTION_BUSY_RETRY_REASON
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }
+          : {}),
+        ...(isRestartResume
+          ? {
+              failureRetriesBeforePlannedRestart: executionFailureRetryCount(run),
+              // The copied context may hold the previous run's session choice.
+              // An undefined value is dropped when the context is stored.
+              forceFreshSession: false,
+              resumeFromRunId: restartResumeSession?.resumeFromRunId,
+              resumeSessionDisplayId: restartResumeSession?.sessionDisplayId,
+              resumeSessionParams: restartResumeSession?.sessionParams,
+            }
           : {}),
         ...(shouldQuarantineWorkspaceForRetry
           ? {
@@ -21143,7 +21211,14 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  /**
+   * `reapDeadBootRuns` is for startup only. The server runs one process per
+   * database, so a legacy run owned by another boot id belongs to a
+   * process that is gone, and its lease cannot be live. Such a run is reaped
+   * at once, without waiting for its lease to expire, and resumes when the
+   * remote processes are proven stopped.
+   */
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; reapDeadBootRuns?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
     // Recovery never launches a provider or infers stopped ownership from
@@ -21472,7 +21547,12 @@ export function heartbeatService(
       }
       if (resumedRunIds.has(run.id)) continue;
       if (locallyTracked) continue;
-      if (await hasLiveLegacyController(db, run)) continue;
+      const deadBootRun =
+        opts?.reapDeadBootRuns === true &&
+        run.runtimeMode === "legacy" &&
+        !!run.controllerBootId &&
+        run.controllerBootId !== legacyControllerBootId;
+      if (!deadBootRun && (await hasLiveLegacyController(db, run))) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -21548,7 +21628,7 @@ export function heartbeatService(
         ((tracksLegacyLocalChild &&
           (!!run.processPid || !!run.processGroupId)) ||
           monitorDispatchLostWithoutFutureWake);
-      if (!(await revokeExpiredLegacyController(db, run))) continue;
+      if (!(await revokeExpiredLegacyController(db, run, { ownerGone: deadBootRun }))) continue;
       const baseMessage = buildProcessLossMessage(run);
       const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
 
@@ -21603,10 +21683,23 @@ export function heartbeatService(
       const retryAgent = await getAgent(run.agentId);
       if (shouldRetry) {
         if (retryAgent) {
+          // The old server is gone, but its remote command may not be. Resume
+          // the session only when the stored evidence shows the stop.
+          const resumeAfterRestart =
+            deadBootRun &&
+            (await remoteRunProcessesProvenStopped(
+              db,
+              finalizedRun.companyId,
+              finalizedRun.id,
+            ));
+          if (deadBootRun && !resumeAfterRestart) {
+            await appendRunEvent(finalizedRun, RESTART_RESUME_SKIPPED_EVENT);
+          }
           retriedRun = await enqueueProcessLossRetry(
             finalizedRun,
             retryAgent,
             now,
+            { resumeAfterRestart },
           );
         }
       } else if (retryAgent) {

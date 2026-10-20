@@ -47,8 +47,15 @@ export async function hasLiveLegacyController(db: Db, run: Run): Promise<boolean
 }
 
 /** Atomically revoke an expired controller. Renewal and revocation serialize on
- * the run row. Expiry permits cleanup, never dispatch of a replacement agent. */
-export async function revokeExpiredLegacyController(db: Db, run: Run): Promise<boolean> {
+ * the run row. Expiry permits cleanup, never dispatch of a replacement agent.
+ * `ownerGone` is for a controller whose boot is known to be dead (a startup
+ * after a restart): its lease needs no wait to expire. The boot id still has to
+ * match, so a late renewal wins or loses cleanly. */
+export async function revokeExpiredLegacyController(
+  db: Db,
+  run: Run,
+  opts: { ownerGone?: boolean } = {},
+): Promise<boolean> {
   if (run.runtimeMode === "native" || !run.controllerBootId) return true;
   const [revoked] = await db.update(heartbeatRuns).set({
     controllerBootId: randomUUID(),
@@ -57,7 +64,7 @@ export async function revokeExpiredLegacyController(db: Db, run: Run): Promise<b
     eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
     eq(heartbeatRuns.status, "running"),
     eq(heartbeatRuns.controllerBootId, run.controllerBootId),
-    lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
+    opts.ownerGone ? undefined : lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
   )).returning({ id: heartbeatRuns.id });
   return Boolean(revoked);
 }
