@@ -2021,7 +2021,7 @@ process.stdout.write(${JSON.stringify(options.stdout ?? "")}, () => {
 
 describe("claude execute failure exit cause", () => {
   const WARNING = "Warning: no input received on stdin, continuing without it\n";
-  const TAIL = "Claude exited with code 1. Last lines of stderr:\n";
+  const TAIL = "\nLast lines of stderr:\n";
 
   async function runFailingClaude(
     options: Parameters<typeof writeStderrClaudeCommand>[1],
@@ -2047,11 +2047,12 @@ describe("claude execute failure exit cause", () => {
     }
   }
 
-  it("keeps the auth error that follows a leading warning", async () => {
-    const result = await runFailingClaude({ stderr: `${WARNING}Error: 401 Unauthorized: invalid credentials\n`, end: 1 });
+  it("puts the auth error that follows a leading warning on the first line", async () => {
+    const authError = "Error: 401 Unauthorized: invalid credentials";
+    const result = await runFailingClaude({ stderr: `${WARNING}${authError}\n`, end: 1 });
 
     expect(result.errorCode).toBe("claude_auth_required");
-    expect(result.errorMessage).toBe(`${TAIL}${WARNING}Error: 401 Unauthorized: invalid credentials`);
+    expect(result.errorMessage).toBe(`Claude exited with code 1: ${authError}${TAIL}${WARNING}${authError}`);
   });
 
   it("adds the exit code to a rate-limit result error", async () => {
@@ -2086,7 +2087,8 @@ describe("claude execute failure exit cause", () => {
     const result = await runFailingClaude({ stderr: `${WARNING}${crash.join("\n")}\n`, end: 1 });
 
     expect(result.errorMessage).toBe(
-      `${TAIL}${[WARNING, ...crash].map((line) => line.trim()).filter(Boolean).join("\n")}`,
+      `Claude exited with code 1: Node.js v22.11.0${TAIL}` +
+        `${[WARNING, ...crash].map((line) => line.trim()).filter(Boolean).join("\n")}`,
     );
   });
 
@@ -2118,9 +2120,9 @@ describe("claude execute failure exit cause", () => {
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("timeout");
     expect(result.signal).toMatch(/^SIG(TERM|KILL)$/);
+    const retryLine = "Retrying request (attempt 7/10) after a connection error";
     expect(result.errorMessage).toBe(
-      `Timed out after 1s\nClaude exited with signal ${result.signal}. Last lines of stderr:\n` +
-        `${WARNING}Retrying request (attempt 7/10) after a connection error`,
+      `Timed out after 1s\nClaude exited with signal ${result.signal}: ${retryLine}${TAIL}${WARNING}${retryLine}`,
     );
   });
 
@@ -2128,7 +2130,7 @@ describe("claude execute failure exit cause", () => {
     const lines = Array.from({ length: 30 }, (_, i) => `debug line ${String(i + 1).padStart(2, "0")} ${"x".repeat(120)}`);
     const result = await runFailingClaude({ stderr: `${lines.join("\n")}\n`, end: 1 });
 
-    const prefix = `${TAIL}…`;
+    const prefix = `Claude exited with code 1: ${lines[29]}${TAIL}…`;
     expect(result.errorMessage?.startsWith(prefix)).toBe(true);
     const tail = result.errorMessage!.slice(prefix.length);
     expect(tail.length).toBeLessThanOrEqual(2048);

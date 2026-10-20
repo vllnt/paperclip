@@ -520,6 +520,40 @@ describe("redaction", () => {
     expect(redactSensitiveText(result)).toBe(result);
   });
 
+  it("redacts header-style secrets with unquoted values, as a CLI prints them to stderr", () => {
+    // Built at runtime so the source holds no secret-shaped literal.
+    const secret = ["fixture", "Header", "Value", "0123"].join("");
+    const input = [
+      `x-api-key: ${secret}1`,
+      `X-Api-Key:${secret}2`,
+      `Authorization: token ${secret}3`,
+      `Set-Cookie: session=${secret}4; Path=/`,
+      `headers: { password: ${secret}5, retries: 3 }`,
+    ].join("\n");
+
+    const result = redactSensitiveText(input);
+
+    for (const n of [1, 2, 3, 4, 5]) expect(result).not.toContain(`${secret}${n}`);
+    expect(result).toContain(`x-api-key: ${REDACTED_EVENT_VALUE}`);
+    expect(result).toContain(`Authorization: ${REDACTED_EVENT_VALUE}`);
+    expect(result).toContain("Path=/");
+    expect(result).toContain("retries: 3");
+    expect(redactSensitiveText(result)).toBe(result);
+  });
+
+  it("keeps plain-text labels and failure phrases that only look like header names", () => {
+    const input = [
+      "Login URL: https://login.example.test/device",
+      "tokens used: 1234",
+      "Token usage: 5 of 10",
+      "Usage limit reached. Resets at 4pm (UTC). Retry-After: 120",
+      "Error: spawn agent-cli ENOENT",
+      "Missing API key: no credentials configured",
+    ].join("\n");
+
+    expect(redactSensitiveText(input)).toBe(input);
+  });
+
   it("redacts raw and escaped quote-delimited authorization values without leaking nested content", () => {
     const cases = [
       {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  EXIT_CAUSE_LAST_LINE_MAX_CHARS,
   EXIT_CAUSE_STDERR_MAX_CHARS,
   EXIT_CAUSE_STDERR_MAX_LINES,
   describeProcessExit,
@@ -9,21 +10,32 @@ const failed = { exitCode: 1, signal: null } as const;
 // Built at runtime so the source holds no secret-shaped literal.
 const FAKE_KEY = ["fixture", "Key", "Value", "0123"].join("");
 const pemMarker = (edge: "BEGIN" | "END") => `${"-".repeat(5)}${edge} PRIVATE KEY${"-".repeat(5)}`;
-const TAIL_HEADER = "Agent exited with code 1. Last lines of stderr:\n";
+const TAIL_HEADER = "\nLast lines of stderr:\n";
+const LONE_SURROGATE_RE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
 describe("describeProcessExit", () => {
-  it("keeps a one-line stderr on the exit line", () => {
+  it("puts a one-line stderr on the exit line, with no tail below", () => {
     expect(describeProcessExit("Agent", { ...failed, stderr: "\nError: 401 Unauthorized\n\n" })).toBe(
       "Agent exited with code 1: Error: 401 Unauthorized",
     );
   });
 
-  it("puts a longer stderr below the exit line, without blank lines", () => {
+  it("puts the last stderr line on the first line and the tail below it", () => {
     const stderr = "Warning: no input received on stdin\n\n  Error: 401 Unauthorized  \n";
 
     expect(describeProcessExit("Agent", { ...failed, stderr })).toBe(
-      `${TAIL_HEADER}Warning: no input received on stdin\nError: 401 Unauthorized`,
+      `Agent exited with code 1: Error: 401 Unauthorized${TAIL_HEADER}Warning: no input received on stdin\nError: 401 Unauthorized`,
     );
+  });
+
+  it("cuts a long last line on the first line and keeps it whole in the tail", () => {
+    const longLine = `Error: ${"x".repeat(300)}`;
+
+    const [first, header, tail] = describeProcessExit("Agent", { ...failed, stderr: longLine }).split("\n");
+
+    expect(first).toBe(`Agent exited with code 1: ${longLine.slice(0, EXIT_CAUSE_LAST_LINE_MAX_CHARS - 1)}…`);
+    expect(header).toBe("Last lines of stderr:");
+    expect(tail).toBe(longLine);
   });
 
   it("names the signal and the transport error code when there is no exit code", () => {
@@ -64,25 +76,29 @@ describe("describeProcessExit", () => {
     const message = describeProcessExit("Agent", { ...failed, stderr });
 
     expect(message).not.toContain("MIIEvQ");
-    expect(message).toBe(`${TAIL_HEADER}***REDACTED***\nError: bad key`);
+    expect(message).toBe(`Agent exited with code 1: Error: bad key${TAIL_HEADER}***REDACTED***\nError: bad key`);
   });
 
   it("keeps at most the line bound and marks the cut", () => {
     const stderr = Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join("\n");
 
-    const tail = describeProcessExit("Agent", { ...failed, stderr }).slice(TAIL_HEADER.length);
+    const message = describeProcessExit("Agent", { ...failed, stderr });
+    const tail = message.slice(message.indexOf(TAIL_HEADER) + TAIL_HEADER.length);
 
+    expect(message.startsWith("Agent exited with code 1: line 50\n")).toBe(true);
     expect(tail.split("\n")).toHaveLength(EXIT_CAUSE_STDERR_MAX_LINES);
     expect(tail.startsWith("…line 31\n")).toBe(true);
     expect(tail.endsWith("line 50")).toBe(true);
   });
 
-  it("keeps whole characters when the character cut lands inside a surrogate pair", () => {
-    const message = describeProcessExit("Agent", { ...failed, stderr: `${"😀".repeat(1500)}x` });
+  it("keeps whole characters when a cut lands inside a surrogate pair", () => {
+    const [first, , tail] = describeProcessExit("Agent", { ...failed, stderr: `${"😀".repeat(1500)}x` }).split("\n");
 
-    const tail = message.slice("Agent exited with code 1: …".length);
-    expect(tail.length).toBeLessThanOrEqual(EXIT_CAUSE_STDERR_MAX_CHARS);
-    expect(tail).toMatch(/^😀/u);
-    expect(tail.endsWith("x")).toBe(true);
+    expect(first!.endsWith("😀…")).toBe(true);
+    expect(first).not.toMatch(LONE_SURROGATE_RE);
+    expect(tail!.startsWith("…😀")).toBe(true);
+    expect(tail!.length).toBeLessThanOrEqual(EXIT_CAUSE_STDERR_MAX_CHARS + 1);
+    expect(tail).not.toMatch(LONE_SURROGATE_RE);
+    expect(tail!.endsWith("x")).toBe(true);
   });
 });

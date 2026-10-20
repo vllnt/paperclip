@@ -20,19 +20,24 @@ subscription quota exhaustion merely because ACP labels them `limit`.
 ## Failure messages
 
 When a CLI run fails, the run's error message says how the Claude process
-ended. It reads only structural facts, never the wording of one message:
+ended. It reads only structural facts, never the wording of one message. One
+fact goes on each line, and the first line carries the cause, because
+single-line views such as the Inbox show only that line:
 
 - `Timed out after <n>s`, when Paperclip stopped the process at its timeout.
 - The result error, when Claude's stream-json output reported one.
 - The exit line: the exit code, the signal, and the transport error code when
-  one applies, for example `Claude exited with signal SIGKILL`.
-- The end of stderr: at most the last 20 lines and 2048 characters, without
-  blank lines. A one-line tail stays on the exit line. A longer tail goes below
-  `... Last lines of stderr:`. A leading `…` marks a cut tail.
+  one applies, then the last non-empty stderr line (cut to 200 characters), for
+  example `Claude exited with code 1: Error: 401 Unauthorized`.
+- When stderr holds more than that line, `Last lines of stderr:` and the end of
+  stderr: at most the last 20 lines and 2048 characters, without blank lines. A
+  leading `…` marks a cut tail.
 
 Secret-shaped text (API keys, bearer tokens, `key=value` secrets, URL
-passwords, PEM blocks) is redacted before the tail is cut. The run still keeps
-the full stderr excerpt and log. The shared helper is `describeProcessExit` in
+passwords, PEM blocks) is redacted before any cut. The server redacts the
+stored error message of every adapter again with its own text redaction, which
+also covers header forms such as `x-api-key: <value>`. The run still keeps the
+full stderr excerpt and log. The shared helper is `describeProcessExit` in
 `@paperclipai/adapter-utils/process-exit-cause`, so other local adapters can
 use the same message.
 

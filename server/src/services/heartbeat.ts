@@ -28148,16 +28148,18 @@ export function heartbeatService(
           usageBasis: adapterResult.usageBasis ?? null,
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
+        // Only the stored copy is redacted. The outcome, the error code and the
+        // quota reclassification above already read the adapter's raw result.
         const runErrorMessage =
           outcome === "cancelled"
-            ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
+            ? redactSensitiveText(redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions))
             : outcome === "succeeded"
               ? null
-              : redactCurrentUserText(
+              : redactSensitiveText(redactCurrentUserText(
                   adapterResult.errorMessage ??
                     (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
                   currentUserRedactionOptions,
-                );
+                ));
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
         const runErrorCode =
@@ -28288,7 +28290,7 @@ export function heartbeatService(
                   ? {
                       backgroundTaskStopped: true,
                       backgroundTaskStopWarning: adapterResult.errorMessage
-                        ? redactCurrentUserText(adapterResult.errorMessage, currentUserRedactionOptions)
+                        ? redactSensitiveText(redactCurrentUserText(adapterResult.errorMessage, currentUserRedactionOptions))
                         : null,
                     }
                   : {}),

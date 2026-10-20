@@ -359,6 +359,20 @@ const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
   "gi",
 );
+// An HTTP-header-style secret with an unquoted value, as a CLI prints it to
+// stderr: `x-api-key: <value>`, `Cookie: <value>`, `Authorization: token <value>`.
+// The name must start a word and end in a secret word; it is narrower than the
+// field-name pattern, so plain-text labels such as `Login URL:` stay visible.
+// An optional auth scheme word is redacted with the value, so `token <value>`
+// never keeps the value visible.
+const HEADER_SECRET_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|token|secrets?|password|passwd|credentials?|cookie|authorization|private[-_]?key|jwt)`;
+const HEADER_SECRET_FIELD_TEXT_RE = new RegExp(
+  String.raw`((?:^|[\s{,;(])${HEADER_SECRET_NAME_PATTERN}[ \t]*:[ \t]*)` +
+    String.raw`(?!["'\\]|\*\*\*REDACTED\*\*\*)(?:(?:basic|bearer|digest|token)[ \t]+)?[^\s"'` +
+    "`" +
+    String.raw`,;}\])]+`,
+  "gim",
+);
 const SECRET_TEXT_HINTS = [
   "api",
   "key",
@@ -1023,7 +1037,8 @@ export function redactSensitiveText(input: string): string {
       .replace(
         ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
         `$1${REDACTED_EVENT_VALUE}$2`,
-      ),
+      )
+      .replace(HEADER_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}`),
     REDACTED_EVENT_VALUE,
   );
 }
