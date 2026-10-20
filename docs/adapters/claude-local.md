@@ -37,6 +37,10 @@ because single-line views such as the Inbox show only that line:
   than 2048 characters loses its end. A leading `…` marks that earlier lines
   were left out.
 
+Every cut ends at the end of a word and drops the partial word, so the server
+can still mask a registered secret value: it masks a value only where the value
+is whole.
+
 A failed run that exited with a non-zero code or a signal always gets this
 text, also when Claude's result event reported success.
 
@@ -44,8 +48,9 @@ The adapter returns this text as `errorDetail`. Its short `errorMessage` stays
 as before, and failure classification (error codes, quota cooldowns, recovery)
 keeps reading the short message. The run keeps it in `resultJson.errorSummary`.
 Prompts that quote a run error, and the "Failure summary" row of a stranded-run
-notice, get the short one-line message (prompts cap it at 500 characters). The
-run page and the Inbox show the full stored error.
+notice, get the stored error collapsed to one line, so its first line, which
+carries the cause, comes first (prompts cap it at 500 characters). The run page
+and the Inbox show the full stored error.
 
 The helper redacts before it cuts the tail, and it bounds the text it redacts.
 It masks secret-shaped text (API keys, bearer tokens, `key=value` secrets, JSON
@@ -64,7 +69,11 @@ stores it, with the same header rules from
 `@paperclipai/adapter-utils/command-redaction`. It first masks the values of the
 run's registered env and secret bindings (a value of 4 or more characters, so an
 exit code is never masked), then applies its own text redaction. It cuts the
-stored error at 8 KB, after the redaction, and the cut keeps the first line. The
+stored error at 8 KiB, after the redaction, and the cut keeps the first line.
+The text redaction is slow on a long unbroken run and an adapter's error can be
+megabytes long, so it reads only the first 12 KiB (the 8 KiB bound and a 4 KiB
+margin). For a longer error, the margin is dropped again before the cut, so a
+secret that the 12 KiB window splits never reaches the stored copy. The
 run still keeps the full stderr excerpt and log. The shared helper is
 `describeProcessExit` in `@paperclipai/adapter-utils/process-exit-cause`, so
 other local adapters can use the same message.

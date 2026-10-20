@@ -44,7 +44,9 @@ function redact(text: string): string {
  * line, the message ends with the stderr tail: blank lines dropped, at most the last
  * {@link EXIT_CAUSE_STDERR_MAX_LINES} lines and {@link EXIT_CAUSE_STDERR_MAX_CHARS} characters, and
  * a leading `…` when earlier lines were left out. The result error is cut to
- * {@link EXIT_CAUSE_RESULT_ERROR_MAX_CHARS} characters.
+ * {@link EXIT_CAUSE_RESULT_ERROR_MAX_CHARS} characters. Every cut ends at the end of a word and
+ * drops the partial word: the server masks a run's registered secret values only where they are
+ * whole, so a cut inside one would leave its start visible.
  *
  * Stderr and the result error are redacted with the full diagnostic rules
  * (`redactDiagnosticText`), but only the end of stderr: the last whole lines that fit in
@@ -165,6 +167,13 @@ function stderrTail(lines: string[], cutEarlier: boolean): string {
 
 function cutEnd(text: string, max: number): string {
   if (text.length <= max) return text;
+  let end = max - 1;
   // Never end on half of a surrogate pair: JSONB rejects it.
-  return `${text.slice(0, max - 1).replace(/[\ud800-\udbff]$/, "")}…`;
+  if (/[\ud800-\udbff]/.test(text.charAt(end - 1))) end -= 1;
+  // Never end inside a word. The server masks a run's registered secret values only where they
+  // are whole, so a cut inside one would leave its start visible. The cut drops the partial word.
+  if (/\S/.test(text.charAt(end))) {
+    while (end > 0 && /\S/.test(text.charAt(end - 1))) end -= 1;
+  }
+  return `${text.slice(0, end).trimEnd()}…`;
 }

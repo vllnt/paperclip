@@ -36,14 +36,45 @@ describe("describeProcessExit", () => {
     );
   });
 
-  it("cuts a long last line on the first line and keeps it whole in the tail", () => {
-    const longLine = `Error: ${"x".repeat(300)}`;
+  it("cuts a long last line on the first line at a word end and keeps it whole in the tail", () => {
+    const longLine = `Error: ${"lost connection ".repeat(20).trim()}`;
 
     const [first, header, tail] = describeProcessExit("Agent", { ...failed, stderr: longLine }).split("\n");
 
-    expect(first).toBe(`Agent exited with code 1: ${longLine.slice(0, EXIT_CAUSE_LAST_LINE_MAX_CHARS - 1)}…`);
+    expect(first!.startsWith("Agent exited with code 1: Error: lost connection lost")).toBe(true);
+    expect(first!.endsWith(" connection…")).toBe(true);
+    expect(first!.length).toBeLessThanOrEqual("Agent exited with code 1: ".length + EXIT_CAUSE_LAST_LINE_MAX_CHARS);
     expect(header).toBe("Last lines of stderr:");
     expect(tail).toBe(longLine);
+  });
+
+  // The server masks a run's registered env values after this message is built, and only where a
+  // value is whole. A cut inside an opaque value would keep its start, which no rule recognizes.
+  it("drops the partial word at the exit line cut, so no start of an opaque value stays visible", () => {
+    const opaque = ["opaque", "Bound", "Value", "x7Qm2Lp9Zr4Kt8Wn3Vb6Hy1Jc5Fd0"].join("");
+    const lead = `request to the service failed ${"while reading the response ".repeat(6)}`.slice(0, 180);
+    const line = `${lead} ${opaque} please check the service`;
+
+    const message = describeProcessExit("Agent", { ...failed, stderr: `Warning: something\n${line}\n` });
+    const [first] = message.split("\n");
+
+    expect(first!.endsWith("…")).toBe(true);
+    expect(first).not.toContain(opaque.slice(0, 6));
+    // The tail keeps the line whole, so the server can mask the whole value there.
+    expect(message.slice(message.indexOf(TAIL_HEADER) + TAIL_HEADER.length)).toContain(opaque);
+  });
+
+  it("drops the partial word at the stderr tail cut, so no start of an opaque value stays visible", () => {
+    const opaque = ["opaque", "Tail", "Value", "x7Qm2Lp9Zr4Kt8Wn3Vb6Hy1Jc5Fd0"].join("");
+    const lead = "while reading the response ".repeat(100).slice(0, EXIT_CAUSE_STDERR_MAX_CHARS - 20);
+    const line = `${lead} ${opaque} please check the service`;
+
+    const message = describeProcessExit("Agent", { ...failed, stderr: `Error: older\n${line}\n` });
+    const tail = message.slice(message.indexOf(TAIL_HEADER) + TAIL_HEADER.length);
+
+    expect(tail.endsWith("…")).toBe(true);
+    expect(tail.length).toBeLessThanOrEqual(EXIT_CAUSE_STDERR_MAX_CHARS + 1);
+    expect(message).not.toContain(opaque.slice(0, 6));
   });
 
   it("names the signal and the transport error code when there is no exit code", () => {
@@ -100,7 +131,7 @@ describe("describeProcessExit", () => {
   });
 
   it("keeps the start of an over-long line and whole characters when the cut lands inside a surrogate pair", () => {
-    const [first, , tail] = describeProcessExit("Agent", { ...failed, stderr: `${"😀".repeat(1500)}x` }).split("\n");
+    const [first, , tail] = describeProcessExit("Agent", { ...failed, stderr: `${"😀😀😀 ".repeat(600)}x` }).split("\n");
 
     expect(first!.endsWith("😀…")).toBe(true);
     expect(first).not.toMatch(LONE_SURROGATE_RE);
@@ -169,13 +200,13 @@ describe("describeProcessExit", () => {
   });
 
   it("keeps the start of a last line that is over the window, and marks the lines before it", () => {
-    const stderr = `Error: older\nError: ${"y".repeat(EXIT_CAUSE_SCAN_WINDOW_CHARS * 2)}`;
+    const stderr = `Error: older\nError: ${"yyyy ".repeat(EXIT_CAUSE_SCAN_WINDOW_CHARS / 2)}`;
 
     const [first, header, tail] = describeProcessExit("Agent", { ...failed, stderr }).split("\n");
 
-    expect(first!.startsWith("Agent exited with code 1: Error: yyy")).toBe(true);
+    expect(first!.startsWith("Agent exited with code 1: Error: yyyy yyyy")).toBe(true);
     expect(header).toBe("Last lines of stderr:");
-    expect(tail!.startsWith("…Error: yyy")).toBe(true);
+    expect(tail!.startsWith("…Error: yyyy yyyy")).toBe(true);
     expect(tail!.length).toBeLessThanOrEqual(EXIT_CAUSE_STDERR_MAX_CHARS + 1);
   });
 
@@ -206,19 +237,20 @@ describe("describeProcessExit", () => {
       const elapsed = performance.now() - started;
 
       expect(elapsed).toBeLessThan(SCAN_BUDGET_MS);
-      expect(message.startsWith("Run failed. ")).toBe(true);
+      // The run is one word, so the cut drops it whole.
+      expect(message.startsWith("Run failed.…")).toBe(true);
       expect(message.length).toBeLessThan(EXIT_CAUSE_RESULT_ERROR_MAX_CHARS + 2 * EXIT_CAUSE_STDERR_MAX_CHARS + 500);
     });
   });
 
   it("cuts the result error and keeps its start", () => {
-    const resultError = `Run failed: ${"e".repeat(10_000)}`;
+    const resultError = `Run failed: ${"error ".repeat(2_000)}`;
 
     const [first, ...rest] = describeProcessExit("Agent", { exitCode: 0, signal: null, stderr: "" }, { resultError }).split("\n");
 
     expect(rest).toEqual([]);
     expect(first!.length).toBeLessThanOrEqual(EXIT_CAUSE_RESULT_ERROR_MAX_CHARS);
-    expect(first!.startsWith("Run failed: eee")).toBe(true);
+    expect(first!.startsWith("Run failed: error error")).toBe(true);
     expect(first!.endsWith("…")).toBe(true);
   });
 
