@@ -25,3 +25,5 @@ owner who must act on it; do not require writes to the parent.
 
 Honor existing authorization and approval boundaries. Use Paperclip's planning
 mechanics when approval is required; decomposition does not create new approval gates.
+
+For a recurring workflow (a standing process that runs many times, a lane), use `paperclip-designing-lanes` if it is installed.

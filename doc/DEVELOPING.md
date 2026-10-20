@@ -665,6 +665,12 @@ pnpm test
 pnpm test:watch
 ```
 
+`pnpm test:run` is the grouped and sharded runner that CI uses
+(`scripts/run-vitest-stable.mjs`). It starts one Vitest process for each project
+or serialized suite. A failing process does not stop the run. The runner starts
+every remaining process, then prints a list of the failed processes and exits
+with the exit code of the first failure.
+
 Browser suites stay separate:
 
 ```sh

@@ -579,8 +579,9 @@ test("a failed chat child fails the job after its sibling finishes", { skip: pro
       env: { ...process.env, PATH: `${directory}${path.delimiter}${process.env.PATH}`,
         PAPERCLIP_TEST_DATABASE_URL: "", PAPERCLIP_CI_PROFILE: "false" },
     });
-    assert.equal(result.status, 1, result.stdout + result.stderr);
-    assert.match(result.stderr, /failed \(7\)/);
+    // The first failed invocation's exit code is the run's exit code.
+    assert.equal(result.status, 7, result.stdout + result.stderr);
+    assert.match(result.stderr, /chat integration test shard \(exit 7\)/);
     assert.equal(readFileSync(receipt, "utf8"), "finished", "a failed worker must not abandon its sibling");
   } finally {
     rmSync(directory, { recursive: true, force: true });

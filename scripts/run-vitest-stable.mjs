@@ -75,6 +75,7 @@ const additionalSerializedServerTests = new Set([
   "server/src/__tests__/routines-e2e.test.ts",
 ]);
 let invocationIndex = 0;
+const failedInvocations = [];
 const serializedModeName = "serialized";
 const generalModeName = "general";
 const allModeName = "all";
@@ -445,10 +446,30 @@ async function runVitest(args, label, testShard = null) {
     });
     child.once("error", reject);
     child.once("close", (code, signal) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${label} failed (${signal ?? code})`));
+      if (code !== 0) {
+        // Keep going: one red invocation must not hide the ones after it. The
+        // summary at the end of the run lists every failure and sets the exit code.
+        failedInvocations.push({
+          label,
+          exitCode: code ?? 1,
+          outcome: signal ? `signal ${signal}` : `exit ${code}`,
+        });
+      }
+      resolve();
     });
   });
+}
+
+function reportFailedInvocations() {
+  if (failedInvocations.length === 0) {
+    return;
+  }
+  console.error(`\n[test:run] ${failedInvocations.length} of ${invocationIndex} Vitest invocations failed:`);
+  for (const { label, outcome } of failedInvocations) {
+    console.error(`[test:run]   ${label} (${outcome})`);
+  }
+  // The first failure sets the exit code, as the old exit-on-first-failure did.
+  process.exitCode = failedInvocations[0].exitCode;
 }
 
 async function runGeneralSuites(routeTests) {
@@ -687,3 +708,5 @@ try {
   console.error(`[test:run] ${error.message}`);
   process.exitCode = 1;
 }
+
+reportFailedInvocations();
