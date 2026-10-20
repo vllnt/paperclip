@@ -660,6 +660,14 @@ export type RoutineConcurrencyPolicy = (typeof ROUTINE_CONCURRENCY_POLICIES)[num
 export const ROUTINE_CATCH_UP_POLICIES = ["skip_missed", "enqueue_missed_with_cap"] as const;
 export type RoutineCatchUpPolicy = (typeof ROUTINE_CATCH_UP_POLICIES)[number];
 
+/**
+ * Where a routine's queued runs stand when their agent claims its next run.
+ * `normal` keeps the agent's queue order; `first` offers the routine's runs
+ * before the agent's other queued runs, so they take the next free slot.
+ */
+export const ROUTINE_SLOT_PRIORITIES = ["normal", "first"] as const;
+export type RoutineSlotPriority = (typeof ROUTINE_SLOT_PRIORITIES)[number];
+
 export const ROUTINE_ACTIVITY_GATE_POLICIES = ["always", "require_external_activity"] as const;
 export type RoutineActivityGatePolicy = (typeof ROUTINE_ACTIVITY_GATE_POLICIES)[number];
 

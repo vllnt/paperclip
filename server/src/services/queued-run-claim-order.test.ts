@@ -21,7 +21,7 @@ function run(id: string, waitedMs: number, issue: Partial<QueuedRunIssueFacts> |
     id,
     createdAt: new Date(NOW.getTime() - waitedMs),
     scheduledRetryAt,
-    issue: issue ? { priority: "medium", inProgress: false, dependencyReady: true, ...issue } : null,
+    issue: issue ? { priority: "medium", inProgress: false, dependencyReady: true, routineRunsFirst: false, ...issue } : null,
   };
 }
 
@@ -74,6 +74,42 @@ describe("orderQueuedRunsForClaim", () => {
       run("todo-older", 10 * MINUTE, { priority: "medium" }),
       run("in-progress-newer", 1 * MINUTE, { priority: "medium", inProgress: true }),
     ])).toEqual(["in-progress-newer", "todo-older"]);
+  });
+
+  describe("routine slot priority", () => {
+    it("starts a routine run set to first before older, aged and more urgent work", () => {
+      expect(order([
+        run("critical-old", 4 * STEP, { priority: "critical", inProgress: true }),
+        run("high-aged", 2 * STEP, { priority: "high" }),
+        run("routine-tick", MINUTE, { priority: "low", routineRunsFirst: true }),
+        run("no-issue", 3 * STEP, null),
+      ])).toEqual(["routine-tick", "critical-old", "no-issue", "high-aged"]);
+    });
+
+    it("keeps the usual order among several routine runs set to first", () => {
+      expect(order([
+        run("first-low-new", MINUTE, { priority: "low", routineRunsFirst: true }),
+        run("first-high", 2 * MINUTE, { priority: "high", routineRunsFirst: true }),
+        run("first-low-old", 3 * MINUTE, { priority: "low", routineRunsFirst: true }),
+        run("medium", 4 * MINUTE, { priority: "medium" }),
+      ])).toEqual(["first-high", "first-low-old", "first-low-new", "medium"]);
+    });
+
+    it("still starts a dependency-blocked routine run last", () => {
+      expect(order([
+        run("blocked-routine", 5 * MINUTE, { priority: "critical", routineRunsFirst: true, dependencyReady: false }),
+        run("low", MINUTE, { priority: "low" }),
+      ])).toEqual(["low", "blocked-routine"]);
+    });
+
+    it("leaves the order unchanged for a routine at the default", () => {
+      const queue = [
+        run("routine-tick", MINUTE, { priority: "medium" }),
+        run("medium-old", 2 * MINUTE, { priority: "medium" }),
+        run("high", MINUTE, { priority: "high" }),
+      ];
+      expect(order(queue)).toEqual(["high", "medium-old", "routine-tick"]);
+    });
   });
 
   describe("aging", () => {

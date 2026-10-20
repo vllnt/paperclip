@@ -9,6 +9,7 @@ import {
   heartbeatRuns,
   issueComments,
   issues,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -103,7 +104,12 @@ describeEmbeddedPostgres("heartbeat queued-run priority order", () => {
   // seeded up front so a finished run needs no follow-up.
   async function insertIssueRun(
     ids: { companyId: string; agentId: string },
-    issue: { priority: string; status: "todo" | "in_progress" },
+    issue: {
+      priority: string;
+      status: "todo" | "in_progress";
+      /** A routine's execution or step issue, as the routine's dispatch creates it. */
+      origin?: { kind: "routine_execution" | "routine_step"; routineId: string };
+    },
     createdAt: Date,
   ) {
     const issueId = randomUUID();
@@ -117,6 +123,7 @@ describeEmbeddedPostgres("heartbeat queued-run priority order", () => {
       priority: issue.priority,
       assigneeAgentId: ids.agentId,
       responsibleUserId: "responsible-user",
+      ...(issue.origin ? { originKind: issue.origin.kind, originId: issue.origin.routineId } : {}),
     });
     await db.insert(agentWakeupRequests).values({
       id: wakeupRequestId,
@@ -149,6 +156,20 @@ describeEmbeddedPostgres("heartbeat queued-run priority order", () => {
       body: "Done.",
     });
     return { runId, issueId };
+  }
+
+  async function insertRoutine(ids: { companyId: string; agentId: string }, slotPriority: "normal" | "first") {
+    const [routine] = await db
+      .insert(routines)
+      .values({
+        companyId: ids.companyId,
+        title: "Hourly maintenance",
+        assigneeAgentId: ids.agentId,
+        responsibleUserId: "responsible-user",
+        slotPriority,
+      })
+      .returning();
+    return routine!.id;
   }
 
   // A manual wake with no issue, like a timer heartbeat or a routine run.
@@ -255,4 +276,45 @@ describeEmbeddedPostgres("heartbeat queued-run priority order", () => {
       low.runId,
     ]);
   }, 90_000);
+
+  describe("routine slot priority", () => {
+    async function busyAgentWithRoutineTick(slotPriority: "normal" | "first") {
+      const ids = await insertAgent();
+      const routineId = await insertRoutine(ids, slotPriority);
+      const now = Date.now();
+      const agedHigh = await insertIssueRun(
+        ids,
+        { priority: "high", status: "todo" },
+        new Date(now - 2 * QUEUED_RUN_PRIORITY_AGING_STEP_MS),
+      );
+      const inProgress = await insertIssueRun(ids, { priority: "medium", status: "in_progress" }, new Date(now - 10 * MINUTE));
+      const tick = await insertIssueRun(
+        ids,
+        { priority: "medium", status: "todo", origin: { kind: "routine_execution", routineId } },
+        new Date(now - MINUTE),
+      );
+      const step = await insertIssueRun(
+        ids,
+        { priority: "low", status: "todo", origin: { kind: "routine_step", routineId } },
+        new Date(now - MINUTE / 2),
+      );
+      return { agedHigh, inProgress, tick, step };
+    }
+
+    it("starts a routine's runs at the next free slot when its slot priority is first", async () => {
+      const { agedHigh, inProgress, tick, step } = await busyAgentWithRoutineTick("first");
+
+      const order = await drainStartOrder([agedHigh.runId, inProgress.runId, tick.runId, step.runId]);
+
+      expect(order).toEqual([tick.runId, step.runId, agedHigh.runId, inProgress.runId]);
+    }, 90_000);
+
+    it("keeps today's order for a routine at the default slot priority", async () => {
+      const { agedHigh, inProgress, tick, step } = await busyAgentWithRoutineTick("normal");
+
+      const order = await drainStartOrder([agedHigh.runId, inProgress.runId, tick.runId, step.runId]);
+
+      expect(order).toEqual([agedHigh.runId, inProgress.runId, tick.runId, step.runId]);
+    }, 90_000);
+  });
 });

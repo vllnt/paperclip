@@ -34,7 +34,8 @@ POST /api/companies/{companyId}/routines
   "priority": "medium",
   "status": "active",
   "concurrencyPolicy": "coalesce_if_active",
-  "catchUpPolicy": "skip_missed"
+  "catchUpPolicy": "skip_missed",
+  "slotPriority": "normal"
 }
 ```
 
@@ -55,6 +56,7 @@ Fields:
 | `steps` | no | Ordered sub-tasks each run creates under the run's task. See [Routine Steps](#routine-steps). Default `[]` (no steps) |
 | `concurrencyPolicy` | no | Behaviour when a run fires while a previous one is still active |
 | `catchUpPolicy` | no | Behaviour for missed scheduled runs |
+| `slotPriority` | no | Where the routine's runs wait in the agent's queue: `normal` (default) or `first` |
 
 **Concurrency policies:**
 
@@ -70,6 +72,15 @@ Fields:
 |-------|-----------|
 | `skip_missed` (default) | Missed scheduled runs are dropped |
 | `enqueue_missed_with_cap` | Missed runs are enqueued up to an internal cap |
+
+**Slot priorities:**
+
+| Value | Behaviour |
+|-------|-----------|
+| `normal` (default) | The routine's runs wait in the agent's queue in the usual order (issue priority, then age) |
+| `first` | When the agent has a free run slot, the routine's queued runs (on its run task and step sub-tasks) start before the agent's other queued runs. Runs whose issue has unresolved blockers still go last |
+
+The slot priority is queue tuning, not routine content: changing it does not create a revision, and restoring a revision leaves it as it is.
 
 ## Update Routine
 

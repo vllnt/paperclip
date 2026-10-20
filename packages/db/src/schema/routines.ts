@@ -1,4 +1,4 @@
-import type { TransientRetryPolicy } from "@paperclipai/shared";
+import type { RoutineSlotPriority, TransientRetryPolicy } from "@paperclipai/shared";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
@@ -66,6 +66,8 @@ export const routines = pgTable(
     gate: jsonb("gate").$type<RoutineGate>(),
     runContextPolicy: jsonb("run_context_policy").$type<RunContextPolicy>(),
     transientRetryPolicy: jsonb("transient_retry_policy").$type<TransientRetryPolicy>().notNull().default({}),
+    /** `normal` or `first`; see `ROUTINE_SLOT_PRIORITIES`. Not versioned in revisions. */
+    slotPriority: text("slot_priority").$type<RoutineSlotPriority>().notNull().default("normal"),
     latestRevisionId: uuid("latest_revision_id"),
     latestRevisionNumber: integer("latest_revision_number").notNull().default(1),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),

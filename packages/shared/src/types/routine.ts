@@ -12,6 +12,7 @@ import type {
   RoutineActivityGateScope,
   RoutineCatchUpPolicy,
   RoutineConcurrencyPolicy,
+  RoutineSlotPriority,
   RoutineStatus,
   RoutineTriggerKind,
   RoutineTriggerSigningMode,
@@ -93,6 +94,12 @@ export interface Routine {
   activityGatePolicy: string;
   activityGateScope: string;
   transientRetryPolicy?: TransientRetryPolicy;
+  /**
+   * Where the routine's queued runs stand when their agent claims its next
+   * run; see `ROUTINE_SLOT_PRIORITIES`. Operational tuning, not versioned in
+   * revisions. Absent means `normal`.
+   */
+  slotPriority?: RoutineSlotPriority;
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];

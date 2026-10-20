@@ -20,6 +20,8 @@ export type QueuedRunIssueFacts = {
   priority: string | null | undefined;
   inProgress: boolean;
   dependencyReady: boolean;
+  /** The issue belongs to a routine run whose routine's slot priority is `first`. */
+  routineRunsFirst: boolean;
 };
 
 type QueuedRunTiming = {
@@ -62,6 +64,7 @@ function rank(run: QueuedRunTiming, issue: QueuedRunIssueFacts | null, now: Date
   const baseLevel = issue ? priorityLevel(issue.priority) : DEFAULT_PRIORITY_LEVEL;
   return {
     blocked: issue ? !issue.dependencyReady : false,
+    first: issue?.routineRunsFirst ?? false,
     level: Math.max(0, baseLevel - agingSteps),
     aged: agingSteps > 0,
     inProgress: issue?.inProgress ?? false,
@@ -72,10 +75,11 @@ function rank(run: QueuedRunTiming, issue: QueuedRunIssueFacts | null, now: Date
 /**
  * The order in which an agent's queued runs are offered to the claim:
  * 1. runs whose issue still has unresolved blockers go last;
- * 2. higher effective priority first (issue priority, raised one level per aging step);
- * 3. at equal effective priority, a run that has aged starts before a fresh one,
+ * 2. runs of a routine whose slot priority is `first` go before the rest;
+ * 3. higher effective priority first (issue priority, raised one level per aging step);
+ * 4. at equal effective priority, a run that has aged starts before a fresh one,
  *    and fresh runs of in-progress issues start before other fresh runs;
- * 4. then the run that has waited longest first, measured like aging.
+ * 5. then the run that has waited longest first, measured like aging.
  */
 export function orderQueuedRunsForClaim<T extends QueuedRunTiming>(
   runs: readonly T[],
@@ -86,6 +90,7 @@ export function orderQueuedRunsForClaim<T extends QueuedRunTiming>(
     .map((run) => ({ run, rank: rank(run, issueOf(run), now) }))
     .sort((a, b) =>
       Number(a.rank.blocked) - Number(b.rank.blocked) ||
+      Number(b.rank.first) - Number(a.rank.first) ||
       a.rank.level - b.rank.level ||
       Number(b.rank.aged) - Number(a.rank.aged) ||
       (a.rank.aged ? 0 : Number(b.rank.inProgress) - Number(a.rank.inProgress)) ||

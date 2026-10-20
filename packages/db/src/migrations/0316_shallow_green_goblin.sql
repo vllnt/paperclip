@@ -1,0 +1,1 @@
+ALTER TABLE "routines" ADD COLUMN "slot_priority" text DEFAULT 'normal' NOT NULL;

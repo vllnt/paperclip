@@ -10,6 +10,7 @@ import {
   ROUTINE_ACTIVITY_GATE_SCOPES,
   ROUTINE_CATCH_UP_POLICIES,
   ROUTINE_CONCURRENCY_POLICIES,
+  ROUTINE_SLOT_PRIORITIES,
   ROUTINE_STATUSES,
   ROUTINE_TRIGGER_KINDS,
   ROUTINE_TRIGGER_SIGNING_MODES,
@@ -134,6 +135,8 @@ export const createRoutineSchema = z.object({
   gate: routineGateSchema.optional().nullable(),
   runContextPolicy: runContextPolicySchema.optional().nullable(),
   transientRetryPolicy: transientRetryPolicySchema.optional(),
+  /** Unset means `normal`: the agent's queue order. */
+  slotPriority: z.enum(ROUTINE_SLOT_PRIORITIES).optional(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
