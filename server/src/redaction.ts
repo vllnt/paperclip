@@ -1,5 +1,9 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
-import { isPublicExecutorToolSelector, looksLikeCredentialJwt } from "@paperclipai/adapter-utils/command-redaction";
+import {
+  isPublicExecutorToolSelector,
+  looksLikeCredentialJwt,
+  redactHeaderSecretText,
+} from "@paperclipai/adapter-utils/command-redaction";
 import { hasCredentialKeyName, redactSecretShapedText } from "@paperclipai/adapter-utils/log-value-redaction";
 
 const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
@@ -358,31 +362,6 @@ const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
 const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
   "gi",
-);
-// An HTTP-header-style secret with an unquoted value, as a CLI prints it to
-// stderr: `x-api-key: <value>`, `x-auth-key=<value>`, `Authorization: token
-// <value>`. The name must start a word and either be an `x-…-key` header or
-// end in a secret word; it is narrower than the field-name pattern, so
-// plain-text labels such as `Login URL:` stay visible. An optional auth scheme
-// word is redacted with the value, so `token <value>` never keeps the value
-// visible.
-const HEADER_SECRET_NAME_PATTERN = String.raw`(?:x-[A-Za-z0-9-]+-key|[A-Za-z0-9_-]*(?:api[-_]?key|token|secrets?|password|passwd|credentials?|authorization|private[-_]?key|jwt))`;
-const HEADER_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:^|[\s{,;(])${HEADER_SECRET_NAME_PATTERN}[ \t]*[:=][ \t]*)` +
-    String.raw`(?!["'\\]|\*\*\*REDACTED\*\*\*)(?:(?:basic|bearer|digest|token)[ \t]+)?[^\s"'` +
-    "`" +
-    String.raw`,;}\])]+`,
-  "gim",
-);
-// A cookie header holds several `name=value` pairs split by `;` and spaces
-// (`Cookie: a=S1; b=S2`, `Set-Cookie: id=S1; Path=/`), so the rule above would
-// stop after the first pair. A cookie value is redacted to the end of the line.
-// It also matches a value an earlier rule already masked, so a masked first
-// pair never hides the pairs after it. The replacement equals the match for an
-// already redacted line, so the rule is idempotent.
-const COOKIE_HEADER_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:^|[\s{,;(])[A-Za-z0-9_-]*cookie[ \t]*[:=][ \t]*)(?!["'\\])[^\r\n]+`,
-  "gim",
 );
 const SECRET_TEXT_HINTS = [
   "api",
@@ -1043,14 +1022,15 @@ export function redactSensitiveText(input: string): string {
   const masked = redactSecretShapedText(input);
   if (!maybeContainsSecretText(masked)) return masked;
   return redactCommandText(
-    redactStandaloneBearerCredentials(redactAuthorizationCredentials(masked))
-      .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
-      .replace(
-        ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
-        `$1${REDACTED_EVENT_VALUE}$2`,
-      )
-      .replace(COOKIE_HEADER_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}`)
-      .replace(HEADER_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}`),
+    redactHeaderSecretText(
+      redactStandaloneBearerCredentials(redactAuthorizationCredentials(masked))
+        .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
+        .replace(
+          ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
+          `$1${REDACTED_EVENT_VALUE}$2`,
+        ),
+      REDACTED_EVENT_VALUE,
+    ),
     REDACTED_EVENT_VALUE,
   );
 }

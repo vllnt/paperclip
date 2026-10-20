@@ -7,6 +7,8 @@ export const EXIT_CAUSE_STDERR_MAX_LINES = 20;
 export const EXIT_CAUSE_STDERR_MAX_CHARS = 2048;
 /** The most characters of the last stderr line that the exit line shows. */
 export const EXIT_CAUSE_LAST_LINE_MAX_CHARS = 200;
+/** The most characters of the result error that an exit cause keeps. */
+export const EXIT_CAUSE_RESULT_ERROR_MAX_CHARS = 2048;
 
 /** The fields of a finished process that an exit cause reads. */
 export interface ProcessExitFacts {
@@ -32,8 +34,13 @@ function redact(text: string): string {
  * line, cut to {@link EXIT_CAUSE_LAST_LINE_MAX_CHARS} characters. When stderr holds more than that
  * line, the message ends with the stderr tail: blank lines dropped, at most the last
  * {@link EXIT_CAUSE_STDERR_MAX_LINES} lines and {@link EXIT_CAUSE_STDERR_MAX_CHARS} characters, and
- * a leading `…` when it was cut. Stderr and the result error are redacted before any cut, so a
- * secret that spans lines (a PEM block) or a cut is never left half visible.
+ * a leading `…` when earlier lines were left out. The result error is cut to
+ * {@link EXIT_CAUSE_RESULT_ERROR_MAX_CHARS} characters.
+ *
+ * Stderr and the result error are redacted before any cut, with the full diagnostic rules
+ * (`redactDiagnosticText`), so a secret that spans lines (a PEM block) is never left half visible.
+ * A cut never separates a secret's name from its value: the tail starts at the start of a line, and
+ * an over-long line loses its end, never its start.
  *
  * @param label - The program name that the message shows, for example `Claude`.
  * @param proc - The finished process.
@@ -65,7 +72,9 @@ export function describeProcessExit(
 
   const lines = [
     extra.timeoutSec != null ? `Timed out after ${extra.timeoutSec}s` : null,
-    extra.resultError?.trim() ? redact(extra.resultError.trim()) : null,
+    extra.resultError?.trim()
+      ? cutEnd(redact(extra.resultError.trim()), EXIT_CAUSE_RESULT_ERROR_MAX_CHARS)
+      : null,
   ].filter((line): line is string => Boolean(line));
   // A clean exit with no stderr adds nothing to a reported error.
   const exitSaysMore = proc.exitCode !== 0 || Boolean(proc.signal) || Boolean(proc.errorCode) || Boolean(lastLine);
@@ -77,13 +86,19 @@ export function describeProcessExit(
 }
 
 function stderrTail(lines: string[]): string {
-  let tail = lines.slice(-EXIT_CAUSE_STDERR_MAX_LINES).join("\n");
-  const cut = lines.length > EXIT_CAUSE_STDERR_MAX_LINES || tail.length > EXIT_CAUSE_STDERR_MAX_CHARS;
-  if (tail.length > EXIT_CAUSE_STDERR_MAX_CHARS) {
-    // Never start the tail with half of a surrogate pair: JSONB rejects it.
-    tail = tail.slice(-EXIT_CAUSE_STDERR_MAX_CHARS).replace(/^[\udc00-\udfff]/, "").trimStart();
+  // Whole lines from the end, newest first. The tail never starts inside a line: a cut that
+  // starts inside `x-api-key: <value>` would leave the value with no name to recognize.
+  const kept: string[] = [];
+  let size = 0;
+  for (let index = lines.length - 1; index >= 0 && kept.length < EXIT_CAUSE_STDERR_MAX_LINES; index -= 1) {
+    const next = size + lines[index].length + (kept.length > 0 ? 1 : 0);
+    if (kept.length > 0 && next > EXIT_CAUSE_STDERR_MAX_CHARS) break;
+    kept.unshift(lines[index]);
+    size = next;
   }
-  return cut ? `…${tail}` : tail;
+  // One line over the budget keeps its start and loses its end.
+  const tail = cutEnd(kept.join("\n"), EXIT_CAUSE_STDERR_MAX_CHARS);
+  return kept.length < lines.length ? `…${tail}` : tail;
 }
 
 function cutEnd(text: string, max: number): string {

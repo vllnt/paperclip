@@ -468,6 +468,30 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
     expect(run.error).toContain("Usage limit reached. Resets at 4pm (UTC).");
   });
 
+  it("cuts an over-long error detail at the run error bound, keeps its first line and splits no character", async () => {
+    const { agentId, issueId } = await seed();
+    const first = "Agent exited with code 1: out of memory";
+    mockAdapterExecute.mockImplementation(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: first,
+      errorDetail: `${first}\nLast lines of stderr:\n${"😀".repeat(20_000)}`,
+      errorCode: "adapter_failed",
+      provider: "test",
+      model: "test-model",
+    }));
+
+    const run = await runOnce(agentId, issueId);
+
+    expect(run.status).toBe("failed");
+    expect(run.error!.length).toBeLessThanOrEqual(8 * 1024);
+    expect(run.error!.startsWith(`${first}\nLast lines of stderr:\n😀`)).toBe(true);
+    expect(run.error!.endsWith("😀…")).toBe(true);
+    expect(run.error).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/);
+    expect(run.resultJson).toMatchObject({ errorSummary: first });
+  });
+
   it("redacts the run's registered env values from every stored copy of the error, even a value with no secret shape", async () => {
     // An opaque value has no recognizable shape, so only the registered-value rule can mask it.
     const opaque = ["plain", "words", "only", "7loaded"].join("-");

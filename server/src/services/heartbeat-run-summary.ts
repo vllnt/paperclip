@@ -23,8 +23,8 @@ export const HEARTBEAT_RUN_ERROR_FOR_MODEL_MAX_CHARS = 500;
  */
 export function readRunErrorSummary(run: { error: string | null; resultJson?: unknown }): string | null {
   const resultJson = run.resultJson;
-  const summary = resultJson && typeof resultJson === "object" && !Array.isArray(resultJson)
-    ? (resultJson as Record<string, unknown>).errorSummary
+  const summary = typeof resultJson === "object" && resultJson !== null && "errorSummary" in resultJson
+    ? resultJson.errorSummary
     : null;
   return typeof summary === "string" && summary.length > 0 ? summary : run.error;
 }

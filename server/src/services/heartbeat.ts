@@ -37,7 +37,7 @@ import {
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
-import { hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, truncateAtGrapheme, type ExecutionBlocker } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
@@ -766,6 +766,10 @@ const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
 // not a credential. Masking it everywhere would rewrite the exit code in the
 // stored run error ("exited with code 1").
 const MIN_RUN_ERROR_SECRET_VALUE_CHARS = 4;
+// The most characters of an error that a run stores. The error text lands in the run row, the
+// wakeup, the agent's error reason and the live events, so an adapter's detail never grows them
+// without bound. The cut ends the text and keeps its first line, which carries the cause.
+const MAX_RUN_ERROR_CHARS = 8 * 1024;
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -28152,12 +28156,17 @@ export function heartbeatService(
         const failureSecretValues = readFailureReportSecrets().filter(
           (value) => value.length >= MIN_RUN_ERROR_SECRET_VALUE_CHARS,
         );
+        // The cut comes after the redaction: a cut before it could leave half of a secret that
+        // no rule recognizes.
         const redactRunError = (text: string) =>
-          redactSensitiveText(
-            redactCurrentUserText(
-              redactRunFailureSecretValues(text, failureSecretValues),
-              currentUserRedactionOptions,
+          truncateAtGrapheme(
+            redactSensitiveText(
+              redactCurrentUserText(
+                redactRunFailureSecretValues(text, failureSecretValues),
+                currentUserRedactionOptions,
+              ),
             ),
+            MAX_RUN_ERROR_CHARS,
           );
         // Classifiers read the adapter's short errorMessage. A failed run stores
         // the adapter's fuller errorDetail when it has one, and keeps the short

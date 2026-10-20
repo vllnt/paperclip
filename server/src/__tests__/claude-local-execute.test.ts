@@ -2164,6 +2164,32 @@ describe("claude execute failure exit cause", () => {
     );
   });
 
+  it("keeps the stderr tail when the output does not parse and the exit is clean", async () => {
+    const closed = "Error: the output stream closed before a result event";
+    const result = await runFailingClaude({ stderr: `${WARNING}${closed}\n`, end: 0 });
+
+    expect(result).toMatchObject({ exitCode: 0, signal: null, errorMessage: "Failed to parse claude JSON output" });
+    expect(result.errorDetail).toBe(
+      `Failed to parse claude JSON output\nClaude exited with code 0: ${closed}${TAIL}${WARNING}${closed}`,
+    );
+  });
+
+  it("names a non-zero exit after a result event that reported success", async () => {
+    const resultEvent = {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Done.",
+      session_id: "11111111-1111-4111-8111-111111111111",
+    };
+    const crash = "Error: the process crashed while it shut down";
+    const result = await runFailingClaude({ stdout: `${JSON.stringify(resultEvent)}\n`, stderr: `${WARNING}${crash}\n`, end: 1 });
+
+    // The server marks the run failed because of the exit code, with no message from the adapter.
+    expect(result).toMatchObject({ exitCode: 1, errorMessage: null });
+    expect(result.errorDetail).toBe(`Claude exited with code 1: ${crash}${TAIL}${WARNING}${crash}`);
+  });
+
   it("reports the timeout with the signal and the stderr tail", async () => {
     const result = await runFailingClaude(
       { stderr: `${WARNING}Retrying request (attempt 7/10) after a connection error\n`, end: "hang" },

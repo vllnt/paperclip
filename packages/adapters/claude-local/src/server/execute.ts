@@ -1090,8 +1090,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: proc.signal,
         timedOut: false,
         errorMessage: fallbackErrorMessage,
-        // A signal kill has no exit code, but it is still a failed exit.
-        errorDetail: (proc.exitCode ?? 0) === 0 && !proc.signal ? null : describeProcessExit("Claude", proc),
+        // Output that does not parse is a failure whatever the exit code, so the detail always
+        // carries the stderr tail. A clean exit has no exit line of its own to name the cause, so
+        // the parse failure leads. A signal kill has no exit code; the exit line names the signal.
+        errorDetail: describeProcessExit("Claude", proc, {
+          resultError: (proc.exitCode ?? 0) === 0 && !proc.signal ? fallbackErrorMessage : null,
+        }),
         errorCode,
         errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
@@ -1263,7 +1267,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: proc.signal,
       timedOut: false,
       errorMessage,
-      errorDetail: failed ? describeProcessExit("Claude", proc, { resultError: parsedFailure }) : null,
+      // The server marks a run failed when the exit code is not zero or a signal ended the process,
+      // even when the result event reported success, so the detail covers those exits too.
+      errorDetail: failed || (proc.exitCode ?? 0) !== 0 || proc.signal
+        ? describeProcessExit("Claude", proc, { resultError: parsedFailure })
+        : null,
       errorCode: resolvedErrorCode,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,

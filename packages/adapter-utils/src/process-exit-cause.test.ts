@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   EXIT_CAUSE_LAST_LINE_MAX_CHARS,
+  EXIT_CAUSE_RESULT_ERROR_MAX_CHARS,
   EXIT_CAUSE_STDERR_MAX_CHARS,
   EXIT_CAUSE_STDERR_MAX_LINES,
   describeProcessExit,
@@ -10,6 +11,8 @@ const failed = { exitCode: 1, signal: null } as const;
 // Built at runtime so the source holds no secret-shaped literal.
 const FAKE_KEY = ["fixture", "Key", "Value", "0123"].join("");
 const pemMarker = (edge: "BEGIN" | "END") => `${"-".repeat(5)}${edge} PRIVATE KEY${"-".repeat(5)}`;
+// Built at runtime so the source holds no secret-shaped literal.
+const FAKE_HEADER_VALUE = ["opaque", "Header", "Value", "8f3k2m9q7z"].join("");
 const TAIL_HEADER = "\nLast lines of stderr:\n";
 const LONE_SURROGATE_RE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
@@ -91,14 +94,65 @@ describe("describeProcessExit", () => {
     expect(tail.endsWith("line 50")).toBe(true);
   });
 
-  it("keeps whole characters when a cut lands inside a surrogate pair", () => {
+  it("keeps the start of an over-long line and whole characters when the cut lands inside a surrogate pair", () => {
     const [first, , tail] = describeProcessExit("Agent", { ...failed, stderr: `${"😀".repeat(1500)}x` }).split("\n");
 
     expect(first!.endsWith("😀…")).toBe(true);
     expect(first).not.toMatch(LONE_SURROGATE_RE);
-    expect(tail!.startsWith("…😀")).toBe(true);
-    expect(tail!.length).toBeLessThanOrEqual(EXIT_CAUSE_STDERR_MAX_CHARS + 1);
+    expect(tail!.startsWith("😀")).toBe(true);
+    expect(tail!.endsWith("😀…")).toBe(true);
+    expect(tail!.length).toBeLessThanOrEqual(EXIT_CAUSE_STDERR_MAX_CHARS);
     expect(tail).not.toMatch(LONE_SURROGATE_RE);
-    expect(tail!.endsWith("x")).toBe(true);
+  });
+
+  it("starts the tail at the start of a line, so a cut never drops half of a line", () => {
+    const older = `older ${"a".repeat(1500)}`;
+    const newer = `newer ${"b".repeat(1500)}`;
+
+    const message = describeProcessExit("Agent", { ...failed, stderr: `${older}\n${newer}\n` });
+    const tail = message.slice(message.indexOf(TAIL_HEADER) + TAIL_HEADER.length);
+
+    expect(tail).toBe(`…${newer}`);
+  });
+
+  it("keeps the first line of the tail whole while the lines before it fit", () => {
+    const a = `a ${"x".repeat(1000)}`;
+    const b = `b ${"y".repeat(1000)}`;
+
+    const message = describeProcessExit("Agent", { ...failed, stderr: `${a}\n${b}\n` });
+
+    expect(message.endsWith(`${TAIL_HEADER}${a}\n${b}`)).toBe(true);
+  });
+
+  it("cuts the result error and keeps its start", () => {
+    const resultError = `Run failed: ${"e".repeat(10_000)}`;
+
+    const [first, ...rest] = describeProcessExit("Agent", { exitCode: 0, signal: null, stderr: "" }, { resultError }).split("\n");
+
+    expect(rest).toEqual([]);
+    expect(first!.length).toBeLessThanOrEqual(EXIT_CAUSE_RESULT_ERROR_MAX_CHARS);
+    expect(first!.startsWith("Run failed: eee")).toBe(true);
+    expect(first!.endsWith("…")).toBe(true);
+  });
+
+  // The tail cut must never separate the name of a credential header from its value. A header
+  // line sits before a filler line, and the filler line grows one character at a time so the cut
+  // lands on every offset of the header line.
+  describe.each([
+    ["an x-…-key header", `x-api-key: ${FAKE_HEADER_VALUE}`],
+    ["an x-…-key assignment", `x-auth-key=${FAKE_HEADER_VALUE}`],
+    ["a Basic authorization header", `Authorization: Basic ${FAKE_HEADER_VALUE}`],
+    ["a cookie header", `Cookie: sid=${FAKE_HEADER_VALUE}; theme=dark`],
+  ])("with %s next to the stderr cut", (_name, header) => {
+    it("never keeps any part of the value", () => {
+      for (let fill = EXIT_CAUSE_STDERR_MAX_CHARS - 150; fill <= EXIT_CAUSE_STDERR_MAX_CHARS + 50; fill += 1) {
+        const message = describeProcessExit("Agent", { ...failed, stderr: `${header}\n${"f".repeat(fill)}\n` });
+
+        // Any run of the value that is long enough to be a credential on its own.
+        for (let at = 0; at + 6 <= FAKE_HEADER_VALUE.length; at += 1) {
+          expect(message, `fill ${fill}`).not.toContain(FAKE_HEADER_VALUE.slice(at, at + 6));
+        }
+      }
+    });
   });
 });
