@@ -9,6 +9,8 @@ import {
 } from "./adapters/postgres.js";
 import {
   claimDeferredWakeExamination,
+  closeDeferredWake,
+  coalesceParkedSignalWakesIntoRun,
   getDeferredWakeAgentStats,
   getDeferredWakeParkedBreakdown,
   listOrphanedDeferredWakes,
@@ -66,16 +68,19 @@ export {
 } from "./domain/self-reblock-wake.js";
 export type { SelfReblockWakeMarker } from "./domain/self-reblock-wake.js";
 export {
+  COALESCIBLE_PARKED_WAKE_REASONS,
   DEFERRED_WAKE_SWEEP_BATCH_LIMIT,
+  DEFERRED_WAKE_SWEEP_MAX_PER_AGENT_PER_PASS,
   DEFERRED_WAKE_SWEEP_MAX_PER_PASS,
   DEFERRED_WAKE_SWEEP_MIN_AGE_MS,
   DEFERRED_WAKE_SWEEP_RECHECK_MS,
   compareDeferredWakes,
+  decideDeferredWakeDisposition,
   issuePriorityRank,
   selectDeferredWakesToPromote,
   sweepPromotionBudget,
 } from "./domain/deferred-wake-sweep.js";
-export type { OrphanedDeferredWake } from "./domain/deferred-wake-sweep.js";
+export type { DeferredWakeDisposition, OrphanedDeferredWake } from "./domain/deferred-wake-sweep.js";
 export type {
   DeferredWakeAgentStats,
   DeferredWakeParkedBreakdown,
@@ -163,6 +168,13 @@ export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
     },
     claimDeferredWakeExamination(input: Parameters<typeof claimDeferredWakeExamination>[1]) {
       return claimDeferredWakeExamination(db, input);
+    },
+    /** Pass `tx` to close the wake inside the caller's transaction. */
+    closeDeferredWake(input: Parameters<typeof closeDeferredWake>[1], tx: Db = db) {
+      return closeDeferredWake(tx, input);
+    },
+    coalesceParkedSignalWakesIntoRun(input: Parameters<typeof coalesceParkedSignalWakesIntoRun>[1]) {
+      return coalesceParkedSignalWakesIntoRun(db, input);
     },
     getDeferredWakeAgentStats(input: Parameters<typeof getDeferredWakeAgentStats>[1]) {
       return getDeferredWakeAgentStats(db, input);

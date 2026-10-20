@@ -5,6 +5,7 @@ import { SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY } from "../domain/self-reblock-wak
 import { DEFERRED_WAKE_SWEEP_BATCH_LIMIT, type OrphanedDeferredWake } from "../domain/deferred-wake-sweep.js";
 
 const DEFERRED_WAKE_STATUS = "deferred_issue_execution";
+const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const PROMOTED_WAKE_REASON = "issue_execution_promoted";
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 /** A closed task is not revived by an old parked wake. */
@@ -30,7 +31,24 @@ export type OrphanedDeferredWakeRow = OrphanedDeferredWake & {
   observedUpdatedAt: Date;
   /** The issue's project, which scopes a project budget hard stop. */
   projectId: string | null;
+  /** The issue's current assignee, which decides whether an assignee wake is superseded. */
+  issueAssigneeAgentId: string | null;
+  /** The reason the wake was requested for: the parked context's `wakeReason`, else the row's reason. */
+  wakeReason: string | null;
+  /** The wake delivers saved input, so it never expires; see `carriesSavedInput`. */
+  carriesSavedInput: boolean;
 };
+
+/**
+ * A wake that delivers saved input: a comment (`commentId` or a non-empty
+ * parked `wakeCommentIds`) or a message held for execution recovery
+ * (`executionWait`). Such a wake is never expired or folded into another run.
+ */
+const carriesSavedInput = (payload: AnyPgColumn) => sql<boolean>`(
+  ${payload} -> 'executionWait' is not null
+  or ${payload} ->> 'commentId' is not null
+  or coalesce(jsonb_array_length(case jsonb_typeof(${payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text -> 'wakeCommentIds') when 'array' then ${payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text -> 'wakeCommentIds' end), 0) > 0
+)`;
 
 /** `payload.issueId` as a uuid, or null when it is not one, so the join can use the issue primary key. */
 const wakeIssueId = sql`(case when ${agentWakeupRequests.payload} ->> 'issueId' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' then (${agentWakeupRequests.payload} ->> 'issueId')::uuid end)`;
@@ -78,6 +96,9 @@ export async function listOrphanedDeferredWakes(
       issueId: issues.id,
       issuePriority: issues.priority,
       projectId: issues.projectId,
+      issueAssigneeAgentId: issues.assigneeAgentId,
+      wakeReason: sql<string | null>`coalesce(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ->> 'wakeReason', ${agentWakeupRequests.reason})`,
+      carriesSavedInput: carriesSavedInput(agentWakeupRequests.payload),
     })
     .from(agentWakeupRequests)
     .innerJoin(
@@ -272,6 +293,73 @@ export async function claimDeferredWakeExamination(
     )
     .returning({ id: agentWakeupRequests.id });
   return claimed.length > 0;
+}
+
+/**
+ * Closes one parked wake the sweep will not run (expired or superseded) with
+ * the existing terminal status `cancelled` and its reason. The status
+ * predicate makes it a no-op when another writer already moved the wake.
+ *
+ * @returns Whether this call closed the wake.
+ */
+export async function closeDeferredWake(
+  db: Db,
+  input: { companyId: string; wakeId: string; error: string; now: Date },
+): Promise<boolean> {
+  const closed = await db
+    .update(agentWakeupRequests)
+    .set({ status: "cancelled", error: input.error, finishedAt: input.now, updatedAt: input.now })
+    .where(
+      and(
+        eq(agentWakeupRequests.id, input.wakeId),
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+      ),
+    )
+    .returning({ id: agentWakeupRequests.id });
+  return closed.length > 0;
+}
+
+/**
+ * Folds an agent's other parked signal wakes on one issue into the run a
+ * promoted wake just queued, as admission folds parked comment wakes: status
+ * `coalesced`, linked to that run. Only wakes that carry nothing but their
+ * reason qualify: one of `reasons`, no queued comments, no recovery wait, and
+ * not owned by another recovery. Wakes with comments keep their own delivery.
+ *
+ * @returns The folded wakes.
+ */
+export async function coalesceParkedSignalWakesIntoRun(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    runId: string;
+    reasons: readonly string[];
+    now: Date;
+  },
+): Promise<Array<{ id: string }>> {
+  if (input.reasons.length === 0) return [];
+  return db
+    .update(agentWakeupRequests)
+    .set({ status: "coalesced", runId: input.runId, finishedAt: input.now, updatedAt: input.now })
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
+        lte(agentWakeupRequests.requestedAt, input.now),
+        notOwnedByOtherRecovery(agentWakeupRequests),
+        sql`not ${carriesSavedInput(agentWakeupRequests.payload)}`,
+        sql`coalesce(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ->> 'wakeReason', ${agentWakeupRequests.reason}) in (${sql.join(
+          input.reasons.map((reason) => sql`${reason}`),
+          sql`, `,
+        )})`,
+      ),
+    )
+    .returning({ id: agentWakeupRequests.id });
 }
 
 export type DeferredWakeParkedBreakdown = {

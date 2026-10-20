@@ -48,6 +48,11 @@ export interface InstanceGeneralSettings {
    * Linking itself is always on. Absent = off.
    */
   gitStatusAutomation?: boolean;
+  /**
+   * Hours a parked (deferred) wake may wait before the deferred-wake sweep
+   * expires it instead of starting a run, 1 to 720. Absent = 24.
+   */
+  deferredWakeMaxAgeHours?: number;
 }
 
 export interface InstanceExperimentalSettings {

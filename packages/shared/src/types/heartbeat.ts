@@ -390,6 +390,12 @@ export interface DeferredWakeSweepCounters {
   promoted: number;
   /** Retired by admission instead of started (for example, skipped as final). */
   retired: number;
+  /** Parked longer than the instance's deferred-wake max age: closed with a reason, never run. */
+  expired: number;
+  /** An assignee wake for an agent that no longer holds the issue: closed with a reason, never run. */
+  superseded: number;
+  /** Duplicate parked wakes of the same agent and issue folded into a promoted wake's run. */
+  coalesced: number;
   /** Left parked after admission declined to start them yet. */
   stillDeferred: number;
   /** Not woken: a pause hold, an execution blocker or an operator Stop. The sum of the three below. */
@@ -403,7 +409,11 @@ export interface DeferredWakeSweepCounters {
   /** Not woken: a company, agent or project budget hard stop. */
   skippedBudget: number;
   skippedNotInvokable: number;
-  /** Issues with an eligible wake that a pass left for later: no free agent slot, or the per-pass cap. */
+  /**
+   * Issues with an eligible wake that a pass left for a later pass: the per-pass
+   * or per-agent cap. A busy agent no longer holds a wake back; the wake joins
+   * the agent's queue and waits there for a free run slot.
+   */
   skippedCapacity: number;
   /** Execution blockers behind `skippedExecutionBlocker`, counted by their cause. */
   executionBlockerCauses: Record<string, number>;

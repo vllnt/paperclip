@@ -5,8 +5,9 @@
 // Several paths clear the lock without that drain (the stale-lock sweeper, the
 // claim-time stale-run cancel, a reaped holder). A wake parked behind one of
 // them is orphaned: nothing will ever promote it. The sweep finds those wakes
-// and re-drives them. This file only orders and budgets the candidates; the
-// caller reads the database and applies the hold checks.
+// and re-drives them. This file decides which candidates may still run, then
+// orders and budgets them; the caller reads the database and applies the hold
+// checks.
 
 /** A deferred wake must be parked this long before the periodic sweep touches it. */
 export const DEFERRED_WAKE_SWEEP_MIN_AGE_MS = 2 * 60 * 1000;
@@ -20,10 +21,83 @@ export const DEFERRED_WAKE_SWEEP_BATCH_LIMIT = 100;
  * (30 seconds apart by default) instead of one burst of runs and holds checks.
  */
 export const DEFERRED_WAKE_SWEEP_MAX_PER_PASS = 20;
+/**
+ * Upper bound on one agent's wakes re-delivered per pass, so one agent's
+ * backlog cannot fill a pass and the other agents' wakes still move.
+ */
+export const DEFERRED_WAKE_SWEEP_MAX_PER_AGENT_PER_PASS = 3;
 
 /** A caller may ask for fewer wakes per pass, never for more than the cap. */
 export function sweepPromotionBudget(requested?: number): number {
   return Math.max(0, Math.min(requested ?? DEFERRED_WAKE_SWEEP_MAX_PER_PASS, DEFERRED_WAKE_SWEEP_MAX_PER_PASS));
+}
+
+/**
+ * Wake reasons that address the agent as the issue's assignee. Such a wake for
+ * an agent that no longer holds the issue is superseded: the new assignee got
+ * its own wake. Mentions, review and approval requests are not in this set,
+ * because they address an agent that need not be the assignee.
+ */
+const ASSIGNEE_WAKE_REASONS: ReadonlySet<string> = new Set([
+  "issue_assigned",
+  "issue_commented",
+  "issue_reopened_via_comment",
+  "issue_continuation_needed",
+]);
+
+/**
+ * Wake reasons that only signal "look at this issue again". When one wake of
+ * an agent on an issue is promoted, the agent's other parked wakes on that
+ * issue with one of these reasons (and no queued comments) add nothing the
+ * promoted run will not see, so they are folded into its run.
+ */
+export const COALESCIBLE_PARKED_WAKE_REASONS: readonly string[] = [
+  "issue_assigned",
+  "issue_continuation_needed",
+  "issue_status_changed",
+  "issue_children_completed",
+  "issue_blockers_resolved",
+];
+
+export type DeferredWakeDisposition =
+  /** Re-deliver it through ordinary admission. */
+  | "promote"
+  /** Parked longer than the max age: close it with a reason, never run it. */
+  | "expired"
+  /** An assignee wake for an agent that no longer holds the issue: close it, never run it. */
+  | "superseded";
+
+export type DeferredWakeDispositionFacts = {
+  agentId: string;
+  requestedAt: Date;
+  /** The reason the wake was requested for (the parked context's `wakeReason`, else the row's reason). */
+  wakeReason: string | null;
+  issueAssigneeAgentId: string | null;
+  /** The wake delivers saved input: comments, or a message held for execution recovery. */
+  carriesSavedInput: boolean;
+};
+
+/**
+ * Decides whether an orphaned parked wake may still run. An old backlog must
+ * not start stale work after a deploy, so a wake parked longer than
+ * `maxAgeMs` expires and an assignee wake whose agent lost the issue is
+ * superseded. Both are closed with their reason instead of started. A wake
+ * that carries saved input never expires: dropping it would lose a message
+ * the sender was told is saved.
+ */
+export function decideDeferredWakeDisposition(
+  wake: DeferredWakeDispositionFacts,
+  input: { now: Date; maxAgeMs: number },
+): DeferredWakeDisposition {
+  if (
+    wake.wakeReason !== null &&
+    ASSIGNEE_WAKE_REASONS.has(wake.wakeReason) &&
+    wake.issueAssigneeAgentId !== wake.agentId
+  ) {
+    return "superseded";
+  }
+  if (!wake.carriesSavedInput && input.now.getTime() - wake.requestedAt.getTime() > input.maxAgeMs) return "expired";
+  return "promote";
 }
 
 const ISSUE_PRIORITY_RANK: Readonly<Record<string, number>> = {
@@ -61,17 +135,19 @@ export function compareDeferredWakes(left: OrphanedDeferredWake, right: Orphaned
  *
  * - One wake per issue, the issue's oldest: its queue drains in request order
  *   and promotes one wake at a time, so a younger wake on the same issue waits
- *   for the first one's run to release. Capacity is judged on that oldest wake;
- *   if its agent is full the issue is skipped, never served through a younger
- *   wake, because the drain would still promote the oldest.
+ *   for the first one's run to release. The per-agent cap is judged on that
+ *   oldest wake; if its agent's share of the pass is used up the issue is
+ *   skipped, never served through a younger wake.
  * - FIFO and priority-aware: the chosen wakes are ordered by `compareDeferredWakes`.
- * - Capacity: an agent receives at most its free slots. An agent absent from
- *   `freeSlotsByAgent` has none, so its wakes stay parked until a run completes.
+ * - A busy agent does not hold a wake back. Promotion queues a run, and the
+ *   agent's queue claim admits it only into a free run slot, ordered by how
+ *   long it has waited since its request. Holding it parked until a slot is
+ *   free starved it: the agent's queued runs took every freed slot first.
+ * - At most `maxTotal` wakes per pass, and at most `maxPerAgent` of one agent.
  */
 export function selectDeferredWakesToPromote<T extends OrphanedDeferredWake>(
   candidates: readonly T[],
-  freeSlotsByAgent: ReadonlyMap<string, number>,
-  options: { maxTotal?: number } = {},
+  options: { maxTotal?: number; maxPerAgent?: number } = {},
 ): T[] {
   const oldestByIssue = new Map<string, T>();
   for (const candidate of candidates) {
@@ -85,13 +161,14 @@ export function selectDeferredWakesToPromote<T extends OrphanedDeferredWake>(
     }
   }
 
-  const remainingSlots = new Map(freeSlotsByAgent);
+  const maxPerAgent = options.maxPerAgent ?? DEFERRED_WAKE_SWEEP_MAX_PER_AGENT_PER_PASS;
+  const selectedByAgent = new Map<string, number>();
   const selected: T[] = [];
   for (const candidate of [...oldestByIssue.values()].sort(compareDeferredWakes)) {
     if (options.maxTotal !== undefined && selected.length >= options.maxTotal) break;
-    const slots = remainingSlots.get(candidate.agentId) ?? 0;
-    if (slots <= 0) continue;
-    remainingSlots.set(candidate.agentId, slots - 1);
+    const taken = selectedByAgent.get(candidate.agentId) ?? 0;
+    if (taken >= maxPerAgent) continue;
+    selectedByAgent.set(candidate.agentId, taken + 1);
     selected.push(candidate);
   }
   return selected;

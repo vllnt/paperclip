@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   orderQueuedRunsForClaim,
   QUEUED_RUN_PRIORITY_AGING_STEP_MS,
+  QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY,
   type QueuedRunIssueFacts,
 } from "./queued-run-claim-order.js";
 
@@ -13,8 +14,20 @@ type Run = {
   id: string;
   createdAt: Date;
   scheduledRetryAt: Date | null;
+  contextSnapshot?: Record<string, unknown> | null;
   issue: QueuedRunIssueFacts | null;
 };
+
+/** A run re-delivered from a wake that was first requested `parkedForMs` before the run was created. */
+function redelivered(id: string, waitedMs: number, parkedForMs: number, issue: Partial<QueuedRunIssueFacts> | null): Run {
+  const queued = run(id, waitedMs, issue);
+  return {
+    ...queued,
+    contextSnapshot: {
+      [QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY]: new Date(queued.createdAt.getTime() - parkedForMs).toISOString(),
+    },
+  };
+}
 
 function run(id: string, waitedMs: number, issue: Partial<QueuedRunIssueFacts> | null, scheduledRetryAt: Date | null = null): Run {
   return {
@@ -104,6 +117,25 @@ describe("orderQueuedRunsForClaim", () => {
         run("critical-in-progress", 0, { priority: "critical", inProgress: true }),
         run("low-aged", 4 * STEP, { priority: "low" }),
       ])).toEqual(["low-aged", "critical-in-progress"]);
+    });
+
+    it("serves a re-delivered parked wake before younger queued work: first come, first served", () => {
+      // The wake was requested 3 hours ago and sat parked; it was just queued.
+      // The other run was queued 20 minutes ago. Without the request time it
+      // would start last and keep waiting behind every newer queued run.
+      expect(order([
+        run("queued-20-min-ago", 20 * MINUTE, { priority: "medium" }),
+        redelivered("parked-3-hours", 0, 3 * 60 * MINUTE, { priority: "medium" }),
+      ])).toEqual(["parked-3-hours", "queued-20-min-ago"]);
+    });
+
+    it("ignores a parked request time that is missing, invalid or not before the run's creation", () => {
+      const invalid = { ...run("invalid", 0, { priority: "medium" }), contextSnapshot: { [QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY]: "not-a-date" } };
+      const future = {
+        ...run("future", 0, { priority: "medium" }),
+        contextSnapshot: { [QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY]: new Date(NOW.getTime() + STEP).toISOString() },
+      };
+      expect(order([invalid, future, run("waited", MINUTE, { priority: "medium" })])).toEqual(["waited", "future", "invalid"]);
     });
 
     it("counts a promoted scheduled retry's wait from when it became due", () => {

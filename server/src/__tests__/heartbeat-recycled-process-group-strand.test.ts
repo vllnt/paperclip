@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -483,7 +483,7 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
     expect(after!.updatedAt.getTime()).toBeGreaterThan(before!.updatedAt.getTime());
   });
 
-  it("records one held entry for a wake that waits on a full agent", async () => {
+  it("queues a wake for a full agent instead of keeping it parked, so it waits for the slot in the queue", async () => {
     const { companyId, agentId, issueId } = await seed({ issueStatus: "todo", process: "none" });
     // The agent's one run slot is taken by a run on another task.
     await db.insert(heartbeatRuns).values({
@@ -495,12 +495,17 @@ describeEmbeddedPostgres("a finished run whose process group id was recycled", (
     await heartbeat.sweepDeferredWakes({ recheckMs: 0 });
     await heartbeat.sweepDeferredWakes({ recheckMs: 0 });
 
-    expect((await parkedWakes(companyId)).map((wake) => wake.id)).toEqual([wakeId]);
-    expect(await heldNotes(companyId)).toEqual([{
-      entityId: issueId, details: expect.objectContaining({ wakeId, reason: "no_free_run_slot" }),
-    }]);
+    // The wake left the parked set and its run waits in the queue: the slot is
+    // still taken, so nothing runs over the agent's concurrency.
+    expect(await parkedWakes(companyId)).toEqual([]);
+    const issueRuns = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`));
+    expect(issueRuns).toEqual([{ status: "queued" }]);
+    const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(after!.status).not.toBe("deferred_issue_execution");
+    expect(await heldNotes(companyId)).toEqual([]);
     await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
-      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "running")));
+      .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["running", "queued"])));
   });
 
   // The sweep ages a wake by requested_at. For the wakes it reads (not durable
