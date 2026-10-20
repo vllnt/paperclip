@@ -1,16 +1,28 @@
 import { isIPv6 } from "node:net";
 import crypto from "node:crypto";
-import { and, asc, desc, eq, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   eventDeliveries,
   eventSources,
+  issueLabels,
+  issues,
+  labels as issueLabelRows,
   routines,
   routineTriggers,
 } from "@paperclipai/db";
 import {
+  EVENT_SOURCE_NORMALIZERS,
+  PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
+  PAPERCLIP_INTERNAL_EVENT_SOURCE,
+  PAPERCLIP_INTERNAL_EVENT_SOURCE_NAME,
+  PAPERCLIP_ISSUE_CREATED_EVENT_TYPE,
+  PAPERCLIP_ISSUE_EVENT_MAX_LABELS,
   matchesEvent,
+  paperclipIssueLabelEventKey,
+  sanitizeEventSingleLine,
   validateEventSourceNormalizerConfig,
+  type EventSourceNormalizer,
   type CreateEventSource,
   type EventDelivery,
   type EventDeliveryPage,
@@ -36,6 +48,7 @@ import { routineService } from "../routines.js";
 import { secretService } from "../secrets.js";
 import { verifyBearerAuthorization, verifyHmacSha256Signature } from "../webhook-auth.js";
 import { registerGatedEventHooks, type GatedEventSettlement } from "../routine-gates/hooks.js";
+import { hasOpenRoutineSteps } from "../routine-steps.js";
 import { previewEventRoutine } from "./event-dispatch.js";
 import { pruneEventData } from "./prune.js";
 import { normalizeEvent } from "./normalizers.js";
@@ -80,6 +93,45 @@ export function eventSourceIngressUrl(publicId: string): string {
   return baseUrl ? `${baseUrl.replace(/\/+$/, "")}${path}` : path;
 }
 
+/**
+ * The per-company source Paperclip publishes `issue.created` events to. It has no secret and no
+ * ingress: only the server publishes to it, and only `enabled` can change.
+ */
+function isInternalSource(row: { normalizer: string }): boolean {
+  return row.normalizer === PAPERCLIP_INTERNAL_EVENT_NORMALIZER;
+}
+
+function isConfigurableNormalizer(value: string): value is EventSourceNormalizer {
+  return EVENT_SOURCE_NORMALIZERS.some((normalizer) => normalizer === value);
+}
+
+const INTERNAL_SOURCE_MANAGED_MESSAGE =
+  "This event source is managed by Paperclip; only enabled can be changed, and it cannot be archived, rotated or tested";
+
+/**
+ * New tasks per hour the internal source attaches steps to before it folds the rest. Higher than the
+ * default of a source fed by an external sender: tasks are created by people and agents, not by an
+ * alert storm.
+ */
+const INTERNAL_SOURCE_MAX_NEW_ISSUES_PER_HOUR = 200;
+
+/** Longest title an `issue.created` event carries, in characters. */
+const INTERNAL_EVENT_TITLE_MAX_CHARS = 200;
+
+/** Task origins that never publish: they belong to a routine run or a conversation. */
+const UNPUBLISHED_ISSUE_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step", "chat_channel"];
+
+/** Parent origins that stop a task from publishing, so a step that creates subtasks cannot recurse. */
+const UNPUBLISHED_PARENT_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step"];
+
+/** What publishing an internal event did. */
+export interface PublishInternalResult {
+  /** True when a routine attached its steps to the task, so the caller must not wake the task's assignee. */
+  stepsAttached: boolean;
+  /** The routine runs the event started, including failed ones. */
+  routineRunIds: string[];
+}
+
 function toApiSource(row: EventSourceRow): EventSource {
   return {
     id: row.id,
@@ -88,7 +140,7 @@ function toApiSource(row: EventSourceRow): EventSource {
     enabled: row.enabled,
     archived: row.archived,
     publicId: row.publicId,
-    ingressUrl: eventSourceIngressUrl(row.publicId),
+    ingressUrl: isInternalSource(row) ? null : eventSourceIngressUrl(row.publicId),
     secretId: row.secretId,
     signingMode: row.signingMode as EventSource["signingMode"],
     replayWindowSec: row.replayWindowSec,
@@ -246,7 +298,17 @@ export function eventSourceService(
   const cache = createEventSourceCache<CachedSource>({
     now,
     loadAll: async (previous) => {
-      const rows = await db.select().from(eventSources).where(and(eq(eventSources.enabled, true), eq(eventSources.archived, false)));
+      // The internal source has no ingress: leaving it out makes its public id as unknown as any other.
+      const rows = await db
+        .select()
+        .from(eventSources)
+        .where(
+          and(
+            eq(eventSources.enabled, true),
+            eq(eventSources.archived, false),
+            ne(eventSources.normalizer, PAPERCLIP_INTERNAL_EVENT_NORMALIZER),
+          ),
+        );
       const previousById = new Map([...previous.values()].map((value) => [value.row.id, value]));
       const loaded: Array<{ publicId: string; value: CachedSource }> = [];
       for (const row of rows) {
@@ -527,7 +589,7 @@ export function eventSourceService(
     }
 
     try {
-      return await processDelivery(source, event, claim, startedAt);
+      return (await processDelivery(source, event, claim, startedAt)).result;
     } catch (err) {
       logger.error({ err, sourceId: source.id, deliveryId: claim.deliveryId }, "event delivery processing failed");
       await finishDelivery(claim, {
@@ -669,12 +731,18 @@ export function eventSourceService(
     };
   }
 
+  /** The answer to the sender, and what each routine did with the event. */
+  interface ProcessedDelivery {
+    result: IngestResult;
+    outcomes: Record<string, EventRoutineOutcome>;
+  }
+
   async function processDelivery(
     source: EventSourceRow,
     event: NormalizedEvent,
     claim: Extract<Claim, { kind: "claimed" }>,
     startedAt: number,
-  ): Promise<IngestResult> {
+  ): Promise<ProcessedDelivery> {
     const subscribers = await findSubscribers(source, event);
     const outcomes: Record<string, EventRoutineOutcome> = { ...claim.priorOutcomes };
     const triggerIds = new Set<string>();
@@ -710,9 +778,12 @@ export function eventSourceService(
     if (superseded) {
       // A newer attempt owns the delivery now; this one must not write its result.
       return {
-        status: 409,
-        body: { inProgress: true },
-        headers: { "Retry-After": String(EVENT_RETRY_AFTER_SECONDS) },
+        result: {
+          status: 409,
+          body: { inProgress: true },
+          headers: { "Retry-After": String(EVENT_RETRY_AFTER_SECONDS) },
+        },
+        outcomes,
       };
     }
 
@@ -739,9 +810,12 @@ export function eventSourceService(
       await finishDelivery(claim, { ...common, status: "failed", httpStatus: 503, error: "transient dispatch failure" });
       await touchSource(source.id, "failed");
       return {
-        status: 503,
-        body: { error: "dispatch_failed", deliveryId: claim.deliveryId, outcomes: summary },
-        headers: { "Retry-After": String(EVENT_RETRY_AFTER_SECONDS) },
+        result: {
+          status: 503,
+          body: { error: "dispatch_failed", deliveryId: claim.deliveryId, outcomes: summary },
+          headers: { "Retry-After": String(EVENT_RETRY_AFTER_SECONDS) },
+        },
+        outcomes,
       };
     }
 
@@ -752,13 +826,106 @@ export function eventSourceService(
     await finishDelivery(claim, { ...common, status, httpStatus: 202, error });
     await touchSource(source.id, status);
     return {
-      status: 202,
-      body: {
-        deliveryId: claim.deliveryId,
-        matched: subscribers.regular.length,
-        fallback: usedFallback,
-        outcomes: summary,
+      result: {
+        status: 202,
+        body: {
+          deliveryId: claim.deliveryId,
+          matched: subscribers.regular.length,
+          fallback: usedFallback,
+          outcomes: summary,
+        },
       },
+      outcomes,
+    };
+  }
+
+  // ── internal events ───────────────────────────────────────────────────────
+
+  /**
+   * The internal source of the company, when it is on and at least one event trigger listens to it.
+   * One indexed query: it is the whole cost of creating a task in a company that uses no event trigger.
+   */
+  async function findListenedInternalSource(companyId: string): Promise<EventSourceRow | null> {
+    return db
+      .select()
+      .from(eventSources)
+      .where(
+        and(
+          eq(eventSources.companyId, companyId),
+          eq(eventSources.normalizer, PAPERCLIP_INTERNAL_EVENT_NORMALIZER),
+          eq(eventSources.enabled, true),
+          eq(eventSources.archived, false),
+          sql`exists (
+            select 1 from ${routineTriggers}
+            where ${routineTriggers.eventSourceId} = ${eventSources.id}
+              and ${routineTriggers.kind} = 'event'
+              and ${routineTriggers.enabled}
+              and not ${routineTriggers.archived}
+              and not ${routineTriggers.setupPending}
+          )`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /** The `issue.created` event of a task, or null when the task never publishes. */
+  async function buildIssueCreatedEvent(companyId: string, issueId: string): Promise<NormalizedEvent | null> {
+    const issue = await db
+      .select({
+        id: issues.id,
+        title: issues.title,
+        projectId: issues.projectId,
+        parentId: issues.parentId,
+        originKind: issues.originKind,
+        hiddenAt: issues.hiddenAt,
+        conversationAgentId: issues.conversationAgentId,
+        createdByAgentId: issues.createdByAgentId,
+        createdByUserId: issues.createdByUserId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue || issue.hiddenAt || issue.conversationAgentId) return null;
+    if (issue.originKind && UNPUBLISHED_ISSUE_ORIGIN_KINDS.includes(issue.originKind)) return null;
+    if (issue.parentId) {
+      const parent = await db
+        .select({ originKind: issues.originKind })
+        .from(issues)
+        .where(and(eq(issues.id, issue.parentId), eq(issues.companyId, companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (parent?.originKind && UNPUBLISHED_PARENT_ORIGIN_KINDS.includes(parent.originKind)) return null;
+    }
+
+    const names = await db
+      .select({ name: issueLabelRows.name })
+      .from(issueLabels)
+      .innerJoin(issueLabelRows, eq(issueLabelRows.id, issueLabels.labelId))
+      .where(and(eq(issueLabels.issueId, issue.id), eq(issueLabels.companyId, companyId)));
+    const labelKeys = [
+      ...new Set(names.flatMap(({ name }) => paperclipIssueLabelEventKey(name) ?? [])),
+    ]
+      .sort()
+      .slice(0, PAPERCLIP_ISSUE_EVENT_MAX_LABELS);
+
+    const eventLabels: Record<string, string> = {};
+    if (issue.projectId) eventLabels.project = issue.projectId;
+    if (issue.createdByAgentId) eventLabels.created_by = "agent";
+    else if (issue.createdByUserId) eventLabels.created_by = "user";
+    for (const key of labelKeys) eventLabels[key] = "true";
+
+    return {
+      eventId: null,
+      source: PAPERCLIP_INTERNAL_EVENT_SOURCE,
+      type: PAPERCLIP_ISSUE_CREATED_EVENT_TYPE,
+      severity: "info",
+      state: "info",
+      dedupeKey: issue.id,
+      title: [...sanitizeEventSingleLine(issue.title)].slice(0, INTERNAL_EVENT_TITLE_MAX_CHARS).join(""),
+      summary: "",
+      labels: eventLabels,
+      occurredAt: new Date(now()).toISOString(),
+      url: null,
     };
   }
 
@@ -832,6 +999,7 @@ export function eventSourceService(
 
   async function dryRun(sourceId: string, payload: Record<string, unknown>): Promise<EventSourceDryRunResult> {
     const source = await getSourceRow(sourceId);
+    if (isInternalSource(source)) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
     const normalized = safeNormalize(source, payload, new Date(now()));
     if (!normalized.ok) {
       return { event: null, validationErrors: normalized.errors, matched: [], fallback: [], wouldBe: "invalid" };
@@ -974,6 +1142,88 @@ export function eventSourceService(
       return rows.map(toApiSource);
     },
 
+    /**
+     * Returns the company's built-in Paperclip source, creating it on the first call. Calls that race
+     * on a company take turns on an advisory lock, so there is never more than one: the table has no
+     * unique key for it.
+     * @returns the source, and whether this call created it.
+     */
+    ensureInternal: async (companyId: string, actor: EventActor): Promise<{ source: EventSource; created: boolean }> =>
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip-internal-event-source:${companyId}`}, 0))`,
+        );
+        const existing = await tx
+          .select()
+          .from(eventSources)
+          .where(and(eq(eventSources.companyId, companyId), eq(eventSources.normalizer, PAPERCLIP_INTERNAL_EVENT_NORMALIZER)))
+          .orderBy(asc(eventSources.createdAt), asc(eventSources.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) return { source: toApiSource(existing), created: false };
+        const [row] = await tx
+          .insert(eventSources)
+          .values({
+            companyId,
+            name: PAPERCLIP_INTERNAL_EVENT_SOURCE_NAME,
+            publicId: crypto.randomBytes(12).toString("hex"),
+            secretId: null,
+            normalizer: PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
+            maxNewIssuesPerHour: INTERNAL_SOURCE_MAX_NEW_ISSUES_PER_HOUR,
+            createdByAgentId: actor.agentId ?? null,
+            createdByUserId: actor.userId ?? null,
+            updatedByAgentId: actor.agentId ?? null,
+            updatedByUserId: actor.userId ?? null,
+          })
+          .returning();
+        return { source: toApiSource(row!), created: true };
+      }),
+
+    /**
+     * Publishes the `issue.created` event of a task that was just created, and runs the routines that
+     * listen to it before returning, so the caller knows whether to wake the task's assignee. It never
+     * throws: a failure is logged, recorded on the delivery, and reported as no steps attached.
+     * A company with no enabled event trigger on its internal source costs one query and writes nothing.
+     */
+    publishInternal: async (companyId: string, input: { issueId: string }): Promise<PublishInternalResult> => {
+      const nothing: PublishInternalResult = { stepsAttached: false, routineRunIds: [] };
+      let claim: Extract<Claim, { kind: "claimed" }> | null = null;
+      try {
+        const source = await findListenedInternalSource(companyId);
+        if (!source) return nothing;
+        const event = await buildIssueCreatedEvent(companyId, input.issueId);
+        if (!event) return nothing;
+        const startedAt = now();
+        const attempt = await claimDelivery(
+          source,
+          event,
+          sha256Hex(`${source.id}:${event.source}:${event.type}:${input.issueId}`),
+          null,
+          startedAt,
+        );
+        if (attempt.kind !== "claimed") return nothing;
+        claim = attempt;
+        const { outcomes } = await processDelivery(source, event, attempt, startedAt);
+        const settled = Object.values(outcomes);
+        return {
+          stepsAttached: settled.some(
+            (outcome) => outcome.status === "issue_created" && outcome.issueId === input.issueId && outcome.note === "steps_attached",
+          ),
+          routineRunIds: settled.flatMap((outcome) => outcome.runId ?? []),
+        };
+      } catch (err) {
+        logger.warn({ err, companyId, issueId: input.issueId }, "publishing an internal event failed");
+        if (!claim) return nothing;
+        await finishDelivery(claim, {
+          status: "failed",
+          error: (err instanceof Error ? err.message : String(err)).slice(0, 2000),
+        }).catch(() => undefined);
+        // A failure after the steps were attached must still keep the assignee asleep.
+        const attached = await hasOpenRoutineSteps(db, companyId, input.issueId).catch(() => false);
+        return { stepsAttached: attached, routineRunIds: [] };
+      }
+    },
+
     get: async (id: string): Promise<EventSource> => toApiSource(await getSourceRow(id)),
     find: async (id: string): Promise<EventSource | null> => {
       const row = await db.select().from(eventSources).where(eq(eventSources.id, id)).then((rows) => rows[0] ?? null);
@@ -1026,9 +1276,12 @@ export function eventSourceService(
 
     update: async (id: string, patch: UpdateEventSource, actor: EventActor): Promise<EventSource> => {
       const existing = await getSourceRow(id);
-      const nextNormalizer = (patch.normalizer ?? existing.normalizer) as EventSource["normalizer"];
+      const changesMoreThanEnabled = Object.entries(patch).some(([key, value]) => key !== "enabled" && value !== undefined);
+      if (isInternalSource(existing) && changesMoreThanEnabled) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
+      const nextNormalizer = patch.normalizer ?? existing.normalizer;
       const nextConfig = patch.normalizerConfig === undefined ? existing.normalizerConfig : patch.normalizerConfig;
       if (patch.normalizer !== undefined || patch.normalizerConfig !== undefined) {
+        if (!isConfigurableNormalizer(nextNormalizer)) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
         const error = validateEventSourceNormalizerConfig(nextNormalizer, nextConfig);
         if (error) throw unprocessable(error);
       }
@@ -1059,6 +1312,7 @@ export function eventSourceService(
     /** Soft delete: the source stops answering, its history stays. */
     archive: async (id: string, actor: EventActor): Promise<EventSource> => {
       const existing = await getSourceRow(id);
+      if (isInternalSource(existing)) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
       const [row] = await db
         .update(eventSources)
         .set({ archived: true, updatedByAgentId: actor.agentId ?? null, updatedByUserId: actor.userId ?? null, updatedAt: new Date() })
@@ -1073,6 +1327,7 @@ export function eventSourceService(
       actor: EventActor,
     ): Promise<{ source: EventSource; secretMaterial: EventSourceSecretMaterial }> => {
       const existing = await getSourceRow(id);
+      if (isInternalSource(existing)) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
       if (!existing.secretId) throw conflict("Event source has no secret to rotate");
       const secretValue = crypto.randomBytes(24).toString("hex");
       await secretsSvc.rotate(existing.secretId, { value: secretValue }, { agentId: actor.agentId ?? null, userId: actor.userId ?? null });
