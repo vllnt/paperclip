@@ -501,9 +501,14 @@ branches that cannot be read, is refused, as git refuses a lease whose remote ha
 moved: fetch, look at what is new on that branch, and run it again. A value from
 the checkout's refs for a ref that is not a branch is refused too (name the
 commit: `--force-with-lease=<ref>:<commit>`). The
-environment holds only the credential, `PATH`, the locale and what git needs, and
-none of the checkout's steering (`GIT_DIR`, `GIT_EXEC_PATH`, `GIT_TRACE*`,
-`GIT_SSH`, object and index paths); `HOME` is the private directory.
+environment holds only the credential, `PATH`, the locale, the resolver settings
+(`RES_OPTIONS`, `LOCALDOMAIN`, `HOSTALIASES`) and what git needs, and none of the
+checkout's steering (`GIT_DIR`, `GIT_EXEC_PATH`, `GIT_TRACE*`, `GIT_SSH`, object
+and index paths); `HOME` is the private directory. The resolver settings are kept
+because a host whose container DNS works only over TCP needs `RES_OPTIONS=use-vc`
+for git to find the remote. They hold no secret, and git checks the TLS
+certificate against the host in the URL, so they cannot send the credential to
+another host.
 
 The git directory it runs in is made for it, under the launcher's private
 directory. It holds nothing the push resolves: no remote, no refs, no push
