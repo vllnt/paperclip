@@ -326,6 +326,10 @@ describe("openapi routes", () => {
 
     const issueMode = paths["/api/routines/{id}/triggers"].post.requestBody.content["application/json"].schema;
     expect(JSON.stringify(issueMode)).toContain("event_issue");
+    for (const operation of [paths["/api/routines/{id}/triggers"].post, paths["/api/routine-triggers/{id}"].patch]) {
+      expect(operation.responses["403"]).toBeDefined();
+      expect(operation.description).toContain("event_issue");
+    }
 
     const run = paths["/api/routines/{id}/run"].post;
     expect(run.responses["202"]).toBeDefined();
