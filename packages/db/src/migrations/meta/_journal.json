@@ -2626,6 +2626,13 @@
       "when": 1792446794923,
       "tag": "0376_lowly_phil_sheldon",
       "breakpoints": true
+    },
+    {
+      "idx": 377,
+      "version": "7",
+      "when": 1792451328293,
+      "tag": "0377_clear_manta",
+      "breakpoints": true
     }
   ]
 }
