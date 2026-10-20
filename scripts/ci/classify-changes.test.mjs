@@ -14,6 +14,7 @@ test("docs and screenshots only is the only way to skip work", () => {
   assert.equal(pr("docs/a.md").mode, "none");
   assert.equal(pr("docs/deep/a.md", "screenshots/b.png").mode, "none");
   assert.equal(pr("docs/a.md").need_sentry, false);
+  assert.equal(pr("docs/a.md").need_perf_guards, false);
 });
 
 test("anything else is full", () => {
@@ -28,14 +29,35 @@ test("fails closed on odd input", () => {
     const result = pr(...paths);
     assert.equal(result.mode, "full", paths.join());
     assert.equal(result.need_sentry, true, paths.join());
+    assert.equal(result.need_perf_guards, true, paths.join());
   }
 });
 
-test("every other event is full with sentry", () => {
+test("every other event is full with sentry and the perf guards", () => {
   for (const event of ["push", "merge_group", "workflow_dispatch", "schedule", ""]) {
     const result = classify({ event, paths: ["docs/a.md"] });
     assert.equal(result.mode, "full", event);
     assert.equal(result.need_sentry, true, event);
+    assert.equal(result.need_perf_guards, true, event);
+  }
+});
+
+test("perf guards follow the server, the schema, shared types, dependencies and ci.yml", () => {
+  for (const changed of [
+    "server/src/routes/agents.ts",
+    "server/package.json",
+    "packages/db/src/schema/heartbeat_runs.ts",
+    "packages/db/src/migrations/0314_a.sql",
+    "packages/shared/src/index.ts",
+    "pnpm-lock.yaml",
+    "vitest.config.ts",
+    "scripts/ci/assert-vitest-ran.mjs",
+    ".github/workflows/ci.yml",
+  ]) {
+    assert.equal(pr(changed).need_perf_guards, true, changed);
+  }
+  for (const changed of ["ui/src/App.tsx", "cli/src/index.ts", "packages/adapters/claude-local/src/a.ts", "doc/DATABASE.md", "skills/a/SKILL.md", "packages/database/a.ts"]) {
+    assert.equal(pr(changed).need_perf_guards, false, changed);
   }
 });
 
@@ -70,7 +92,7 @@ test("cli reads NUL paths from stdin, prints JSON and writes GITHUB_OUTPUT", () 
     const ok = run(["--event", "pull_request"], "docs/a.md\0", { GITHUB_OUTPUT: output });
     assert.equal(ok.status, 0);
     assert.equal(JSON.parse(ok.stdout).mode, "none");
-    assert.equal(readFileSync(output, "utf8"), "mode=none\nneed_sentry=false\n");
+    assert.equal(readFileSync(output, "utf8"), "mode=none\nneed_sentry=false\nneed_perf_guards=false\n");
     assert.equal(JSON.parse(run(["--event", "pull_request"], "").stdout).mode, "full");
     assert.equal(run([], "").status, 2);
     assert.equal(run(["--event"], "").status, 2);

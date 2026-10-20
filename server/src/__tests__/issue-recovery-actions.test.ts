@@ -78,7 +78,8 @@ describe("issueRecoveryActionService", () => {
   it("does not reactivate an action resolved between the active read and update", async () => {
     const existingRow = makeRecoveryActionRow({ id: "existing-action", attemptCount: 1 });
     const createdRow = makeRecoveryActionRow({ id: "new-action", attemptCount: 1 });
-    const selectResults = [[existingRow], []];
+    // Active read, re-read after the lost update, then the source issue lock before the insert.
+    const selectResults = [[existingRow], [], [{ id: "source-1" }]];
 
     const makeSelectQuery = (rows: unknown[]) => ({
       from() {
@@ -91,6 +92,9 @@ describe("issueRecoveryActionService", () => {
         return this;
       },
       limit() {
+        return Promise.resolve(rows);
+      },
+      for() {
         return Promise.resolve(rows);
       },
     });

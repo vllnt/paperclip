@@ -15,7 +15,7 @@
 export const MODES = ["none", "affected", "full"];
 export const ALWAYS = ["scripts", "secrets"];
 // job id -> classifier output that says whether the job must run
-export const CONDITIONAL = { sentry: "need_sentry" };
+export const CONDITIONAL = { sentry: "need_sentry", "perf-guards": "need_perf_guards" };
 
 // Failing steps that belong to the runner or an action, not to the repository's own checks.
 const SETUP_STEP = /^(set up job|complete job|post |run actions\/)/i;
