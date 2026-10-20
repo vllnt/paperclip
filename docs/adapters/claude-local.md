@@ -17,6 +17,25 @@ and run log retain only the generic failure message, recovery labels, and reset
 timestamp. Context, turn, rate, and configured budget limits are not treated as
 subscription quota exhaustion merely because ACP labels them `limit`.
 
+## Failure messages
+
+When a CLI run fails, the run's error message says how the Claude process
+ended. It reads only structural facts, never the wording of one message:
+
+- `Timed out after <n>s`, when Paperclip stopped the process at its timeout.
+- The result error, when Claude's stream-json output reported one.
+- The exit line: the exit code, the signal, and the transport error code when
+  one applies, for example `Claude exited with signal SIGKILL`.
+- The end of stderr: at most the last 20 lines and 2048 characters, without
+  blank lines. A one-line tail stays on the exit line. A longer tail goes below
+  `... Last lines of stderr:`. A leading `…` marks a cut tail.
+
+Secret-shaped text (API keys, bearer tokens, `key=value` secrets, URL
+passwords, PEM blocks) is redacted before the tail is cut. The run still keeps
+the full stderr excerpt and log. The shared helper is `describeProcessExit` in
+`@paperclipai/adapter-utils/process-exit-cause`, so other local adapters can
+use the same message.
+
 ## Prerequisites
 
 - Claude Code CLI installed (`claude` command available)

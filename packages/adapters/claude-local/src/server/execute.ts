@@ -55,6 +55,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
 } from "@paperclipai/adapter-utils/server-utils";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
+import { describeProcessExit } from "@paperclipai/adapter-utils/process-exit-cause";
 import {
   parseLocalProcessFilesystemScope,
   parseLocalProcessSandboxExtraPaths,
@@ -886,6 +887,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return args;
   };
 
+  // The classifiers below were tuned on this one-line message, so they keep
+  // reading it. The run stores the fuller describeProcessExit text instead.
   const parseFallbackErrorMessage = (proc: RunProcessResult) => {
     const stderrLine =
       proc.stderr
@@ -1036,7 +1039,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: true,
-        errorMessage: `Timed out after ${timeoutSec}s`,
+        errorMessage: describeProcessExit("Claude", proc, { timeoutSec }),
         errorCode: "timeout",
         errorMeta,
         clearSession: Boolean(opts.clearSessionOnMissingSession),
@@ -1087,7 +1090,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: false,
-        errorMessage: fallbackErrorMessage,
+        // A signal kill has no exit code, but it is still a failed exit.
+        errorMessage: (proc.exitCode ?? 0) === 0 && !proc.signal
+          ? fallbackErrorMessage
+          : describeProcessExit("Claude", proc),
         errorCode,
         errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
@@ -1173,8 +1179,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
       } as Record<string, unknown>)
       : null;
-    const errorMessage = failed
-      ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
+    const parsedFailure = failed ? describeClaudeFailure(parsed) : null;
+    // The classifiers read this one-line message, unchanged. The run stores
+    // reportedErrorMessage below, which adds the exit cause.
+    const classifierMessage = failed
+      ? parsedFailure ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : stoppedLingeringBackgroundTask
       ? "Claude finished its turn successfully, but a background task it started was still running, " +
         `so Paperclip stopped the process (${proc.signal ?? `exit code ${proc.exitCode ?? -1}`}).`
@@ -1195,14 +1204,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed,
         stdout: proc.stdout,
         stderr: proc.stderr,
-        errorMessage,
+        errorMessage: classifierMessage,
       });
     const transientRetryNotBefore = providerQuota || transientUpstream
       ? extractClaudeRetryNotBefore({
           parsed,
           stdout: proc.stdout,
           stderr: proc.stderr,
-          errorMessage,
+          errorMessage: classifierMessage,
         })
       : null;
     const resolvedErrorCode = proc.errorCode
@@ -1218,7 +1227,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed,
         stdout: proc.stdout,
         stderr: proc.stderr,
-        errorMessage,
+        errorMessage: classifierMessage,
       })
       ? "model_not_found"
       : failed && clearSessionForMaxTurns
@@ -1253,11 +1262,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
     };
 
+    const reportedErrorMessage = failed
+      ? describeProcessExit("Claude", proc, { resultError: parsedFailure })
+      : classifierMessage;
+
     return {
       exitCode: proc.exitCode,
       signal: proc.signal,
       timedOut: false,
-      errorMessage,
+      errorMessage: reportedErrorMessage,
       errorCode: resolvedErrorCode,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,

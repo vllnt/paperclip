@@ -1996,3 +1996,162 @@ describe("claude execute", () => {
     }
   });
 });
+
+// A CLI stand-in that fails like a real agent CLI: it writes stderr (and
+// optional stdout), then exits with a code, dies by a signal, or hangs until
+// Paperclip's timeout stops it.
+async function writeStderrClaudeCommand(
+  commandPath: string,
+  options: { stdout?: string; stderr: string; end: number | NodeJS.Signals | "hang" },
+): Promise<void> {
+  const end = options.end === "hang"
+    ? "setInterval(() => {}, 1000)"
+    : typeof options.end === "number"
+    ? `process.exit(${options.end})`
+    : `process.kill(process.pid, ${JSON.stringify(options.end)})`;
+  const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
+process.stdout.write(${JSON.stringify(options.stdout ?? "")}, () => {
+  process.stderr.write(${JSON.stringify(options.stderr)}, () => { ${end}; });
+});
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
+describe("claude execute failure exit cause", () => {
+  const WARNING = "Warning: no input received on stdin, continuing without it\n";
+  const TAIL = "Claude exited with code 1. Last lines of stderr:\n";
+
+  async function runFailingClaude(
+    options: Parameters<typeof writeStderrClaudeCommand>[1],
+    config: Record<string, unknown> = {},
+  ) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exit-cause-"));
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root, {
+      commandWriter: (commandPath) => writeStderrClaudeCommand(commandPath, options),
+    });
+    try {
+      return await execute({
+        runId: "run-exit-cause",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { engine: "cli", command: commandPath, cwd: workspace, promptTemplate: "Do work.", ...config },
+        context: {},
+        authToken: "tok",
+        onLog: async () => {},
+      });
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("keeps the auth error that follows a leading warning", async () => {
+    const result = await runFailingClaude({ stderr: `${WARNING}Error: 401 Unauthorized: invalid credentials\n`, end: 1 });
+
+    expect(result.errorCode).toBe("claude_auth_required");
+    expect(result.errorMessage).toBe(`${TAIL}${WARNING}Error: 401 Unauthorized: invalid credentials`);
+  });
+
+  it("adds the exit code to a rate-limit result error", async () => {
+    const resultError = "API Error: 429 Too Many Requests: rate limit exceeded, retry later";
+    const resultEvent = {
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: resultError,
+      session_id: "11111111-1111-4111-8111-111111111111",
+    };
+    const result = await runFailingClaude({ stdout: `${JSON.stringify(resultEvent)}\n`, stderr: WARNING, end: 1 });
+
+    expect(result.errorCode).toBe("claude_transient_upstream");
+    expect(result.errorMessage).toBe(
+      `Claude run failed: subtype=success: ${resultError}\nClaude exited with code 1: ${WARNING.trim()}`,
+    );
+  });
+
+  it("keeps a crash stack trace", async () => {
+    const cli = "file:///opt/agent-cli/cli.js";
+    const crash = [
+      `${cli}:4521`,
+      "    const text = message.content.map((block) => block.text);",
+      "                         ^",
+      "",
+      "TypeError: Cannot read properties of undefined (reading 'map')",
+      ...Array.from({ length: 10 }, (_, i) => `    at frame${i} (${cli}:${4521 + i * 7}:${11 + i})`),
+      "",
+      "Node.js v22.11.0",
+    ];
+    const result = await runFailingClaude({ stderr: `${WARNING}${crash.join("\n")}\n`, end: 1 });
+
+    expect(result.errorMessage).toBe(
+      `${TAIL}${[WARNING, ...crash].map((line) => line.trim()).filter(Boolean).join("\n")}`,
+    );
+  });
+
+  it("keeps a warning when stderr holds nothing else", async () => {
+    const result = await runFailingClaude({ stderr: WARNING, end: 1 });
+
+    expect(result.errorMessage).toBe(`Claude exited with code 1: ${WARNING.trim()}`);
+  });
+
+  it("reports a kill by signal as a failed exit", async () => {
+    const result = await runFailingClaude({
+      stderr: "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n",
+      end: "SIGKILL",
+    });
+
+    expect(result.exitCode).toBeNull();
+    expect(result.signal).toBe("SIGKILL");
+    expect(result.errorMessage).toBe(
+      "Claude exited with signal SIGKILL: FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory",
+    );
+  });
+
+  it("reports the timeout with the signal and the stderr tail", async () => {
+    const result = await runFailingClaude(
+      { stderr: `${WARNING}Retrying request (attempt 7/10) after a connection error\n`, end: "hang" },
+      { timeoutSec: 1, graceSec: 1 },
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("timeout");
+    expect(result.signal).toMatch(/^SIG(TERM|KILL)$/);
+    expect(result.errorMessage).toBe(
+      `Timed out after 1s\nClaude exited with signal ${result.signal}. Last lines of stderr:\n` +
+        `${WARNING}Retrying request (attempt 7/10) after a connection error`,
+    );
+  });
+
+  it("keeps at most the last 20 lines and 2 KB of stderr", async () => {
+    const lines = Array.from({ length: 30 }, (_, i) => `debug line ${String(i + 1).padStart(2, "0")} ${"x".repeat(120)}`);
+    const result = await runFailingClaude({ stderr: `${lines.join("\n")}\n`, end: 1 });
+
+    const prefix = `${TAIL}…`;
+    expect(result.errorMessage?.startsWith(prefix)).toBe(true);
+    const tail = result.errorMessage!.slice(prefix.length);
+    expect(tail.length).toBeLessThanOrEqual(2048);
+    expect(tail.split("\n").length).toBeLessThanOrEqual(20);
+    expect(tail.endsWith(lines[29]!)).toBe(true);
+    expect(tail).not.toContain("debug line 10 ");
+  });
+
+  it("redacts secrets in the stderr tail", async () => {
+    // Built at runtime so the source holds no secret-shaped literal.
+    const apiKey = ["fixture", "Key", "Value", "0123"].join("");
+    const bearer = "opaqueBearerValue8f3k2m9q7z";
+    const password = "pr0xyPassw0rdValue";
+    const result = await runFailingClaude({
+      stderr:
+        `${WARNING}request failed with api_key=${apiKey}\n` +
+        `Authorization: Bearer ${bearer}\n` +
+        `proxy https://agent:${password}@proxy.example.test:8443 refused the connection\n`,
+      end: 1,
+    });
+
+    expect(result.errorMessage).toContain("***REDACTED***");
+    expect(result.errorMessage).toContain("refused the connection");
+    for (const secret of [apiKey, bearer, password]) expect(result.errorMessage).not.toContain(secret);
+  });
+});
