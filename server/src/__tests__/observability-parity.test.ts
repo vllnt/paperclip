@@ -12,10 +12,14 @@ const PREFIX = "/api/companies/{companyId}/observability/";
 const CLI_SOURCE = fs.readFileSync(path.join(REPO_ROOT, "cli/src/commands/client/observability.ts"), "utf8");
 const UI_SOURCE = fs.readFileSync(path.join(REPO_ROOT, "ui/src/api/observability.ts"), "utf8");
 
-const specSchema = z.object({ paths: z.record(z.string(), z.unknown()) });
-const segments = Object.keys(specSchema.parse(buildOpenApiSpec()).paths)
-  .filter((route) => route.startsWith(PREFIX))
-  .map((route) => route.slice(PREFIX.length))
+const operationSchema = z.object({ tags: z.array(z.string()).optional() });
+const specSchema = z.object({ paths: z.record(z.string(), z.record(z.string(), z.unknown())) });
+// Upstream's agent export settings (tag "agent-observability") share this path prefix; this test covers the run usage reports.
+const isRunUsageReport = (operations: Record<string, unknown>) =>
+  Object.values(operations).some((operation) => operationSchema.safeParse(operation).data?.tags?.includes("observability"));
+const segments = Object.entries(specSchema.parse(buildOpenApiSpec()).paths)
+  .filter(([route, operations]) => route.startsWith(PREFIX) && isRunUsageReport(operations))
+  .map(([route]) => route.slice(PREFIX.length))
   .sort();
 
 /**
