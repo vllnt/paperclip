@@ -615,6 +615,43 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
     expect(await grantKeys(companyId, peerId)).toEqual(["agents:configure"]);
   });
 
+  it("refuses a policy or grant update started by an agent of another company, even one that holds agents:configure there", async () => {
+    const { companyId, services, managedAgentId } = await seed();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other",
+      issuePrefix: `T${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    const [outsider] = await db
+      .insert(agents)
+      .values({
+        companyId: otherCompanyId, name: "Outsider", role: "engineer", adapterType: "process",
+        adapterConfig: {}, runtimeConfig: {}, permissions: {},
+      })
+      .returning();
+    await db.insert(principalPermissionGrants).values({
+      companyId: otherCompanyId, principalType: "agent", principalId: outsider!.id,
+      permissionKey: "agents:configure", scope: null, grantedByUserId: null,
+    });
+    const before = await readAgent(managedAgentId);
+    const asOutsider = <T>(fn: () => Promise<T>) =>
+      runWithPluginHostCallAgent({ agentId: outsider!.id, runId: null, companyId: otherCompanyId }, fn);
+
+    await expect(asOutsider(() => updateAgentPolicy(services, companyId, managedAgentId)))
+      .rejects.toMatchObject({ status: 403, details: { code: "agent_self_protected_config_change" } });
+    await expect(asOutsider(() => setGrants(services, companyId, "agent", managedAgentId)))
+      .rejects.toMatchObject({ status: 403, details: { code: "agent_self_protected_config_change" } });
+
+    expect((await readAgent(managedAgentId)).permissions).toEqual(before.permissions);
+    expect(await grantKeys(companyId, managedAgentId)).toEqual([]);
+    expect((await deniedActivity(managedAgentId)).map((entry) => entry.details)).toEqual([
+      expect.objectContaining({ surface: "plugin_policy_update" }),
+      expect.objectContaining({ surface: "plugin_grants_update" }),
+    ]);
+  });
+
   async function pluginAudit(companyId: string, action: string, entityId: string) {
     return db
       .select()

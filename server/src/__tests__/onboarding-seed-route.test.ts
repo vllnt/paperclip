@@ -335,6 +335,28 @@ describeEmbeddedPostgres("POST /api/companies/:companyId/onboarding-seed", () =>
     expect(await ctx.db.select().from(companyOnboardingSeeds)).toHaveLength(0);
   });
 
+  it("refuses an agent key of another company and applies nothing", async () => {
+    const { companyId } = await seedCompany();
+    const { companyId: otherCompanyId } = await seedCompanyWithBoardAccess(ctx.db, "Other company");
+    const outsiderId = randomUUID();
+    await ctx.db.insert(agents).values({
+      id: outsiderId, companyId: otherCompanyId, name: "Outsider", role: "ceo", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    const outsiderApp = routeApp(
+      ctx.db,
+      { type: "agent", source: "agent_key", companyId: otherCompanyId, agentId: outsiderId } as never,
+      onboardingSeedRoutes,
+    );
+
+    const response = await post(outsiderApp, companyId, SEED);
+
+    expect(response.status).toBe(403);
+    expect(await ctx.db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(0);
+    expect(await ctx.db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
+    expect(await ctx.db.select().from(companyOnboardingSeeds)).toHaveLength(0);
+  });
+
   it("lets the board rename a short term company goal", async () => {
     const { companyId, app } = await seedCompany();
     const [goal] = await ctx.db
