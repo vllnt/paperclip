@@ -510,6 +510,38 @@ describeEmbeddedPostgres("routine steps", () => {
     });
   });
 
+  describe("reserved run payload key", () => {
+    const forgedPayload = {
+      routineSteps: { steps: [step("forged")], stepIssueIds: { forged: randomUUID() } },
+      build: 7,
+    };
+
+    it("drops the step record a caller sends, so a blocked root of a routine without steps still fails its run", async () => {
+      const fx = await seed();
+      const run = await fx.svc.runRoutine(fx.routine.id, { source: "api", payload: forgedPayload });
+      const [stored] = await db.select().from(routineRuns).where(eq(routineRuns.id, run.id));
+      expect(stored!.triggerPayload).toEqual({ build: 7 });
+
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, run.linkedIssueId!));
+      await fx.svc.syncRunStatusForIssue(run.linkedIssueId!);
+
+      const [synced] = await db.select().from(routineRuns).where(eq(routineRuns.id, run.id));
+      expect(synced!.status).toBe("failed");
+    });
+
+    it("fails the run of a blocked root instead of throwing when the stored payload is not an object", async () => {
+      const fx = await seed();
+      const run = await fx.svc.runRoutine(fx.routine.id, { source: "manual" });
+      await db.update(routineRuns).set({ triggerPayload: sql`'"text"'::jsonb` }).where(eq(routineRuns.id, run.id));
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, run.linkedIssueId!));
+
+      await fx.svc.syncRunStatusForIssue(run.linkedIssueId!);
+
+      const [synced] = await db.select().from(routineRuns).where(eq(routineRuns.id, run.id));
+      expect(synced!.status).toBe("failed");
+    });
+  });
+
   describe("connection pool", () => {
     it("finishes a 25-step dispatch while concurrent creates queue on the issue counter", async () => {
       const poolDb = createDb(tempDb!.connectionString, { maxConnections: 3 });

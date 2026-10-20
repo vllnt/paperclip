@@ -610,10 +610,19 @@ function resolveRoutineVariableValues(
   return resolved;
 }
 
-function mergeRoutineRunPayload(
+/** The key a run uses to record its steps belongs to dispatch: a caller's payload never carries it. */
+function withoutReservedRunPayloadKeys(
   payload: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null | undefined {
+  if (!payload || !(ROUTINE_STEPS_RUN_PAYLOAD_KEY in payload)) return payload;
+  return Object.fromEntries(Object.entries(payload).filter(([key]) => key !== ROUTINE_STEPS_RUN_PAYLOAD_KEY));
+}
+
+function mergeRoutineRunPayload(
+  callerPayload: Record<string, unknown> | null | undefined,
   variables: Record<string, string | number | boolean>,
 ) {
+  const payload = withoutReservedRunPayloadKeys(callerPayload);
   if (Object.keys(variables).length === 0) return payload ?? null;
   if (!payload) return { variables };
   const existingVariables = isPlainRecord(payload.variables) ? payload.variables : {};
@@ -4474,7 +4483,7 @@ export function routineService(
             : {}),
         });
       }
-      if (issue.status === "blocked" && run.triggerPayload && ROUTINE_STEPS_RUN_PAYLOAD_KEY in run.triggerPayload) {
+      if (issue.status === "blocked" && readRoutineStepsRunPayload(run.triggerPayload) !== null) {
         if (await hasOpenRoutineSteps(db, issue.companyId, issue.id)) return null;
         const readiness = await issueSvc.getDependencyReadiness(issue.id);
         if (readiness.allBlockersDone) return null;
