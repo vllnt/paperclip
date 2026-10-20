@@ -64,6 +64,7 @@ describeEmbeddedPostgres("transient retry policy layers", () => {
     company?: TransientRetryPolicy;
     agent?: TransientRetryPolicy;
     routine?: TransientRetryPolicy;
+    routineIssueKind?: "routine_execution" | "routine_step";
     issueStatus?: string;
   }) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
@@ -106,7 +107,7 @@ describeEmbeddedPostgres("transient retry policy layers", () => {
       title: "Retry policy fixture",
       status: input.issueStatus ?? "in_progress",
       assigneeAgentId: agentId,
-      ...(routineId ? { originKind: "routine_execution", originId: routineId } : {}),
+      ...(routineId ? { originKind: input.routineIssueKind ?? "routine_execution", originId: routineId } : {}),
     });
     const failureResult = {
       workspaceRestoreFailure: "restore_lock_timeout",
@@ -181,6 +182,15 @@ describeEmbeddedPostgres("transient retry policy layers", () => {
         company: { perIssuePerHour: 5 },
         agent: { perIssuePerHour: 0 },
         routine: { perIssuePerHour: 1 },
+      });
+      expect(await scheduledDelayMs(runId)).toBe(HOUR_MS);
+    });
+
+    it("a step issue gets its routine's policy, like the root issue", async () => {
+      const { runId } = await seed({
+        company: { perIssuePerHour: 5 },
+        routine: { perIssuePerHour: 1 },
+        routineIssueKind: "routine_step",
       });
       expect(await scheduledDelayMs(runId)).toBe(HOUR_MS);
     });

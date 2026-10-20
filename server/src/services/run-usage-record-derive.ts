@@ -3,6 +3,7 @@ import {
   RUN_USAGE_RECORD_SCHEMA_VERSION,
   RUN_USAGE_TERMINAL_STATUSES,
   classifyRunFailure,
+  isRoutineRunIssueOriginKind,
   type RunUsageQuality,
   type RunUsageRecordSource,
 } from "@paperclipai/shared";
@@ -150,7 +151,7 @@ function resolveUsageQuality(input: {
 }
 
 function resolveRoutineId(issue: RunUsageDeriveIssue | null): string | null {
-  if (issue?.originKind !== "routine_execution") return null;
+  if (!issue || !isRoutineRunIssueOriginKind(issue.originKind)) return null;
   return issue.originId !== null && UUID_PATTERN.test(issue.originId) ? issue.originId.toLowerCase() : null;
 }
 

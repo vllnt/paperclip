@@ -6,6 +6,7 @@ import type {
   RoutineDetail as RoutineDetailType,
   RoutineEnvConfig,
   RunContextPolicy,
+  RoutineStep,
   RoutineVariable,
 } from "@paperclipai/shared";
 import type { MarkdownEditorRef, MentionOption } from "../MarkdownEditor";
@@ -22,6 +23,7 @@ import type { secretsApi } from "../../api/secrets";
 
 export const ROUTINE_SECTION_KEYS = [
   "overview",
+  "steps",
   "triggers",
   "variables",
   "secrets",
@@ -37,6 +39,7 @@ export type RoutineSectionKey = (typeof ROUTINE_SECTION_KEYS)[number];
 /** Editable sections own a save bar; read-only (operate) sections do not. */
 export const EDITABLE_SECTIONS: RoutineSectionKey[] = [
   "overview",
+  "steps",
   "triggers",
   "variables",
   "secrets",
@@ -46,6 +49,7 @@ export const EDITABLE_SECTIONS: RoutineSectionKey[] = [
 /** Which dirty-field keys belong to which section (for scoped save state). */
 export const SECTION_FIELD_KEYS: Record<string, string[]> = {
   overview: ["title", "description", "projectId", "assigneeAgentId", "priority"],
+  steps: ["steps"],
   variables: ["variables"],
   secrets: ["env"],
   delivery: ["concurrencyPolicy", "catchUpPolicy", "activityGatePolicy", "activityGateScope", "automationWakeSettings", "runContextPolicy"],
@@ -62,6 +66,7 @@ export type RoutineEditDraft = {
   activityGatePolicy: string;
   activityGateScope: string;
   variables: RoutineVariable[];
+  steps: RoutineStep[];
   env: RoutineEnvConfig | null;
   automationWakeSettings: AutomationWakeSettings;
   runContextPolicy: RunContextPolicy | null;

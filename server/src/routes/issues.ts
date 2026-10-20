@@ -341,10 +341,10 @@ import {
   resolveActorSourceTrustForIssue,
   sanitizeQuarantinedCommentForHigherTrust,
 } from "../services/source-trust.js";
+import { agentTrustService } from "../services/agent-trust.js";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
   resolveCoreTrustPreset,
-  type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
@@ -3960,68 +3960,8 @@ export function issueRoutes(
     );
   }
 
-  async function resolveAgentTrustForIssue(
-    input: {
-      agentId: string | null | undefined;
-      runId?: string | null;
-    },
-    companyId: string,
-    issue?: {
-      companyId: string;
-      projectId?: string | null;
-      executionPolicy?: unknown;
-    } | null,
-  ): Promise<TrustPresetResolution | null> {
-    if (!input.agentId) return null;
-    const [agent, run] = await Promise.all([
-      agentsSvc.getById(input.agentId),
-      input.runId
-        ? db
-            .select({
-              companyId: heartbeatRuns.companyId,
-              agentId: heartbeatRuns.agentId,
-              contextSnapshot: heartbeatRuns.contextSnapshot,
-            })
-            .from(heartbeatRuns)
-            .where(
-              and(
-                eq(heartbeatRuns.id, input.runId),
-                eq(heartbeatRuns.companyId, companyId),
-              ),
-            )
-            .then((rows) => rows[0] ?? null)
-        : Promise.resolve(null),
-    ]);
-    if (!agent || agent.companyId !== companyId) return null;
-    const runContext =
-      run?.agentId === agent.id &&
-      run.contextSnapshot &&
-      typeof run.contextSnapshot === "object"
-        ? (run.contextSnapshot as Record<string, unknown>)
-        : null;
-    const runExecutionPolicy =
-      runContext?.executionPolicy &&
-      typeof runContext.executionPolicy === "object"
-        ? (runContext.executionPolicy as Record<string, unknown>)
-        : null;
-    const project = issue?.projectId
-      ? await projectsSvc.getById(issue.projectId)
-      : null;
-    return resolveCoreTrustPreset({
-      companyId,
-      agent,
-      project: project?.companyId === companyId ? project : null,
-      issue: issue
-        ? {
-            companyId: issue.companyId,
-            executionPolicy: issue.executionPolicy,
-          }
-        : null,
-      run: runExecutionPolicy
-        ? { companyId, executionPolicy: runExecutionPolicy }
-        : null,
-    });
-  }
+  const agentTrust = agentTrustService(db, { agents: agentsSvc, projects: projectsSvc });
+  const { resolveAgentTrustForIssue } = agentTrust;
 
   async function actorIsLowTrustReview(
     req: Request,
@@ -4053,25 +3993,13 @@ export function issueRoutes(
     projectId: string | null,
     requestedPolicy: unknown,
   ) {
-    const policy = normalizeIssueExecutionPolicy(requestedPolicy);
-    if (req.actor.type !== "agent") return policy;
-    const trust = await resolveAgentTrustForIssue(
+    if (req.actor.type !== "agent") return normalizeIssueExecutionPolicy(requestedPolicy);
+    return agentTrust.containCreatedExecutionPolicy(
       { agentId: req.actor.agentId, runId: req.actor.runId },
       companyId,
-      { companyId, projectId, executionPolicy: policy },
+      projectId,
+      requestedPolicy,
     );
-    if (trust?.kind === "denied") throw forbidden(trust.detail);
-    if (trust?.kind !== "low_trust_review") return policy;
-    // A new task must retain the creator's effective containment, including
-    // run-only restrictions. Client policy can narrow it, never reset it.
-    return normalizeIssueExecutionPolicy({
-      ...policy,
-      authorizationPolicy: {
-        ...policy?.authorizationPolicy,
-        trustPreset: trust.preset,
-        trustBoundary: trust.boundary,
-      },
-    });
   }
 
   async function directParentReportDisabledForIssue(issue: {

@@ -674,6 +674,37 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await expect(svc.count(companyId, { attention: "blocked" })).resolves.toBe(1);
   });
 
+  it("leaves the roots and the steps of routine runs out of the blocked list when asked to", async () => {
+    const { companyId } = await createCompany("BIR");
+    const routineId = randomUUID();
+    const manualId = await insertIssue({ companyId, identifier: "BIR-1", title: "Blocked by hand", status: "blocked" });
+    const rootId = await insertIssue({
+      companyId,
+      identifier: "BIR-2",
+      title: "Routine root",
+      status: "blocked",
+      originKind: "routine_execution",
+      originId: routineId,
+    });
+    const stepId = await insertIssue({
+      companyId,
+      identifier: "BIR-3",
+      title: "Routine step",
+      status: "blocked",
+      parentId: rootId,
+      originKind: "routine_step",
+      originId: routineId,
+    });
+
+    const everything = (await svc.list(companyId, { attention: "blocked" })).map((issue) => issue.id);
+    const withoutRoutineRuns = (
+      await svc.list(companyId, { attention: "blocked", excludeRoutineExecutions: true })
+    ).map((issue) => issue.id);
+
+    expect(everything).toEqual(expect.arrayContaining([manualId, rootId, stepId]));
+    expect(withoutRoutineRuns).toEqual([manualId]);
+  });
+
   it("surfaces cancelled-blocker attention on an assigned todo source", async () => {
     const { companyId, agentId } = await createCompany("BICX");
     const sourceId = await insertIssue({
