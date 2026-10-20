@@ -167,7 +167,7 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   responsibleUserId: z.string().nullable().default(null),
   // Present only on gated routines, so snapshots of every other routine keep their exact stored shape.
   gate: routineGateSchema.nullable().optional(),
-  // Present only on routines with steps, for the same reason.
+  /** Present only on routines with steps, for the same reason. */
   steps: routineStepsSchema.optional(),
 }).strict();
 

@@ -379,7 +379,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
     let parkedRunId: string | null = null;
     // Set when a committing run hit a transient failure: its row stays `gating` and the worker retries the claim.
     let retryError: unknown = null;
-    // Steps a new group issue got; their first agents are woken after the transaction commits.
+    /** Steps a new group issue got; their first agents are woken after the transaction commits. */
     const stepsToStart: AttachedRoutineSteps[] = [];
     const now = input.now ?? new Date();
     const prepared = await deps.prepareRoutine(routine);
@@ -762,8 +762,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           note = "append_target_unavailable";
         }
 
-        // No open group issue: open one and wake its assignee. A storm digest stays a single issue; a normal
-        // group of a routine with steps opens blocked and gets its steps, whose first agents wake after commit.
+        // No open group issue: open one and wake its assignee.
         const steps = storm ? [] : (routine.steps ?? []);
         const groupIssueInput = {
           projectId: routine.projectId,
@@ -787,7 +786,6 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         };
         let created: Awaited<ReturnType<typeof issueSvc.create>>;
         if (steps.length > 0) {
-          // The group issue and its steps are one unit in a savepoint of this transaction.
           const withSteps = await txDb.transaction(async (savepoint) => {
             const root = await issueSvc.create(routine.companyId, groupIssueInput, savepoint);
             const attached = await attachRoutineSteps({
@@ -842,8 +840,6 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         );
         return stampOutcome({ status: storm ? "storm_folded" : "issue_created", runId: createdRun.id, issueId: created.id });
       } catch (err) {
-        // The group issue and its steps belong to this transaction: a failure after they were created
-        // rolls all of it back instead of recording a failed run beside committed issues.
         if (attachedSteps) throw err;
         if (createdIssueId) {
           // The group row cascades with the issue.

@@ -695,7 +695,6 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     responsibleUserId: routine.responsibleUserId ?? null,
     // Only gated routines carry it, so snapshots of every other routine keep their stored shape.
     ...(routine.gate ? { gate: routine.gate } : {}),
-    // Only routines with steps carry it, so snapshots of every other routine keep their stored shape.
     ...(routine.steps?.length ? { steps: routine.steps } : {}),
   };
 }
@@ -1363,7 +1362,6 @@ export function routineService(
       }
     }
 
-    // A routine with steps keeps its root blocked and idle while the steps work: the open root is its live issue.
     const stillMissingRoutineIds = routineIds.filter((routineId) => !rowsByOriginId.has(routineId));
     if (stillMissingRoutineIds.length > 0) {
       const stepRootRows = await db
@@ -1767,8 +1765,6 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
     if (heartbeatBoundIssue || !routine.steps?.length) return heartbeatBoundIssue;
 
-    // A run with steps keeps its root blocked and idle while the steps work, so no heartbeat run is
-    // bound to it. For such a routine the open root itself is the live work.
     return executor
       .select()
       .from(issues)
@@ -2309,10 +2305,9 @@ export function routineService(
           return false;
         });
     let reusedExistingRun = false;
-    // Plugin-managed routines keep their single-issue shape; steps are not supported on them.
     const steps = managedRoutineBinding ? [] : (input.routine.steps ?? []);
     const hasSteps = steps.length > 0;
-    // Set inside the transaction, acted on only after it commits.
+    /** Filled inside the transaction and acted on only after it commits. */
     const stepsToStart: AttachedRoutineSteps[] = [];
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
@@ -2586,8 +2581,6 @@ export function routineService(
 
         // So that no issue is committed only to be deleted; a refusal is recorded below exactly
         // like the same wake failure.
-        // Only the agents woken now are checked: with steps that is each starting step's agent, and the
-        // root's agent is woken later by the blocker wake.
         const woken = hasSteps ? routineStartingStepAgentIds(steps, assigneeAgentId) : [assigneeAgentId];
         for (const wokenAgentId of woken) {
           await assertWakeAdmitsAssignee(txDb, input.routine.companyId, wokenAgentId, projectId);
@@ -2600,7 +2593,6 @@ export function routineService(
           parentId: input.routine.parentIssueId,
           title,
           description: issueDescription,
-          // A run with steps waits on them, so its root starts blocked and is never woken directly.
           status: hasSteps ? "blocked" : "todo",
           priority: input.routine.priority,
           assigneeAgentId,
@@ -2620,8 +2612,6 @@ export function routineService(
 
         try {
           if (hasSteps) {
-            // The root and its steps are one unit in a savepoint of this transaction: nothing is visible
-            // before commit, and a failure leaves no root behind to delete.
             const created = await txDb.transaction(async (savepoint) => {
               const savepointDb = savepoint as unknown as Db;
               const root = await issueSvc.create(input.routine.companyId, rootInput, savepoint);
@@ -2687,7 +2677,6 @@ export function routineService(
         }
 
         if (attachedSteps) {
-          // The steps are not committed yet: their agents are woken once this transaction commits.
           stepsToStart.push(attachedSteps);
         } else {
           // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
@@ -2717,8 +2706,6 @@ export function routineService(
         }, txDb);
         return updated ?? createdRun;
       } catch (error) {
-        // The root and steps belong to this transaction, so a failure after they were created has to
-        // roll all of it back; there is nothing to delete and no failed run row to keep.
         if (attachedSteps) throw error;
         if (createdIssue) {
           // The issue is committed outside this transaction because the wake reads and updates it
@@ -3224,7 +3211,6 @@ export function routineService(
       if (patch.goalId) await assertGoal(existing.companyId, patch.goalId);
       if (patch.parentIssueId) await assertParentIssue(existing.companyId, patch.parentIssueId);
       assertRoutineVariableDefinitions(nextVariables);
-      // Re-checked when the steps or the default agent changed: an unrelated edit must not fail on steps that predate it.
       if (patch.steps !== undefined || patch.assigneeAgentId !== undefined) {
         await assertRoutineStepReferences(db, existing.companyId, nextSteps, nextAssigneeAgentId);
       }
@@ -4426,7 +4412,6 @@ export function routineService(
         });
       }
       if (issue.status === "blocked" && readRoutineStepsRunPayload(run.triggerPayload)) {
-        // The root of a run with steps is blocked by design while its steps are open; that is not a failure.
         const openStep = await db
           .select({ id: issues.id })
           .from(issues)

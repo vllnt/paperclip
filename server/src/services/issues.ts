@@ -9366,7 +9366,6 @@ export function issueService(db: Db) {
       data: IssueChildCreateInput,
       dbOrTx: Db | DbTransaction = db,
     ) => {
-      // A transaction exposes the same query builder as the client; helpers type their reader as Db.
       const executor = dbOrTx as unknown as Db;
       const parent = await executor
         .select()

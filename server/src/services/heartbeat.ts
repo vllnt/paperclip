@@ -23231,7 +23231,6 @@ export function heartbeatService(
       const sessionCodec = getAdapterSessionCodec(agent.adapterType);
       const issueId = readNonEmptyString(context.issueId);
       if (issueId) {
-        // A routine step reuses the workspace of the step it waited for; best effort, never blocks the run.
         await inheritRoutineStepWorkspace(db, agent.companyId, issueId).catch((error) => {
           logger.warn({ err: error, issueId }, "failed to inherit the workspace of a routine step's predecessor");
         });
