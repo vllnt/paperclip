@@ -13,6 +13,7 @@ import {
   REDACTED_COMMAND_TEXT_VALUE,
   redactDiagnosticText,
   redactCommandText,
+  redactHeaderSecretText,
 } from "./command-redaction.js";
 
 describe("redactDiagnosticText", () => {
@@ -112,5 +113,47 @@ second-line\" status=401`;
     const output = redactDiagnosticText(input);
     expect(output).not.toContain("MARKERBACKSLASH_B");
     expect(output).toContain(REDACTED_COMMAND_TEXT_VALUE);
+  });
+});
+
+describe("redactHeaderSecretText", () => {
+  // Built at runtime so the source holds no secret-shaped literal.
+  const value = ["opaque", "Header", "Value", "8f3k2m9q7z"].join("");
+  const marker = REDACTED_COMMAND_TEXT_VALUE;
+
+  it("redacts header forms that no shell-style rule recognizes", () => {
+    expect(redactHeaderSecretText(`x-api-key: ${value}`)).toBe(`x-api-key: ${marker}`);
+    expect(redactHeaderSecretText(`x-auth-key=${value}`)).toBe(`x-auth-key=${marker}`);
+    expect(redactHeaderSecretText(`Authorization: Basic ${value}`)).toBe(`Authorization: ${marker}`);
+    expect(redactHeaderSecretText(`proxy-authorization: token ${value}`)).toBe(`proxy-authorization: ${marker}`);
+  });
+
+  it("redacts a whole cookie header to the end of its line", () => {
+    expect(redactHeaderSecretText(`Cookie: sid=${value}; theme=dark\nnext line`)).toBe(`Cookie: ${marker}\nnext line`);
+    expect(redactHeaderSecretText(`Set-Cookie: id=${value}; Path=/; HttpOnly`)).toBe(`Set-Cookie: ${marker}`);
+  });
+
+  it("leaves plain-text labels and quoted values to the other rules", () => {
+    for (const text of ["Login URL: https://example.test/start", "Retry after: 30", 'token: "quoted"', "see the token docs"]) {
+      expect(redactHeaderSecretText(text)).toBe(text);
+    }
+  });
+
+  it("is idempotent for the default marker and for a custom marker", () => {
+    for (const customMarker of [marker, "[REDACTED]", "<hidden>"]) {
+      const once = redactHeaderSecretText(
+        `x-api-key: ${value}\nAuthorization: Bearer ${value}\nCookie: a=${value}; b=2`,
+        customMarker,
+      );
+      expect(once).not.toContain(value);
+      expect(redactHeaderSecretText(once, customMarker)).toBe(once);
+    }
+  });
+
+  it("runs inside redactDiagnosticText, after the shell-style rules, and keeps their output", () => {
+    const text = `Authorization: Bearer ${value}\nx-api-key: ${value}`;
+
+    expect(redactDiagnosticText(text)).toBe(`Authorization: Bearer ${marker}\nx-api-key: ${marker}`);
+    expect(redactDiagnosticText(text, "[REDACTED]")).toBe("Authorization: Bearer [REDACTED]\nx-api-key: [REDACTED]");
   });
 });
