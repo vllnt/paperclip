@@ -10,7 +10,7 @@ import type {
   IssueExecutionState,
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
-import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
+import { issueExecutionPolicySchema, issueExecutionStateSchema, parseIssueWaitPullRequestUrl } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 
 type AssigneeLike = {
@@ -392,6 +392,9 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       kind: parsed.data.monitor.kind ?? null,
       serviceName: normalizeMonitorText(parsed.data.monitor.serviceName),
       externalRef: redactIssueMonitorExternalRef(parsed.data.monitor.externalRef),
+      pullRequestUrl: parsed.data.monitor.pullRequestUrl
+        ? parseIssueWaitPullRequestUrl(parsed.data.monitor.pullRequestUrl)?.url ?? null
+        : null,
       timeoutAt: parsed.data.monitor.timeoutAt ?? null,
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,

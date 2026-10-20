@@ -4,15 +4,19 @@
  */
 export type FakePullRequestState = {
   headSha: string;
+  baseSha: string;
   prState: "open" | "closed";
   merged: boolean;
+  mergeableState: string;
   updatedAt: string;
   comments: number;
   reviewComments: number;
   reviewIds: number[];
+  /** Answer the review list with a `rel="next"` link, as GitHub does past one page. */
+  reviewsHaveNextPage?: boolean;
   checkRuns: Array<{ name: string; status: string; conclusion: string | null }>;
   statusState: string;
-  statusCount: number;
+  statuses: Array<{ context: string; state: string }>;
   /** Answer every request with this HTTP status instead. */
   failWithStatus?: number;
   /** Never answer; resolve only when the caller aborts. */
@@ -22,15 +26,17 @@ export type FakePullRequestState = {
 export function defaultFakePullRequestState(): FakePullRequestState {
   return {
     headSha: "1111111111111111111111111111111111111111",
+    baseSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     prState: "open",
     merged: false,
+    mergeableState: "blocked",
     updatedAt: "2026-04-11T12:00:00Z",
     comments: 2,
     reviewComments: 1,
     reviewIds: [101],
     checkRuns: [{ name: "test", status: "in_progress", conclusion: null }],
     statusState: "pending",
-    statusCount: 1,
+    statuses: [{ context: "ci/build", state: "pending" }],
   };
 }
 
@@ -38,10 +44,10 @@ export function createFakeGitHubPullRequestApi(input: { owner: string; repo: str
   const state: FakePullRequestState = defaultFakePullRequestState();
   const calls: string[] = [];
   const base = `/repos/${input.owner}/${input.repo}`;
-  const json = (body: unknown, status = 200) =>
+  const json = (body: unknown, status = 200, extraHeaders: Record<string, string> = {}) =>
     new Response(JSON.stringify(body), {
       status,
-      headers: { "content-type": "application/json", "x-ratelimit-remaining": "4999" },
+      headers: { "content-type": "application/json", "x-ratelimit-remaining": "4999", ...extraHeaders },
     });
   const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const parsed = new URL(typeof url === "string" ? url : url instanceof URL ? url.href : url.url);
@@ -60,20 +66,27 @@ export function createFakeGitHubPullRequestApi(input: { owner: string; repo: str
         merged: state.merged,
         merged_at: state.merged ? state.updatedAt : null,
         draft: false,
+        mergeable_state: state.mergeableState,
         updated_at: state.updatedAt,
         comments: state.comments,
         review_comments: state.reviewComments,
         head: { sha: state.headSha, ref: "feature" },
+        base: { sha: state.baseSha, ref: "main" },
       });
     }
     if (path === `${base}/pulls/${input.number}/reviews`) {
-      return json(state.reviewIds.map((id) => ({ id, state: "COMMENTED" })));
+      const next = `<https://api.github.com${base}/pulls/${input.number}/reviews?page=2>; rel="next"`;
+      return json(
+        state.reviewIds.map((id) => ({ id, state: "COMMENTED" })),
+        200,
+        state.reviewsHaveNextPage ? { link: next } : {},
+      );
     }
     if (path === `${base}/commits/${state.headSha}/check-runs`) {
       return json({ total_count: state.checkRuns.length, check_runs: state.checkRuns });
     }
     if (path === `${base}/commits/${state.headSha}/status`) {
-      return json({ state: state.statusState, total_count: state.statusCount, statuses: [] });
+      return json({ state: state.statusState, total_count: state.statuses.length, statuses: state.statuses });
     }
     return json({ message: "Not Found" }, 404);
   }) as typeof globalThis.fetch;

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { PULL_REQUEST_WAIT_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
   agents,
   companies,
@@ -26,12 +27,15 @@ import { scheduleIssueWaitMonitor } from "../services/issue-waits.ts";
  * a 10-minute monitor. The pull request stays unchanged for 10 monitor ticks,
  * then gets a new commit before tick 11. The fake agent counts each adapter
  * invocation and, like a real agent, arms the same wait again before it ends.
+ * The scenario runs twice: with a plain wait (as before this change, and still
+ * for every wait without a pull request target) and with a pull request target.
  */
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 const WAIT_MS = 10 * 60_000;
 const UNCHANGED_TICKS = 10;
+const PULL_REQUEST_URL = "https://github.com/acme/app/pull/7";
 
 function percentile(values: number[], p: number) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -65,12 +69,13 @@ describeEmbeddedPostgres("local simulation: monitor ticks on an unchanged pull r
     rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("counts adapter invocations over 10 unchanged ticks and one change", async () => {
+  async function runScenario(pullRequestTarget: boolean) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
-    const countFile = join(workDir, "invocations.log");
-    const goFile = join(workDir, "go");
+    const prefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const countFile = join(workDir, `${prefix}-invocations.log`);
+    const goFile = join(workDir, `${prefix}-go`);
     writeFileSync(countFile, "");
     const agentScript = [
       `const fs = require("fs");`,
@@ -89,7 +94,7 @@ describeEmbeddedPostgres("local simulation: monitor ticks on an unchanged pull r
     await db.insert(companies).values({
       id: companyId,
       name: "Simulation Co",
-      issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      issuePrefix: prefix,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
@@ -112,7 +117,7 @@ describeEmbeddedPostgres("local simulation: monitor ticks on an unchanged pull r
       priority: "medium",
       assigneeAgentId: agentId,
       issueNumber: 1,
-      identifier: "SIM-1",
+      identifier: `${prefix}-1`,
       executionPolicy: { mode: "normal", commentRequired: false, stages: [] },
     });
     await db.insert(issueWorkProducts).values({
@@ -122,20 +127,22 @@ describeEmbeddedPostgres("local simulation: monitor ticks on an unchanged pull r
       provider: "github",
       externalId: "acme/app#pull/7",
       title: "Fix the bug",
-      url: "https://github.com/acme/app/pull/7",
+      url: PULL_REQUEST_URL,
       status: "active",
       metadata: { repo: "acme/app", number: 7, state: "open" },
     });
 
     const issuesSvc = issueService(db);
+    // What `issue wait --in 10m --reason ... [--pull-request <url>]` stores.
     const armWait = async (nextCheckAt: Date) => {
       const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
       await scheduleIssueWaitMonitor(db, issuesSvc, {
         issue,
         nextCheckAt,
-        notes: "Re-check CI and review on the pull request",
-        serviceName: "GitHub",
+        notes: "Waiting: CI and review on the pull request",
+        serviceName: pullRequestTarget ? PULL_REQUEST_WAIT_MONITOR_SERVICE_NAME : null,
         externalRef: null,
+        pullRequestUrl: pullRequestTarget ? PULL_REQUEST_URL : null,
         activity: { actorType: "agent", actorId: agentId, agentId, runId: null, source: "simulation" },
       });
     };
@@ -178,8 +185,8 @@ describeEmbeddedPostgres("local simulation: monitor ticks on an unchanged pull r
     }
 
     const skipTicks = ticks.filter((row) => row.adapterInvocations === 0);
-    const summary = {
-      scenario: "local simulation: 10 unchanged monitor ticks, then one new commit",
+    return {
+      scenario: `local simulation: 10 unchanged monitor ticks, then one new commit; ${pullRequestTarget ? "wait with a pull request target" : "plain wait"}`,
       adapterInvocations: invocations(),
       ticks,
       githubCallsPerTick: ticks.map((row) => row.githubCalls),
@@ -187,11 +194,20 @@ describeEmbeddedPostgres("local simulation: monitor ticks on an unchanged pull r
         ? { p50: percentile(skipTicks.map((row) => row.ms), 50), p95: percentile(skipTicks.map((row) => row.ms), 95) }
         : null,
     };
-    console.log(`PR_WAKE_GATE_SIMULATION ${JSON.stringify(summary)}`);
+  }
 
-    // Tick 1 has no earlier run to compare with, ticks 2-10 see an unchanged
-    // pull request, and tick 11 sees the new commit.
-    expect(ticks.map((row) => row.adapterInvocations)).toEqual([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-    expect(invocations()).toBe(2);
-  }, 240_000);
+  it("counts adapter invocations over 10 unchanged ticks and one change, without and with a pull request target", async () => {
+    const plain = await runScenario(false);
+    const targeted = await runScenario(true);
+    console.log(`PR_WAKE_GATE_SIMULATION ${JSON.stringify({ plain, targeted })}`);
+
+    // A plain wait wakes the agent on every tick and never calls GitHub.
+    expect(plain.ticks.map((row) => row.adapterInvocations)).toEqual(Array(UNCHANGED_TICKS + 1).fill(1));
+    expect(plain.githubCallsPerTick).toEqual(Array(UNCHANGED_TICKS + 1).fill(0));
+    // With a target, tick 1 has no earlier monitor check to compare with,
+    // ticks 2-10 see an unchanged pull request, and tick 11 sees the new commit.
+    expect(targeted.ticks.map((row) => row.adapterInvocations)).toEqual([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    expect(targeted.adapterInvocations).toBe(2);
+    expect(targeted.githubCallsPerTick).toEqual(Array(UNCHANGED_TICKS + 1).fill(4));
+  }, 360_000);
 });

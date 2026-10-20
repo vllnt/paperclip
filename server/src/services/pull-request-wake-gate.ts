@@ -1,23 +1,22 @@
 import { createHash } from "node:crypto";
-import { and, desc, eq, sql } from "drizzle-orm";
-import { heartbeatRuns, issueWorkProducts, type Db } from "@paperclipai/db";
+import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
+import { parseIssueWaitPullRequestUrl } from "@paperclipai/shared";
 import { createGitRemoteAuthProvider } from "./git-credentials.js";
-import {
-  extractGitHubPullRequestReferences,
-  type GitHubPullRequestReference,
-} from "./github-pull-request-merge.js";
-import { linkedWorkProductCondition } from "./work-product-visibility.js";
 
 /**
- * Pre-wake gate for wakes that only re-check a linked GitHub pull request.
+ * Pre-wake gate for a wait that explicitly targets one GitHub pull request
+ * (`issue wait --pull-request <url>`).
  *
- * Before Paperclip starts a run for such a wake, it reads a cheap fingerprint of
- * every pull request linked to the issue as a work product: head commit, state,
- * check and commit-status rollup, comment and review counts, and the last update
- * time. It compares that fingerprint with the one the agent's last run on the
- * issue started from. When nothing changed, the wake is recorded as skipped and
- * the adapter is not invoked. Any doubt (no linked pull request, no company
- * credential, a GitHub error, a timeout or a low rate limit) means "wake".
+ * Before Paperclip starts a run for such a wait's due check, it reads a cheap
+ * fingerprint of that pull request: state, head and base commit, merge
+ * conflict, check and commit-status rollup, comment and review counts, and the
+ * last update time. It compares the fingerprint with the one the agent's last
+ * monitor-check run on the issue started from. When nothing changed, the wake
+ * is recorded as skipped and the adapter is not invoked. Any doubt (no company
+ * credential, a GitHub error, a timeout, a low rate limit, a pull request that
+ * is not open) means "wake". A wait without a pull request target never
+ * reaches this gate.
  */
 
 /** Skip reason recorded on the wake request when the pull request did not change. */
@@ -26,16 +25,15 @@ export const PULL_REQUEST_UNCHANGED_SKIP_REASON = "heartbeat.pull_request_unchan
 export const PULL_REQUEST_FINGERPRINT_CONTEXT_KEY = "pullRequestFingerprint";
 /**
  * An unchanged pull request still wakes the agent once this long after its last
- * finished run, so a wait that is about something outside the pull request
- * cannot stall for good.
+ * finished run, so a wait cannot stall for good on a pull request nobody touches.
  */
 export const PULL_REQUEST_UNCHANGED_MAX_QUIET_MS = 4 * 60 * 60_000;
 /** Hard budget for one gate evaluation: credential plus every GitHub request. */
 export const PULL_REQUEST_GATE_BUDGET_MS = 5_000;
+/** A larger GitHub answer means "wake": the gate never buffers an unbounded body. */
+export const MAX_GITHUB_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 const FINGERPRINT_VERSION = 1;
-/** More linked pull requests than this means "wake": the gate stays cheap. */
-const MAX_LINKED_PULL_REQUESTS = 3;
 /** Below this many remaining GitHub requests, leave the quota to the agents. */
 const RATE_LIMIT_FLOOR = 100;
 const BACKOFF_FALLBACK_MS = 5 * 60_000;
@@ -49,6 +47,10 @@ const FAILING_CHECK_CONCLUSIONS = new Set([
   "startup_failure",
   "stale",
 ]);
+const FAILING_STATUS_STATES = new Set(["failure", "error"]);
+
+/** The pull request a wait targets. */
+export type PullRequestWaitTarget = { owner: string; repo: string; number: number };
 
 export type PullRequestCheckRollup = "none" | "pending" | "success" | "failure";
 
@@ -58,7 +60,10 @@ export type PullRequestFingerprintEntry = {
   number: number;
   state: "open" | "closed" | "merged";
   draft: boolean;
+  /** GitHub's `mergeable_state` is `dirty`: the branch conflicts with its base. */
+  mergeConflict: boolean;
   headSha: string;
+  baseSha: string | null;
   updatedAt: string | null;
   comments: number;
   reviewComments: number;
@@ -67,18 +72,24 @@ export type PullRequestFingerprintEntry = {
   checks: PullRequestCheckRollup;
   failingChecks: string[];
   status: string;
+  failingStatuses: string[];
 };
 
 export type IssuePullRequestFingerprint = {
   version: typeof FINGERPRINT_VERSION;
   digest: string;
   computedAt: string;
-  pullRequests: PullRequestFingerprintEntry[];
+  pullRequest: PullRequestFingerprintEntry;
 };
 
+/** What a run and its wake request store: only what the next comparison reads. */
+export type StoredPullRequestFingerprint = Pick<IssuePullRequestFingerprint, "version" | "digest" | "computedAt">;
+
+export function toStoredPullRequestFingerprint(fingerprint: IssuePullRequestFingerprint): StoredPullRequestFingerprint {
+  return { version: fingerprint.version, digest: fingerprint.digest, computedAt: fingerprint.computedAt };
+}
+
 export type PullRequestFingerprintFailure =
-  | "no_linked_pull_request"
-  | "too_many_linked_pull_requests"
   | "github_backoff"
   | "github_credentials_missing"
   | "github_credentials_unavailable"
@@ -86,7 +97,8 @@ export type PullRequestFingerprintFailure =
   | "github_rate_limit_low"
   | "github_request_failed"
   | "github_timeout"
-  | "github_response_incomplete";
+  | "github_response_incomplete"
+  | "github_response_too_large";
 
 export type PullRequestWakeGateDeps = {
   fetch?: typeof fetch;
@@ -95,7 +107,7 @@ export type PullRequestWakeGateDeps = {
     companyId: string;
     issueId: string;
     agentId: string;
-    reference: GitHubPullRequestReference;
+    pullRequest: PullRequestWaitTarget;
   }) => Promise<string | null>;
   budgetMs?: number;
 };
@@ -121,6 +133,24 @@ class FingerprintUnavailable extends Error {
   ) {
     super(message);
   }
+}
+
+/**
+ * The pull request a monitor explicitly targets (`monitor.pullRequestUrl`),
+ * re-validated at gate time: other paths (the issue PATCH, the board's monitor
+ * editor, imports, rows written before validation) can also write the policy.
+ * Only the canonical github.com URL that `issue wait --pull-request` stores
+ * qualifies; anything else (another host, a missing or malformed URL) means
+ * "no target", so the wait wakes as usual.
+ */
+export function readPullRequestWaitTarget(
+  monitor: { pullRequestUrl?: string | null } | null | undefined,
+): PullRequestWaitTarget | null {
+  const url = monitor?.pullRequestUrl;
+  if (typeof url !== "string") return null;
+  const parsed = parseIssueWaitPullRequestUrl(url);
+  if (!parsed || parsed.url !== url) return null;
+  return { owner: parsed.owner, repo: parsed.repo, number: parsed.number };
 }
 
 /**
@@ -158,36 +188,34 @@ function readCount(value: unknown) {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
-/** The GitHub pull requests linked to the issue as work products (unlinked ones excluded). */
-export async function listLinkedGitHubPullRequests(
-  db: Db,
-  input: { companyId: string; issueId: string },
-): Promise<GitHubPullRequestReference[]> {
-  const rows = await db
-    .select({ url: issueWorkProducts.url, metadata: issueWorkProducts.metadata })
-    .from(issueWorkProducts)
-    .where(
-      and(
-        eq(issueWorkProducts.companyId, input.companyId),
-        eq(issueWorkProducts.issueId, input.issueId),
-        eq(issueWorkProducts.type, "pull_request"),
-        eq(issueWorkProducts.provider, "github"),
-        linkedWorkProductCondition(),
-      ),
+/** Parses a JSON body, failing once it passes MAX_GITHUB_RESPONSE_BYTES. */
+async function readCappedJson(response: Response): Promise<unknown> {
+  const tooLarge = () =>
+    new FingerprintUnavailable(
+      "github_response_too_large",
+      `GitHub answered more than ${MAX_GITHUB_RESPONSE_BYTES} bytes`,
     );
-  const references = new Map<string, GitHubPullRequestReference>();
-  for (const row of rows) {
-    const metadata = readRecord(row.metadata);
-    const shorthand =
-      typeof metadata.repo === "string" && typeof metadata.number === "number"
-        ? `${metadata.repo}#${metadata.number}`
-        : null;
-    const [reference] = extractGitHubPullRequestReferences([row.url, shorthand]);
-    if (!reference) continue;
-    const key = `${reference.owner.toLowerCase()}/${reference.repo.toLowerCase()}#${reference.number}`;
-    if (!references.has(key)) references.set(key, reference);
+  const declared = response.headers.get("content-length");
+  if (declared && /^[0-9]+$/.test(declared) && Number(declared) > MAX_GITHUB_RESPONSE_BYTES) {
+    await response.body?.cancel().catch(() => undefined);
+    throw tooLarge();
   }
-  return [...references.values()];
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  if (response.body) {
+    const reader = response.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > MAX_GITHUB_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw tooLarge();
+      }
+      chunks.push(value);
+    }
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
 }
 
 /**
@@ -196,7 +224,7 @@ export async function listLinkedGitHubPullRequests(
  */
 async function defaultResolveToken(
   db: Db,
-  input: { companyId: string; issueId: string; agentId: string; reference: GitHubPullRequestReference },
+  input: { companyId: string; issueId: string; agentId: string; pullRequest: PullRequestWaitTarget },
 ) {
   const provider = createGitRemoteAuthProvider(
     db,
@@ -204,20 +232,20 @@ async function defaultResolveToken(
     { issueId: input.issueId, agentId: input.agentId },
     { env: {} },
   );
-  const invocation = await provider(`https://github.com/${input.reference.owner}/${input.reference.repo}.git`);
+  const invocation = await provider(`https://github.com/${input.pullRequest.owner}/${input.pullRequest.repo}.git`);
   const token = invocation?.env.GH_TOKEN?.trim();
   return token ? token : null;
 }
 
 async function readPullRequestEntry(input: {
-  reference: GitHubPullRequestReference;
+  pullRequest: PullRequestWaitTarget;
   token: string;
   fetchImpl: typeof fetch;
   signal: AbortSignal;
   onRateLimit: (headers: Headers) => void;
 }): Promise<PullRequestFingerprintEntry> {
-  const { reference, token, fetchImpl, signal } = input;
-  const base = `https://api.github.com/repos/${encodeURIComponent(reference.owner)}/${encodeURIComponent(reference.repo)}`;
+  const { pullRequest, token, fetchImpl, signal } = input;
+  const base = `https://api.github.com/repos/${encodeURIComponent(pullRequest.owner)}/${encodeURIComponent(pullRequest.repo)}`;
   const get = async (path: string) => {
     let response: Response;
     try {
@@ -239,7 +267,11 @@ async function readPullRequestEntry(input: {
       );
     }
     const remaining = response.headers.get("x-ratelimit-remaining");
-    if (response.status === 429 || (response.status === 403 && remaining === "0")) {
+    // A 403 with `retry-after` is GitHub's secondary rate limit.
+    if (
+      response.status === 429 ||
+      (response.status === 403 && (remaining === "0" || response.headers.has("retry-after")))
+    ) {
       input.onRateLimit(response.headers);
       throw new FingerprintUnavailable("github_rate_limited", `GitHub answered ${response.status} (rate limited)`);
     }
@@ -251,7 +283,7 @@ async function readPullRequestEntry(input: {
       throw new FingerprintUnavailable("github_rate_limit_low", `GitHub rate limit is low (${remaining} left)`);
     }
     const hasNextPage = /<[^>]*>;\s*rel="next"/.test(response.headers.get("link") ?? "");
-    return { body: (await response.json()) as unknown, hasNextPage };
+    return { body: await readCappedJson(response), hasNextPage };
   };
   const incomplete = (what: string) =>
     new FingerprintUnavailable("github_response_incomplete", `GitHub returned an incomplete ${what}`);
@@ -259,11 +291,12 @@ async function readPullRequestEntry(input: {
   // Two rounds: the pull request and its reviews, then the checks and statuses
   // of the head commit the first answer names.
   const [pullResponse, reviews] = await Promise.all([
-    get(`/pulls/${reference.number}`),
-    get(`/pulls/${reference.number}/reviews?per_page=${PAGE_SIZE}`),
+    get(`/pulls/${pullRequest.number}`),
+    get(`/pulls/${pullRequest.number}/reviews?per_page=${PAGE_SIZE}`),
   ]);
   const pull = readRecord(pullResponse.body);
   const headSha = readRecord(pull.head).sha;
+  const baseSha = readRecord(pull.base).sha;
   const comments = readCount(pull.comments);
   const reviewComments = readCount(pull.review_comments);
   if (typeof headSha !== "string" || !headSha || comments === null || reviewComments === null) {
@@ -297,20 +330,35 @@ async function readPullRequestEntry(input: {
 
   const statusBody = readRecord(status.body);
   const statusCount = readCount(statusBody.total_count);
-  if (statusCount === null || typeof statusBody.state !== "string") throw incomplete("commit status");
+  const statuses = Array.isArray(statusBody.statuses) ? statusBody.statuses.map(readRecord) : null;
+  if (
+    statusCount === null ||
+    typeof statusBody.state !== "string" ||
+    !statuses ||
+    statusCount > statuses.length ||
+    status.hasNextPage
+  ) {
+    throw incomplete("commit status");
+  }
+  const failingStatuses = statuses
+    .filter((entry) => FAILING_STATUS_STATES.has(String(entry.state)))
+    .map((entry) => String(entry.context ?? ""))
+    .sort();
 
   const reviewIds = reviews.body
     .map((review) => readCount(readRecord(review).id))
     .filter((id): id is number => id !== null);
 
   return {
-    repo: `${reference.owner}/${reference.repo}`.toLowerCase(),
-    number: reference.number,
+    repo: `${pullRequest.owner}/${pullRequest.repo}`.toLowerCase(),
+    number: pullRequest.number,
     state: pull.merged === true || typeof pull.merged_at === "string"
       ? "merged"
       : pull.state === "closed" ? "closed" : "open",
     draft: pull.draft === true,
+    mergeConflict: pull.mergeable_state === "dirty",
     headSha,
+    baseSha: typeof baseSha === "string" && baseSha ? baseSha : null,
     updatedAt: typeof pull.updated_at === "string" ? pull.updated_at : null,
     comments,
     reviewComments,
@@ -320,39 +368,27 @@ async function readPullRequestEntry(input: {
     failingChecks,
     // GitHub reports "pending" for a commit with no statuses at all.
     status: statusCount === 0 ? "none" : statusBody.state,
+    failingStatuses,
   };
 }
 
-export function fingerprintDigest(entries: readonly PullRequestFingerprintEntry[]) {
-  const ordered = [...entries].sort((a, b) =>
-    a.repo === b.repo ? a.number - b.number : a.repo < b.repo ? -1 : 1,
-  );
-  return `sha256:${createHash("sha256").update(JSON.stringify(ordered)).digest("hex")}`;
+export function fingerprintDigest(entry: PullRequestFingerprintEntry) {
+  return `sha256:${createHash("sha256").update(JSON.stringify(entry)).digest("hex")}`;
 }
 
 /**
- * Reads the fingerprint of every pull request linked to the issue within one
- * hard budget. Never throws: every failure is a reason to wake.
+ * Reads the fingerprint of the targeted pull request within one hard budget.
+ * Never throws: every failure is a reason to wake.
  */
 export async function computeIssuePullRequestFingerprint(
   db: Db,
-  input: { companyId: string; issueId: string; agentId: string },
+  input: { companyId: string; issueId: string; agentId: string; pullRequest: PullRequestWaitTarget },
   deps: PullRequestWakeGateDeps = {},
 ): Promise<
   | { ok: true; fingerprint: IssuePullRequestFingerprint }
   | { ok: false; reason: PullRequestFingerprintFailure; detail: string }
 > {
   const fail = (reason: PullRequestFingerprintFailure, detail: string) => ({ ok: false as const, reason, detail });
-  let references: GitHubPullRequestReference[];
-  try {
-    references = await listLinkedGitHubPullRequests(db, input);
-  } catch (error) {
-    return fail("github_request_failed", error instanceof Error ? error.message : "Linked pull requests unreadable");
-  }
-  if (references.length === 0) return fail("no_linked_pull_request", "The issue has no linked GitHub pull request");
-  if (references.length > MAX_LINKED_PULL_REQUESTS) {
-    return fail("too_many_linked_pull_requests", `The issue links ${references.length} pull requests`);
-  }
   if ((githubBackoffUntil.get(input.companyId) ?? 0) > Date.now()) {
     return fail("github_backoff", "GitHub was rate limited or slow for this company recently");
   }
@@ -371,8 +407,7 @@ export async function computeIssuePullRequestFingerprint(
   const read = async () => {
     let token: string | null;
     try {
-      // GitHub credentials are company-wide here; one resolution serves every linked pull request.
-      token = await resolveToken({ ...input, reference: references[0]! });
+      token = await resolveToken(input);
     } catch (error) {
       throw new FingerprintUnavailable(
         "github_credentials_unavailable",
@@ -380,27 +415,23 @@ export async function computeIssuePullRequestFingerprint(
       );
     }
     if (!token) throw new FingerprintUnavailable("github_credentials_missing", "No company GitHub credential is configured");
-    return Promise.all(
-      references.map((reference) =>
-        readPullRequestEntry({
-          reference,
-          token,
-          fetchImpl,
-          signal: controller.signal,
-          onRateLimit: (headers) => backOff(input.companyId, Date.now() + rateLimitRetryMs(headers, Date.now())),
-        }),
-      ),
-    );
+    return readPullRequestEntry({
+      pullRequest: input.pullRequest,
+      token,
+      fetchImpl,
+      signal: controller.signal,
+      onRateLimit: (headers) => backOff(input.companyId, Date.now() + rateLimitRetryMs(headers, Date.now())),
+    });
   };
   try {
-    const entries = await Promise.race([read(), budget]);
+    const entry = await Promise.race([read(), budget]);
     return {
       ok: true,
       fingerprint: {
         version: FINGERPRINT_VERSION,
-        digest: fingerprintDigest(entries),
+        digest: fingerprintDigest(entry),
         computedAt: new Date().toISOString(),
-        pullRequests: entries,
+        pullRequest: entry,
       },
     };
   } catch (error) {
@@ -420,47 +451,71 @@ type BaselineRun = {
   status: string;
   startedAt: Date | null;
   finishedAt: Date | null;
+  wakeReason: string | null;
   fingerprint: unknown;
+  /** Comments on the issue by anyone but this agent since the run started. */
+  newCommentsSinceStart?: boolean;
 };
 
 /**
  * The agent's most recent run on the issue, with the fingerprint it started
- * from. The inner select uses the heartbeat_runs_company_issue_or_task_idx
- * expression and reads no context; only the one chosen row's context is read.
+ * from. The candidates come from the heartbeat_runs_company_issue_or_task_idx
+ * expression in a materialized CTE with no ORDER BY or LIMIT: with them, the
+ * planner may walk the company's newest runs instead and read (detoast) the
+ * context of every run it passes, which for an issue whose runs are all old
+ * means thousands of buffers. Only the one chosen row's context is read.
  */
 async function readBaselineRun(
   db: Db,
   input: { companyId: string; issueId: string; agentId: string },
 ): Promise<BaselineRun | null> {
-  const latestRunId = db
-    .select({ id: heartbeatRuns.id })
-    .from(heartbeatRuns)
-    .where(
-      and(
-        eq(heartbeatRuns.companyId, input.companyId),
-        sql`(coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')) = ${input.issueId}`,
-        eq(heartbeatRuns.agentId, input.agentId),
-      ),
+  const latestRunId = sql`(
+    with candidate as materialized (
+      select ${heartbeatRuns.id} as id, ${heartbeatRuns.createdAt} as created_at
+      from ${heartbeatRuns}
+      where ${heartbeatRuns.companyId} = ${input.companyId}
+        and (coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')) = ${input.issueId}
+        and ${heartbeatRuns.agentId} = ${input.agentId}
     )
-    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
-    .limit(1);
-  return db
+    select id from candidate order by created_at desc, id desc limit 1
+  )`;
+  const baseline = await db
     .select({
       id: heartbeatRuns.id,
       status: heartbeatRuns.status,
       startedAt: heartbeatRuns.startedAt,
       finishedAt: heartbeatRuns.finishedAt,
+      wakeReason: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'wakeReason'`,
       fingerprint: sql<unknown>`${heartbeatRuns.contextSnapshot} -> ${PULL_REQUEST_FINGERPRINT_CONTEXT_KEY}`,
     })
     .from(heartbeatRuns)
-    .where(eq(heartbeatRuns.id, sql`(${latestRunId})`))
+    .where(eq(heartbeatRuns.id, latestRunId))
     .then((rows) => rows[0] ?? null);
+  if (!baseline?.startedAt) return baseline;
+  // A comment that someone else left after the run started is new input for the agent.
+  const newComment = await db
+    .select({ id: issueComments.id })
+    .from(issueComments)
+    .where(
+      and(
+        eq(issueComments.companyId, input.companyId),
+        eq(issueComments.issueId, input.issueId),
+        gt(issueComments.createdAt, baseline.startedAt),
+        isNull(issueComments.deletedAt),
+        sql`${issueComments.authorAgentId} is distinct from ${input.agentId}`,
+      ),
+    )
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  return { ...baseline, newCommentsSinceStart: Boolean(newComment) };
 }
 
 /**
- * Pure rule: skip only when the agent's last run on the issue succeeded, started
- * from this exact fingerprint (read before the run started, so nothing that
- * changed during the run counts as seen), and finished within the quiet period.
+ * Pure rule: skip only when the pull request is still open, and the agent's
+ * last run on the issue was a monitor check that succeeded, started from this
+ * exact fingerprint (read before the run started, so nothing that changed
+ * during the run counts as seen), saw no newer comment from anyone else, and
+ * finished within the quiet period.
  */
 export function decidePullRequestWake(input: {
   current: IssuePullRequestFingerprint;
@@ -468,8 +523,14 @@ export function decidePullRequestWake(input: {
   now: Date;
 }): { skip: true; baselineFinishedAt: Date } | { skip: false; reason: string } {
   const { baseline, current } = input;
+  // A closed or merged pull request cannot change further, so a wait on it is
+  // about something else (a deploy, a release): never skip it.
+  if (current.pullRequest.state !== "open") return { skip: false, reason: "pull_request_not_open" };
   if (!baseline) return { skip: false, reason: "no_previous_run" };
   if (baseline.status !== "succeeded") return { skip: false, reason: "previous_run_not_succeeded" };
+  // Another wake (a comment, an assignment) merged into that run took it over.
+  if (baseline.wakeReason !== "issue_monitor_due") return { skip: false, reason: "previous_run_not_a_monitor_check" };
+  if (baseline.newCommentsSinceStart) return { skip: false, reason: "new_comment_since_previous_run" };
   const previous = readRecord(baseline.fingerprint);
   if (previous.version !== FINGERPRINT_VERSION || typeof previous.digest !== "string") {
     return { skip: false, reason: "previous_run_without_fingerprint" };
@@ -487,10 +548,10 @@ export function decidePullRequestWake(input: {
   return { skip: true, baselineFinishedAt: baseline.finishedAt };
 }
 
-/** Fingerprints the issue's linked pull requests and decides whether the wake may skip. */
+/** Fingerprints the targeted pull request and decides whether the wake may skip. */
 export async function evaluatePullRequestWakeGate(
   db: Db,
-  input: { companyId: string; issueId: string; agentId: string },
+  input: { companyId: string; issueId: string; agentId: string; pullRequest: PullRequestWaitTarget },
   deps: PullRequestWakeGateDeps = {},
 ): Promise<PullRequestWakeGateDecision> {
   const computed = await computeIssuePullRequestFingerprint(db, input, deps);

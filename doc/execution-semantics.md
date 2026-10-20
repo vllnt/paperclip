@@ -609,34 +609,42 @@ Monitor policy lives under `executionPolicy.monitor` and includes:
 - `notes`: non-secret instructions for what the assignee should check
 - `serviceName`: optional non-secret external-service context
 - `externalRef`: optional external-service reference input; Paperclip treats it as secret-adjacent, redacts it before persistence/visibility, and omits it from activity and wake payloads
+- `pullRequestUrl`: optional GitHub pull request the wait is about, stored canonical as `https://github.com/{owner}/{repo}/pull/{n}`; any other value is rejected (see [Unchanged pull request checks](#unchanged-pull-request-checks))
 - `timeoutAt`, `maxAttempts`, and `recoveryPolicy`: optional recovery hints for bounded waits
 
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
 
 #### Unchanged pull request checks
 
-A scheduled monitor often re-checks a GitHub pull request that has not changed. Before Paperclip queues the `issue_monitor_due` wake, it compares the pull requests linked to the issue with the state that the assignee's last run started from. If nothing changed, Paperclip does not start the agent.
+An agent that waits on review, CI checks or new commits of one open GitHub pull request can name it: `paperclipai issue wait <issue> --in 10m --reason "..." --pull-request <url>` (REST: `POST /api/issues/{id}/wait` with `pullRequest`). The wait stores `serviceName: "GitHub pull request"` and the canonical `pullRequestUrl`. Before Paperclip queues the wait's scheduled `issue_monitor_due` wake, it compares that pull request with the state that the assignee's last monitor check started from. If nothing changed, Paperclip does not start the agent.
 
-- **Link source.** Paperclip uses the issue's `pull_request` work products from GitHub. It ignores pull requests that a person unlinked. If the issue links no pull request, or more than three, the wake runs as before.
-- **Fingerprint.** For each pull request, Paperclip reads the head commit, the state (open, closed or merged), the draft flag and the last update time. It also reads the issue-comment and review-comment counts, the review count and the latest review id. Then it reads a check-run rollup (none, pending, success or failure, plus the names of failing checks) and the combined commit status. Paperclip stores a digest of these values as `pullRequestFingerprint` in the context of the run that the wake starts.
+A wait without `--pull-request` behaves exactly as before: it always wakes the agent, whatever pull requests the issue links. Use the target only when the pull request itself is what you wait on, not for a deploy after a merge, a lock, a release or another repository.
+
+- **Target.** Only a canonical `https://github.com/{owner}/{repo}/pull/{n}` qualifies, with no `.` or `..` segment. The wait API and the policy validator reject anything else. The gate re-validates the stored value: another host (including GitHub Enterprise), a missing URL or a malformed one means the wait wakes as before. The board's monitor editor keeps the target when it reschedules, but a board-scheduled monitor always wakes.
+- **Fingerprint.** Paperclip reads the pull request's state (open, closed or merged), draft flag, merge conflict (`mergeable_state` is `dirty`), head and base commits and last update time. It also reads the issue-comment and review-comment counts, the review count and the latest review id. Then it reads a check-run rollup (none, pending, success or failure, plus the names of failing checks) and the combined commit status with the names of failing status contexts. Paperclip stores only `{ version, digest, computedAt }` as `pullRequestFingerprint` in the context of the run that the wake starts.
 - **Skip rule.** Paperclip skips the wake only when all of these are true:
-  - the assignee's latest run on the issue succeeded
+  - the pull request is open (a closed or merged pull request cannot change, so a wait on it is about something else)
+  - the assignee's latest run on the issue was a monitor check (`issue_monitor_due`) and succeeded
   - that run started from the same digest
   - the digest was read before that run started
+  - nobody else commented on the issue after that run started
   - that run finished less than 4 hours ago (`PULL_REQUEST_UNCHANGED_MAX_QUIET_MS`)
-- **Record of a skip.** Paperclip writes a skipped wake request with reason `heartbeat.pull_request_unchanged`. Its `payload.heartbeatSkip` holds `outcome: "no_change"`, the baseline run and the pull request summary. Paperclip also writes an `issue.monitor_pull_request_unchanged` activity entry on the issue. The issue wake diagnostics show the reason. Paperclip creates no heartbeat run and does not invoke the adapter.
-- **Re-arm.** Paperclip re-arms the monitor for the same wait that the agent chose, within 1 minute to 24 hours. It counts the check as an attempt and records the check time, so `maxAttempts` and `timeoutAt` apply as before.
+
+  When a wake merges into a run that is queued or running, the run keeps the digest it was admitted with.
+- **Record of a skip.** Paperclip writes a skipped wake request with reason `heartbeat.pull_request_unchanged`. Its `payload.heartbeatSkip` holds `outcome: "no_change"`, the baseline run and a short pull request summary (repository, number, state, head commit, check and status rollup). Paperclip also writes an `issue.monitor_pull_request_unchanged` activity entry on the issue. The issue wake diagnostics show the reason. Paperclip creates no heartbeat run and does not invoke the adapter.
+- **Re-arm.** Paperclip re-arms the monitor for the same wait that the agent chose, within 1 minute to 24 hours, and never later than `timeoutAt`. It counts the check as an attempt and records the check time, so `maxAttempts` and `timeoutAt` apply as before. If the issue or its monitor changed while Paperclip read GitHub, the change wins and Paperclip does not re-arm.
 - **Always wakes.** These wakes are never skipped:
+  - every wait without a pull request target
   - a manual "check now"
   - a monitor that the board scheduled
   - a server-owned monitor (provider quota, background-task re-check)
   - the last attempt that a re-arm allows
   - any wake that is not a scheduled monitor wake, including every comment wake
-- **Fail open.** Paperclip reads GitHub with the company's own credential: the managed GitHub connection, else a `GITHUB_TOKEN`/`GH_TOKEN`/`PAPERCLIP_GITHUB_TOKEN` company secret. It never uses the server-environment token. Any of the following means the agent wakes as before, and Paperclip logs the reason with the company and issue ids:
-  - there is no credential
-  - GitHub answers with an error, or with a rate limit
+- **Fail open.** Paperclip reads GitHub with the company's own credential: the managed GitHub connection, else a `GITHUB_TOKEN`/`GH_TOKEN`/`PAPERCLIP_GITHUB_TOKEN` company secret. It never uses the server-environment token, and it sends the credential only to `https://api.github.com`. Any of the following means the agent wakes as before, and Paperclip logs the reason with the company and issue ids:
+  - there is no credential, or it cannot be resolved
+  - GitHub answers with an error, or with a rate limit (a 429, or a 403 with no requests left or with `retry-after`)
   - fewer than 100 requests remain in the rate limit
-  - the response is incomplete or paginated
+  - the response is incomplete, paginated, or larger than 2 MiB (`MAX_GITHUB_RESPONSE_BYTES`)
   - the check takes longer than 5 seconds (`PULL_REQUEST_GATE_BUDGET_MS`)
 - **Backoff.** After a rate limit or a timeout, Paperclip stops calling GitHub for that company for a short time and the company's agents wake as before. One scheduler tick spends at most 20 seconds on these checks. When that budget runs out, the tick's remaining due monitors wake without a check.
 

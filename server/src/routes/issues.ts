@@ -2,8 +2,10 @@ import { capGoalTextForAgents, heartbeatContextGoal, readCompanyFocusForIssue } 
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import {
+  PULL_REQUEST_WAIT_MONITOR_SERVICE_NAME,
   issueWaitRequestSchema,
   parseIssueWaitDurationMs,
+  parseIssueWaitPullRequestUrl,
   type IssueWaitRequest,
 } from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -13053,21 +13055,26 @@ export function issueRoutes(
         .then((rows) => rows[0] ?? null);
       if (!row) throw notFound("Issue not found");
 
+      // An explicit pull request target lets an unchanged pull request skip the check.
+      const pullRequest = body.pullRequest ? parseIssueWaitPullRequestUrl(body.pullRequest) : null;
+      if (body.pullRequest && !pullRequest) throw unprocessable("Invalid pull request URL");
+
       const actor = getActorInfo(req);
       const nextCheckAt = new Date(Date.now() + delayMs);
       const updated = await scheduleIssueWaitMonitor(db, svc, {
         issue: row,
         nextCheckAt,
         notes: `Waiting: ${body.reason}`,
-        serviceName: null,
+        serviceName: pullRequest ? PULL_REQUEST_WAIT_MONITOR_SERVICE_NAME : null,
         externalRef: null,
+        pullRequestUrl: pullRequest?.url ?? null,
         activity: {
           actorType: actor.actorType,
           actorId: actor.actorId,
           agentId: actor.agentId ?? null,
           runId: actor.runId ?? null,
           source: "issue.wait",
-          details: { delayMs, reason: body.reason },
+          details: { delayMs, reason: body.reason, pullRequest: pullRequest?.url ?? null },
         },
       });
       if (!updated) throw notFound("Issue not found");
@@ -13078,6 +13085,7 @@ export function issueRoutes(
         status: updated.status,
         nextCheckAt: nextCheckAt.toISOString(),
         reason: body.reason,
+        pullRequest: pullRequest?.url ?? null,
       });
     },
   );
