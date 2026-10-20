@@ -311,7 +311,7 @@ Use `steps` when the same multi-stage work repeats (for example implement, revie
 | `key` | yes | Lowercase slug (letters, digits, `-`, `_`; at most 40), unique in the routine |
 | `title` | yes | Task title (at most 200). `{{variables}}` are filled in at run time |
 | `description` | no | Task instructions in Markdown. `{{variables}}` and `skill://` mentions work |
-| `assigneeAgentId` | no | Agent for the step. Defaults to the routine's agent. Every step needs an agent, so validation fails when it has neither |
+| `assigneeAgentId` | no | Agent for the step. Defaults to the run's agent: the `assigneeAgentId` of the run request, else the routine's agent. An agent can name only itself in a run of a routine with steps. Every step needs an agent, so validation fails when it has neither |
 | `after` | no | Keys of the steps it waits for. Empty means it starts with the run |
 | `executionPolicy` | no | Review or approval stages for this step, as on any task |
 | `labelIds` | no | Labels of the company |

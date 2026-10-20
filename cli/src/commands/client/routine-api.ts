@@ -137,9 +137,9 @@ async function readStepsFile(file: string): Promise<unknown> {
   const text = await readFile(file, "utf8");
   try {
     return parseJson(text);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`${file} is not valid JSON: ${reason}`);
+  } catch {
+    // The parser's message quotes part of the file, which may hold secrets: name only the file.
+    throw new Error(`${file} is not valid JSON.`);
   }
 }
 

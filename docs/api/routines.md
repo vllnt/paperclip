@@ -134,7 +134,7 @@ A step has these fields:
 | `key` | yes | Lowercase slug (letters, digits, `-`, `_`; at most 40), unique in the routine |
 | `title` | yes | Task title, at most 200 characters. `{{variables}}` are filled in at run time |
 | `description` | no | Task instructions in Markdown. `{{variables}}` and `skill://` mentions work |
-| `assigneeAgentId` | no | Agent that runs the step. Defaults to the routine's agent. Validation fails when a step has neither |
+| `assigneeAgentId` | no | Agent that runs the step. Defaults to the run's agent: the `assigneeAgentId` of the run request, else the routine's agent. An agent can name only itself in a run of a routine with steps. Validation fails when a step has neither |
 | `after` | no | Keys of the steps this one waits for. Empty (default) means it starts with the run |
 | `priority` | no | Defaults to the routine's priority |
 | `labelIds` | no | Labels of the company |
