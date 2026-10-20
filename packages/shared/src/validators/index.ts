@@ -214,6 +214,7 @@ export {
   companySkillProjectScanResultSchema,
   companySkillCreateSchema,
   companySkillFileDetailSchema,
+  companySkillFileHunkSchema,
   companySkillFileUpdateSchema,
   companySkillFileDeleteSchema,
   companySkillTestRunStatusSchema,

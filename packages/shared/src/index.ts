@@ -2488,6 +2488,7 @@ export {
   companySkillProjectScanResultSchema,
   companySkillCreateSchema,
   companySkillFileDetailSchema,
+  companySkillFileHunkSchema,
   companySkillFileUpdateSchema,
   companySkillFileDeleteSchema,
   companySkillTestRunStatusSchema,
@@ -2851,6 +2852,13 @@ export {
   rewriteUrlHostToLoopback,
 } from "./runtime-exposure/loopback-bind.js";
 export { ACCOUNT_HANDLE_MAX_LENGTH, toAccountHandle } from "./account-handle.js";
+export {
+  applySkillFileHunks,
+  diffSkillFileHunk,
+  type SkillFileHunk,
+  type SkillFileHunkFailure,
+  type SkillFileHunkResult,
+} from "./skill-file-patch.js";
 export type { ExecutionContinuationEnvelope } from "./types/execution-continuation.js";
 export type { ExecutionProjection, ExecutionReconciliation, ExecutionBlocker } from "./types/execution-projection.js";
 

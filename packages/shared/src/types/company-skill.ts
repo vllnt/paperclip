@@ -453,7 +453,13 @@ export interface CompanySkillFileUpdateRequest {
   encoding?: "utf8" | "base64";
   executable?: boolean;
   path: string;
-  content: string;
+  /** The full file. Send exactly one of `content` or `hunks`. */
+  content?: string;
+  /** `old → new` replacements applied to the current UTF-8 file; each `old` must match exactly once. */
+  hunks?: Array<{ old: string; new: string }>;
+  /** Optional base check: the write fails with 409 `version_changed` when the skill moved past it. */
+  expectedVersionId?: string | null;
+  idempotencyKey?: string;
 }
 
 export interface CompanySkillFileDeleteRequest {
