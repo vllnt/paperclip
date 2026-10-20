@@ -72,6 +72,9 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
 const LOCK_TIMEOUT_TEST_ADAPTER = "restore_lock_timeout_test";
 const ORDINARY_FAILURE_TEST_ADAPTER = "ordinary_throw_test";
+const CONTEXT_OVERFLOW_TEST_ADAPTER = "context_overflow_test";
+const CONTEXT_OVERFLOW_THROW_TEST_ADAPTER = "context_overflow_throw_test";
+const TRANSIENT_FAILURE_TEST_ADAPTER = "transient_failure_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -126,7 +129,29 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    // The adapter's own output guessed a transient failure; only the terminal
+    // error message says the prompt overflowed the context window.
+    for (const [type, errorMessage] of [
+      [CONTEXT_OVERFLOW_TEST_ADAPTER, "Claude run failed: subtype=success: Prompt is too long"],
+      [TRANSIENT_FAILURE_TEST_ADAPTER, "Claude run failed: subtype=success: API Error: 529 overloaded"],
+    ] as const) {
+      registerServerAdapter({
+        type,
+        execute: async () => ({
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage,
+          errorCode: "claude_transient_upstream",
+          errorFamily: "transient_upstream",
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false }, errorFamily: "transient_upstream" },
+        }),
+        testEnvironment: async () => ({ adapterType: type, status: "pass", checks: [], testedAt: new Date().toISOString() }),
+      });
+    }
     for (const [type, fail] of [
+      [CONTEXT_OVERFLOW_THROW_TEST_ADAPTER, () => new Error("API Error: 400 prompt is too long: 1040000 tokens > 1000000 maximum")],
       [LOCK_TIMEOUT_TEST_ADAPTER, () => Object.assign(new Error("Timed out waiting for workspace restore lock at /locks/directory-merge/abc.lock"), { code: "ERR_WORKSPACE_RESTORE_LOCK_TIMEOUT" })],
       [ORDINARY_FAILURE_TEST_ADAPTER, () => new Error("The adapter crashed")],
     ] as const) {
@@ -154,6 +179,9 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
     unregisterServerAdapter(LOCK_TIMEOUT_TEST_ADAPTER);
     unregisterServerAdapter(ORDINARY_FAILURE_TEST_ADAPTER);
+    unregisterServerAdapter(CONTEXT_OVERFLOW_TEST_ADAPTER);
+    unregisterServerAdapter(CONTEXT_OVERFLOW_THROW_TEST_ADAPTER);
+    unregisterServerAdapter(TRANSIENT_FAILURE_TEST_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -321,6 +349,76 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     expect(failed.errorCode).toBe("adapter_failed");
     expect((failed.resultJson as Record<string, unknown> | null)?.workspaceRestoreFailure).toBeUndefined();
+  });
+
+  describe("a context overflow is never retried", () => {
+    const agentRuns = (agentId: string) =>
+      db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const notRetriedEvents = (runId: string) =>
+      db.select({ message: heartbeatRunEvents.message }).from(heartbeatRunEvents)
+        .where(and(eq(heartbeatRunEvents.runId, runId), sql`${heartbeatRunEvents.message} like 'Not retried automatically%'`));
+
+    it("records the overflow, schedules no retry and takes no slot, although the adapter guessed a transient failure", async () => {
+      const failed = await failedThrownRun(CONTEXT_OVERFLOW_TEST_ADAPTER);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      expect(failed.errorCode).toBe("context_window_exceeded");
+      expect(await retryChildren(failed.id)).toEqual([]);
+      expect(await agentRuns(failed.agentId)).toEqual([{ id: failed.id, status: "failed" }]);
+      expect(await notRetriedEvents(failed.id)).toHaveLength(1);
+      // A caller that asks for a retry with its own policy is refused too.
+      expect(await heartbeat.scheduleBoundedRetry(failed.id, { retryReason: "transient_failure", maxAttempts: 9 }))
+        .toMatchObject({ outcome: "not_scheduled", reason: expect.stringContaining("context window") });
+      expect(await retryChildren(failed.id)).toEqual([]);
+    });
+
+    it("queues no recovery run for the assigned task either", async () => {
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId, name: "Paperclip", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user",
+      });
+      await db.insert(agents).values({
+        id: agentId, companyId, name: "Overflow Test", role: "engineer", status: "idle", adapterType: CONTEXT_OVERFLOW_TEST_ADAPTER,
+        adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {},
+      });
+      await db.insert(issues).values({ id: issueId, companyId, title: "Overflow fixture", status: "in_progress", assigneeAgentId: agentId });
+
+      const run = await heartbeat.wakeup(agentId, {
+        source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        payload: { issueId, mutation: "update" }, contextSnapshot: { issueId, source: "issue.update" },
+        requestedByActorType: "user", requestedByActorId: "local-board",
+      });
+      const failed = await waitForRunToFinish(heartbeat, run!.id);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      expect(failed?.errorCode).toBe("context_window_exceeded");
+      expect(await agentRuns(agentId)).toEqual([{ id: run!.id, status: "failed" }]);
+      const [issue] = await db.select({ status: issues.status, executionRunId: issues.executionRunId })
+        .from(issues).where(eq(issues.id, issueId));
+      // The task waits for a person (blocked with a recovery notice), not for another doomed run.
+      expect(issue).toEqual({ status: "blocked", executionRunId: null });
+    });
+
+    it("records a thrown overflow the same way", async () => {
+      const failed = await failedThrownRun(CONTEXT_OVERFLOW_THROW_TEST_ADAPTER);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      expect(failed.errorCode).toBe("context_window_exceeded");
+      expect(await retryChildren(failed.id)).toEqual([]);
+      expect(await notRetriedEvents(failed.id)).toHaveLength(1);
+    });
+
+    it("still retries a transient failure of the same shape", async () => {
+      const failed = await failedThrownRun(TRANSIENT_FAILURE_TEST_ADAPTER);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+      expect(failed.errorCode).toBe("claude_transient_upstream");
+      expect(await retryChildren(failed.id)).toEqual([
+        expect.objectContaining({ scheduledRetryReason: "transient_failure" }),
+      ]);
+      expect(await notRetriedEvents(failed.id)).toEqual([]);
+    });
   });
 
   it("never schedules invalid provider definitions even when a caller supplies a retry policy", async () => {

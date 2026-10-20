@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  CONTEXT_WINDOW_EXCEEDED_ERROR_CODE,
   RUN_FAILURE_CAUSES,
   classifyRunFailure,
+  isContextWindowExceededMessage,
   isRunFailureCause,
   type RunFailureCause,
 } from "./run-failure-cause.js";
@@ -58,6 +60,7 @@ describe("classifyRunFailure", () => {
     ["hermes_gateway_cancelled", "operator_cancel"],
     ["adapter_failed", "adapter_failure"],
     ["acpx_protocol_error", "adapter_failure"],
+    [CONTEXT_WINDOW_EXCEEDED_ERROR_CODE, "context_overflow"],
     ["openclaw_gateway_agent_error", "adapter_failure"],
     ["tool_execution_failed", "adapter_failure"],
   ];
@@ -133,5 +136,43 @@ describe("isRunFailureCause", () => {
     expect(isRunFailureCause("timeout")).toBe(true);
     expect(isRunFailureCause("nope")).toBe(false);
     expect(isRunFailureCause(null)).toBe(false);
+  });
+});
+
+describe("isContextWindowExceededMessage", () => {
+  it("recognizes each provider's wording of a prompt that does not fit the context window", () => {
+    for (const message of [
+      "Claude run failed: subtype=success: Prompt is too long",
+      "API Error: 400 prompt is too long: 1040000 tokens > 1000000 maximum",
+      "Turn failed\nContext window limit exceeded",
+      "Error code: context_length_exceeded",
+      "Your input exceeds the context window of this model. Please adjust your input and try again.",
+      "Codex ran out of room in the model's context window. Start a new conversation or clear earlier history before retrying.",
+      "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.",
+      "ValidationException: Input is too long for requested model.",
+      "The input token count (1100000) exceeds the maximum number of tokens allowed (1048576).",
+    ]) {
+      expect(isContextWindowExceededMessage(message), message).toBe(true);
+    }
+  });
+
+  it("does not match other failures, an empty message, or a long line that only quotes the words", () => {
+    for (const message of [
+      null,
+      undefined,
+      "",
+      "Claude run failed: subtype=error_max_turns",
+      "API Error: 529 overloaded",
+      "Rate limit exceeded; retry later",
+      "Maximum number of turns reached",
+      "Tool description is too long",
+      `I looked into why the earlier run said "Prompt is too long". ${"The replay grows with every comment. ".repeat(20)}`,
+    ]) {
+      expect(isContextWindowExceededMessage(message), String(message)).toBe(false);
+    }
+  });
+
+  it("reads only the head of a very long message", () => {
+    expect(isContextWindowExceededMessage(`${"x\n".repeat(3000)}Prompt is too long`)).toBe(false);
   });
 });
