@@ -182,6 +182,20 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
       expect(delivery!.routineRunIds).toEqual([run!.id]);
     });
 
+    it("keeps the task title out of the delivery and the run, which every agent of the company can read", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      await s.listen(routine);
+      const task = await s.newTask({ title: "Quarterly figures" });
+
+      await s.publish(task.id);
+
+      expect(JSON.stringify(await s.deliveries())).not.toContain("Quarterly figures");
+      expect(JSON.stringify(await s.runsOf(routine.id))).not.toContain("Quarterly figures");
+      const children = await s.childrenOf(task.id);
+      expect(children.map((child) => child.title)).toContain(`Build ${task.identifier}: Quarterly figures`);
+    });
+
     it("leaves a task nobody owns in its status", async () => {
       const s = await seed();
       const routine = await s.createRoutine();

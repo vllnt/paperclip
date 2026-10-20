@@ -20,7 +20,6 @@ import {
   PAPERCLIP_ISSUE_EVENT_MAX_LABELS,
   matchesEvent,
   paperclipIssueLabelEventKey,
-  sanitizeEventSingleLine,
   validateEventSourceNormalizerConfig,
   type EventSourceNormalizer,
   type CreateEventSource,
@@ -114,9 +113,6 @@ const INTERNAL_SOURCE_MANAGED_MESSAGE =
  * alert storm.
  */
 const INTERNAL_SOURCE_MAX_NEW_ISSUES_PER_HOUR = 200;
-
-/** Longest title an `issue.created` event carries, in characters. */
-const INTERNAL_EVENT_TITLE_MAX_CHARS = 200;
 
 /** Task origins that never publish: they belong to a routine run or a conversation. */
 const UNPUBLISHED_ISSUE_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step", "chat_channel"];
@@ -874,7 +870,6 @@ export function eventSourceService(
     const issue = await db
       .select({
         id: issues.id,
-        title: issues.title,
         projectId: issues.projectId,
         parentId: issues.parentId,
         originKind: issues.originKind,
@@ -921,7 +916,9 @@ export function eventSourceService(
       severity: "info",
       state: "info",
       dedupeKey: issue.id,
-      title: [...sanitizeEventSingleLine(issue.title)].slice(0, INTERNAL_EVENT_TITLE_MAX_CHARS).join(""),
+      // Deliveries and run payloads are readable by every agent of the company, which may not read this
+      // task: the event names the task by id only. The steps read the title from the task itself.
+      title: "",
       summary: "",
       labels: eventLabels,
       occurredAt: new Date(now()).toISOString(),

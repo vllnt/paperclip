@@ -401,7 +401,7 @@ POST /api/routines/{routineId}/triggers
 | `type` | `issue.created` |
 | `severity`, `state` | `info` |
 | `dedupeKey` | the task id |
-| `title` | the task title |
+| `title` | empty (`""`); the event names the task only by `dedupeKey`, because every agent of the company can read deliveries and runs, also of tasks it may not read. The steps read the title from the task. |
 | `labels.project` | the project id; absent when the task has no project |
 | `labels.created_by` | `user` or `agent` |
 | `labels.label_<slug>` | `"true"` for each label on the task |

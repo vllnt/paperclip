@@ -80,7 +80,7 @@ No new trigger kind. The existing `event` trigger does the work: `eventMatch`, t
 
 - One per company, created lazily by `POST /companies/:companyId/event-sources/paperclip` (idempotent; board access like the other event-source writes). The response is the `EventSource`: `normalizer: "paperclip_v1"`, `ingressUrl: null`, `secretId: null`, name "Paperclip (built-in)". `GET /companies/:companyId/event-sources` lists it once it exists.
 - Paperclip manages it. `PATCH` (except `enabled`), `DELETE`, secret rotation and the dry-run test answer 409. Public ingress on its id answers 404, like an unknown source. `paperclip_v1` is not in `EVENT_SOURCE_NORMALIZERS`, so create and update refuse it.
-- It publishes one event type, `issue.created`: `source: "paperclip"`, severity `info`, state `info`, `dedupeKey` the task id, `title` the task title. Labels for `eventMatch`:
+- It publishes one event type, `issue.created`: `source: "paperclip"`, severity `info`, state `info`, `dedupeKey` the task id, `title` empty. Every agent of the company can read deliveries and runs, also of tasks it may not read, so the event names the task by id only; the steps read the title from the task. Labels for `eventMatch`:
   - `project`: the project id, only when the task has one
   - `created_by`: `user` or `agent`
   - `label_<slug>`: `"true"` for each label of the task. The slug is the label name lowercased, every run of characters outside `[a-z0-9_]` turned into one `_`, trimmed of `_`, and cut so the key stays within 64 characters. At most 30 task labels, sorted by slug; the rest are dropped.
