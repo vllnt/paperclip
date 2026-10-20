@@ -1942,7 +1942,7 @@ async function assertExecutionTaskParent(db: DbReader, companyId: string, parent
   if (parent?.conversationAgentId) throw unprocessable("Conversations cannot have new subtasks; create a task in a project instead");
 }
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+export type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" | "titleNeedsGeneration"> & {
   title?: string;
   initialPlan?: string | null;

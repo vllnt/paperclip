@@ -15,11 +15,17 @@ import {
   routineRevisions,
   routines,
 } from "@paperclipai/db";
-import { readRoutineStepsRunPayload, type EventGrouping, type RoutineStep } from "@paperclipai/shared";
+import {
+  MAX_ROUTINE_STEPS,
+  readRoutineStepsRunPayload,
+  type EventGrouping,
+  type RoutineStep,
+} from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture, wireEvent } from "./helpers/event-source-fixture.js";
-import { issueService } from "../services/issues.ts";
+import { MAX_CHILD_ISSUES_CREATED_BY_HELPER, issueService } from "../services/issues.ts";
 import { inheritRoutineStepWorkspace } from "../services/routine-steps.ts";
+import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
 import { routineService } from "../services/routines.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -210,6 +216,28 @@ describeEmbeddedPostgres("routine steps", () => {
       expect(fx.wakeups.some((wake) => wake.issueId === run.linkedIssueId)).toBe(false);
     });
 
+    it("still wakes the starting steps and keeps the run when publishing the activity throws", async () => {
+      const fx = await seed();
+      const routine = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));
+      const unsubscribe = subscribeCompanyLiveEvents(fx.companyId, (event) => {
+        if (event.type === "activity.logged") throw new Error("subscriber failed");
+      });
+
+      try {
+        const run = await fx.svc.runRoutine(routine.id, { source: "manual" });
+
+        expect(run.status).toBe("issue_created");
+        const implement = (await stepIssuesOf(routine.id)).find((issue) => issue.title === "Step implement")!;
+        expect(fx.wakeups).toEqual([{ agentId: fx.builderId, issueId: implement.id, reason: "issue_assigned" }]);
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it("keeps the step limit equal to the number of children the helper may create under one parent", () => {
+      expect(MAX_ROUTINE_STEPS).toBe(MAX_CHILD_ISSUES_CREATED_BY_HELPER);
+    });
+
     it("records the steps and their issue ids on the run", async () => {
       const fx = await seed();
       const steps = releaseSteps(fx.builderId, fx.reviewerId);
@@ -283,6 +311,7 @@ describeEmbeddedPostgres("routine steps", () => {
       const run = await fx.svc.runRoutine(routine.id, { source: "manual" });
 
       expect(run.status).toBe("failed");
+      expect(run.failureReason).toContain('Step "second"');
       expect(run.linkedIssueId).toBeNull();
       expect(await db.select().from(issues).where(eq(issues.companyId, fx.companyId))).toHaveLength(0);
       expect(await db.select().from(issueRelations).where(eq(issueRelations.companyId, fx.companyId))).toHaveLength(0);
@@ -462,22 +491,43 @@ describeEmbeddedPostgres("routine steps", () => {
       const fx = await seed();
       await expect(
         fx.create([step("orphan")], { assigneeAgentId: null, status: "paused" }),
-      ).rejects.toMatchObject({ status: 422 });
+      ).rejects.toMatchObject({
+        status: 422,
+        message: expect.stringContaining('Step "orphan"'),
+        details: { stepKey: "orphan" },
+      });
     });
 
-    it("rejects an agent from another company", async () => {
+    it("rejects an agent from another company and names the step", async () => {
       const fx = await seed();
       const other = await seedCompany("Other");
       const strangerId = await other.newAgent("Stranger");
-      await expect(fx.create([step("a", [], { assigneeAgentId: strangerId })])).rejects.toMatchObject({ status: 422 });
+      await expect(
+        fx.create([step("ok", [], { assigneeAgentId: fx.builderId }), step("a", ["ok"], { assigneeAgentId: strangerId })]),
+      ).rejects.toMatchObject({ status: 422, message: expect.stringContaining('Step "a"'), details: { stepKey: "a" } });
     });
 
-    it("rejects a label from another company", async () => {
+    it("rejects a terminated agent and names the step, keeping the conflict status", async () => {
+      const fx = await seed();
+      const doomedId = await fx.newAgent("Doomed");
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, doomedId));
+      await expect(fx.create([step("late", [], { assigneeAgentId: doomedId })])).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining('Step "late"'),
+        details: { stepKey: "late", code: "agent_not_assignable" },
+      });
+    });
+
+    it("rejects a label from another company and names the step", async () => {
       const fx = await seed();
       const other = await seedCompany("Other");
       const labelId = randomUUID();
       await db.insert(labels).values({ id: labelId, companyId: other.companyId, name: "theirs", color: "#ff0000" });
-      await expect(fx.create([step("a", [], { labelIds: [labelId] })])).rejects.toMatchObject({ status: 422 });
+      await expect(fx.create([step("a"), step("b", ["a"], { labelIds: [labelId] })])).rejects.toMatchObject({
+        status: 422,
+        message: expect.stringContaining('Step "b"'),
+        details: { stepKey: "b" },
+      });
     });
 
     it("rejects an agent named in a review stage that belongs to another company", async () => {
@@ -494,7 +544,7 @@ describeEmbeddedPostgres("routine steps", () => {
             },
           }),
         ]),
-      ).rejects.toMatchObject({ status: 422 });
+      ).rejects.toMatchObject({ status: 422, message: expect.stringContaining('Step "a"'), details: { stepKey: "a" } });
     });
 
     it("records steps in the revision, restores them and clears them", async () => {
@@ -535,6 +585,35 @@ describeEmbeddedPostgres("routine steps", () => {
       return executionWorkspaceId;
     }
 
+    async function inherit(companyId: string, issueId: string) {
+      const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+      return inheritRoutineStepWorkspace(db, companyId, row!);
+    }
+
+    async function seedForkedRun(options: { workspaceStatus?: string } = {}) {
+      const fx = await seed();
+      const routine = await fx.create([
+        step("implement", [], { assigneeAgentId: fx.builderId }),
+        step("left", ["implement"], { assigneeAgentId: fx.reviewerId }),
+        step("right", ["implement"], { assigneeAgentId: fx.reviewerId }),
+      ]);
+      await fx.svc.runRoutine(routine.id, { source: "manual" });
+      const stepIssues = await stepIssuesOf(routine.id);
+      const issueOf = (key: string) => stepIssues.find((issue) => issue.title === `Step ${key}`)!;
+      const workspaceId = await seedWorkspace(fx.companyId, fx.projectId);
+      if (options.workspaceStatus) {
+        await db
+          .update(executionWorkspaces)
+          .set({ status: options.workspaceStatus })
+          .where(eq(executionWorkspaces.id, workspaceId));
+      }
+      await db
+        .update(issues)
+        .set({ executionWorkspaceId: workspaceId, status: "done" })
+        .where(eq(issues.id, issueOf("implement").id));
+      return { fx, issueOf, workspaceId };
+    }
+
     it("points a step at the workspace of the step it waited for", async () => {
       const fx = await seed();
       const routine = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));
@@ -543,10 +622,13 @@ describeEmbeddedPostgres("routine steps", () => {
       const implement = stepIssues.find((issue) => issue.title === "Step implement")!;
       const review = stepIssues.find((issue) => issue.title === "Step review")!;
       const workspaceId = await seedWorkspace(fx.companyId, fx.projectId);
-      await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, implement.id));
+      await db
+        .update(issues)
+        .set({ executionWorkspaceId: workspaceId, status: "done" })
+        .where(eq(issues.id, implement.id));
 
       expect(review.executionWorkspaceId).toBeNull();
-      expect(await inheritRoutineStepWorkspace(db, fx.companyId, review.id)).toBe(true);
+      expect(await inherit(fx.companyId, review.id)).toBe(true);
 
       const [updated] = await db.select().from(issues).where(eq(issues.id, review.id));
       expect(updated).toMatchObject({
@@ -564,17 +646,72 @@ describeEmbeddedPostgres("routine steps", () => {
       const implement = stepIssues.find((issue) => issue.title === "Step implement")!;
       const review = stepIssues.find((issue) => issue.title === "Step review")!;
 
-      expect(await inheritRoutineStepWorkspace(db, fx.companyId, implement.id)).toBe(false);
-      expect(await inheritRoutineStepWorkspace(db, fx.companyId, review.id)).toBe(false);
-      expect(await inheritRoutineStepWorkspace(db, fx.companyId, run.linkedIssueId!)).toBe(false);
+      expect(await inherit(fx.companyId, implement.id)).toBe(false);
+      expect(await inherit(fx.companyId, review.id)).toBe(false);
+      expect(await inherit(fx.companyId, run.linkedIssueId!)).toBe(false);
 
       const ownWorkspaceId = await seedWorkspace(fx.companyId, fx.projectId);
       const otherWorkspaceId = await seedWorkspace(fx.companyId, fx.projectId);
       await db.update(issues).set({ executionWorkspaceId: ownWorkspaceId }).where(eq(issues.id, implement.id));
       await db.update(issues).set({ executionWorkspaceId: otherWorkspaceId }).where(eq(issues.id, review.id));
-      expect(await inheritRoutineStepWorkspace(db, fx.companyId, review.id)).toBe(false);
+      expect(await inherit(fx.companyId, review.id)).toBe(false);
       const [kept] = await db.select().from(issues).where(eq(issues.id, review.id));
       expect(kept!.executionWorkspaceId).toBe(otherWorkspaceId);
+    });
+
+    it.each(["archived", "cleanup_failed"])("does not inherit a workspace that is %s", async (workspaceStatus) => {
+      const { fx, issueOf } = await seedForkedRun({ workspaceStatus });
+
+      expect(await inherit(fx.companyId, issueOf("left").id)).toBe(false);
+      const [left] = await db.select().from(issues).where(eq(issues.id, issueOf("left").id));
+      expect(left!.executionWorkspaceId).toBeNull();
+    });
+
+    it("does not overwrite a workspace the step received after it was read", async () => {
+      const { fx, issueOf, workspaceId } = await seedForkedRun();
+      const [stale] = await db.select().from(issues).where(eq(issues.id, issueOf("left").id));
+      const ownWorkspaceId = await seedWorkspace(fx.companyId, fx.projectId);
+      await db.update(issues).set({ executionWorkspaceId: ownWorkspaceId }).where(eq(issues.id, stale!.id));
+
+      expect(await inheritRoutineStepWorkspace(db, fx.companyId, stale!)).toBe(false);
+      const [after] = await db.select().from(issues).where(eq(issues.id, stale!.id));
+      expect(after!.executionWorkspaceId).toBe(ownWorkspaceId);
+      expect(after!.executionWorkspaceId).not.toBe(workspaceId);
+    });
+
+    it("gives a parallel branch its own workspace while a sibling step still holds the predecessor's", async () => {
+      const { fx, issueOf, workspaceId } = await seedForkedRun();
+
+      expect(await inherit(fx.companyId, issueOf("left").id)).toBe(true);
+      expect(await inherit(fx.companyId, issueOf("right").id)).toBe(false);
+      const [right] = await db.select().from(issues).where(eq(issues.id, issueOf("right").id));
+      expect(right!.executionWorkspaceId).toBeNull();
+
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueOf("left").id));
+      expect(await inherit(fx.companyId, issueOf("right").id)).toBe(true);
+      const [reused] = await db.select().from(issues).where(eq(issues.id, issueOf("right").id));
+      expect(reused!.executionWorkspaceId).toBe(workspaceId);
+    });
+
+    it("picks the earliest predecessor by issue number", async () => {
+      const fx = await seed();
+      const routine = await fx.create([
+        step("zeta", [], { assigneeAgentId: fx.builderId }),
+        step("alpha", [], { assigneeAgentId: fx.builderId }),
+        step("join", ["zeta", "alpha"], { assigneeAgentId: fx.reviewerId }),
+      ]);
+      await fx.svc.runRoutine(routine.id, { source: "manual" });
+      const stepIssues = await stepIssuesOf(routine.id);
+      const issueOf = (key: string) => stepIssues.find((issue) => issue.title === `Step ${key}`)!;
+      const first = await seedWorkspace(fx.companyId, fx.projectId);
+      const second = await seedWorkspace(fx.companyId, fx.projectId);
+      const [earlier, later] = [issueOf("zeta"), issueOf("alpha")].sort((a, b) => a.issueNumber! - b.issueNumber!);
+      await db.update(issues).set({ executionWorkspaceId: first, status: "done" }).where(eq(issues.id, earlier!.id));
+      await db.update(issues).set({ executionWorkspaceId: second, status: "done" }).where(eq(issues.id, later!.id));
+
+      expect(await inherit(fx.companyId, issueOf("join").id)).toBe(true);
+      const [join] = await db.select().from(issues).where(eq(issues.id, issueOf("join").id));
+      expect(join!.executionWorkspaceId).toBe(first);
     });
   });
 

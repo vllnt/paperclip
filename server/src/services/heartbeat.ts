@@ -23230,14 +23230,16 @@ export function heartbeatService(
       const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
       const sessionCodec = getAdapterSessionCodec(agent.adapterType);
       const issueId = readNonEmptyString(context.issueId);
-      if (issueId) {
-        await inheritRoutineStepWorkspace(db, agent.companyId, issueId).catch((error) => {
-          logger.warn({ err: error, issueId }, "failed to inherit the workspace of a routine step's predecessor");
-        });
-      }
       let issueContext = issueId
         ? await getIssueExecutionContext(agent.companyId, issueId)
         : null;
+      if (issueId && issueContext) {
+        const inherited = await inheritRoutineStepWorkspace(db, agent.companyId, issueContext).catch((error) => {
+          logger.warn({ err: error, issueId }, "failed to inherit the workspace of a routine step's predecessor");
+          return false;
+        });
+        if (inherited) issueContext = await getIssueExecutionContext(agent.companyId, issueId);
+      }
       const issueDependencyReadiness = issueId
         ? await issuesSvc
             .listDependencyReadiness(agent.companyId, [issueId])

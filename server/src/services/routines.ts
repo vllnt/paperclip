@@ -109,7 +109,7 @@ import { logActivity } from "./activity-log.js";
 import {
   ROUTINE_STEP_ACTOR_ID,
   assertRoutineStepReferences,
-  attachRoutineSteps,
+  createRoutineRunIssues,
   routineStartingStepAgentIds,
   startAttachedRoutineSteps,
   type AttachedRoutineSteps,
@@ -2612,20 +2612,15 @@ export function routineService(
 
         try {
           if (hasSteps) {
-            const created = await txDb.transaction(async (savepoint) => {
-              const savepointDb = savepoint as unknown as Db;
-              const root = await issueSvc.create(input.routine.companyId, rootInput, savepoint);
-              const attached = await attachRoutineSteps({
-                tx: savepointDb,
-                issueSvc,
-                root,
-                run: createdRun,
-                routine: input.routine,
-                steps,
-                defaultAssigneeAgentId: assigneeAgentId,
-                variables: allVariables,
-              });
-              return { root, attached };
+            const created = await createRoutineRunIssues({
+              tx: txDb,
+              issueSvc,
+              createRoot: (savepoint) => issueSvc.create(input.routine.companyId, rootInput, savepoint),
+              run: createdRun,
+              routine: input.routine,
+              steps,
+              defaultAssigneeAgentId: assigneeAgentId,
+              variables: allVariables,
             });
             createdIssue = created.root;
             attachedSteps = created.attached;

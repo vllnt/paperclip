@@ -17,7 +17,7 @@ import { HttpError, conflict } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import type { issueService } from "../issues.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../issue-assignment-wakeup.js";
-import { attachRoutineSteps, startAttachedRoutineSteps, type AttachedRoutineSteps } from "../routine-steps.js";
+import { createRoutineRunIssues, startAttachedRoutineSteps, type AttachedRoutineSteps } from "../routine-steps.js";
 import {
   renderGateDecisionBlock,
   type GateDecision,
@@ -786,19 +786,15 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
         };
         let created: Awaited<ReturnType<typeof issueSvc.create>>;
         if (steps.length > 0) {
-          const withSteps = await txDb.transaction(async (savepoint) => {
-            const root = await issueSvc.create(routine.companyId, groupIssueInput, savepoint);
-            const attached = await attachRoutineSteps({
-              tx: savepoint as unknown as Db,
-              issueSvc,
-              root,
-              run: createdRun,
-              routine,
-              steps,
-              defaultAssigneeAgentId: prepared.assigneeAgentId,
-              variables: prepared.variables,
-            });
-            return { root, attached };
+          const withSteps = await createRoutineRunIssues({
+            tx: txDb,
+            issueSvc,
+            createRoot: (savepoint) => issueSvc.create(routine.companyId, groupIssueInput, savepoint),
+            run: createdRun,
+            routine,
+            steps,
+            defaultAssigneeAgentId: prepared.assigneeAgentId,
+            variables: prepared.variables,
           });
           created = withSteps.root;
           attachedSteps = withSteps.attached;
