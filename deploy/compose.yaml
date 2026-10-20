@@ -1,6 +1,6 @@
 services:
   paperclip:
-    image: ghcr.io/vllnt/paperclip@sha256:1259a1305b00e879638289564a415d42a7c94e8d8190aea33d1e9bc8599b9415
+    image: ghcr.io/vllnt/paperclip@sha256:f43b28ab1d7629cf7611e5b6779bfe6b118346bfbde65f1473392bca7c069766
     restart: unless-stopped
     # Keep equal to PAPERCLIP_STOP_TIMEOUT_MS below: the server ends its shutdown
     # 10 seconds before this, so it exits 0 instead of being killed.
