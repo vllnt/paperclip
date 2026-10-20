@@ -336,7 +336,8 @@ export interface RoutineStepWorkspaceCandidate {
  * (by issue number) that has an open one. It changes nothing when the issue is not a step, already has
  * a workspace, or has no predecessor with an open workspace in the same project. It also skips a
  * workspace that another unfinished step of the same run holds, so two parallel branches never share a
- * checkout. The step row is read by the caller, so a plain issue costs no query here.
+ * checkout; branches woken at the same time queue on a per-run advisory lock, so exactly one takes it.
+ * The step row is read by the caller, so a plain issue costs no query here.
  * @param step The step issue as the caller already read it.
  * @returns whether the step now reuses a predecessor's workspace.
  */
@@ -371,39 +372,49 @@ export async function inheritRoutineStepWorkspace(
   );
   if (open.length === 0) return false;
 
-  const heldBySiblings = step.originRunId
-    ? new Set(
-        (
-          await db
-            .select({ executionWorkspaceId: issues.executionWorkspaceId })
-            .from(issues)
-            .where(
-              and(
-                eq(issues.companyId, companyId),
-                eq(issues.originKind, "routine_step"),
-                eq(issues.originRunId, step.originRunId),
-                ne(issues.id, step.id),
-                notInArray(issues.status, ["done", "cancelled"]),
-              ),
-            )
-        ).map((row) => row.executionWorkspaceId),
-      )
-    : new Set<string | null>();
-  const predecessor = open.find((candidate) => !heldBySiblings.has(candidate.executionWorkspaceId));
-  if (!predecessor?.executionWorkspaceId) return false;
+  // The sibling check and the update are one unit: two branches woken together would otherwise both
+  // see a predecessor's workspace as free and both take it. The lock is per run, held to the end of the
+  // transaction, and every read below uses the transaction, so the second branch sees the first one's claim.
+  return db.transaction(async (tx) => {
+    if (step.originRunId) {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${`routine-step-workspace:${step.originRunId}`}, 0))`,
+      );
+    }
+    const heldBySiblings = step.originRunId
+      ? new Set(
+          (
+            await tx
+              .select({ executionWorkspaceId: issues.executionWorkspaceId })
+              .from(issues)
+              .where(
+                and(
+                  eq(issues.companyId, companyId),
+                  eq(issues.originKind, "routine_step"),
+                  eq(issues.originRunId, step.originRunId),
+                  ne(issues.id, step.id),
+                  notInArray(issues.status, ["done", "cancelled"]),
+                ),
+              )
+          ).map((row) => row.executionWorkspaceId),
+        )
+      : new Set<string | null>();
+    const predecessor = open.find((candidate) => !heldBySiblings.has(candidate.executionWorkspaceId));
+    if (!predecessor?.executionWorkspaceId) return false;
 
-  const updated = await db
-    .update(issues)
-    .set({
-      executionWorkspaceId: predecessor.executionWorkspaceId,
-      executionWorkspacePreference: "reuse_existing",
-      executionWorkspaceSettings: {
-        ...(step.executionWorkspaceSettings ?? {}),
-        mode: issueExecutionWorkspaceModeForPersistedWorkspace(predecessor.workspace.mode),
-      },
-      ...(step.projectWorkspaceId ? {} : { projectWorkspaceId: predecessor.projectWorkspaceId }),
-    })
-    .where(and(eq(issues.id, step.id), eq(issues.companyId, companyId), isNull(issues.executionWorkspaceId)))
-    .returning({ id: issues.id });
-  return updated.length > 0;
+    const updated = await tx
+      .update(issues)
+      .set({
+        executionWorkspaceId: predecessor.executionWorkspaceId,
+        executionWorkspacePreference: "reuse_existing",
+        executionWorkspaceSettings: {
+          ...(step.executionWorkspaceSettings ?? {}),
+          mode: issueExecutionWorkspaceModeForPersistedWorkspace(predecessor.workspace.mode),
+        },
+        ...(step.projectWorkspaceId ? {} : { projectWorkspaceId: predecessor.projectWorkspaceId }),
+      })
+      .where(and(eq(issues.id, step.id), eq(issues.companyId, companyId), isNull(issues.executionWorkspaceId)))
+      .returning({ id: issues.id });
+    return updated.length > 0;
+  });
 }

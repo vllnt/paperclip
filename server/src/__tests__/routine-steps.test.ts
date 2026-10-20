@@ -825,6 +825,32 @@ describeEmbeddedPostgres("routine steps", () => {
       expect(reused!.executionWorkspaceId).toBe(workspaceId);
     });
 
+    it("lets exactly one of several parallel branches woken together take the predecessor's workspace", async () => {
+      const fx = await seed();
+      const branchKeys = ["b1", "b2", "b3", "b4", "b5", "b6"];
+      const routine = await fx.create([
+        step("implement", [], { assigneeAgentId: fx.builderId }),
+        ...branchKeys.map((key) => step(key, ["implement"], { assigneeAgentId: fx.reviewerId })),
+      ]);
+      await fx.svc.runRoutine(routine.id, { source: "manual" });
+      const stepIssues = await stepIssuesOf(routine.id);
+      const issueOf = (key: string) => stepIssues.find((issue) => issue.title === `Step ${key}`)!;
+      const workspaceId = await seedWorkspace(fx.companyId, fx.projectId);
+      await db
+        .update(issues)
+        .set({ executionWorkspaceId: workspaceId, status: "done" })
+        .where(eq(issues.id, issueOf("implement").id));
+
+      const results = await Promise.all(branchKeys.map((key) => inherit(fx.companyId, issueOf(key).id)));
+
+      expect(results.filter(Boolean)).toHaveLength(1);
+      const holders = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.originId, routine.id), eq(issues.executionWorkspaceId, workspaceId)));
+      expect(holders.map((holder) => holder.id).filter((id) => id !== issueOf("implement").id)).toHaveLength(1);
+    });
+
     it("picks the earliest predecessor by issue number", async () => {
       const fx = await seed();
       const routine = await fx.create([
