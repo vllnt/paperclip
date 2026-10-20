@@ -271,9 +271,10 @@ export function routineRoutes(
    * an agent-owned one becomes blocked) and creates a subtask for each step. An agent therefore needs
    * what the issue routes ask before it changes a task and adds a subtask to it: the `issue:mutate`
    * decision on the task, and the `tasks:assign` decision under the task for each agent the steps go to.
-   * Board users are covered by the routine route's company-level `tasks:assign` check.
+   * Board users with company access may change every task, but the task or its project can still block
+   * an assignment for them, so the `tasks:assign` decision applies to every actor.
    * @throws HttpError 404 when the task is missing, hidden or in another company; 403 when an agent may
-   * not change it or may not assign the steps under it.
+   * not change it, or the actor may not assign the steps under it.
    */
   async function assertCanStartStepsOnTask(
     req: Request,
@@ -283,9 +284,10 @@ export function routineRoutes(
   ) {
     const task = await issues.getById(taskId);
     if (!task || task.companyId !== routine.companyId || task.hiddenAt) throw notFound("Task not found");
-    if (req.actor.type !== "agent") return;
-    const decision = await decideOnTask(req, "issue:mutate", task);
-    if (!decision.allowed) throw forbidden("This agent may not change the task", { issueId: task.id });
+    if (req.actor.type === "agent") {
+      const decision = await decideOnTask(req, "issue:mutate", task);
+      if (!decision.allowed) throw forbidden("This agent may not change the task", { issueId: task.id });
+    }
     const defaultAgentId = runAssigneeAgentId ?? routine.assigneeAgentId;
     const stepAgentIds = new Set((routine.steps ?? []).map((step) => step.assigneeAgentId ?? defaultAgentId));
     for (const assigneeAgentId of stepAgentIds) {

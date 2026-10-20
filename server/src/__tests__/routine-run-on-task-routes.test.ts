@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, companies, createDb, issues, projects, routineRuns } from "@paperclipai/db";
+import { activityLog, agents, companies, companyMemberships, createDb, issues, projects, routineRuns } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET, readRoutineStepsRunPayload, type RoutineStep } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture } from "./helpers/event-source-fixture.js";
@@ -433,6 +433,43 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
       expect(onTask.status).toBe(202);
       expect(plain.status).toBe(409);
       expect(await s.runsOf(routine.id)).toHaveLength(1);
+    });
+  });
+
+  describe("for a board member", () => {
+    it("is refused when the task blocks a step's agent, and the task is left alone", async () => {
+      const s = await seed();
+      await db.insert(companyMemberships).values({
+        companyId: s.companyId,
+        principalType: "user",
+        principalId: "operator-user",
+        status: "active",
+        membershipRole: "operator",
+      });
+      const operator = { type: "board", userId: "operator-user", source: "session", isInstanceAdmin: false, companyIds: [s.companyId] };
+      const routine = await s.createRoutine();
+      const guarded = await s.newTask();
+      const open = await s.newTask();
+      await db
+        .update(issues)
+        .set({
+          executionPolicy: {
+            authorizationPolicy: {
+              assignmentPolicy: { mode: "protected" },
+              protectedAgent: { blockAssignment: true, blockReason: "Release owner only" },
+              managedBy: "permissions-extension",
+            },
+          } as never,
+        })
+        .where(eq(issues.id, guarded.id));
+
+      const refused = await request(appFor(operator)).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: guarded.id });
+      const allowed = await request(appFor(operator)).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: open.id });
+
+      expect(refused.status).toBe(403);
+      expect(await s.childrenOf(guarded.id)).toEqual([]);
+      expect(allowed.status).toBe(202);
+      expect(await s.childrenOf(open.id)).toHaveLength(2);
     });
   });
 
