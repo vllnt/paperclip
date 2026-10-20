@@ -83,8 +83,22 @@ for reasons not to wake the agent, including:
 - a provider-quota monitor is pending;
 - the run was explicitly cancelled by an operator;
 - the assigned agent is not invokable;
-- invocation budget or retry/backoff policy prevents a run; or
+- invocation budget or retry/backoff policy prevents a run;
+- for work with no run yet (an assigned `todo` issue, a review participant, or
+  an `in_progress` issue that a run without an issue checked out), the agent's
+  own heartbeat policy would skip the wake: `wakeOnDemand` is off, or the agent
+  is at its daily run or cost cap for the current UTC day; or
 - recovery has failed enough times that the issue should be escalated instead.
+
+A dispatch held by the agent's policy writes no wake receipt and leaves the
+issue assigned. The policy is read once per agent per sweep (again after each
+dispatch), with the same count and UTC day window as the cap check in
+`enqueueWakeup`. For a daily cap, the first held dispatch in a window writes one
+`heartbeat.daily_cap_dispatch_held` activity entry on the agent (with
+`windowStart` and `resetsAt`), however many issues and sweeps the cap holds
+back. The first sweep after the window resets dispatches the held work. Recovery
+lanes for work that already has a run still go through `enqueueWakeup`, which
+records a skipped receipt at the cap.
 
 For an eligible `in_progress` issue with no live path, it creates an automated
 wake/run with:
