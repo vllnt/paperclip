@@ -398,7 +398,7 @@ import {
   emitAgentTaskRunById,
 } from "./agent-task-run-telemetry.js";
 import { reportRunFailure } from "./run-failure-report.js";
-import { collectRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
+import { collectRunFailureSecretValues, redactRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
@@ -761,6 +761,10 @@ import {
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
+// A registered env value shorter than this is a flag or a number such as `1`,
+// not a credential. Masking it everywhere would rewrite the exit code in the
+// stored run error ("exited with code 1").
+const MIN_RUN_ERROR_SECRET_VALUE_CHARS = 4;
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -1346,7 +1350,7 @@ export function parseSandboxProviderPluginNotReadyFailureMessage(
   };
 }
 
-function isRetryableInteractionContinuationInfrastructureFailure(
+export function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<
     typeof heartbeatRuns.$inferSelect,
     "error" | "errorCode" | "resultJson"
@@ -28153,8 +28157,20 @@ export function heartbeatService(
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
         // Only the stored copies are redacted. The outcome, the error code and
         // the quota reclassification above already read the adapter's raw result.
+        // The run's registered env and secret values go first, because an opaque
+        // value has no shape for the text rule to recognize. Every reader of the
+        // stored error (Inbox, live and plugin events, wakeup error, agent error
+        // reason) then sees the redacted text.
+        const failureSecretValues = readFailureReportSecrets().filter(
+          (value) => value.length >= MIN_RUN_ERROR_SECRET_VALUE_CHARS,
+        );
         const redactRunError = (text: string) =>
-          redactSensitiveText(redactCurrentUserText(text, currentUserRedactionOptions));
+          redactSensitiveText(
+            redactCurrentUserText(
+              redactRunFailureSecretValues(text, failureSecretValues),
+              currentUserRedactionOptions,
+            ),
+          );
         // Classifiers read the adapter's short errorMessage. A failed run stores
         // the adapter's fuller errorDetail when it has one, and keeps the short
         // message in resultJson.errorSummary for classifiers that read it back.

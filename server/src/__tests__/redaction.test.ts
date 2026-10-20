@@ -540,8 +540,35 @@ describe("redaction", () => {
     expect(result).toContain(`x-api-key: ${REDACTED_EVENT_VALUE}`);
     expect(result).toContain(`X-Custom-Key=${REDACTED_EVENT_VALUE}`);
     expect(result).toContain(`Authorization: ${REDACTED_EVENT_VALUE}`);
-    expect(result).toContain("Path=/");
     expect(result).toContain("retries: 3");
+    expect(redactSensitiveText(result)).toBe(result);
+  });
+
+  it("redacts every pair of a cookie header to the end of the line", () => {
+    // Built at runtime so the source holds no secret-shaped literal.
+    const secret = ["fixture", "Cookie", "Value", "0123"].join("");
+    const shaped = ["ghp", "_", "A".repeat(36)].join("");
+    const input = [
+      `Cookie: a=${secret}1; b=${secret}2; c=${secret}3`,
+      `Set-Cookie: id=${secret}4; Path=/; HttpOnly`,
+      `cookie=a=${secret}5; b=${secret}6`,
+      `request failed, session_cookie: s=${secret}7; t=${secret}8`,
+      `Cookie: ${shaped}; b=${secret}9`,
+      "next line stays visible",
+    ].join("\n");
+
+    const result = redactSensitiveText(input);
+
+    for (const n of [1, 2, 3, 4, 5, 6, 7, 8, 9]) expect(result).not.toContain(`${secret}${n}`);
+    expect(result).not.toContain(shaped);
+    expect(result.split("\n")).toEqual([
+      `Cookie: ${REDACTED_EVENT_VALUE}`,
+      `Set-Cookie: ${REDACTED_EVENT_VALUE}`,
+      `cookie=${REDACTED_EVENT_VALUE}`,
+      `request failed, session_cookie: ${REDACTED_EVENT_VALUE}`,
+      `Cookie: ${REDACTED_EVENT_VALUE}`,
+      "next line stays visible",
+    ]);
     expect(redactSensitiveText(result)).toBe(result);
   });
 
@@ -554,6 +581,7 @@ describe("redaction", () => {
       "Error: spawn agent-cli ENOENT",
       "Missing API key: no credentials configured",
       "max_tokens=4096 hotkey: ctrl",
+      "cookies: 3 cookie jar: /tmp/jar.txt",
     ].join("\n");
 
     expect(redactSensitiveText(input)).toBe(input);

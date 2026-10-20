@@ -406,7 +406,7 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   );
 }
 
-function resolveStrandedRecoveryCause(
+export function resolveStrandedRecoveryCause(
   latestRun: LatestIssueRun,
   explicitCause?: StrandedRecoveryCause,
 ): StrandedRecoveryCause {
@@ -4273,6 +4273,11 @@ export function recoveryService(
           input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
+    // The short summary keeps the notice's "Failure summary" row to one line.
+    // The run page and the Inbox still show the full stored error.
+    const sourceRunErrorSummary = input.latestRun
+      ? readRunErrorSummary(input.latestRun)
+      : null;
     const escalationNotice = buildStrandedRecoveryEscalationNotice({
       seed: input.notice,
       fallbackBody: input.comment,
@@ -4288,8 +4293,8 @@ export function recoveryService(
             agentId: input.latestRun.agentId,
             status: input.latestRun.status,
             errorCode: input.latestRun.errorCode,
-            errorSummary: input.latestRun.error
-              ? redactSensitiveText(input.latestRun.error)
+            errorSummary: sourceRunErrorSummary
+              ? redactSensitiveText(sourceRunErrorSummary)
               : null,
           }
         : null,

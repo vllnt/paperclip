@@ -36,13 +36,19 @@ because single-line views such as the Inbox show only that line:
 The adapter returns this text as `errorDetail`. Its short `errorMessage` stays
 as before, and failure classification (error codes, quota cooldowns, recovery)
 keeps reading the short message. The run keeps it in `resultJson.errorSummary`.
-Prompts that quote a run error get it as one line of at most 500 characters.
+Prompts that quote a run error, and the "Failure summary" row of a stranded-run
+notice, get the short one-line message (prompts cap it at 500 characters). The
+run page and the Inbox show the full stored error.
 
 Secret-shaped text (API keys, bearer tokens, `key=value` secrets, URL
 passwords, PEM blocks) is redacted before any cut. The server redacts the
-stored error message of every adapter again with its own text redaction, which
-also covers header forms such as `x-api-key: <value>`. The run still keeps the
-full stderr excerpt and log. The shared helper is `describeProcessExit` in
+stored error message of every adapter again, before it is stored. It masks the
+values of the run's registered env and secret bindings (a value of 4 or more
+characters, so an exit code is never masked), then applies its own text
+redaction. The text redaction also covers header forms such as
+`x-api-key: <value>`, and a `Cookie` or `Set-Cookie` header is redacted to the
+end of its line. The run still keeps the full stderr excerpt and log. The
+shared helper is `describeProcessExit` in
 `@paperclipai/adapter-utils/process-exit-cause`, so other local adapters can
 use the same message.
 

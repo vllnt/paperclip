@@ -133,7 +133,7 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
     await tempDb?.cleanup();
   });
 
-  async function seed(input: { runtimeConfig?: Record<string, unknown> } = {}) {
+  async function seed(input: { runtimeConfig?: Record<string, unknown>; adapterConfig?: Record<string, unknown> } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const otherAgentId = randomUUID();
@@ -153,7 +153,7 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
         role: "engineer",
         status: "active",
         adapterType: "codex_local",
-        adapterConfig: {},
+        adapterConfig: input.adapterConfig ?? {},
         runtimeConfig: {
           heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 },
           ...(input.runtimeConfig ?? {}),
@@ -466,5 +466,40 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
     expect(run.stderrExcerpt).toContain("x-auth-key=***REDACTED***");
     // Redaction keeps the text that people and classifiers read.
     expect(run.error).toContain("Usage limit reached. Resets at 4pm (UTC).");
+  });
+
+  it("redacts the run's registered env values from every stored copy of the error, even a value with no secret shape", async () => {
+    // An opaque value has no recognizable shape, so only the registered-value rule can mask it.
+    const opaque = ["plain", "words", "only", "7loaded"].join("-");
+    const { agentId, issueId } = await seed({
+      adapterConfig: { env: { SERVICE_BINDING: opaque, FEATURE_FLAG: "1" } },
+    });
+    mockAdapterExecute.mockImplementation(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: `Agent exited with code 1: GET https://svc.example.test/${opaque}/status failed`,
+      errorDetail: `Agent exited with code 1: GET https://svc.example.test/${opaque}/status failed\nLast lines of stderr:\nretrying ${opaque}`,
+      errorCode: "adapter_failed",
+      provider: "test",
+      model: "test-model",
+    }));
+
+    const run = await runOnce(agentId, issueId);
+
+    expect(run.status).toBe("failed");
+    expect(run.error).toBe(
+      "Agent exited with code 1: GET https://svc.example.test/***REDACTED***/status failed\nLast lines of stderr:\nretrying ***REDACTED***",
+    );
+    expect(run.resultJson).toMatchObject({
+      errorSummary: "Agent exited with code 1: GET https://svc.example.test/***REDACTED***/status failed",
+    });
+    const [wakeup] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, run.wakeupRequestId!));
+    const [runtimeState] = await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agentId));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    for (const stored of [wakeup?.error, runtimeState?.lastError, agent?.errorReason]) {
+      expect(stored ?? "").not.toContain(opaque);
+    }
+    expect(agent?.errorReason).toContain("Agent exited with code 1");
   });
 });
