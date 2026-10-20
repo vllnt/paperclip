@@ -10,50 +10,29 @@ export const ROUTINE_STEPS_RUN_PAYLOAD_KEY = "routineSteps";
 /** A step key is a short lowercase slug, unique inside one routine. */
 export const ROUTINE_STEP_KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 
-/** Rejection text for a conditional `after` entry. Conditions are not part of this release. */
-export const ROUTINE_STEP_CONDITIONS_UNSUPPORTED_MESSAGE = "Step conditions (when) are not supported yet";
-
-export const ROUTINE_STEP_AFTER_CONDITIONS = ["done", "cancelled"] as const;
-export type RoutineStepAfterCondition = (typeof ROUTINE_STEP_AFTER_CONDITIONS)[number];
-
 const routineStepKeySchema = z
   .string()
   .trim()
   .regex(ROUTINE_STEP_KEY_PATTERN, "Step keys are lowercase letters, digits, hyphens and underscores (max 40)");
 
-/**
- * One predecessor of a step: a step key, or a key with the outcome it must have.
- * The object form is accepted by the type so it can be stored later, but
- * {@link routineStepsSchema} rejects it until conditions are supported.
- */
-export const routineStepAfterEntrySchema = z.union([
-  routineStepKeySchema,
-  z.object({ step: routineStepKeySchema, when: z.enum(ROUTINE_STEP_AFTER_CONDITIONS) }).strict(),
-]);
-export type RoutineStepAfterEntry = z.infer<typeof routineStepAfterEntrySchema>;
-
 export const routineStepSchema = routineStepIssueFieldsSchema
   .extend({
     key: routineStepKeySchema,
     title: z.string().trim().min(1).max(200),
-    after: z.array(routineStepAfterEntrySchema).max(MAX_ROUTINE_STEPS).default([]),
+    after: z.array(routineStepKeySchema).max(MAX_ROUTINE_STEPS).default([]),
   })
   .strict();
 export type RoutineStep = z.infer<typeof routineStepSchema>;
 
-/** The key of the step an `after` entry points to. */
-export function routineStepAfterKey(entry: RoutineStepAfterEntry): string {
-  return typeof entry === "string" ? entry : entry.step;
-}
-
 /** Keys of the steps that must finish before `step` starts, in the order they were written. */
 export function routineStepPredecessorKeys(step: Pick<RoutineStep, "after">): string[] {
-  return [...new Set(step.after.map(routineStepAfterKey))];
+  return [...new Set(step.after)];
 }
 
 /**
- * Orders steps so every step comes after the steps it waits for. Steps that are
- * not ordered by `after` keep the order they were written in.
+ * Orders steps in layers: first the steps with nothing to wait for, then the steps whose
+ * predecessors are all placed, and so on. Every step comes after the steps it waits for,
+ * and the steps of one layer keep the order they were written in.
  * @throws Error when a step waits for an unknown key or the steps form a cycle.
  */
 export function orderRoutineStepsTopologically<T extends Pick<RoutineStep, "key" | "after">>(steps: T[]): T[] {
@@ -96,8 +75,48 @@ export function routineStartingSteps<T extends Pick<RoutineStep, "after">>(steps
 }
 
 /**
+ * Whether the steps of one run can no longer move on their own.
+ *
+ * That holds when no step has work left (every status is done, cancelled or blocked), at least one
+ * step was cancelled, and every blocked step waits, directly or through other blocked steps, for a
+ * cancelled one. A cancelled step never resolves a blocker, so its dependents and the run's root
+ * stay blocked for good. Nothing cascades: the dependents stay visibly blocked. A step with any
+ * other status, or with none, counts as live, so a missing issue never frees the routine.
+ * @param statusesByKey Issue status of each step, by step key.
+ */
+export function isRoutineStepRunStalled(
+  steps: ReadonlyArray<Pick<RoutineStep, "key" | "after">>,
+  statusesByKey: Readonly<Record<string, string>>,
+): boolean {
+  let anyCancelled = false;
+  for (const step of steps) {
+    const status = statusesByKey[step.key];
+    if (status !== "done" && status !== "cancelled" && status !== "blocked") return false;
+    if (status === "cancelled") anyCancelled = true;
+  }
+  if (!anyCancelled) return false;
+
+  const stuck = new Set<string>();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const step of steps) {
+      if (stuck.has(step.key) || statusesByKey[step.key] !== "blocked") continue;
+      const waitsForDeadEnd = routineStepPredecessorKeys(step).some(
+        (key) => statusesByKey[key] === "cancelled" || stuck.has(key),
+      );
+      if (waitsForDeadEnd) {
+        stuck.add(step.key);
+        grew = true;
+      }
+    }
+  }
+  return steps.every((step) => statusesByKey[step.key] !== "blocked" || stuck.has(step.key));
+}
+
+/**
  * The steps of one routine. Checks the structure only: unique keys, `after`
- * pointing at other steps, no cycles, no conditions. Agents and labels need the
+ * pointing at other steps, no cycles. Agents and labels need the
  * database and are checked by the routine service.
  */
 export const routineStepsSchema = z
@@ -114,15 +133,6 @@ export const routineStepsSchema = z
     let structurallyValid = true;
     steps.forEach((step, index) => {
       step.after.forEach((entry, afterIndex) => {
-        if (typeof entry !== "string") {
-          structurallyValid = false;
-          ctx.addIssue({
-            code: "custom",
-            path: [index, "after", afterIndex],
-            message: ROUTINE_STEP_CONDITIONS_UNSUPPORTED_MESSAGE,
-          });
-          return;
-        }
         if (entry === step.key) {
           structurallyValid = false;
           ctx.addIssue({ code: "custom", path: [index, "after", afterIndex], message: "A step cannot wait for itself" });

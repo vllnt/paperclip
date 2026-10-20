@@ -1,9 +1,4 @@
-import {
-  routineStepAfterKey,
-  routineStepsSchema,
-  type RoutineStep,
-  type RoutineStepAfterEntry,
-} from "@paperclipai/shared";
+import { routineStepsSchema, type RoutineStep } from "@paperclipai/shared";
 
 /** The fields of a step an editor can change; the key has its own rename helper. */
 export type RoutineStepPatch = Partial<Omit<RoutineStep, "key" | "after">>;
@@ -30,11 +25,6 @@ export function updateRoutineStep(
   return steps.map((step) => (step.key === key ? { ...step, ...patch } : step));
 }
 
-function renameAfterEntry(entry: RoutineStepAfterEntry, from: string, to: string): RoutineStepAfterEntry {
-  if (typeof entry === "string") return entry === from ? to : entry;
-  return entry.step === from ? { ...entry, step: to } : entry;
-}
-
 /**
  * Renames a step and every `after` entry that points to it. A key another step
  * already uses is ignored, so two steps never share one.
@@ -44,7 +34,7 @@ export function renameRoutineStepKey(steps: readonly RoutineStep[], from: string
   return steps.map((step) => ({
     ...step,
     key: step.key === from ? to : step.key,
-    after: step.after.map((entry) => renameAfterEntry(entry, from, to)),
+    after: step.after.map((entry) => (entry === from ? to : entry)),
   }));
 }
 
@@ -52,7 +42,7 @@ export function renameRoutineStepKey(steps: readonly RoutineStep[], from: string
 export function removeRoutineStep(steps: readonly RoutineStep[], key: string): RoutineStep[] {
   return steps
     .filter((step) => step.key !== key)
-    .map((step) => ({ ...step, after: step.after.filter((entry) => routineStepAfterKey(entry) !== key) }));
+    .map((step) => ({ ...step, after: step.after.filter((entry) => entry !== key) }));
 }
 
 /** True when `key` waits for `predecessorKey`, directly or through other steps. */
@@ -64,8 +54,7 @@ function waitsForTransitively(steps: readonly RoutineStep[], key: string, predec
     const current = pending.pop();
     if (current === undefined || seen.has(current)) continue;
     seen.add(current);
-    for (const entry of byKey.get(current)?.after ?? []) {
-      const next = routineStepAfterKey(entry);
+    for (const next of byKey.get(current)?.after ?? []) {
       if (next === predecessorKey) return true;
       pending.push(next);
     }
@@ -86,12 +75,10 @@ export function toggleRoutineStepPredecessor(
 ): RoutineStep[] {
   return steps.map((step) => {
     if (step.key !== key) return step;
-    const waits = step.after.some((entry) => routineStepAfterKey(entry) === predecessorKey);
+    const waits = step.after.includes(predecessorKey);
     return {
       ...step,
-      after: waits
-        ? step.after.filter((entry) => routineStepAfterKey(entry) !== predecessorKey)
-        : [...step.after, predecessorKey],
+      after: waits ? step.after.filter((entry) => entry !== predecessorKey) : [...step.after, predecessorKey],
     };
   });
 }

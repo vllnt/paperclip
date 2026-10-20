@@ -772,7 +772,7 @@ describe("routine routes", () => {
       expect(mockRoutineService.update).not.toHaveBeenCalled();
     });
 
-    it("rejects a step condition (when) on create and update with the not-supported-yet message", async () => {
+    it("rejects a step condition (when) on create and update", async () => {
       mockAccessService.canUser.mockResolvedValue(true);
       const app = await createApp({
         type: "board",
@@ -792,9 +792,7 @@ describe("routine routes", () => {
         .send({ projectId, title: "Daily routine", assigneeAgentId: agentId, steps: conditional });
 
       expect(patched.status).toBe(400);
-      expect(JSON.stringify(patched.body)).toContain("Step conditions (when) are not supported yet");
       expect(created.status).toBe(400);
-      expect(JSON.stringify(created.body)).toContain("Step conditions (when) are not supported yet");
       expect(mockRoutineService.update).not.toHaveBeenCalled();
       expect(mockRoutineService.create).not.toHaveBeenCalled();
     });

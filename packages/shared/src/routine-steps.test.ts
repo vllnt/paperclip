@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_ROUTINE_STEPS,
   ROUTINE_STEPS_RUN_PAYLOAD_KEY,
-  ROUTINE_STEP_CONDITIONS_UNSUPPORTED_MESSAGE,
+  isRoutineStepRunStalled,
   orderRoutineStepsTopologically,
   readRoutineStepsRunPayload,
   routineStartingSteps,
@@ -59,11 +59,14 @@ describe("routineStepsSchema", () => {
     expect(routineStepsSchema.safeParse(many.slice(0, MAX_ROUTINE_STEPS)).success).toBe(true);
   });
 
-  it("rejects conditional after entries until conditions are supported", () => {
-    expect(ROUTINE_STEP_CONDITIONS_UNSUPPORTED_MESSAGE).toBe("Step conditions (when) are not supported yet");
-    expect(issueMessages([step("a"), step("b", [{ step: "a", when: "done" }])])).toContain(
-      ROUTINE_STEP_CONDITIONS_UNSUPPORTED_MESSAGE,
-    );
+  it("accepts step keys in after and nothing else", () => {
+    expect(routineStepsSchema.safeParse([step("a"), step("b", [{ step: "a", when: "done" }])]).success).toBe(false);
+    expect(routineStepsSchema.safeParse([step("a"), step("b", [7])]).success).toBe(false);
+  });
+
+  it("rejects an after list longer than the step limit", () => {
+    const wide = [step("a"), step("b", Array.from({ length: MAX_ROUTINE_STEPS + 1 }, () => "a"))];
+    expect(routineStepsSchema.safeParse(wide).success).toBe(false);
   });
 
   it.each(["Has Caps", "has space", "", "-leading", "x".repeat(41)])("rejects the key %j", (key) => {
@@ -76,7 +79,7 @@ describe("routineStepsSchema", () => {
 });
 
 describe("orderRoutineStepsTopologically", () => {
-  it("puts every step after the steps it waits for and keeps written order otherwise", () => {
+  it("places steps layer by layer, in written order within a layer", () => {
     const ordered = orderRoutineStepsTopologically([
       { key: "ship", after: ["lint", "types"] },
       { key: "lint", after: ["build"] },
@@ -85,6 +88,16 @@ describe("orderRoutineStepsTopologically", () => {
       { key: "docs", after: [] },
     ]);
     expect(ordered.map((entry) => entry.key)).toEqual(["build", "docs", "lint", "types", "ship"]);
+  });
+
+  it("places a step with a long chain behind a step written later", () => {
+    const ordered = orderRoutineStepsTopologically([
+      { key: "c", after: ["b"] },
+      { key: "d", after: [] },
+      { key: "b", after: ["a"] },
+      { key: "a", after: [] },
+    ]);
+    expect(ordered.map((entry) => entry.key)).toEqual(["d", "a", "b", "c"]);
   });
 
   it("throws on an unknown key and on a cycle", () => {
@@ -116,6 +129,66 @@ describe("orderRoutineStepsTopologically", () => {
         { key: "c", after: [] },
       ]).map((entry) => entry.key),
     ).toEqual(["a", "c"]);
+  });
+});
+
+describe("isRoutineStepRunStalled", () => {
+  const chain = [
+    { key: "a", after: [] },
+    { key: "b", after: ["a"] },
+    { key: "c", after: ["b"] },
+  ];
+  const fork = [
+    { key: "a", after: [] },
+    { key: "b", after: ["a"] },
+    { key: "c", after: ["a"] },
+    { key: "d", after: ["b", "c"] },
+  ];
+
+  it("is stalled when a middle step was cancelled and the rest wait behind it", () => {
+    expect(isRoutineStepRunStalled(chain, { a: "done", b: "cancelled", c: "blocked" })).toBe(true);
+  });
+
+  it("is stalled when the last step was cancelled and nothing waits", () => {
+    expect(isRoutineStepRunStalled(chain, { a: "done", b: "done", c: "cancelled" })).toBe(true);
+  });
+
+  it("follows the wait through several blocked steps", () => {
+    const longer = [...chain, { key: "d", after: ["c"] }];
+    expect(isRoutineStepRunStalled(longer, { a: "done", b: "cancelled", c: "blocked", d: "blocked" })).toBe(true);
+  });
+
+  it.each(["todo", "in_progress", "in_review", "backlog"])("is live while a step is %s", (status) => {
+    expect(isRoutineStepRunStalled(chain, { a: status, b: "cancelled", c: "blocked" })).toBe(false);
+  });
+
+  it("is live while one branch of a fork still runs although the other was cancelled", () => {
+    expect(isRoutineStepRunStalled(fork, { a: "done", b: "cancelled", c: "in_progress", d: "blocked" })).toBe(false);
+  });
+
+  it("is stalled once the running branch of a fork finishes", () => {
+    expect(isRoutineStepRunStalled(fork, { a: "done", b: "cancelled", c: "done", d: "blocked" })).toBe(true);
+  });
+
+  it("is live when no step was cancelled, even if every step is finished or blocked", () => {
+    expect(isRoutineStepRunStalled(chain, { a: "done", b: "done", c: "done" })).toBe(false);
+    expect(isRoutineStepRunStalled(chain, { a: "blocked", b: "blocked", c: "blocked" })).toBe(false);
+  });
+
+  it("is live when a blocked step has every predecessor done and is about to be woken", () => {
+    expect(isRoutineStepRunStalled(fork, { a: "done", b: "done", c: "done", d: "blocked" })).toBe(false);
+    const unrelated = [
+      { key: "a", after: [] },
+      { key: "b", after: [] },
+      { key: "c", after: ["b"] },
+    ];
+    expect(isRoutineStepRunStalled(unrelated, { a: "cancelled", b: "done", c: "blocked" })).toBe(false);
+  });
+
+  it("is live when a step has no status or an unknown one, and when there are no steps", () => {
+    expect(isRoutineStepRunStalled(chain, { a: "done", b: "cancelled" })).toBe(false);
+    expect(isRoutineStepRunStalled(chain, { a: "done", b: "cancelled", c: "missing" })).toBe(false);
+    expect(isRoutineStepRunStalled([], {})).toBe(false);
   });
 });
 

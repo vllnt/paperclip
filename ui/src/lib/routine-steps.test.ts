@@ -33,10 +33,10 @@ describe("routine step helpers", () => {
   });
 
   it("renames a key and the after entries that point to it", () => {
-    const renamed = renameRoutineStepKey([step("a"), step("b", ["a"]), step("c", [{ step: "a", when: "done" }])], "a", "build");
+    const renamed = renameRoutineStepKey([step("a"), step("b", ["a"]), step("c", ["b", "a"])], "a", "build");
     expect(renamed.map((entry) => entry.key)).toEqual(["build", "b", "c"]);
     expect(renamed[1]!.after).toEqual(["build"]);
-    expect(renamed[2]!.after).toEqual([{ step: "build", when: "done" }]);
+    expect(renamed[2]!.after).toEqual(["b", "build"]);
   });
 
   it("ignores a rename onto a key another step already uses", () => {

@@ -1,5 +1,5 @@
 import { Plus, X } from "lucide-react";
-import { ISSUE_PRIORITIES, routineStepAfterKey, type RoutineStep } from "@paperclipai/shared";
+import { ISSUE_PRIORITIES, type RoutineStep } from "@paperclipai/shared";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -107,7 +107,7 @@ function StepCard({
   mentionOptions: MentionOption[];
 }) {
   const others = steps.filter((other) => other.key !== step.key);
-  const waitsFor = new Set(step.after.map(routineStepAfterKey));
+  const waitsFor = new Set(step.after);
   const needsAgent = !step.assigneeAgentId && defaultAgentName === null;
   const inputId = `routine-step-${index}`;
 
