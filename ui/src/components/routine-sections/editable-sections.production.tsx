@@ -321,6 +321,7 @@ export function OverviewSection({
         <RoutineVariablesEditor
           title={editDraft.title}
           description={editDraft.description}
+          steps={editDraft.steps}
           value={editDraft.variables}
           onChange={(variables) => setEditDraft((current) => ({ ...current, variables }))}
         />
@@ -421,6 +422,8 @@ function SummaryCard({
     </button>
   );
 }
+
+export { StepsSection } from "./steps-section";
 
 export function TriggersSection() {
   const ctx = useRoutineDetail();
@@ -642,6 +645,7 @@ export function VariablesSection() {
         <RoutineVariablesEditor
           title={editDraft.title}
           description={editDraft.description}
+          steps={editDraft.steps}
           value={editDraft.variables}
           onChange={(variables) => setEditDraft((current) => ({ ...current, variables }))}
         />

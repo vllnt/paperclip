@@ -211,6 +211,24 @@ paperclipai pipelines set-automation \
 
 **Convention:** v1 "templates" version with the routine prompt plus the batch file below, not with the pipeline. The pipeline `guidance` document carries the durable rubric. This is the accepted divergence from the long-term template-on-pipeline shape.
 
+**Routine steps.** When the work behind a stage is itself a repeatable sequence (draft, review, then two checks in parallel), put the sequence on the routine as `steps` instead of describing it in the prompt. Each run then creates the run's task plus one validated sub-task per step, linked by blockers, and the usual wakes run them. The routine above becomes:
+
+```sh
+cat > /tmp/drafting-steps.json <<JSON
+[
+  { "key": "draft", "title": "Draft the content case" },
+  { "key": "review", "title": "Review the draft", "after": ["draft"] },
+  { "key": "links", "title": "Check links", "after": ["review"] },
+  { "key": "tone", "title": "Check tone", "after": ["review"] },
+  { "key": "ready", "title": "Suggest Drafting -> Assets", "after": ["links", "tone"] }
+]
+JSON
+
+paperclipai routine update "$DRAFTING_ROUTINE_ID" --steps-file /tmp/drafting-steps.json
+```
+
+Steps default to the routine's agent; set `assigneeAgentId` on a step to hand it to another agent. See [Routines](api/routines.md#routine-steps) for the step fields, review loops, and limits.
+
 ## Step 2: Trigger, Intake, And Gate
 
 A real system would start with a release-cut routine. Today, the routine fires on a timer or API trigger and creates an intake issue. On that issue, the agent writes a proposal document and asks the board for a checkbox confirmation.

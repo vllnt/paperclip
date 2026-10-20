@@ -138,7 +138,7 @@ export function bumpExecutionWorkspaceLifecycleGeneration(
   };
 }
 
-function isClosedExecutionWorkspaceStatus(status: string | null | undefined): boolean {
+export function isClosedExecutionWorkspaceStatus(status: string | null | undefined): boolean {
   return status === "archived" || status === "cleanup_failed";
 }
 

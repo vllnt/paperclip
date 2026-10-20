@@ -30,6 +30,7 @@ import type {
   RoutineGateResult,
   RoutineNoopSkipSettings,
   RoutineRevisionSnapshotV1,
+  RoutineStep,
   RoutineVariable,
   RoutineWebhookDelivery,
   RunContextPolicy,
@@ -56,6 +57,8 @@ export const routines = pgTable(
     originKind: text("origin_kind").notNull().default("manual"),
     originId: text("origin_id"),
     variables: jsonb("variables").$type<RoutineVariable[]>().notNull().default([]),
+    /** Ordered sub-tasks a run creates under its root issue; empty means a plain single-issue routine. */
+    steps: jsonb("steps").$type<RoutineStep[]>().notNull().default([]),
     env: jsonb("env").$type<RoutineEnvConfig>(),
     automationWakeSettings: jsonb("automation_wake_settings").$type<AutomationWakeSettings>().notNull().default({}),
     routineNoopSkipSettings: jsonb("routine_noop_skip_settings").$type<RoutineNoopSkipSettings>().notNull().default({}),

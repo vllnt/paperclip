@@ -107,7 +107,7 @@ describeEmbeddedPostgres("heartbeat automation wake coalescing", () => {
     routine?: AutomationWakeSettings;
   };
 
-  async function seedLayers(layers: Layers) {
+  async function seedLayers(layers: Layers, issueOriginKind: "routine_execution" | "routine_step" = "routine_execution") {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -150,7 +150,7 @@ describeEmbeddedPostgres("heartbeat automation wake coalescing", () => {
     await db.insert(issues).values({
       id: issueId,
       companyId,
-      ...(layers.routine ? { originKind: "routine_execution", originId: routineId } : {}),
+      ...(layers.routine ? { originKind: issueOriginKind, originId: routineId } : {}),
       title: "Recurring recovery",
       status: "in_progress",
       priority: "medium",
@@ -322,6 +322,17 @@ describeEmbeddedPostgres("heartbeat automation wake coalescing", () => {
           routine: { minSecondsBetweenAutomationWakes: 0 },
         }),
       ).toEqual({ deferred: false, admitted: true });
+    });
+
+    it("a step issue gets its routine's window, like the root issue", async () => {
+      const { companyId, agentId, issueId } = await seedLayers(
+        { routine: { minSecondsBetweenAutomationWakes: 300 } },
+        "routine_step",
+      );
+      await seedAutomationRun({ companyId, agentId, issueId, startedSecondsAgo: 10 });
+
+      expect(await automationWake(agentId, issueId, "issue_monitor_due")).toBeNull();
+      expect(await deferredReceipts(agentId)).toHaveLength(1);
     });
 
     it("wake type beats the level-wide value of every level", async () => {

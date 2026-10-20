@@ -2,6 +2,7 @@ import type { AutomationWakeSettings } from "../automation-wake.js";
 import type { EventGrouping, EventMatch } from "../event-sources.js";
 import type { RoutineNoopSkipSettings } from "../routine-noop-skip.js";
 import type { RoutineGate, RoutineGateResult } from "../routine-gate.js";
+import type { RoutineStep } from "../routine-steps.js";
 import type { RunContextPolicy } from "../run-context.js";
 import type { TransientRetryPolicy } from "../transient-retry-policy.js";
 import type {
@@ -95,6 +96,8 @@ export interface Routine {
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];
+  /** Sub-tasks each run creates under its root issue; empty or absent for a single-issue routine. */
+  steps?: RoutineStep[];
   env?: RoutineEnvConfig | null;
   automationWakeSettings?: AutomationWakeSettings;
   routineNoopSkipSettings?: RoutineNoopSkipSettings;
@@ -150,6 +153,8 @@ export interface RoutineRevisionSnapshotRoutineV1 {
   responsibleUserId: string | null;
   /** Present only on gated routines. */
   gate?: RoutineGate | null;
+  /** Present only on routines with steps. */
+  steps?: RoutineStep[];
 }
 
 export interface RoutineRevisionSnapshotTriggerV1 {
