@@ -6157,9 +6157,14 @@ export function routineTaskSessionKey(input: {
     originId: string | null;
   } | null;
   conversation: boolean;
+  /** The agent's session compaction is on and has a limit. */
+  sessionRotates: boolean;
 }): string | null {
   const { issue } = input;
   if (!issue || input.conversation) return null;
+  // A shared routine session grows with every tick, so only a session that
+  // rotates is shared. Adapter-managed defaults (all limits 0) keep one per issue.
+  if (!input.sessionRotates) return null;
   if (issue.originKind !== "routine_execution" || !issue.originId) return null;
   // An explicit non-issue task key on the wake keeps its own session.
   if (input.issueTaskKey !== issue.id) return null;
@@ -23721,11 +23726,14 @@ export function heartbeatService(
         context.executionPolicy = retainedTrust.executionPolicy;
       }
       const config = parseObject(agent.adapterConfig);
+      const sessionCompactionPolicy = parseSessionCompactionPolicy(agent);
       const candidateRoutineSessionKey = routineTaskSessionKey({
         adapterType: agent.adapterType,
         issueTaskKey,
         issue: issueContext,
         conversation: isConversation(issueContext),
+        sessionRotates:
+          sessionCompactionPolicy.enabled && hasSessionCompactionThresholds(sessionCompactionPolicy),
       });
       const routineSessionKey =
         candidateRoutineSessionKey &&

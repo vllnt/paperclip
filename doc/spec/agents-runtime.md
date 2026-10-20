@@ -72,9 +72,11 @@ Templates support variables like `{{agent.id}}`, `{{agent.name}}`, and run conte
 
 Paperclip stores resumable session state per `(agent, taskKey, adapterType)`.
 `taskKey` is derived from wakeup context (`taskKey`, `taskId`, or `issueId`).
-A routine-execution issue uses its routine's key, `routine:<routineId>`, so
-consecutive ticks of one routine for one agent resume one session (see
-"Routine sessions across ticks" in `doc/execution-semantics.md`).
+A routine-execution issue uses its routine's key, `routine:<routineId>`, when
+the agent's session compaction sets a limit, so consecutive ticks of one routine
+for one agent resume one session (see "Routine sessions across ticks" in
+`doc/execution-semantics.md`). Without a limit, each routine issue keeps its own
+session.
 
 - A heartbeat for the same task key reuses the previous session for that task.
 - Different task keys for the same agent keep separate session state.

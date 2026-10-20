@@ -164,7 +164,10 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
     await tempDb?.cleanup();
   });
 
-  async function seed(options: { concurrencyPolicy?: "coalesce_if_active" | "always_enqueue" } = {}) {
+  async function seed(options: {
+    concurrencyPolicy?: "coalesce_if_active" | "always_enqueue";
+    sessionCompaction?: Record<string, unknown>;
+  } = {}) {
     const companyId = randomUUID();
     const issuePrefix = `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     await db.insert(companies).values({
@@ -180,7 +183,7 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
           wakeOnDemand: true,
           maxConcurrentRuns: 4,
           // Rotation by a token threshold on the session's raw input.
-          sessionCompaction: { enabled: true, maxRawInputTokens: TOKEN_THRESHOLD },
+          sessionCompaction: options.sessionCompaction ?? { enabled: true, maxRawInputTokens: TOKEN_THRESHOLD },
         },
       },
     })));
@@ -445,6 +448,20 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
     expect(await routineSessionRows(companyId, routine.id)).toEqual([]);
     await tick(routine.id);
     expect(invocations[1]!.sessionId).toBeNull();
+  });
+
+  it("an agent whose sessions never rotate keeps one session per routine issue", async () => {
+    // The adapter-managed default: compaction on, every limit 0.
+    const { companyId, routine } = await seed({
+      sessionCompaction: { enabled: true, maxSessionRuns: 0, maxRawInputTokens: 0, maxSessionAgeHours: 0 },
+    });
+    const ticks = [await tick(routine.id), await tick(routine.id)];
+
+    expect(invocations.map((invocation) => invocation.sessionId)).toEqual([null, null]);
+    expect(invocations.every((invocation) => invocation.wake.routineSession === undefined)).toBe(true);
+    expect(await routineSessionRows(companyId, routine.id)).toEqual([]);
+    const keys = (await db.select().from(agentTaskSessions)).map((row) => row.taskKey).sort();
+    expect(keys).toEqual(ticks.map((issue) => issue.id).sort());
   });
 
   it("non-routine issues keep one fresh session per issue", async () => {
