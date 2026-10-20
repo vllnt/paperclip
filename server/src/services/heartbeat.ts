@@ -2179,6 +2179,7 @@ const PROVIDER_QUOTA_RETRY_JITTER_RATIO = 0.2;
 const PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION =
   "heartbeat.provider_quota_cap_exemption_exhausted";
 const PROVIDER_QUOTA_EXHAUSTED_ACTION = "heartbeat.provider_quota_exhausted";
+const DAILY_CAP_DISPATCH_HELD_ACTION = "heartbeat.daily_cap_dispatch_held";
 
 export interface ProviderQuotaRetryPolicy {
   /** False restores the default transient retry budget and charges every quota failure. */
@@ -10158,8 +10159,36 @@ export function heartbeatService(
       const agent = await getAgent(agentId);
       if (!agent) return null;
       const policy = parseHeartbeatPolicy(agent);
-      if (!policy.wakeOnDemand) return "heartbeat.wakeOnDemand.disabled";
-      return (await getHeartbeatDailyCapBlock(agent, policy))?.reason ?? null;
+      if (!policy.wakeOnDemand) return { reason: "heartbeat.wakeOnDemand.disabled" };
+      return getHeartbeatDailyCapBlock(agent, policy);
+    },
+    // One entry per agent and cap window, however many sweeps or issues the
+    // cap holds back; the next window writes its own entry.
+    recordDailyCapDispatchHold: async ({ companyId, agentId, issueId, block }) => {
+      const windowStart = block.windowStart.toISOString();
+      await logActivityOnce({
+        lockKey: `daily-cap-dispatch-hold:${agentId}:${windowStart}`,
+        alreadyRecorded: and(
+          eq(activityLog.entityType, "agent"),
+          eq(activityLog.entityId, agentId),
+          sql`${activityLog.details} ->> 'windowStart' = ${windowStart}`,
+        ),
+        companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId,
+        action: DAILY_CAP_DISPATCH_HELD_ACTION,
+        entityType: "agent",
+        entityId: agentId,
+        details: {
+          reason: block.reason,
+          observed: block.observed ?? null,
+          limit: block.limit ?? null,
+          windowStart,
+          resetsAt: block.resetsAt.toISOString(),
+          firstHeldIssueId: issueId,
+        },
+      });
     },
     // The same slot count as the deferred-wake sweep: running runs against
     // the agent's limit. Queued work waits its turn and does not starve
@@ -18922,6 +18951,8 @@ export function heartbeatService(
           reason: "heartbeat.daily_run_limit",
           observed,
           limit: policy.maxDailyRuns,
+          windowStart: start,
+          resetsAt: end,
         };
       }
     }
@@ -18946,6 +18977,8 @@ export function heartbeatService(
           reason: "heartbeat.daily_cost_limit",
           observed,
           limit: policy.maxDailyCostCents,
+          windowStart: start,
+          resetsAt: end,
         };
       }
     }

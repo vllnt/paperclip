@@ -42,21 +42,38 @@ test("every other event is full with sentry and the perf guards", () => {
   }
 });
 
-test("perf guards follow the server, the schema, shared types, dependencies and ci.yml", () => {
+test("perf guards follow the server, the schema, shared types, bundled skills, dependencies, workspace setup and ci.yml", () => {
   for (const changed of [
     "server/src/routes/agents.ts",
     "server/package.json",
     "packages/db/src/schema/heartbeat_runs.ts",
     "packages/db/src/migrations/0314_a.sql",
     "packages/shared/src/index.ts",
+    "skills/paperclip/SKILL.md",
+    "skills-releases/paperclip/registry.json",
+    "package.json",
     "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "scripts/ensure-workspace-package-links.ts",
+    "scripts/ensure-plugin-build-deps.mjs",
     "vitest.config.ts",
     "scripts/ci/assert-vitest-ran.mjs",
     ".github/workflows/ci.yml",
   ]) {
     assert.equal(pr(changed).need_perf_guards, true, changed);
   }
-  for (const changed of ["ui/src/App.tsx", "cli/src/index.ts", "packages/adapters/claude-local/src/a.ts", "doc/DATABASE.md", "skills/a/SKILL.md", "packages/database/a.ts"]) {
+  for (const changed of [
+    "ui/src/App.tsx",
+    "ui/package.json",
+    "cli/src/index.ts",
+    "cli/skills/a.md",
+    "packages/adapters/claude-local/src/a.ts",
+    "doc/DATABASE.md",
+    "skillsx/a.md",
+    "skills-releasesx/a.json",
+    "packages/database/a.ts",
+    "scripts/other.ts",
+  ]) {
     assert.equal(pr(changed).need_perf_guards, false, changed);
   }
 });
