@@ -7,7 +7,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agentWakeupRequests,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issues,
@@ -48,6 +50,15 @@ describe("automation wake window on the real queue", () => {
       issuePrefix: `W${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`,
       defaultResponsibleUserId: "window-user",
       requireBoardApprovalForNewAgents: false,
+    });
+    // Agents act within their responsible user's access, so that user must
+    // exist and be an active member for a later run to reuse the task's workspace.
+    await db.insert(authUsers).values({
+      id: "window-user", name: "Window user", email: "window-user@example.test",
+      createdAt: new Date(), updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "window-user", status: "active", membershipRole: "member",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -272,24 +283,45 @@ describe("automation wake window on the real queue", () => {
     };
   }
 
+  // Waits until `count` sessions wait for an agent's window lock.
+  async function waitForWindowLockWaiters(count: number) {
+    const deadline = Date.now() + 10_000;
+    let waiting = 0;
+    while (Date.now() < deadline && waiting < count) {
+      const result = await db.execute(sql`select count(*)::int as count from pg_stat_activity
+        where datname = current_database() and wait_event_type = 'Lock' and wait_event = 'advisory'`);
+      waiting = Number(result[0]?.count ?? 0);
+      if (waiting < count) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(waiting).toBe(count);
+  }
+
   it("rechecks the window under the promotion lock when a fresh wake commits first", async () => {
     const { companyId, agentId, issueIds } = await seed(300, 2);
     const retryId = await insertScheduledRetry(companyId, agentId, issueIds[0]!);
-    const lock = await holdIssueLock(issueIds[0]!);
-    const pending = heartbeat.promoteDueScheduledRetries();
+    // A promotion holds the company accounting lock from before its issue lock until it commits,
+    // and every wake takes that lock for its budget check. So the fresh wake can only commit
+    // first if it passed its budget check before the promotion locked. Both then queue on the
+    // agent's window lock, the fresh wake first, while the promotion already holds its retry.
+    const unlockWindow = await holdWindowLock(companyId, agentId);
+    let wake: Promise<unknown> = Promise.resolve();
+    let pending: Promise<{ promoted: number; runIds: string[] }> = Promise.resolve({ promoted: 0, runIds: [] });
     try {
-      await lock.waitForWaiter();
-      await monitorWake(agentId, issueIds[1]!);
+      wake = monitorWake(agentId, issueIds[1]!);
+      await waitForWindowLockWaiters(1);
+      pending = heartbeat.promoteDueScheduledRetries();
+      await waitForWindowLockWaiters(2);
     } finally {
-      await lock.release();
+      await unlockWindow();
     }
+    await wake;
     const promoted = await pending;
 
     expect(await monitorRuns(agentId)).toHaveLength(1);
     expect(promoted.runIds).not.toContain(retryId);
     const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
     expect(retry?.status).toBe("scheduled_retry");
-  });
+  }, 30_000);
 
   it("stamps admission after waiting for locks, not at the start of the sweep", async () => {
     const { companyId, agentId, issueIds } = await seed(1, 2);
@@ -693,18 +725,28 @@ describe("automation wake window on the real queue", () => {
   // The recovery run opens the agent's next window. A wait on the issue lock must not age it:
   // its creation time is the admission time, not the start of the release transaction.
   it("stamps the immediate recovery run with its admission time after an issue-lock wait", async () => {
-    const { companyId, agentId, issueIds } = await seed(300, 1);
+    const { companyId, agentId, issueIds } = await seed(300, 2);
     const manual = await queueManualRun(companyId, agentId, issueIds[0]!);
-    const lock = await holdIssueLock(issueIds[0]!);
-    const pending = heartbeat.cancelRun(manual.id);
+    // The cancellation first terminalizes the run under its own issue's lock, with a 1-second
+    // lock timeout. The release that follows reads its clock, then locks every issue that still
+    // references the run. A second issue holding the run as its checkout makes only the release
+    // wait, after its clock was read.
+    await db.update(issues).set({ checkoutRunId: manual.id }).where(eq(issues.id, issueIds[1]!));
+    const lock = await holdIssueLock(issueIds[1]!);
+    let settled = false;
+    const pending = heartbeat.cancelRun(manual.id).finally(() => {
+      settled = true;
+    });
     await new Promise((resolve) => setTimeout(resolve, 2_000));
+    expect(settled).toBe(false);
     const releasedAt = Date.now();
     await lock.release();
     await pending;
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
 
     const recovery = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
-      .find((run) => run.contextSnapshot?.wakeReason === "issue_continuation_needed");
+      .find((run) => run.contextSnapshot?.wakeReason === "issue_continuation_needed"
+        && run.contextSnapshot?.issueId === issueIds[0]);
     expect(recovery).toBeDefined();
     expect(recovery!.createdAt.getTime()).toBeGreaterThanOrEqual(releasedAt - 100);
   }, 60_000);
