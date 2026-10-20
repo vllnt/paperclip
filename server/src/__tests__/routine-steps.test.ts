@@ -365,6 +365,33 @@ describeEmbeddedPostgres("routine steps", () => {
       expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
     });
 
+    describe("two runs started together", () => {
+      it.each([
+        { policy: "coalesce_if_active", followerStatus: "coalesced" },
+        { policy: "skip_if_active", followerStatus: "skipped" },
+      ] as const)(
+        "leave one root and one set of steps under $policy",
+        async ({ policy, followerStatus }) => {
+          const fx = await seed({ concurrencyPolicy: policy });
+          const routine = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));
+
+          const runs = await Promise.all([
+            fx.svc.runRoutine(routine.id, { source: "manual" }),
+            fx.svc.runRoutine(routine.id, { source: "manual" }),
+          ]);
+
+          expect(runs.map((run) => run.status).sort()).toEqual(["issue_created", followerStatus].sort());
+          const roots = await db
+            .select()
+            .from(issues)
+            .where(and(eq(issues.originId, routine.id), eq(issues.originKind, "routine_execution")));
+          expect(roots).toHaveLength(1);
+          expect(await stepIssuesOf(routine.id)).toHaveLength(5);
+          expect(fx.wakeups).toHaveLength(1);
+        },
+      );
+    });
+
     describe("a cancelled step", () => {
       async function setStatuses(routineId: string, statuses: Record<string, string>) {
         const stepIssues = await stepIssuesOf(routineId);

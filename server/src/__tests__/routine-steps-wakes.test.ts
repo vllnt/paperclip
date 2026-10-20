@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, companies, createDb, issues, projects } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import type { RoutineStep } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -34,6 +36,8 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { routineService } from "../services/routines.ts";
 
@@ -65,7 +69,15 @@ describeEmbeddedPostgres("routine step wakes", () => {
     await tempDb?.cleanup();
   });
 
-  async function dispatchRelease() {
+  const releaseSteps = (builderId: string): RoutineStep[] => [
+    step("implement", [], { assigneeAgentId: builderId }),
+    step("review", ["implement"]),
+    step("lint", ["review"]),
+    step("types", ["review"]),
+    step("ship", ["lint", "types"]),
+  ];
+
+  async function dispatchRelease(makeSteps: (builderId: string) => RoutineStep[] = releaseSteps) {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -108,13 +120,7 @@ describeEmbeddedPostgres("routine step wakes", () => {
         status: "active",
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
-        steps: [
-          step("implement", [], { assigneeAgentId: builderId }),
-          step("review", ["implement"]),
-          step("lint", ["review"]),
-          step("types", ["review"]),
-          step("ship", ["lint", "types"]),
-        ],
+        steps: makeSteps(builderId),
       } as never,
       {},
     );
@@ -124,7 +130,7 @@ describeEmbeddedPostgres("routine step wakes", () => {
       .from(issues)
       .where(and(eq(issues.originId, routine.id), eq(issues.originKind, "routine_step")));
     const byKey = new Map(stepIssues.map((issue) => [issue.title.replace("Step ", ""), issue]));
-    return { companyId, rootId: run.linkedIssueId!, issueOf: (key: string) => byKey.get(key)!.id };
+    return { companyId, leadId, rootId: run.linkedIssueId!, issueOf: (key: string) => byKey.get(key)!.id };
   }
 
   async function finish(issueIds: string[]) {
@@ -189,4 +195,48 @@ describeEmbeddedPostgres("routine step wakes", () => {
     for (const id of blockedIds) expect(wokenIssueIds).not.toContain(id);
     expect(wokenIssueIds).toContain(fx.issueOf("implement"));
   });
+
+  it("runs the lead once when the two last steps are finished through the issue route at the same time", async () => {
+    const fx = await dispatchRelease((builderId) => [
+      step("left", [], { assigneeAgentId: builderId }),
+      step("right", [], { assigneeAgentId: builderId }),
+    ]);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      Object.assign(req, {
+        actor: {
+          type: "board",
+          source: "local_implicit",
+          userId: "local-board",
+          companyIds: [fx.companyId],
+          memberships: [{ companyId: fx.companyId, status: "active", membershipRole: "owner" }],
+          isInstanceAdmin: true,
+        },
+      });
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never, {}));
+    app.use(errorHandler);
+    const leadRuns = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, fx.leadId));
+
+    const responses = await Promise.all(
+      ["left", "right"].map((key) => request(app).patch(`/api/issues/${fx.issueOf(key)}`).send({ status: "done" })),
+    );
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    const deadline = Date.now() + 15_000;
+    while ((await leadRuns()).length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await heartbeatService(db).drainActiveRunExecutions();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await heartbeatService(db).drainActiveRunExecutions();
+    const stepWakeRuns = (await leadRuns()).filter((run) => {
+      const snapshot = run.contextSnapshot as { wakeReason?: string } | null;
+      return snapshot?.wakeReason === "issue_children_completed" || snapshot?.wakeReason === "issue_blockers_resolved";
+    });
+    expect(stepWakeRuns).toHaveLength(1);
+    expect((stepWakeRuns[0]!.contextSnapshot as { issueId?: string } | null)?.issueId).toBe(fx.rootId);
+  }, 45_000);
 });
