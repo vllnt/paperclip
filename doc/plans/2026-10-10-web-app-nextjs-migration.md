@@ -1,7 +1,7 @@
 # Web app migration to Next.js, measured route by route
 
 Date: 2026-10-10
-Status: Plan only. No code ships with this pull request. The M0 code PR starts after this plan is approved and after a maintainer allows the install of the new dependency.
+Status: Approved for execution on 2026-10-20 (maintainer). The plan check against `main` of that day is section 12, the slice order and acceptance checks are section 13, and the baseline protocol is section 14. Where those sections correct an earlier section, they win: the version pin of section 4.3 is one such case.
 Branch: `docs/web-app-speed-nextjs-plan`
 Evidence base: `doc/plans/2026-10-10-web-app-speed-nextjs-plan.md` (same pull request, fact-checked). It holds the route inventory, the B0 and B1 numbers, the boot waterfall and the constraints. This plan does not repeat them; it cites them as "speed plan, section N".
 
@@ -173,7 +173,7 @@ Without this slice, a migrated route gets its data prefetched on the server but 
 
 | Item | Pin | Reason |
 |---|---|---|
-| `next` | **16.3.8**, exact | Released 2026-09-30. It fixes the seven advisories published that day (one high: SSRF in image optimisation; five medium; one low) and includes the earlier critical fixes (16.3.6 `next/og` RCE, 16.3.3 image-optimisation RCE, 16.2.11 Server Actions SSRF on custom servers). It is the newest release older than the install cooldown. The cooldown is the build host's configuration, not this repository's (pnpm `minimum-release-age=10080` minutes and npm `min-release-age=7` days in the host's user config). `16.4.0` (2026-10-06) clears it on 2026-10-13. M0 rechecks the cooldown and the advisories at install time and records the registry dates in its PR |
+| `next` | **16.4.1 or newer, exact** (corrected on 2026-10-20, section 12.1 row 4: three advisories published 2026-10-14 affect every release up to 16.4.0, including the 16.3.8 below) | Original text for 16.3.8, kept for the record: released 2026-09-30. It fixes the seven advisories published that day (one high: SSRF in image optimisation; five medium; one low) and includes the earlier critical fixes (16.3.6 `next/og` RCE, 16.3.3 image-optimisation RCE, 16.2.11 Server Actions SSRF on custom servers). It is the newest release older than the install cooldown. The cooldown is the build host's configuration, not this repository's (pnpm `minimum-release-age=10080` minutes and npm `min-release-age=7` days in the host's user config). `16.4.0` (2026-10-06) clears it on 2026-10-13. M0 rechecks the cooldown and the advisories at install time and records the registry dates in its PR |
 | React used by the App Router | `19.3.0-canary-cbb046ab-20260731`, vendored by `next@16.3.8` (`package.json` of the Next.js repository at `v16.3.8`) | the App Router ships its own React canary build; `react` and `react-dom` 19.2.8 stay in `package.json` for tooling. The canary is dated 2026-07-31, after the fix for the latest React Server Components advisory (GHSA-wx67-qw84-cm4g, 2026-07-21, fixed in 19.2.8); M0 confirms the fix is in it |
 | `react-router-dom` | 7.18.4, unchanged | removed in MF; no v8 upgrade |
 | Re-check | at M0 install time | take the newest patch of the newest minor that is older than 7 days and has no open advisory; re-read the advisories of `vercel/next.js` and `facebook/react` |
@@ -340,6 +340,81 @@ Order: H, M0, M0b, M0c, M1 (the spike decides here), then M2 to M10 (each one de
 | 9 | Phones and slow links (speed plan open question 1) | Still useful: if phones matter, M10 (public routes) and the mobile profile move earlier |
 | 10 | Should the shell render on the server (M0c), with its risk? | Yes. Without it the migration gives no server-rendered first paint, which is the main cold-load gain the maintainers expect |
 | 11 | A failed UI makes `/api/health` answer 503 (decided). At `compose up` the gateway is then not started or recreated (`deploy/compose.yaml:98-99`), so the API is unreachable through it until a rollback; a gateway that is already running is not stopped (section 3.3). Keep it? | Keep the decision: a deploy with a failed UI then fails closed, and the deploy check rolls it back. The alternatives are to keep today's health status and rely on the deploy check's `GET /`, or to change the gateway's dependency to `service_started`. This is a maintainer call |
+
+## 12. Plan check against `main` (2026-10-20)
+
+Checked at `origin/main` `1a94022f0`. Pull request states come from `gh pr list`; code facts from a fresh worktree of that commit.
+
+### 12.1 Findings that change the plan
+
+| # | Plan premise | `main` today | Effect |
+|---|---|---|---|
+| 1 | B1 is `main` plus #53, #54, #57, #68 and #87, all open (speed plan, section 2) | All five merged on 2026-10-19, together with #50 (the plan and the harness). `ui/vite.config.ts` has `precompressAssetsPlugin` and `bundleBudgetPlugin`; `ui/bundle-budget.json` exists | `main` contains B1. Each slice is compared with `main` built and measured in the same session (section 7 already says so). The speed plan's B1 numbers stay a reference. Section 6.1 has no open item; M0 ports #57 and #68 as section 3.4 says |
+| 2 | M0 lands after #119 and #95 (section 6.4) | #119 merged on 2026-10-19. #95 (the launcher replaces the search page) was closed without a merge | M0 waits for neither. The #95 row of section 6.4 no longer applies. The launcher from #86 stays in `Layout` unchanged |
+| 3 | Slice H depends on #115's backend harness (sections 6.4, 7, 9) | #115 merged as a plan. `tests/perf/backend/` does not exist on `main` | H splits in two (section 13). H1 needs no server sampler. H2 adds the rows that do, with its own one-second sampler, and switches to the backend harness if that lands first. M0 does not merge before every row it is judged on has a tool |
+| 4 | `next` **16.3.8** is the pin (section 4.3) | Three advisories published on 2026-10-14 affect every 16.x release up to and including 16.4.0 and are fixed in 16.4.1: GHSA-673q-mjm6-r5xr (critical, remote code execution in `use cache` functions that return typed arrays), GHSA-2464-fhr4-w9xw (critical, remote code execution in image optimisation with SVG files) and GHSA-p3m5-59mp-jv5r (high, denial of service in the App Router with Server Actions) | 16.3.8 must not ship. The pin is **16.4.1 or newer**: the newest 16.4.x that is older than the 7-day install cooldown on install day. 16.4.1 was published at 2026-10-14T17:43Z and clears the cooldown at 2026-10-21T17:43Z; 16.4.2 (2026-10-15T20:57Z) clears it at 2026-10-22T20:57Z. M0's install is not before 2026-10-21T17:43Z. M0 re-reads the advisories of `vercel/next.js` and `facebook/react` at install time and rechecks the React canary that the chosen release vendors. The no-Server-Actions, no-`use cache` and no-image-optimisation rules (sections 3.3 and 4.2) lower the exposure; they do not replace the patch, as section 4.2 already says for CVE-2025-55182 |
+| 5 | M0 changes deploy files: a deploy check that fetches `/`, and the gateway dependency of open question 11 (sections 3.3, 10) | Constraint of this work (maintainer instruction, 2026-10-20): `deploy/release.json`, `deploy/compose.yaml` and the semantics of the release workflow do not change | The readiness contract of section 3.3 already works with the compose file as it is: the container health check tests the HTTP status of `/api/health`, and that answers 503 while the UI has failed. The `GET /` and header checks of section 10 become steps of each risky slice's production smoke test (section 13), not a workflow change. Open question 11 is closed: the compose file stays, and the `service_started` alternative is out of scope. A slice that finds it needs a deploy-file change stops and asks for a decision |
+| 6 | "At most one risky PR per deploy window" (section 9) | A merge to `main` deploys automatically | A deploy window is one merge plus its production verification. Risky slices (M0, M0b, M0c, MF) merge one at a time, and the production check of one finishes before the next merge |
+
+### 12.2 Counts that moved (no effect on the order)
+
+| Item | Plan | `main` today |
+|---|---|---|
+| Non-test files that import `react-router` or `react-router-dom` (section 3.5) | 16 | 17 |
+| `<Route>` elements in `ui/src/App.tsx` | 269 | 274 |
+| Non-test files that use `localStorage` (open question 3) | 51 | 53 |
+
+The Vite-only surface of section 3.4 is unchanged: 8 non-test uses of `import.meta.env` or `import.meta.glob`, and 2 `?raw` or `?url` imports. Line numbers quoted in sections 3 and 4 moved by a few lines (for example `createServer` is at `server/src/index.ts:935` and `listen` at `:1005`); each slice re-reads the lines it edits.
+
+### 12.3 Verified and unchanged
+
+- There is no `next` dependency and no `ui/app/` directory; the UI builds with Vite (`pnpm --filter @paperclipai/ui build`) and Express serves `ui/dist` (`server/src/app.ts:1015-1071`).
+- `tests/perf/web-app/` holds `measure.mjs`, `report.mjs`, `bundle-report.mjs`, `interact.mjs`, `live-traffic.mjs`, `renders.mjs`, `make-fixture.mjs` and `run-all.sh`. It has no `laptop` profile, no `authenticated` fixture mode and none of the probes of section 8 (`nav-timing`, `route-smoke`, `spa-mounts`, `ws-persistence`, `two-user-isolation`, `start-timer`, `server-load`, `gate`).
+- The production instance runs in `authenticated` mode with private exposure. The nginx gateway template that the operator uses (a file in the operator's infrastructure repository, not in this one) sets no `proxy_cache` and sets `proxy_buffering off`. That settles the gateway layer of the cache gate in section 3.3; the layer in front of the gateway remains the operator's confirmation in M0.
+- The health response of the production instance reports `resourceCapacity.level: "critical"` at its last sample on 2026-10-20. The level is the worst of the host's metrics (`server/src/services/resource-capacity.ts`), and the health response does not say which metric drives it. M0 reads which one before it accepts the memory gate of section 8, because a server-rendering process adds resident memory to a host that is already under pressure.
+
+## 13. Slice order and acceptance checks
+
+### 13.1 Checks every slice passes
+
+1. CI is green at the head that merges, including the image build check and `pnpm check:token-gates` for UI changes.
+2. An independent review of the diff at that head has no open blocker or major.
+3. Before and after against `main` built in the same session on the same machine, for the pages the slice touches: interleaved, at least 5 runs per cell and 2 rounds, load average recorded, requests per load reported (section 7).
+4. Screenshots at 1440 px and 390 px, and zero console errors on the touched pages (the run-log 404s that section 2 of the web-perf plan calls fixture noise are excluded).
+5. Web, REST and CLI parity (AGENTS.md section 5, rule 8): a migration slice changes no capability, so it says "no capability change". A slice that adds one adds all three surfaces.
+6. After the merge, on the production instance: `/api/health` shows the merge commit; the touched pages load at 1440 px and 390 px in a real browser with zero console errors; the slice's metric is measured for them; test data is marked `[qa-test]`, kept to the test company, and cleaned up.
+7. Rollback is a revert pull request through the same checks. A regression found in production gets the revert first.
+
+### 13.2 Order
+
+| Order | Slice | Content | Acceptance beyond section 13.1 |
+|---|---|---|---|
+| 0 | P0 (this plan update) | Sections 12 to 14, the corrected version pin | Documentation only. Every number is reproducible from the command or source it names |
+| 1 | H1 | `laptop` profile; `authenticated` fixture mode; the HTTP/2 proxy; `nav-timing.mjs`, `route-smoke.mjs`, `ws-persistence.mjs`, `two-user-isolation.mjs`; `spa-mounts.mjs` (it reads counters that exist from M0b and reports "not applicable" before); `gate.mjs` with `gate-bands.json` for the rows that need no server sampler | The suite runs end to end on `main` and prints the B1 numbers of this machine. `gate.mjs` passes `main` against `main` and fails on a seeded regression. The browser suites stay opt-in and out of `pnpm test` |
+| 2 | H2 | `start-timer.mjs`; `server-load.mjs` with a one-second CPU and resident-memory sampler; the image rows (Memory, Start, Image and CI) | Every row of section 8 has a tool and a band. The numbers of `main`'s image are recorded; M0 is judged against them |
+| 3 | M0 | Section 3 | Rows of section 8: no regression from M0 and M0b, every other route, websockets, readiness, start, image and CI, memory. A header test for HTML and `?_rsc=`. The image build is reviewed separately, and a production smoke test checks `GET /` and the two headers through the real ingress and the CacheStorage listing. The install is not before 2026-10-21T17:43Z (section 12.1, row 4) and adds `@tailwindcss/postcss` at the version of the locked `tailwindcss` |
+| 4 | M0b | Section 3.5 | Rows: router state, one SPA root, two users at once, the forged-header tests, and the cold LCP gain of section 9 |
+| 5 | M0c | Section 3.6 | The shell paints from the HTML; zero hydration errors; no regression |
+| 6 | M1 | Tasks board and list | The whole go/no-go table of section 8. If it fails, the migration stops at M0b and the numbers go to the maintainers (end of section 8) |
+| 7 to 15 | M2 to M10 | One route group each, in the order of section 9. Lists that stay slow in the numbers of M1, M2 and M5 (issues, agents, runs) get bounding or virtualization with optimistic updates in or just after their slice | The route smoke test for the group's routes at both widths; before and after against `main`; the group's number in section 9 |
+| 16 | MF | Remove the catch-all, React Router, the bridge, the Vite app entry and build, and the `/assets` handler | No regression on any route; no `react-router` import remains; the image no longer holds `ui/dist` |
+
+## 14. Baseline protocol (production, and the same machine)
+
+The goal is a before and after for every slice, so the before has to exist before M0 deploys. The metrics are the ones the speed plan and the web-perf plan name.
+
+| Metric | Source | Pages |
+|---|---|---|
+| FCP, LCP, TTI (quiet window), CLS, TBT; requests, API calls, JS bytes on the wire | `measure.mjs` (profiles `desktop`, `wan`, `slow`, plus `laptop` from H1) | dashboard, tasks board, tasks list, issue with 400 comments, agents, routines, costs, audit, settings |
+| Warm navigation: input to first visual change and to usable, by click, hover then click, Tab then Enter, launcher Enter, chord, back | `nav-timing.mjs` (H1) | board, issue detail, inbox, dashboard, agent detail, run transcript |
+| INP | `interact.mjs` | board, list, issue, dashboard |
+| Initial JS and CSS | `bundle-report.mjs` | whole app |
+
+- **Production.** The same pages and metrics are read from the production instance in a real browser. The instance runs in `authenticated` mode, so the browser needs a signed-in session; a board API key does not give the UI one (`/api/auth/get-session` ignores it and the live-events socket accepts only agent keys). Until a session exists, the production baseline and the production check of section 13.1 (item 6) cannot run, and no UI-changing slice merges. The measuring machine's link to the production instance is a fact of the run, so every production number is stated with the profile used and with the round-trip time of `/api/health` from the same machine.
+- **Same machine.** Each slice is judged against `main` built and measured in the same session (section 7). H1 prints that baseline.
+- **Results.** The numbers are recorded in this section before M0 merges, in a table per profile with the date, the commit, the machine and the load average. The after numbers of each slice are added in the slice's pull request, below the baseline.
+
+Baseline status on 2026-10-20: not recorded. Blocked on an authenticated browser session for the production instance (section 14, first bullet). The local `main` baseline comes with H1.
 
 ## Appendix A. Sources outside the repository
 

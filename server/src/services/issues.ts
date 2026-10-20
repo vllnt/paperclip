@@ -96,6 +96,7 @@ import type {
   SuccessfulRunHandoffState,
 } from "@paperclipai/shared";
 import {
+  ROUTINE_RUN_ISSUE_ORIGIN_KINDS,
   clampIssueRequestDepth,
   extractAgentMentionIds,
   extractProjectMentionIds,
@@ -1935,14 +1936,14 @@ type IssueUserContextInput = {
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
 /** Conversation containers cannot acquire new child edges, even with the experiment disabled. */
-async function assertExecutionTaskParent(db: Db, companyId: string, parentId?: string | null) {
+async function assertExecutionTaskParent(db: DbReader, companyId: string, parentId?: string | null) {
   if (!parentId) return;
   const [parent] = await db.select({ conversationAgentId: issues.conversationAgentId })
     .from(issues).where(and(eq(issues.id, parentId), eq(issues.companyId, companyId)));
   if (parent?.conversationAgentId) throw unprocessable("Conversations cannot have new subtasks; create a task in a project instead");
 }
 
-type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+export type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" | "titleNeedsGeneration"> & {
   title?: string;
   initialPlan?: string | null;
@@ -6206,6 +6207,11 @@ function assertValidAssigneeAgentFilter(
   }
 }
 
+/** Keeps out the roots and the steps of routine runs: what "hide routine runs" means in a list. */
+function notRoutineRunIssueCondition() {
+  return notInArray(issues.originKind, [...ROUTINE_RUN_ISSUE_ORIGIN_KINDS]);
+}
+
 async function blockedInboxIssueConditions(
   dbOrTx: any,
   companyId: string,
@@ -6331,7 +6337,7 @@ async function blockedInboxIssueConditions(
     !filters?.originKind &&
     !filters?.originId
   ) {
-    conditions.push(ne(issues.originKind, "routine_execution"));
+    conditions.push(notRoutineRunIssueCondition());
   }
 
   return { conditions, contextUserId };
@@ -7224,8 +7230,12 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableUser(companyId: string, userId: string) {
-    const membership = await db
+  async function assertAssignableUser(
+    companyId: string,
+    userId: string,
+    dbOrTx: DbReader = db,
+  ) {
+    const membership = await dbOrTx
       .select({ id: companyMemberships.id })
       .from(companyMemberships)
       .where(
@@ -8131,7 +8141,7 @@ export function issueService(db: Db) {
         !filters?.originKind &&
         !filters?.originId
       ) {
-        conditions.push(ne(issues.originKind, "routine_execution"));
+        conditions.push(notRoutineRunIssueCondition());
       }
       const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
       const searchOrder = sql<number>`-task_search.score`;
@@ -9356,18 +9366,58 @@ export function issueService(db: Db) {
       };
     },
 
-    createChild: async (parentIssueId: string, data: IssueChildCreateInput) => {
-      const parent = await db
+    /**
+     * Adds blockers to an issue in one write, keeping the blockers it already has. Children created
+     * without `blockParentUntilDone` can then block their parent together, instead of one parent
+     * sync per child. Pass `dbOrTx` to run on a caller-owned transaction.
+     */
+    addBlockedByIssueIds: async (
+      issueId: string,
+      companyId: string,
+      blockedByIssueIds: string[],
+      dbOrTx: Db | DbTransaction = db,
+    ) => {
+      const existingBlockers = await dbOrTx
+        .select({ blockerIssueId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.relatedIssueId, issueId),
+            eq(issueRelations.type, "blocks"),
+          ),
+        );
+      await syncBlockedByIssueIds(
+        issueId,
+        companyId,
+        [...existingBlockers.map((row) => row.blockerIssueId), ...blockedByIssueIds],
+        {},
+        dbOrTx,
+      );
+    },
+
+    /**
+     * Creates a child issue and, with `blockParentUntilDone`, makes the parent wait for it.
+     * Pass `dbOrTx` to run every read and write on a caller-owned transaction, for example
+     * to create a parent and its children atomically; by default it uses its own.
+     */
+    createChild: async (
+      parentIssueId: string,
+      data: IssueChildCreateInput,
+      dbOrTx: Db | DbTransaction = db,
+    ) => {
+      const executor: DbReader = dbOrTx;
+      const parent = await executor
         .select()
         .from(issues)
         .where(eq(issues.id, parentIssueId))
         .then((rows) => rows[0] ?? null);
       if (!parent) throw notFound("Parent issue not found");
-      await assertExecutionTaskParent(db, parent.companyId, parent.id);
+      await assertExecutionTaskParent(executor, parent.companyId, parent.id);
 
       const idempotencyKey = data.idempotencyKey?.trim();
       if (idempotencyKey) {
-        const existingChild = await db
+        const existingChild = await executor
           .select({ issue: issues })
           .from(issueCreateIdempotencyKeys)
           .innerJoin(issues, eq(issueCreateIdempotencyKeys.issueId, issues.id))
@@ -9387,11 +9437,11 @@ export function issueService(db: Db) {
           }
           await data.assertCanReuseIssue?.(existingChild);
           data.onDeduplicated?.("idempotency_key");
-          const [enriched] = await withIssueLabels(db, [existingChild]);
+          const [enriched] = await withIssueLabels(executor, [existingChild]);
           const [withRelations] = await withIssueRelationSummaries(
             parent.companyId,
             [enriched],
-            db,
+            executor,
           );
           return {
             issue: withRelations,
@@ -9400,7 +9450,7 @@ export function issueService(db: Db) {
         }
       }
 
-      const [{ childCount }] = await db
+      const [{ childCount }] = await executor
         .select({ childCount: sql<number>`count(*)::int` })
         .from(issues)
         .where(
@@ -9473,10 +9523,10 @@ export function issueService(db: Db) {
         ...(inheritStrategyOnly
           ? { skipExecutionWorkspaceInheritance: true }
           : { inheritExecutionWorkspaceFromIssueId: parent.id }),
-      });
+      }, dbOrTx);
 
       if (blockParentUntilDone) {
-        const existingBlockers = await db
+        const existingBlockers = await executor
           .select({ blockerIssueId: issueRelations.issueId })
           .from(issueRelations)
           .where(
@@ -9496,11 +9546,12 @@ export function issueService(db: Db) {
             ]),
           ],
           { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+          dbOrTx,
         );
         [child] = await withIssueRelationSummaries(
           parent.companyId,
           [child],
-          db,
+          executor,
         );
       }
 
@@ -9904,7 +9955,7 @@ export function issueService(db: Db) {
       const deduplicateByTitle = allowDuplicate === false && !titleNeedsGeneration;
       issueData.title = resolvedTitle;
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettings.getExperimental({ db: dbOrTx })
       ).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -9915,12 +9966,12 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(db, companyId, data.assigneeAgentId, {
+        await assertAssignableAgent(dbOrTx, companyId, data.assigneeAgentId, {
           kind: "work",
         });
       }
       if (data.assigneeUserId) {
-        await assertAssignableUser(companyId, data.assigneeUserId);
+        await assertAssignableUser(companyId, data.assigneeUserId, dbOrTx);
       }
       if (
         data.status === "in_progress" &&
@@ -9931,7 +9982,7 @@ export function issueService(db: Db) {
       }
       const created: { event: IssueCreatedEvent | null } = { event: null };
       const persist = async (tx: DbTransaction) => {
-        await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
+        await assertExecutionTaskParent(tx, companyId, issueData.parentId);
         if (issueData.conversationAgentId && issueData.conversationUserId) {
           const identity = `conversation:${companyId}:${issueData.conversationAgentId}:${issueData.conversationUserId}`;
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${identity}, 0))`);

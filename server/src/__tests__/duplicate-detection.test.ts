@@ -152,6 +152,27 @@ describeEmbeddedPostgres("duplicate detection against real Postgres", () => {
       expect(ids).toHaveLength(2);
     });
 
+    it.each(["routine_execution", "routine_step"] as const)(
+      "skips the root and the steps of its own routine run when the new issue is a %s, and keeps other routines",
+      async (kind) => {
+        const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Routine family");
+        const routineId = randomUUID();
+        await seedIssue(pg.db, companyId, { originKind: "routine_execution", originId: routineId });
+        await seedIssue(pg.db, companyId, { originKind: "routine_step", originId: routineId });
+        const otherRoutineStep = await seedIssue(pg.db, companyId, { originKind: "routine_step", originId: randomUUID() });
+        const self = await seedIssue(pg.db, companyId, {
+          originKind: kind,
+          originId: routineId,
+          createdAt: new Date("2026-10-05T00:00:00Z"),
+        });
+
+        const svc = serviceFor(pg.db, judgeAnswering(0.5));
+        const result = await svc.findSimilar({ companyId, title: TITLE, issueId: self, origin: { kind, id: routineId } });
+
+        expect(result.candidates.map((candidate) => candidate.issueId)).toEqual([otherRoutineStep]);
+      },
+    );
+
     it("matches an identical title and caps the pool to the top five", async () => {
       const { companyId } = await seedCompanyWithBoardAccess(pg.db, "Crowded");
       for (let index = 0; index < 8; index += 1) await seedIssue(pg.db, companyId);

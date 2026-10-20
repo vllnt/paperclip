@@ -1,4 +1,11 @@
-import { RUN_CONTEXT_DEFAULTS, resolveCompanyEnvironmentDefault, resolveTransientRetryPolicy, type ResolvedTransientRetryPolicy } from "@paperclipai/shared";
+import {
+  ROUTINE_RUN_ISSUE_ORIGIN_KINDS,
+  RUN_CONTEXT_DEFAULTS,
+  isRoutineRunIssueOriginKind,
+  resolveCompanyEnvironmentDefault,
+  resolveTransientRetryPolicy,
+  type ResolvedTransientRetryPolicy,
+} from "@paperclipai/shared";
 import { issueIdEqualsText } from "./issue-id-match.js";
 import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
@@ -37,7 +44,7 @@ import {
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
-import { hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, truncateAtGrapheme, type ExecutionBlocker } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
@@ -398,7 +405,7 @@ import {
   emitAgentTaskRunById,
 } from "./agent-task-run-telemetry.js";
 import { reportRunFailure } from "./run-failure-report.js";
-import { collectRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
+import { collectRunFailureSecretValues, redactRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
@@ -417,6 +424,7 @@ import {
   isExternalChatPresentationContext,
   mergeHeartbeatRunResultJson,
   readCompletedAssistantMessageCandidate,
+  readRunErrorSummary,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
   summarizeRunErrorForModel,
@@ -506,6 +514,7 @@ import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
 import { isRetryableMonitorWakeBlock, monitorWakeRetryDelayMs } from "./issue-monitor-wake-block.js";
 import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { inheritRoutineStepWorkspace } from "./routine-steps.js";
 import { orderQueuedRunsForClaim, selectAgentQueuedRuns } from "./queued-run-claim-order.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
@@ -761,6 +770,43 @@ import {
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
+// A registered env value shorter than this is a flag or a number such as `1`,
+// not a credential. Masking it everywhere would rewrite the exit code in the
+// stored run error ("exited with code 1").
+const MIN_RUN_ERROR_SECRET_VALUE_CHARS = 4;
+// The most characters of an error that a run stores. The error text lands in the run row, the
+// wakeup, the agent's error reason and the live events, so an adapter's detail never grows them
+// without bound. The cut ends the text and keeps its first line, which carries the cause.
+const MAX_RUN_ERROR_CHARS = 8 * 1024;
+// The text rule's run time grows with the square of its input, and an adapter error can hold
+// megabytes of stderr. So the text rule reads only the stored bound plus this margin. A secret
+// that the margin cut splits sits at the end of the redacted window, so the margin is dropped
+// again before the stored cut: earlier secrets that redaction shortens cannot pull it in.
+// The margin is longer than a secret value that a text rule matches.
+const RUN_ERROR_REDACTION_MARGIN_CHARS = 4 * 1024;
+
+function sliceAtCodePoint(text: string, end: number): string {
+  const lastCode = end > 0 ? text.charCodeAt(end - 1) : 0;
+  return text.slice(0, lastCode >= 0xd800 && lastCode <= 0xdbff ? end - 1 : Math.max(end, 0));
+}
+
+function redactStoredRunError(
+  text: string,
+  failureSecretValues: readonly string[],
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+): string {
+  // The registered values and the current user are exact matches, linear in the text, so they
+  // read all of it: a value of any length is masked before a cut can split it.
+  const exact = redactCurrentUserText(
+    redactRunFailureSecretValues(text, failureSecretValues),
+    currentUserRedactionOptions,
+  );
+  const window = MAX_RUN_ERROR_CHARS + RUN_ERROR_REDACTION_MARGIN_CHARS;
+  if (exact.length <= window) return truncateAtGrapheme(redactSensitiveText(exact), MAX_RUN_ERROR_CHARS);
+  const redacted = redactSensitiveText(sliceAtCodePoint(exact, window));
+  const kept = sliceAtCodePoint(redacted, redacted.length - RUN_ERROR_REDACTION_MARGIN_CHARS);
+  return truncateAtGrapheme(`${kept}…`, MAX_RUN_ERROR_CHARS);
+}
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -1346,7 +1392,7 @@ export function parseSandboxProviderPluginNotReadyFailureMessage(
   };
 }
 
-function isRetryableInteractionContinuationInfrastructureFailure(
+export function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<
     typeof heartbeatRuns.$inferSelect,
     "error" | "errorCode" | "resultJson"
@@ -1363,11 +1409,12 @@ function isRetryableInteractionContinuationInfrastructureFailure(
     return false;
 
   const resultJson = parseObject(run.resultJson);
+  const error = readRunErrorSummary(run);
   return (
-    isSpawnLikeFailureMessage(run.error) ||
+    isSpawnLikeFailureMessage(error) ||
     isSpawnLikeFailureMessage(resultJson.errorMessage) ||
     isSpawnLikeFailureMessage(resultJson.message) ||
-    isSandboxProviderWorkerUnavailableFailureMessage(run.error) ||
+    isSandboxProviderWorkerUnavailableFailureMessage(error) ||
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.errorMessage) ||
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.message)
   );
@@ -3875,6 +3922,7 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
           and length(${heartbeatRuns.resultJson} ->> 'acpPendingToolCount') < 16
           then ${heartbeatRuns.resultJson} -> 'acpPendingToolCount' end,
         'errorFamily', left(${heartbeatRuns.resultJson} ->> 'errorFamily', 32),
+        'errorSummary', left(${heartbeatRuns.resultJson} ->> 'errorSummary', ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}),
         'finalResponseRecorded', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'finalResponseRecorded') = 'boolean'
           then ${heartbeatRuns.resultJson} -> 'finalResponseRecorded' end,
         'executionBeforeRestore', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'executionBeforeRestore') = 'object'
@@ -16673,7 +16721,7 @@ export function heartbeatService(
             and(
               eq(issues.id, input.issueId),
               eq(issues.companyId, input.companyId),
-              eq(issues.originKind, "routine_execution"),
+              inArray(issues.originKind, [...ROUTINE_RUN_ISSUE_ORIGIN_KINDS]),
             ),
           )
           .then((rows) => rows[0]?.policy ?? null)
@@ -18165,7 +18213,7 @@ export function heartbeatService(
         .where(eq(companies.id, agent.companyId))
         .then((rows) => rows[0]?.settings ?? null),
       routine:
-        issue?.originKind === "routine_execution" && issue.originId
+        isRoutineRunIssueOriginKind(issue?.originKind) && issue?.originId
           ? await dbOrTx
               .select({ settings: routines.automationWakeSettings })
               .from(routines)
@@ -18663,7 +18711,7 @@ export function heartbeatService(
       status: run.status,
       errorCode: run.errorCode,
       errorFamily: readHeartbeatRunErrorFamily(run),
-      errorMessage: run.error,
+      errorMessage: readRunErrorSummary(run),
       retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       usefulWork,
     });
@@ -23232,6 +23280,13 @@ export function heartbeatService(
       let issueContext = issueId
         ? await getIssueExecutionContext(agent.companyId, issueId)
         : null;
+      if (issueId && issueContext) {
+        const inherited = await inheritRoutineStepWorkspace(db, agent.companyId, issueContext).catch((error) => {
+          logger.warn({ err: error, issueId }, "failed to inherit the workspace of a routine step's predecessor");
+          return false;
+        });
+        if (inherited) issueContext = await getIssueExecutionContext(agent.companyId, issueId);
+      }
       const issueDependencyReadiness = issueId
         ? await issuesSvc
             .listDependencyReadiness(agent.companyId, [issueId])
@@ -27723,6 +27778,45 @@ export function heartbeatService(
                       },
                     } : {}),
                     onSteeringReady: (handle) => setAdapterSteeringHandle(run.id, handle),
+                    // A run that ends before it returns (for example on a server restart)
+                    // still leaves its session for the retry. The final write below replaces it.
+                    onSessionCheckpoint: async (checkpoint) => {
+                      try {
+                        const next = resolveNextSessionState({
+                          adapterType: agent.adapterType,
+                          codec: sessionCodec,
+                          adapterResult: { exitCode: null, signal: null, timedOut: false, ...checkpoint },
+                          outcome: "succeeded",
+                          previousParams: previousSessionParams,
+                          previousDisplayId: runtimeForAdapter.sessionDisplayId,
+                          previousLegacySessionId: runtimeForAdapter.sessionId,
+                        });
+                        const sessionIdAfter = next.displayId ?? next.legacySessionId;
+                        if (!sessionIdAfter) return;
+                        const [stored] = await db
+                          .update(heartbeatRuns)
+                          .set({ sessionIdAfter, updatedAt: new Date() })
+                          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+                          .returning({ id: heartbeatRuns.id });
+                        if (!stored || !taskKey) return;
+                        await upsertTaskSession({
+                          companyId: agent.companyId,
+                          agentId: agent.id,
+                          adapterType: agent.adapterType,
+                          taskKey,
+                          sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+                            next.params,
+                            configuredModel,
+                            sessionConfigMetadata,
+                          ),
+                          sessionDisplayId: next.displayId,
+                          lastRunId: run.id,
+                          lastError: null,
+                        });
+                      } catch (err) {
+                        logger.warn({ err, runId: run.id }, "failed to store the early session checkpoint");
+                      }
+                    },
                     onCancellationReady: async () => {
                       await registerAdapterExecutionControl(run.id, executionControl);
                       const current = await getRun(run.id);
@@ -28136,16 +28230,36 @@ export function heartbeatService(
           usageBasis: adapterResult.usageBasis ?? null,
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
-        const runErrorMessage =
+        // Only the stored copies are redacted. The outcome, the error code and
+        // the quota reclassification above already read the adapter's raw result.
+        // The run's registered env and secret values go first, because an opaque
+        // value has no shape for the text rule to recognize. Every reader of the
+        // stored error (Inbox, live and plugin events, wakeup error, agent error
+        // reason) then sees the redacted text.
+        const failureSecretValues = readFailureReportSecrets().filter(
+          (value) => value.length >= MIN_RUN_ERROR_SECRET_VALUE_CHARS,
+        );
+        const redactRunError = (text: string) =>
+          redactStoredRunError(text, failureSecretValues, currentUserRedactionOptions);
+        // Classifiers read the adapter's short errorMessage. A failed run stores
+        // the adapter's fuller errorDetail when it has one, and keeps the short
+        // message in resultJson.errorSummary for classifiers that read it back.
+        const runErrorSummary =
           outcome === "cancelled"
-            ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
+            ? redactRunError(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
             : outcome === "succeeded"
               ? null
-              : redactCurrentUserText(
+              : redactRunError(
                   adapterResult.errorMessage ??
                     (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                  currentUserRedactionOptions,
                 );
+        const adapterErrorDetail =
+          outcome === "failed" || outcome === "timed_out"
+            ? readNonEmptyString(adapterResult.errorDetail)
+            : null;
+        const runErrorMessage = adapterErrorDetail
+          ? redactRunError(adapterErrorDetail)
+          : runErrorSummary;
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
         const runErrorCode =
@@ -28276,17 +28390,18 @@ export function heartbeatService(
                   ? {
                       backgroundTaskStopped: true,
                       backgroundTaskStopWarning: adapterResult.errorMessage
-                        ? redactCurrentUserText(adapterResult.errorMessage, currentUserRedactionOptions)
+                        ? redactRunError(adapterResult.errorMessage)
                         : null,
                     }
                   : {}),
+                ...(adapterErrorDetail ? { errorSummary: runErrorSummary } : {}),
                 configFreshness: configFreshnessResultMetadata,
               },
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
             }),
             errorCode: runErrorCode,
-            errorMessage: runErrorMessage,
+            errorMessage: runErrorSummary,
           }),
           adapterResult.summary ?? null,
           ), runErrorCode, runErrorMessage),

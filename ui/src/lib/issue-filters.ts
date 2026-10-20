@@ -1,4 +1,4 @@
-import type { ExternalObjectSummary, Issue } from "@paperclipai/shared";
+import { isRoutineRunIssueOriginKind, type ExternalObjectSummary, type Issue } from "@paperclipai/shared";
 
 export type IssueFilterWorkspaceLookup = {
   mode?: string | null;
@@ -219,7 +219,7 @@ export function applyIssueFilters(
     result = result.filter((issue) => liveIssueIds?.has(issue.id) === true);
   }
   if (enableRoutineVisibilityFilter && state.hideRoutineExecutions) {
-    result = result.filter((issue) => issue.originKind !== "routine_execution");
+    result = result.filter((issue) => !isRoutineRunIssueOriginKind(issue.originKind));
   }
   if (state.statuses.length > 0) result = result.filter((issue) => state.statuses.includes(issue.status));
   if (state.priorities.length > 0) result = result.filter((issue) => state.priorities.includes(issue.priority));
