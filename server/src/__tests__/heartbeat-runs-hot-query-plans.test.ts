@@ -52,6 +52,13 @@ const AGENTS = 26;
  */
 const QUERY_1_BUFFER_BOUND = 100;
 const QUERY_2_BUFFER_BOUND = 1_000;
+/**
+ * Runs without an issue of one agent, all older than its exhausted run. A check that
+ * ranges over created_at reads about 2 buffers. One that compares every older run's time
+ * reads about 77 here, and still 28 once the visibility map spares it the heap.
+ */
+const BUSY_AGENT_OLDER_RUNS = 2_000;
+const BUSY_AGENT_BUFFER_BOUND = 10;
 /** Before every seeded run (the seed spans the last day). */
 const OLD = new Date(Date.now() - 2 * 24 * 3_600_000);
 
@@ -88,6 +95,7 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const companyId = randomUUID();
   const agentIds = Array.from({ length: AGENTS }, () => randomUUID());
+  const busyAgentId = randomUUID();
   const issueIds = Array.from({ length: ISSUES }, () => randomUUID());
   const sourceIssueId = issueIds[7]!;
   let toastPages = 0;
@@ -139,7 +147,7 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-runs-hot-plans-");
     db = createDb(tempDb.connectionString);
     await db.insert(companies).values({ id: companyId, name: "Plans", issuePrefix: "PLN", requireBoardApprovalForNewAgents: false });
-    await db.insert(agents).values(agentIds.map((id, index) => ({
+    await db.insert(agents).values([...agentIds, busyAgentId].map((id, index) => ({
       id, companyId, name: `Agent ${index}`, role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
     })));
     await db.insert(issues).values(issueIds.map((id, index) => ({
@@ -184,9 +192,14 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
       await insertExhaustedRun(agentId, new Date(Date.now() - (index + 1) * 60_000), index === AGENTS - 1 ? {} : { issueId: issueIds[(index * 11) % ISSUES] });
     }
     // An old exhausted run without an issue, older than every seeded run, of an agent whose runs all
-    // have an issue (only agents 0 and 13 have runs without one). Nothing supersedes it, so the
-    // check has to rule out every later run of the agent: about 230 here.
+    // have an issue (in the bulk seed, only agents 0 and 13 have runs without one). Nothing
+    // supersedes it, so the check has to rule out every later run of the agent: about 230 here.
     await insertExhaustedRun(agentIds[5]!, OLD, {});
+    // A busy agent's small runs without an issue, from an hour ago back, like timer runs.
+    await db.$client.unsafe(`
+      insert into heartbeat_runs (company_id, agent_id, invocation_source, status, created_at, updated_at, context_snapshot)
+      select '${companyId}', '${busyAgentId}', 'automation', 'succeeded', now() - interval '1 hour' - g * interval '1 second', now(), '{}'::jsonb
+      from generate_series(1, ${BUSY_AGENT_OLDER_RUNS}) g`);
     // An agent-owned recovery action on a blocked issue: the sweep checks it for a new live path.
     await db.insert(issueRecoveryActions).values({
       companyId, sourceIssueId, kind: "stranded_assigned_issue", status: "active", ownerType: "agent",
@@ -256,8 +269,19 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
     await expectNewerRunCheckPlans(hot[0]!);
   });
 
+  it("hot query 2 checks a recent exhausted run without an issue without reading the agent's older runs", async () => {
+    // Nothing supersedes the run, and its agent has many older runs without an issue: the
+    // check must range over created_at, not compare each older run's time.
+    const candidates = [{ id: randomUUID(), agentId: busyAgentId, createdAt: new Date(), issueId: null }];
+    const recorder = recordingDb(db);
+    expect(await listSupersededExhaustedRunIds(recorder.db, companyId, candidates)).toEqual(new Set());
+    const hot = recorder.statements.filter(({ query }) => query.includes("from (values"));
+    expect(hot).toHaveLength(1);
+    await expectNewerRunCheckPlans(hot[0]!, BUSY_AGENT_BUFFER_BOUND);
+  });
+
   /** A newer-run check uses its index, reads no run context, and stays within the bound. */
-  async function expectNewerRunCheckPlans(statement: Captured) {
+  async function expectNewerRunCheckPlans(statement: Captured, bufferBound = QUERY_2_BUFFER_BOUND) {
     const issueCheck = statement.query.includes("= candidate.issue_id");
     for (const genericPlan of [false, true]) {
       const plan = await explain(statement, genericPlan);
@@ -275,7 +299,7 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
         }
       }
       expect(plan.contextFilters, `${label}: reads the context of every run it visits`).toEqual([]);
-      expect(plan.buffers, `${label}: shared buffers`).toBeLessThan(QUERY_2_BUFFER_BOUND);
+      expect(plan.buffers, `${label}: shared buffers`).toBeLessThan(bufferBound);
     }
   }
 
