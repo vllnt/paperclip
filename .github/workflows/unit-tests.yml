@@ -20,7 +20,10 @@ permissions:
 
 concurrency:
   group: unit-tests-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A new push to a pull request replaces its older run. A run on main finishes,
+  # so main keeps a result to compare a pull request against. A run that is still
+  # waiting for its turn on main is replaced by a newer one, as before.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit:
