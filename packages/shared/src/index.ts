@@ -2634,6 +2634,7 @@ export {
   isRoutineDateVariableName,
   isValidRoutineDateString,
   isValidRoutineVariableName,
+  ROUTINE_TASK_VARIABLE_NAMES,
   stringifyRoutineVariableValue,
   syncRoutineVariablesWithTemplate,
 } from "./routine-variables.js";
