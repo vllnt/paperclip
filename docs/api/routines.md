@@ -217,6 +217,8 @@ What happens to the task:
 - **Owned by a person, or by nobody:** its status does not change. It only gains the blocker edges, so it shows what it waits for.
 - **A step fails to create:** the steps created for this run are removed and the status goes back. The task itself is never deleted.
 
+The steps are sub-tasks of the task, so they take its project and execution workspace like any sub-task. When the task has an execution workspace, every step of its project works in it, also two steps that run at the same time. When it has none, the steps hand their workspaces on as on any run. This is deliberate: the steps check or finish the task's own work.
+
 Two starts on one task (an event and a manual run, say) take turns on the task's row lock, so the task ends up with one tree of steps. A second run on a task whose first run's steps are still open is refused with `409`; after those steps close, the routine can run on the task again. To retry a manual run safely, send an `idempotencyKey`: the same key returns the same run. A key that was already used for a run on another task, or for a run without a task, answers `409`.
 
 In the text of a step on such a run, `{{issue.title}}` and `{{issue.identifier}}` are the task's title and identifier. On any other run they are left as written.
