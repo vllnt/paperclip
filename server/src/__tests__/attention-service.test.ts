@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -1061,6 +1061,42 @@ describeEmbeddedPostgres("attention service", () => {
 
     expect(feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id).sort())
       .toEqual([byOtherAgent.id, byEarlierRun.id].sort());
+  });
+
+  it("supersedes an exhausted run without an issue only by a newer run of the same agent without an issue", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("ATU");
+    const issueA = await insertIssue({ companyId, identifier: "ATU-1", title: "Issue A", status: "in_progress" });
+    const at = (second: number) => new Date(Date.UTC(2026, 6, 9, 12, 0, second));
+    const run = (agentId: string, contextSnapshot: Record<string, unknown>, second: number, status = "succeeded") => ({
+      id: randomUUID(), companyId, agentId, invocationSource: "automation", status, contextSnapshot,
+      createdAt: at(second), updatedAt: at(second), finishedAt: at(second),
+    });
+    const withoutIssue = run(workerId, {}, 30, "failed");
+    const withEmptyIssue = run(reviewerId, { issueId: "" }, 40, "failed");
+    const onIssue = run(reviewerId, { issueId: issueA }, 50, "failed");
+    const exhausted = [withoutIssue, withEmptyIssue, onIssue];
+    // Created half a millisecond after an exhausted run: the same millisecond, so not newer.
+    const sameMillisecond = [run(workerId, {}, 30), run(reviewerId, { issueId: issueA }, 50)];
+    await db.insert(heartbeatRuns).values([
+      ...exhausted,
+      ...sameMillisecond,
+      run(workerId, {}, 25), // before withoutIssue: does not supersede it
+      run(workerId, { issueId: issueA }, 35), // after withoutIssue but on an issue: does not
+      run(reviewerId, {}, 36), // after withoutIssue but another agent, and before withEmptyIssue: does not
+      run(reviewerId, { taskId: "" }, 41), // after withEmptyIssue, empty task: no issue, supersedes it
+    ]);
+    await db.update(heartbeatRuns)
+      .set({ createdAt: sql`${heartbeatRuns.createdAt} + interval '500 microseconds'` })
+      .where(inArray(heartbeatRuns.id, sameMillisecond.map((row) => row.id)));
+    await db.insert(heartbeatRunEvents).values(exhausted.map((row) => ({
+      companyId, runId: row.id, agentId: row.agentId, seq: 1, eventType: "lifecycle", createdAt: row.createdAt,
+      message: "Bounded retry exhausted after 4 scheduled attempts; no further automatic retry will be queued",
+    })));
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+
+    expect(feed.items.filter((item) => item.sourceKind === "failed_run").map((item) => item.subject.id).sort())
+      .toEqual([withoutIssue.id, onIssue.id].sort());
   });
 
   it("enriches interaction details with project, workspace, plan metadata, and images", async () => {
