@@ -13,7 +13,7 @@ import {
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { attentionService } from "../services/attention.js";
-import { heartbeatService } from "../services/heartbeat.js";
+import { claimRoutineTaskSession, heartbeatService } from "../services/heartbeat.js";
 
 /**
  * Guards the plans of two hot heartbeat_runs reads. A run's context_snapshot is
@@ -26,6 +26,9 @@ import { heartbeatService } from "../services/heartbeat.js";
  *   recovery action" check (reconcileStrandedAssignedIssues).
  * - Hot query 2: the attention feed's "did a newer run supersede this
  *   exhausted run" check (attentionService.list).
+ * - Hot query 3: the routine session claim's "does another running run of this
+ *   agent hold the routine session" check (claimRoutineTaskSession), sent on
+ *   every routine-execution run.
  *
  * The test seeds a table large enough that the default plan has to choose,
  * runs the real service code, captures the statements it sends, and explains
@@ -49,6 +52,11 @@ const AGENTS = 26;
  */
 const QUERY_1_BUFFER_BOUND = 100;
 const QUERY_2_BUFFER_BOUND = 1_000;
+/**
+ * Query 3 reads one agent's runs through its index (about 230 here, about 235
+ * buffers) and the claim key of only its running runs' contexts.
+ */
+const CLAIM_BUFFER_BOUND = 1_000;
 
 type Captured = { query: string; params: unknown[] };
 type PlanNode = { "Node Type": string; "Relation Name"?: string; "Index Name"?: string; Plans?: PlanNode[] } & Record<string, unknown>;
@@ -238,6 +246,22 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
         if (issueCheck) expect(plan.usesIssueIndex, `${label}: does not use ${ISSUE_OR_TASK_INDEX}`).toBe(true);
         expect(plan.buffers, `${label}: shared buffers`).toBeLessThan(QUERY_2_BUFFER_BOUND);
       }
+    }
+  });
+
+  it("hot query 3 (routine session claim) reads only the agent's running runs, in custom and generic plans", async () => {
+    const recorder = recordingDb(db);
+    // A run id that is not in the table: the claim's write then changes no seeded row.
+    await claimRoutineTaskSession(recorder.db, { companyId, agentId: agentIds[0]!, runId: randomUUID(), key: "routine:plans" });
+    const hot = recorder.statements.filter(({ query }) => /^\s*select/i.test(query) && query.includes("\"heartbeat_runs\".\"context_snapshot\" ->>"));
+    expect(hot, "claimRoutineTaskSession no longer sends the running-claim lookup; update this guard").toHaveLength(1);
+    expect(selectList(hot[0]!.query), "the claim lookup must not select (detoast) context_snapshot").not.toContain("context_snapshot");
+    for (const genericPlan of [false, true]) {
+      const plan = await explain(hot[0]!, genericPlan);
+      const label = `${genericPlan ? "generic" : "custom"} plan (${plan.shape})`;
+      expect(plan.generic, `${label}: plan kind`).toBe(genericPlan);
+      expect(plan.seqScans, `${label}: sequential scan of heartbeat_runs`).toEqual([]);
+      expect(plan.buffers, `${label}: shared buffers`).toBeLessThan(CLAIM_BUFFER_BOUND);
     }
   });
 
