@@ -9367,6 +9367,36 @@ export function issueService(db: Db) {
     },
 
     /**
+     * Adds blockers to an issue in one write, keeping the blockers it already has. Children created
+     * without `blockParentUntilDone` can then block their parent together, instead of one parent
+     * sync per child. Pass `dbOrTx` to run on a caller-owned transaction.
+     */
+    addBlockedByIssueIds: async (
+      issueId: string,
+      companyId: string,
+      blockedByIssueIds: string[],
+      dbOrTx: Db | DbTransaction = db,
+    ) => {
+      const existingBlockers = await dbOrTx
+        .select({ blockerIssueId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.relatedIssueId, issueId),
+            eq(issueRelations.type, "blocks"),
+          ),
+        );
+      await syncBlockedByIssueIds(
+        issueId,
+        companyId,
+        [...existingBlockers.map((row) => row.blockerIssueId), ...blockedByIssueIds],
+        {},
+        dbOrTx,
+      );
+    },
+
+    /**
      * Creates a child issue and, with `blockParentUntilDone`, makes the parent wait for it.
      * Pass `dbOrTx` to run every read and write on a caller-owned transaction, for example
      * to create a parent and its children atomically; by default it uses its own.
