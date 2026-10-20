@@ -1,5 +1,5 @@
 import path from "node:path";
-import { GIT_ARCHIVE_EXCLUDES } from "./git-workspace-sync.js";
+import { GIT_ARCHIVE_EXCLUDES, PROJECT_REPOSITORIES_DIR } from "./git-workspace-sync.js";
 import {
   type SshConnectionConfig,
   type SshRemoteExecutionSpec,
@@ -16,7 +16,7 @@ import {
   type SandboxAdditionalSource,
   type SandboxManagedRuntimeAssetRestoreContext,
 } from "./sandbox-managed-runtime.js";
-import { captureDirectorySnapshot } from "./workspace-restore-merge.js";
+import { captureDirectorySnapshot, type DirectorySnapshot } from "./workspace-restore-merge.js";
 import type { RuntimeProgressSink } from "./runtime-progress.js";
 
 // The fixed heavy-directory excludes every referenced project drops,
@@ -846,13 +846,16 @@ export async function prepareRemoteManagedRuntime(input: {
         throw error;
       })
     : null;
+  const projectRepositories = preparedWorkspace?.repositories ?? [];
   // The sync-back tar and the merge both use the baseline's exclude list, so
   // dependency trees listed here stay on the remote and the host's own copies
   // are left alone. A Git workspace keeps syncing any name it tracks. A plain
   // directory cannot say, so it drops them all, as the sandbox lane does.
   // "all" mode is the exact-copy contract for plain persistent directories:
   // agent-file checkpoints validate every downloaded byte against a manifest,
-  // so it applies only the caller's `workspaceExclude`.
+  // so it applies only the caller's `workspaceExclude`. Each project
+  // repository is its own Git checkout, uploaded without its untracked
+  // dependency trees, so its baseline leaves the same names out.
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
@@ -860,6 +863,7 @@ export async function prepareRemoteManagedRuntime(input: {
               ...GIT_ARCHIVE_EXCLUDES,
               ".paperclip-runtime",
               ...sshSyncBackDependencyExcludes(await untrackedSshSyncBackDependencyDirNames(input.workspaceLocalDir)),
+              ...(projectRepositories.length > 0 ? [PROJECT_REPOSITORIES_DIR] : []),
             ]
           : [
               ".paperclip-runtime",
@@ -867,6 +871,20 @@ export async function prepareRemoteManagedRuntime(input: {
             ],
       })
     : null;
+  const repositoryBaselines: Array<{ path: string; baselineSnapshot: DirectorySnapshot }> = [];
+  for (const repository of projectRepositories) {
+    const repositoryDir = path.join(input.workspaceLocalDir, repository);
+    repositoryBaselines.push({
+      path: repository,
+      baselineSnapshot: await captureDirectorySnapshot(repositoryDir, {
+        exclude: [
+          ...GIT_ARCHIVE_EXCLUDES,
+          ".paperclip-runtime",
+          ...sshSyncBackDependencyExcludes(await untrackedSshSyncBackDependencyDirNames(repositoryDir)),
+        ],
+      }),
+    });
+  }
 
   const assetDirs: Record<string, string> = {};
   try {
@@ -892,6 +910,7 @@ export async function prepareRemoteManagedRuntime(input: {
         baselineSnapshot,
         restoreGitHistory: preparedWorkspace.gitBacked,
         onProgress: input.onProgress,
+        repositories: repositoryBaselines,
       });
     }
     await markNothingToKeep();
@@ -966,6 +985,7 @@ export async function prepareRemoteManagedRuntime(input: {
           baselineSnapshot,
           restoreGitHistory: preparedWorkspace.gitBacked,
           onProgress,
+          repositories: repositoryBaselines,
         });
       }
       for (const asset of input.assets ?? []) {

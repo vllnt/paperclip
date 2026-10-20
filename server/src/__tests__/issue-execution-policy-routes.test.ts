@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -74,6 +74,11 @@ const mockRunnerGoalService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  // issue-waits imports logActivity directly; mock it here because the modules are now preloaded once in beforeAll.
+  vi.doMock("../services/activity-log.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/activity-log.js")>("../services/activity-log.js")),
+    logActivity: mockLogActivity,
+  }));
   vi.doMock("../services/queued-interaction-response.js", () => ({
     hasQueuedInteractionResponse: vi.fn(async () => false),
   }));
@@ -173,11 +178,15 @@ type TestActor =
       runId: string | null;
     };
 
-async function createApp(actor?: TestActor) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
+function loadAppModules() {
+  return Promise.all([
     import("../middleware/index.js"),
     import("../routes/issues.js"),
   ]);
+}
+
+async function createApp(actor?: TestActor) {
+  const [{ errorHandler }, { issueRoutes }] = await loadAppModules();
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -196,12 +205,16 @@ async function createApp(actor?: TestActor) {
 }
 
 describe("issue execution policy routes", () => {
-  beforeEach(() => {
+  beforeAll(async () => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
+    await loadAppModules();
+  });
+
+  beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -263,6 +276,34 @@ describe("issue execution policy routes", () => {
       };
     });
     mockAccessService.hasPermission.mockResolvedValue(false);
+  });
+
+  it.each([
+    { status: "done" },
+    { status: "cancelled" },
+    { assigneeAgentId: "33333333-3333-4333-8333-333333333333" },
+    { assigneeUserId: "operator" },
+    { interrupt: true },
+    { comment: "Continue now" },
+  ])("rejects mixed snapshot-guarded updates before execution side effects: %j", async (controlFields) => {
+    const res = await request(await createApp({ type: "board", source: "local_implicit", userId: "local-board" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ expectedExecutionPolicy: null, executionPolicy: null, ...controlFields });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("policy-only");
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockRunnerGoalService.act).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("rejects a snapshot without a policy update", async () => {
+    const res = await request(await createApp({ type: "board", source: "local_implicit", userId: "local-board" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ expectedExecutionPolicy: null });
+    expect(res.status).toBe(422);
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("reauthorizes a terminal verdict against the review policy held under the update lock", async () => {
@@ -1245,19 +1286,11 @@ describe("issue execution policy routes", () => {
       }) as any);
     }
 
-    async function waitApp(actor?: TestActor) {
-      vi.doMock("../services/activity-log.js", async () => ({
-        ...(await vi.importActual<typeof import("../services/activity-log.js")>("../services/activity-log.js")),
-        logActivity: mockLogActivity,
-      }));
-      return createApp(actor);
-    }
-
     it("lets the assignee agent wait on its own issue without changing its status", async () => {
       useIssue(waitingIssue());
       const before = Date.now();
 
-      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+      const res = await request(await createApp(agentActor(assigneeAgentId)))
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: "10m", reason: "CI on PR #4320 head abc123" });
 
@@ -1288,7 +1321,7 @@ describe("issue execution policy routes", () => {
     it("refuses an agent waiting on an issue assigned to someone else", async () => {
       useIssue(waitingIssue());
 
-      const res = await request(await waitApp(agentActor(otherAgentId)))
+      const res = await request(await createApp(agentActor(otherAgentId)))
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: "10m", reason: "CI" });
 
@@ -1299,7 +1332,7 @@ describe("issue execution policy routes", () => {
     it.each([["30s"], ["25h"], ["later"]])("rejects the out-of-bounds delay %s", async (delay) => {
       useIssue(waitingIssue());
 
-      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+      const res = await request(await createApp(agentActor(assigneeAgentId)))
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: delay, reason: "CI" });
 
@@ -1310,7 +1343,7 @@ describe("issue execution policy routes", () => {
     it.each([["todo"], ["blocked"], ["done"]])("rejects a wait on a %s issue", async (status) => {
       useIssue(waitingIssue({ status }));
 
-      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+      const res = await request(await createApp(agentActor(assigneeAgentId)))
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: "10m", reason: "CI" });
 
@@ -1321,7 +1354,7 @@ describe("issue execution policy routes", () => {
     it("lets a board user schedule the wait for the assignee", async () => {
       useIssue(waitingIssue({ status: "in_review" }));
 
-      const res = await request(await waitApp())
+      const res = await request(await createApp())
         .post(`/api/issues/${issueId}/wait`)
         .send({ in: 900, reason: "Preview deploy" });
 

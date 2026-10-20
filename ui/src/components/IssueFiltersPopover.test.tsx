@@ -71,14 +71,18 @@ describe("IssueFiltersPopover", () => {
           agents={[{ id: "agent-1", name: "Agent One" }]}
           projects={[{ id: "project-1", name: "Project One" }]}
           labels={[{ id: "label-1", name: "Bug", color: "#ff0000" }]}
-          workspaces={[{ id: "workspace-1", name: "Workspace One" }]}
-          enableRoutineVisibilityFilter
+          enableAgentCreatedVisibilityFilter
         />,
       );
     });
 
     const popoverContent = container.querySelector("[data-testid='popover-content']");
     expect(popoverContent).not.toBeNull();
+
+    expect(popoverContent?.textContent).toContain("Status");
+    expect(popoverContent?.textContent).not.toContain("Priority");
+    expect(popoverContent?.querySelector('[data-filter-options="workspaces"]')).toBeNull();
+    expect(popoverContent?.textContent).not.toContain("Workspace");
     expect(popoverContent?.className).toContain("overflow-y-auto");
     expect(popoverContent?.className).toContain("max-h-(--sz-calc-9)");
     expect(popoverContent?.querySelectorAll(".overflow-y-auto").length).toBe(0);
@@ -88,32 +92,9 @@ describe("IssueFiltersPopover", () => {
     );
     expect(layoutGrid?.className).toContain("grid-cols-1");
     expect(popoverContent?.textContent).toContain("Live runs only");
-  });
-
-  it("hides the Priority filter section while priority UI is off (PAP-411)", () => {
-    const root = createRoot(container);
-
-    act(() => {
-      root.render(
-        <IssueFiltersPopover
-          presentation="streamlined"
-          state={defaultIssueFilterState}
-          onChange={vi.fn()}
-          activeFilterCount={0}
-          agents={[{ id: "agent-1", name: "Agent One" }]}
-          projects={[{ id: "project-1", name: "Project One" }]}
-          labels={[{ id: "label-1", name: "Bug", color: "#ff0000" }]}
-          workspaces={[{ id: "workspace-1", name: "Workspace One" }]}
-          enableRoutineVisibilityFilter
-        />,
-      );
-    });
-
-    const popoverContent = container.querySelector("[data-testid='popover-content']");
-    expect(popoverContent).not.toBeNull();
-    // Status section still renders, Priority section is gated off (PAP-411).
-    expect(popoverContent?.textContent).toContain("Status");
-    expect(popoverContent?.textContent).not.toContain("Priority");
+    const creationToggle = Array.from(popoverContent?.querySelectorAll("label") ?? []).find((label) => label.textContent?.includes("show agent-created tasks"));
+    expect(creationToggle?.textContent).toBe("show agent-created tasks");
+    expect(creationToggle?.querySelector("input")?.checked).toBe(false);
   });
 
   it("searches long option lists while the popover remains the only scroll owner", () => {
@@ -156,7 +137,6 @@ describe("IssueFiltersPopover", () => {
     const projects = Array.from({ length: 40 }, (_, index) => ({ id: `project-${index + 1}`, name: `Project ${index + 1}` }));
     const labels = Array.from({ length: 40 }, (_, index) => ({ id: `label-${index + 1}`, name: `Label ${index + 1}`, color: "#336699" }));
     const agents = Array.from({ length: 40 }, (_, index) => ({ id: `agent-${index + 1}`, name: `Agent ${index + 1}` }));
-    const workspaces = Array.from({ length: 40 }, (_, index) => ({ id: `workspace-${index + 1}`, name: `Workspace ${index + 1}` }));
     const renderPopover = (root: ReturnType<typeof createRoot>, presentation: "streamlined" | "legacy") =>
       root.render(
         <IssueFiltersPopover
@@ -168,7 +148,6 @@ describe("IssueFiltersPopover", () => {
           agents={agents}
           projects={projects}
           labels={labels}
-          workspaces={workspaces}
           enableExternalObjectFilters={false}
         />,
       );
@@ -201,10 +180,8 @@ describe("IssueFiltersPopover", () => {
         // First paint: the sections and their fixed rows are there, the long lists are empty.
         expect(container.querySelector('[data-filter-options="projects"]')).not.toBeNull();
         expect(container.querySelector('[data-filter-options="labels"]')).not.toBeNull();
-        expect(container.querySelector('[data-filter-options="workspaces"]')).not.toBeNull();
         expect(rows("projects")).toBe(0);
         expect(rows("labels")).toBe(0);
-        expect(rows("workspaces")).toBe(0);
         expect(rows("responsible")).toBe(2);
         expect(container.textContent).toContain("No responsible");
         expect(container.textContent).toContain("Me");
@@ -214,7 +191,6 @@ describe("IssueFiltersPopover", () => {
       // Deferred pass: every option is there, with the same markup as before.
       expect(rows("projects")).toBe(40);
       expect(rows("labels")).toBe(40);
-      expect(rows("workspaces")).toBe(40);
       expect(rows("responsible")).toBe(2 + 40);
       expect(container.querySelector('[data-filter-options="projects"]')?.textContent).toContain("Project 40");
       expect(container.querySelector('[data-filter-options="labels"] span[style]')).not.toBeNull();

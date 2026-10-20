@@ -4,5 +4,5 @@ command -v gitleaks >/dev/null || { echo "Install gitleaks before publishing." >
 while read -r local_ref local_oid remote_ref remote_oid; do
   case "$local_oid" in 0000000000000000000000000000000000000000) continue ;; esac
   python3 scripts/check-public-config.py "$local_oid"
-  gitleaks git . --redact --no-banner --log-opts="1c07b5903b1b11139b1e1ce052a3cd4885865d90..$local_oid"
+  gitleaks git . --redact --no-banner --log-opts="24067a16b5912aee7c33b208524d7a28639cca26..$local_oid"
 done

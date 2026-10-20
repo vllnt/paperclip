@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, environmentLeases, environments, projects, projectWorkspaces } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, createDb, environmentLeases, environments, projects, projectWorkspaces } from "@paperclipai/db";
 import {
   buildSshEnvLabFixtureConfig,
   getSshEnvLabSupport,
@@ -96,6 +96,15 @@ describeRemoteTemp("remote run temp directory through the heartbeat (SSH)", () =
     await db.insert(companies).values({
       id: companyId, name: "Acme", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       status: "active", defaultResponsibleUserId: "responsible-user", createdAt: new Date(), updatedAt: new Date(),
+    });
+    // Agents act within their responsible user's access, so that user must
+    // exist and be an active member for the run to read the project workspace.
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible user", email: "responsible-user@example.test",
+      createdAt: new Date(), updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
     });
     await db.insert(projects).values({ id: projectId, companyId, name: "Remote Temp", status: "active", createdAt: new Date(), updatedAt: new Date() });
     await db.insert(projectWorkspaces).values({

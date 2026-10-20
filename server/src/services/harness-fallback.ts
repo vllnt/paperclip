@@ -6,6 +6,7 @@ import {
   HARNESS_FALLBACK_ADAPTER_TYPES,
   RUN_TARGET_SOURCES,
   agentFallbacksSchema,
+  agentHarnessType,
   checkHarnessModelCompatibility,
   fallbackEffortConfigKey,
   harnessTargetKey,
@@ -611,9 +612,12 @@ export function isLlmHarnessAdapterType(adapterType: string): boolean {
 /**
  * The run-time harness/model check. Fallback targets must use a recognised
  * model for their harness; a primary may keep an unrecognised model id, but
- * no run may pair a harness with a known-incompatible model.
+ * no run may pair a harness with a known-incompatible model. A Paperclip
+ * Runner agent on Codex, which new Codex hires default to, is checked as
+ * codex_local. ACPX agents are not mapped: each picks its own model vocabulary,
+ * and the runner defaults every ACPX agent to a Claude model.
  *
- * @param input - Executing harness, final run config and dispatch kind.
+ * @param input - Executing adapter, final run config and dispatch kind.
  * @returns The compatibility result.
  */
 export function checkRunHarnessCompatibility(input: {
@@ -621,10 +625,15 @@ export function checkRunHarnessCompatibility(input: {
   config: Record<string, unknown>;
   fallback: boolean;
 }): HarnessModelCompatibilityResult {
-  if (!isLlmHarnessAdapterType(input.adapterType)) return { ok: true };
+  const harness = input.adapterType === "paperclip_runner"
+    && input.config.provider !== "acpx"
+    && agentHarnessType(input.adapterType, input.config) === "codex_local"
+    ? "codex_local"
+    : input.adapterType;
+  if (!isLlmHarnessAdapterType(harness)) return { ok: true };
   return checkHarnessModelCompatibility(
     {
-      adapterType: input.adapterType,
+      adapterType: harness,
       model: typeof input.config.model === "string" ? input.config.model : null,
       extraArgs: input.config.extraArgs,
       args: input.config.args,

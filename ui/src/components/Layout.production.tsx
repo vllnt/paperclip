@@ -1,3 +1,4 @@
+import { BoardDialogs } from "./BoardDialogs";
 import { ChatSetupSidebarProvider } from "@/context/ChatSetupSidebarContext";
 import { PluginAppShellOverlays } from "./PluginAppShellOverlays";
 import {
@@ -25,10 +26,6 @@ import { AppDetailSidebar } from "./AppConnectionSidebar.production";
 import { BreadcrumbBar } from "./BreadcrumbBar.production";
 import { PropertiesPanel } from "./PropertiesPanel";
 import { CommandPalette } from "./CommandPalette";
-import { NewIssueDialog } from "./NewIssueDialog";
-import { NewProjectDialog } from "./NewProjectDialog";
-import { NewGoalDialog } from "./NewGoalDialog";
-import { NewAgentDialog } from "./NewAgentDialog";
 import { KeyboardShortcutsCheatsheet } from "./KeyboardShortcutsCheatsheet";
 import { ToastViewport } from "./ToastViewport";
 import { MobileBottomNav } from "./MobileBottomNav";
@@ -48,6 +45,7 @@ import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { CommandActionsProvider, type CommandActionsHandle } from "../context/CommandActionsContext";
 import { useGlobalCommandActionBindings } from "../lib/command-action-bindings";
 import { useCompanyPageMemory } from "../hooks/useCompanyPageMemory";
+import { useMobileNavVisibility } from "../hooks/useMobileNavVisibility";
 import { healthApi } from "../api/health";
 import {
   resolveArchivedCompanyBounce,
@@ -175,12 +173,11 @@ export function Layout() {
   // app nav collapses to its rail throughout the Skills Store section (PAP-10879).
   const isSkillsRoute = isSkillsStoreRoute(location.pathname, companyPrefix);
   const onboardingTriggered = useRef(false);
-  const lastMainScrollTop = useRef(0);
   const previousPathname = useRef<string | null>(null);
   const mainContentRef = useRef<HTMLElement | null>(null);
   const scrollMemory = useRef(new NavigationScrollMemory());
   const activeScrollKey = useRef<string>(location.key);
-  const [mobileNavVisible, setMobileNavVisible] = useState(true);
+  const mobileNavVisible = useMobileNavVisibility(isMobile, location.pathname);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const matchedCompany = useMemo(() => {
     if (!companyPrefix) return null;
@@ -473,15 +470,6 @@ export function Layout() {
     onRunChord: runChord,
   });
 
-  useEffect(() => {
-    if (!isMobile) {
-      setMobileNavVisible(true);
-      return;
-    }
-    lastMainScrollTop.current = 0;
-    setMobileNavVisible(true);
-  }, [isMobile]);
-
   // Swipe gesture to open/close sidebar on mobile
   useEffect(() => {
     if (!isMobile) return;
@@ -526,41 +514,6 @@ export function Layout() {
       document.removeEventListener("touchend", onTouchEnd);
     };
   }, [isMobile, sidebarOpen, setSidebarOpen]);
-
-  const updateMobileNavVisibility = useCallback((currentTop: number) => {
-    const delta = currentTop - lastMainScrollTop.current;
-
-    if (currentTop <= 24) {
-      setMobileNavVisible(true);
-    } else if (delta > 8) {
-      setMobileNavVisible(false);
-    } else if (delta < -8) {
-      setMobileNavVisible(true);
-    }
-
-    lastMainScrollTop.current = currentTop;
-  }, []);
-
-  useEffect(() => {
-    if (!isMobile) {
-      setMobileNavVisible(true);
-      lastMainScrollTop.current = 0;
-      return;
-    }
-
-    const onScroll = () => {
-      updateMobileNavVisibility(
-        window.scrollY || document.documentElement.scrollTop || 0,
-      );
-    };
-
-    onScroll();
-    window.addEventListener("scroll", onScroll, { passive: true });
-
-    return () => {
-      window.removeEventListener("scroll", onScroll);
-    };
-  }, [isMobile, updateMobileNavVisibility]);
 
   useEffect(() => {
     const previousOverflow = document.body.style.overflow;
@@ -743,6 +696,12 @@ export function Layout() {
                       "--tc-composer-bottom": mobileNavVisible
                           ? "var(--tc-composer-visible-nav-offset)"
                           : "var(--sz-calc-8)",
+                      "--mobile-nav-motion-duration": mobileNavVisible
+                          ? "var(--motion-mobile-nav-enter)"
+                          : "var(--motion-mobile-nav-exit)",
+                      "--mobile-nav-motion-ease": mobileNavVisible
+                          ? "var(--motion-ease-out-expo)"
+                          : "var(--motion-ease-standard)",
                       } as CSSProperties)
                     : undefined
                 }
@@ -752,7 +711,7 @@ export function Layout() {
                   // changes (e.g. switching skill-detail tabs) don't widen/shift
                   // when the vertical scrollbar appears or disappears (PAP-10907).
                   isMobile
-                    ? isTaskDetailRoute && mobileNavVisible
+                    ? isTaskDetailRoute
                       ? "overflow-visible pb-(--tc-composer-visible-nav-offset)"
                       : "overflow-visible pb-(--sz-calc-14)"
                     : "overflow-auto [scrollbar-gutter:stable]",
@@ -779,10 +738,7 @@ export function Layout() {
         </div>
         {isMobile && <MobileBottomNav visible={mobileNavVisible} />}
         <CommandPalette />
-        <NewIssueDialog />
-        <NewProjectDialog />
-        <NewGoalDialog />
-        <NewAgentDialog />
+        <BoardDialogs />
         <KeyboardShortcutsCheatsheet
           open={shortcutsOpen}
           onOpenChange={setShortcutsOpen}

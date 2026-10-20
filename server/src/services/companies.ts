@@ -1,80 +1,21 @@
-import { and, count, eq, getTableName, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
-import type { AnyPgColumn, PgTable } from "drizzle-orm/pg-core";
+import { isRunnerApiResponseAsset } from "./asset-content-access.js";
+import { deleteCompany, type CompanyRemovalOptions } from "./company-deletion.js";
+import { createAgentLifecycle } from "./agent-lifecycle.js";
+import { publishAccountingActivities } from "./accounting-transaction.js";
+import { budgetServiceInTransaction, deliverBudgetEnforcement, type BudgetServiceHooks } from "./budgets.js";
+import { and, count, eq, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companies,
   companyLogos,
   assets,
   agents,
-  agentApiKeys,
-  agentRuntimeState,
-  agentTaskSessions,
   agentWakeupRequests,
   issues,
-  issueComments,
-  projects,
-  goals,
   heartbeatRuns,
-  runIdentityContexts,
-  heartbeatRunEvents,
-  runUsageRecords,
   costEvents,
-  financeEvents,
-  issueReadStates,
-  approvalComments,
-  approvals,
-  activityLog,
-  companySecrets,
-  joinRequests,
-  invites,
-  principalPermissionGrants,
-  companyMemberships,
-  companySkills,
-  documents,
-  routineRuns,
-  routineTriggers,
-  routineRevisions,
-  routines,
-  browserUseBrowsers,
-  browserUseRuns,
-  browserUseSessions,
-  browserUseSettings,
-  budgetIncidents,
-  budgetPolicies,
-  chatEndpoints,
-  completionContracts,
-  decisionArchiveNotificationOutbox,
-  decisionBundles,
-  decisionQueueItems,
-  decisionQueues,
-  decisionRetention,
-  decisionTriage,
-  decisionTriageEvents,
-  decisions,
-  inboxDismissals,
-  nativeRunFinalizations,
-  nativeRunResults,
-  secretAccessEvents,
-  statusDecisionEffects,
-  statusDecisions,
-  workAssessments,
-  workspaceRuntimeServices,
-  chatActions,
-  chatConversations,
-  chatDeliveries,
-  chatGitHubReviews,
-  chatMessageLinks,
-  chatPublications,
-  chatTeamsFileTransfers,
-  companySkillTestRuns,
-  managedAgentProfiles,
-  toolMcpGateways,
-  issueDuplicatePairs,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
-import { logger } from "../middleware/logger.js";
-import { explainBlockedCompanyRemoval } from "./company-removal-conflict.js";
-import { assertNoCrossCompanyReferences, lockCompanyForRemoval } from "./company-removal-cross-company.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
 import { notifyCloudOfPrimaryCompanyLifecycleChange } from "./cloud-lifecycle-sync.js";
 import {
@@ -87,7 +28,7 @@ import {
 } from "./issue-prefix.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, type ActivityPublication } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
 
 
@@ -106,27 +47,7 @@ const SYSTEM_COMPANY_ACTOR: CompanyActivityActor = {
   runId: null,
 };
 
-/** Who asked for a company delete, and how long it waits for locks. */
-export interface CompanyRemovalOptions {
-  /** The user that the request authenticated as. An identifier, never a credential. */
-  actorUserId?: string | null;
-  /** The id of the board key record that the request used, when it used one. An identifier, never a credential. */
-  actorKeyId?: string | null;
-  /** The longest wait for one lock, in milliseconds. Defaults to 5 seconds. */
-  lockTimeoutMs?: number;
-}
-
-/**
- * Reads how many rows a delete without `returning` removed. The postgres.js driver puts it
- * on the result as `count`. Another driver may not, and then the log entry lists no rows.
- */
-function affectedRows(result: unknown): number {
-  if (typeof result !== "object" || result === null) return 0;
-  const total: unknown = Reflect.get(result, "count");
-  return typeof total === "number" ? total : 0;
-}
-
-export function companyService(db: Db) {
+export function companyService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
   const environmentsSvc = environmentService(db);
   const heartbeat = heartbeatService(db);
   const builtInAgents = builtInAgentService(db);
@@ -134,19 +55,7 @@ export function companyService(db: Db) {
   type CompanyTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
   async function applyArchiveCascadeInTx(tx: CompanyTx, id: string) {
-    const pausedAgentRows = await tx
-      .update(agents)
-      .set({
-        status: "paused",
-        pauseReason: "company_archived",
-        pausedAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(and(
-        eq(agents.companyId, id),
-        notInArray(agents.status, ["paused", "terminated", "pending_approval"]),
-      ))
-      .returning({ id: agents.id });
+    const pausedAgentRows = await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.companyId, id), notInArray(agents.status, ["paused", "terminated", "pending_approval"])));
 
     const activeRunIds = await tx
       .select({ id: heartbeatRuns.id })
@@ -397,23 +306,30 @@ export function companyService(db: Db) {
       data: Partial<typeof companies.$inferInsert> & { logoAssetId?: string | null },
       actor: CompanyActivityActor = SYSTEM_COMPANY_ACTOR,
     ) => {
+      const budgetPublications: ActivityPublication[] = [];
       const result = await db.transaction(async (tx) => {
         const existing = await getCompanyQuery(tx)
           .where(eq(companies.id, id))
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
 
+        if (data.budgetMonthlyCents !== undefined) {
+          await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, id)).for("no key update");
+        }
         const { logoAssetId, ...companyPatch } = data;
         const willReactivate = existing.status !== "active" && companyPatch.status === "active";
         const willArchive = existing.status !== "archived" && companyPatch.status === "archived";
 
         if (logoAssetId !== undefined && logoAssetId !== null) {
           const nextLogoAsset = await tx
-            .select({ id: assets.id, companyId: assets.companyId })
+            .select()
             .from(assets)
             .where(eq(assets.id, logoAssetId))
             .then((rows) => rows[0] ?? null);
           if (!nextLogoAsset) throw notFound("Logo asset not found");
+          if (await isRunnerApiResponseAsset(tx, nextLogoAsset)) {
+            throw unprocessable("API response snapshots cannot be company logos; upload a logo asset");
+          }
           if (nextLogoAsset.companyId !== existing.id) {
             throw unprocessable("Logo asset must belong to the same company");
           }
@@ -455,20 +371,7 @@ export function companyService(db: Db) {
 
         let agentsRestored = 0;
         if (willReactivate) {
-          const restoredRows = await tx
-            .update(agents)
-            .set({
-              status: "idle",
-              pauseReason: null,
-              pausedAt: null,
-              updatedAt: new Date(),
-            })
-            .where(and(
-              eq(agents.companyId, id),
-              eq(agents.status, "paused"),
-              eq(agents.pauseReason, "company_archived"),
-            ))
-            .returning({ id: agents.id });
+          const restoredRows = await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.companyId, id), eq(agents.pauseReason, "company_archived")));
           agentsRestored = restoredRows.length;
         }
 
@@ -496,6 +399,13 @@ export function companyService(db: Db) {
           await tx.delete(assets).where(eq(assets.id, existing.logoAssetId));
         }
 
+        if (data.budgetMonthlyCents !== undefined) {
+          await budgetServiceInTransaction(tx as unknown as Db, budgetPublications).upsertPolicy(id, {
+            scopeType: "company", scopeId: id, amount: data.budgetMonthlyCents, isActive: data.budgetMonthlyCents > 0, windowKind: "calendar_month_utc",
+          }, actor.actorType === "user" ? actor.actorId : null);
+          const [budgetUpdated] = await tx.select().from(companies).where(eq(companies.id, id));
+          Object.assign(updated, budgetUpdated);
+        }
         const [hydrated] = await hydrateCompanySpend([{
           ...updated,
           logoAssetId: logoAssetId === undefined ? existing.logoAssetId : logoAssetId,
@@ -513,6 +423,9 @@ export function companyService(db: Db) {
         };
       });
       if (!result) return null;
+      await createAgentLifecycle(db).reconcilePolicyHolds(id);
+      publishAccountingActivities(id, budgetPublications);
+      if (data.budgetMonthlyCents !== undefined) await deliverBudgetEnforcement(db, budgetHooks, id);
       // Post-commit, fire-and-forget, and BEFORE any finalization that
       // could throw: a Cloud-pinned primary company that crossed the
       // archived boundary (either direction) rings the harness so the
@@ -589,6 +502,7 @@ export function companyService(db: Db) {
         };
       });
       if (!result) return null;
+      await createAgentLifecycle(db).reconcilePolicyHolds(id);
 
       // Same doorbell rule as update(): the archive is committed, so ring
       // before finalization, which can throw without undoing it.
@@ -600,134 +514,8 @@ export function companyService(db: Db) {
       return result.company;
     },
 
-    /**
-     * Deletes a company and every row it owns, in one transaction. Each table is
-     * deleted only by its own `company_id`, so no delete here names another company's rows.
-     *
-     * Two kinds of reference can still reach another company. A cascade or set-null key
-     * would delete a row of another company, or clear its reference, when it points at a
-     * row of this company: `assertNoCrossCompanyReferences` finds these first, before any
-     * delete, and the call fails with a 409 and the code
-     * `company_delete_cross_company_references`. A key that blocks the delete is stopped by
-     * the database: the call fails with a 409 that names the blocking table. Either way
-     * nothing is deleted.
-     *
-     * The check only holds if no such row can appear after it. So the transaction first
-     * locks the company row and the rows of this company that other rows could point at
-     * (`lockCompanyForRemoval`). A write that would add such a reference waits, and fails
-     * with a foreign-key error once the delete commits. If a lock cannot be had within the
-     * limit, or Postgres ends the transaction to break a deadlock, the call fails with a 409
-     * and the code `company_delete_busy`, and trying again can work.
-     *
-     * After the commit it writes one `company_deleted` log entry with the actor and the
-     * number of rows removed per table. It holds no names and no content.
-     *
-     * The order below is checked against the live foreign keys by
-     * `company-removal-coverage.test.ts`: a table with a blocking key to any row
-     * that this method deletes must be deleted here before that row.
-     */
-    remove: async (id: string, audit: CompanyRemovalOptions = {}) => {
-      try {
-        const outcome = await db.transaction(async (tx) => {
-          await lockCompanyForRemoval(tx, id, audit.lockTimeoutMs);
-          await assertNoCrossCompanyReferences(tx, id);
-          const rowCounts: Record<string, number> = {};
-          const removeOwned = async <TTable extends PgTable & { companyId: AnyPgColumn }>(table: TTable): Promise<void> => {
-            const removed = affectedRows(await tx.delete(table).where(eq(table.companyId, id)));
-            if (removed > 0) rowCounts[getTableName(table)] = removed;
-          };
-          await removeOwned(heartbeatRunEvents);
-          await removeOwned(agentTaskSessions);
-          await removeOwned(activityLog);
-          await removeOwned(runIdentityContexts);
-          await removeOwned(runUsageRecords);
-          await removeOwned(financeEvents);
-          await removeOwned(nativeRunFinalizations);
-          await removeOwned(statusDecisionEffects);
-          await removeOwned(statusDecisions);
-          await removeOwned(costEvents);
-          await removeOwned(decisionTriageEvents);
-          await removeOwned(workAssessments);
-          await removeOwned(browserUseRuns);
-          await removeOwned(decisionBundles);
-          await removeOwned(decisionQueueItems);
-          await removeOwned(decisionQueues);
-          await removeOwned(decisionRetention);
-          await removeOwned(decisionTriage);
-          await removeOwned(decisions);
-          await removeOwned(nativeRunResults);
-          await removeOwned(heartbeatRuns);
-          await removeOwned(agentWakeupRequests);
-          await removeOwned(agentApiKeys);
-          await removeOwned(agentRuntimeState);
-          await removeOwned(chatMessageLinks);
-          await removeOwned(chatPublications);
-          await removeOwned(issueComments);
-          await removeOwned(issueDuplicatePairs);
-          await removeOwned(approvalComments);
-          await removeOwned(budgetIncidents);
-          await removeOwned(approvals);
-          await removeOwned(managedAgentProfiles);
-          await removeOwned(companySecrets);
-          await removeOwned(joinRequests);
-          await removeOwned(invites);
-          await removeOwned(principalPermissionGrants);
-          await removeOwned(companyMemberships);
-          await removeOwned(companySkillTestRuns);
-          await removeOwned(companySkills);
-          await removeOwned(routineRuns);
-          await removeOwned(routineTriggers);
-          await removeOwned(routineRevisions);
-          await removeOwned(routines);
-          await removeOwned(issueReadStates);
-          await removeOwned(browserUseBrowsers);
-          await removeOwned(documents);
-          await removeOwned(browserUseSessions);
-          await removeOwned(chatActions);
-          await removeOwned(chatDeliveries);
-          await removeOwned(completionContracts);
-          await removeOwned(chatConversations);
-          await removeOwned(chatGitHubReviews);
-          await removeOwned(chatTeamsFileTransfers);
-          await removeOwned(issues);
-          await removeOwned(companyLogos);
-          await removeOwned(assets);
-          await removeOwned(projects);
-          await removeOwned(goals);
-          await removeOwned(chatEndpoints);
-          await removeOwned(decisionArchiveNotificationOutbox);
-          await removeOwned(agents);
-          await removeOwned(browserUseSettings);
-          await removeOwned(budgetPolicies);
-          await removeOwned(inboxDismissals);
-          await removeOwned(secretAccessEvents);
-          await removeOwned(workspaceRuntimeServices);
-          await removeOwned(toolMcpGateways);
-          const rows = await tx
-            .delete(companies)
-            .where(eq(companies.id, id))
-            .returning();
-          const company = rows[0] ?? null;
-          if (company) rowCounts[getTableName(companies)] = 1;
-          return { company, rowCounts };
-        });
-        if (outcome.company) {
-          logger.info(
-            {
-              event: "company_deleted",
-              companyId: id,
-              actorUserId: audit.actorUserId ?? null,
-              actorKeyId: audit.actorKeyId ?? null,
-              rowCounts: outcome.rowCounts,
-            },
-            "Company deleted",
-          );
-        }
-        return outcome.company;
-      } catch (error) {
-        throw (await explainBlockedCompanyRemoval(db, id, error)) ?? error;
-      }
-    },
+    /** Deletes the company and every row it owns. See `deleteCompany` for the guards and order. */
+    remove: (id: string, audit: CompanyRemovalOptions = {}) => deleteCompany(db, id, audit),
 
     stats: () =>
       Promise.all([

@@ -1,6 +1,6 @@
-import { expect, test, type APIResponse } from "@playwright/test";
+import { expect, test, type APIResponse, type Response } from "@playwright/test";
 
-async function json<T>(response: APIResponse, label: string): Promise<T> {
+async function json<T>(response: APIResponse | Response, label: string): Promise<T> {
   expect(response.ok(), `${label} failed ${response.status()}: ${await response.text()}`).toBe(true);
   return (await response.json()) as T;
 }
@@ -39,13 +39,13 @@ test("an operator creates a task on a company run tier", async ({ page, request 
 
   await page.goto(`/${company.issuePrefix}/dashboard`);
   await page.getByRole("button", { name: "New Task" }).first().click();
-  await page.getByPlaceholder("Task title").fill("Sweep the stale branches");
-  await page.getByRole("button", { name: "Assignee", exact: true }).click();
-  await page.getByRole("button", { name: "Implementer" }).first().click();
-  const noProject = page.getByRole("button", { name: "No project", exact: true });
-  if (await noProject.isVisible().catch(() => false)) await noProject.click();
+  // The composer body becomes the task description; the server derives the title.
+  await page.getByRole("textbox", { name: "editable markdown" }).fill("Sweep the stale branches");
+  await page.getByRole("button", { name: "Select assignee", exact: true }).click();
+  await page.getByRole("option").filter({ hasText: "Implementer" }).click();
+  await expect(page.getByRole("searchbox", { name: "Search assignees", includeHidden: true })).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Claude options", exact: true }).click();
+  // The tier picker shows in the composer details once the assignee runs a tier-capable adapter.
   const picker = page.getByTestId("run-tier-picker");
   await expect(picker).toBeVisible();
   await picker.getByRole("combobox", { name: "Run with" }).click();
@@ -63,13 +63,19 @@ test("an operator creates a task on a company run tier", async ({ page, request 
     await page.setViewportSize({ width: 1280, height: 720 });
   }
 
-  await page.getByRole("button", { name: "Create Task", exact: true }).click();
+  const created = page.waitForResponse((response) =>
+    response.request().method() === "POST"
+    && new URL(response.url()).pathname === `/api/companies/${company.id}/issues`,
+  );
+  await page.getByRole("button", { name: "Create task", exact: true }).click();
+  const task = await json<{ id: string; description: string | null }>(await created, "create task");
+  expect(task.description).toBe("Sweep the stale branches");
   await expect.poll(async () => {
-    const issues = await json<Array<{ title: string; assigneeAgentId: string | null; assigneeAdapterOverrides: unknown }>>(
+    const issues = await json<Array<{ id: string; assigneeAgentId: string | null; assigneeAdapterOverrides: unknown }>>(
       await request.get(`/api/companies/${company.id}/issues`),
       "list issues",
     );
-    return issues.find((issue) => issue.title === "Sweep the stale branches") ?? null;
+    return issues.find((issue) => issue.id === task.id) ?? null;
   }).toMatchObject({ assigneeAgentId: agent.id, assigneeAdapterOverrides: { runProfile: { tier: "fast" } } });
 
   expect(consoleErrors).toEqual([]);

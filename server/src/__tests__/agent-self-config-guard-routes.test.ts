@@ -8,6 +8,7 @@ import {
   activityLog,
   agentConfigRevisions,
   agents,
+  budgetPolicies,
   companies,
   companyMemberships,
   costEvents,
@@ -41,6 +42,8 @@ const STORED_RUNTIME_CONFIG = {
   heartbeat: { enabled: true, intervalSec: 3600, maxConcurrentRuns: 1, maxDailyRuns: 5 },
 };
 const STORED_ADAPTER_CONFIG = { model: "small-model", effort: "low", cwd: "/tmp/agent-self-config" };
+// Upstream refuses agent keys any process adapter config change, so seeded agents use an http adapter.
+const SEEDED_ADAPTER_TYPE = "http";
 
 function createApp(db: Db, actor: Express.Request["actor"]) {
   const app = express();
@@ -110,7 +113,7 @@ async function seedAgent(
       name: `Worker ${randomUUID().slice(0, 8)}`,
       role: input.role ?? "engineer",
       status: input.status ?? "idle",
-      adapterType: "process",
+      adapterType: SEEDED_ADAPTER_TYPE,
       adapterConfig: input.adapterConfig ?? STORED_ADAPTER_CONFIG,
       runtimeConfig: STORED_RUNTIME_CONFIG,
       defaultEnvironmentId: input.defaultEnvironmentId ?? null,
@@ -151,7 +154,7 @@ async function seedPeer(db: Db, companyId: string) {
       companyId,
       name: `Peer ${randomUUID().slice(0, 8)}`,
       role: "engineer",
-      adapterType: "process",
+      adapterType: SEEDED_ADAPTER_TYPE,
       adapterConfig: {},
       runtimeConfig: {},
       permissions: {},
@@ -207,6 +210,8 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
     await db.delete(joinRequests);
     await db.delete(invites);
     await db.delete(agents);
+    // A budget change now also writes the agent's budget policy.
+    await db.delete(budgetPolicies);
     await db.delete(environments);
     await db.delete(companies);
   });
@@ -303,7 +308,6 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       fields: ["adapterConfig.dangerouslyEnableFutureEscapeHatch"],
     },
     { label: "budgetMonthlyCents", body: { budgetMonthlyCents: 1_000_000 }, fields: ["budgetMonthlyCents"] },
-    { label: "spentMonthlyCents", body: { spentMonthlyCents: 0 }, fields: ["spentMonthlyCents"] },
     { label: "role (mixed with another field)", body: { role: "ceo", metadata: { note: "promoted" } }, fields: ["role"] },
   ])("denies an agent changing its own $label and logs the attempt", async ({ body, fields }) => {
     const { companyId, agentId } = await seedAgent(db);
@@ -341,6 +345,20 @@ describeEmbeddedPostgres("agent self-config guard routes", () => {
       entityType: "agent",
       details: { surface: "patch", fields, reason: "deny_no_grant" },
     });
+  });
+
+  // Upstream made spentMonthlyCents read-only for every caller, so validation refuses it before the self-config guard.
+  it("refuses an agent resetting its own spentMonthlyCents and keeps the spend", async () => {
+    const { companyId, agentId } = await seedAgent(db);
+    await db.update(agents).set({ spentMonthlyCents: 700 }).where(eq(agents.id, agentId));
+
+    const res = await request(createApp(db, agentActor(companyId, agentId)))
+      .patch(`/api/agents/${agentId}`)
+      .send({ spentMonthlyCents: 0 });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.details).toEqual([expect.objectContaining({ path: ["spentMonthlyCents"] })]);
+    expect((await readAgent(db, agentId)).spentMonthlyCents).toBe(700);
   });
 
   describe("an agent unbinding its own managed AI connection", () => {

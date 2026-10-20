@@ -4,7 +4,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agents,
   agentWakeupRequests,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issueComments,
@@ -84,6 +86,15 @@ describeEmbeddedPostgres("heartbeat queued-run priority order", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+    });
+    // Agents act within their responsible user's access, so that user must
+    // exist and be an active member for a run to use the task's workspace.
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible user", email: "responsible-user@example.test",
+      createdAt: new Date(), updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
     });
     await db.insert(agents).values({
       id: agentId,

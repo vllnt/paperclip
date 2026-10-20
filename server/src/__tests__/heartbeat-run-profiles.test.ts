@@ -5,7 +5,9 @@ import {
   activityLog,
   agentHarnessCooldowns,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   companySecretBindings,
   createDb,
   heartbeatRunEvents,
@@ -194,6 +196,15 @@ describeEmbeddedPostgres("run profiles", () => {
     await db.insert(companies).values({
       id: companyId, name: "Fallback", issuePrefix,
       requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user",
+    });
+    // Agents act within their responsible user's access, so that user must
+    // exist and be an active member for a later run to reuse the task's workspace.
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible user", email: "responsible-user@example.test",
+      createdAt: new Date(), updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
     });
     await db.insert(agents).values({
       id: agentId, companyId, name: "Implementer", role: "engineer", status: "idle",

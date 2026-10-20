@@ -532,7 +532,7 @@ describe("codex_local ACP lane", () => {
     });
   });
 
-  it.each([["gpt-6-astra", "ultra"], ["gpt-6-sol", "ultra"], ["gpt-6-luna", "max"], ["gpt-5.6-sol", "ultra"], ["gpt-5.6-terra", "ultra"], ["gpt-5.6-luna", "max"]])("forwards %s controls to the ACPX Codex target", (model, effort) => {
+  it.each([["gpt-6-astra", "ultra"], ["gpt-6.1-sol", "ultra"], ["gpt-6-sol", "ultra"], ["gpt-6-luna", "max"], ["gpt-5.6-sol", "ultra"], ["gpt-5.6-terra", "ultra"], ["gpt-5.6-luna", "max"]])("forwards %s controls to the ACPX Codex target", (model, effort) => {
     expect(buildCodexAcpConfig({
       engine: "acp",
       model,
@@ -1450,6 +1450,12 @@ describe("codex_local ACP lane", () => {
 });
 
 describe("resolveCodexAcpBillingIdentity", () => {
+  it.each([["openrouter", "api_key", "openrouter"], ["custom", "api_key", "unknown"], ["local", "none", "unknown"]])("classifies managed %s/%s independently of host authentication", (kind, auth, biller) => {
+    expect(resolveCodexAcpBillingIdentity({ config: {
+      managedAiRouting: { kind, auth },
+      env: { OPENAI_API_KEY: "", PAPERCLIP_AI_PROVIDER_KEY: auth === "none" ? "" : "fixture" },
+    } })).toEqual({ provider: "openai", biller, billingType: "api" });
+  });
   const originalOpenAiKey = process.env.OPENAI_API_KEY;
   const originalOpenRouterKey = process.env.OPENROUTER_API_KEY;
 

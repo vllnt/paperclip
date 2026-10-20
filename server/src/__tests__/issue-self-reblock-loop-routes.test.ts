@@ -95,7 +95,7 @@ const SUCCESS = {
 const CYCLE_BOUND = 8;
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -287,41 +287,34 @@ describeEmbeddedPostgres("ANT-3260 self re-block loop through PATCH /issues/:id"
       ));
   }
 
-  it("admits at most 3 self re-block wakes in 10 minutes and parks the rest when each run ends before its dependency wake lands", async () => {
+  it("stops after one run when the assignee re-blocks its own issue, even if a dependency wake would land after the run", async () => {
     const input = await seed();
+    // Were the route to emit the restored-dependency wake, it would reach
+    // admission only after the run ended: the race that escapes owner
+    // suppression.
     dependencyWakeGate.enabled = true;
     const loop = reblockFromEveryRun(input);
     await startLoop(input);
     await settle(loop.cycles);
 
-    // Every re-block went through the real route.
+    // The re-block went through the real route.
     expect(loop.patches.length).toBeGreaterThan(0);
     expect(loop.patches.every((patch) => patch.status === 200), JSON.stringify(loop.patches)).toBe(true);
-    // The assignment run, then at most three self-caused restarts.
-    expect(loop.cycles()).toBeLessThanOrEqual(4);
+    // The assignee blocking its own issue declares a wait, so the route emits
+    // no restored-dependency wake for it (shouldWakeOnRestoredBlockedDependency
+    // in services/issue-dependency-wakeups.ts) and nothing restarts the agent.
+    expect(loop.cycles()).toBe(1);
+    const dependencyWakes = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, input.ceoId),
+      sql`${agentWakeupRequests.payload} ->> 'mutation' = 'blocked_dependency_restored'`,
+    ));
+    expect(dependencyWakes).toEqual([]);
 
+    // No self-caused wake was admitted or parked.
     const wakes = await selfReblockWakes(input.ceoId, input.issueId);
-    const admitted = wakes.filter((wake) => wake.runId !== null && wake.status !== "skipped");
-    const windowStart = Date.now() - 10 * 60 * 1000;
-    expect(admitted.filter((wake) => wake.requestedAt.getTime() >= windowStart).length).toBeLessThanOrEqual(3);
-    // The dependency wake the route built carries the server provenance.
-    expect(admitted.length).toBeGreaterThan(0);
-    expect(admitted.every((wake) => (wake.payload as Record<string, unknown>).mutation === "blocked_dependency_restored"))
-      .toBe(true);
-
-    // The next self-caused wake is held back as a durable parked receipt,
-    // neither run nor dropped.
-    const parked = wakes.filter((wake) => wake.status === "deferred_issue_execution");
-    expect(parked).toEqual([
-      expect.objectContaining({
-        reason: "issue_wake_rate_limited",
-        runId: null,
-        payload: expect.objectContaining({
-          _paperclipSelfReblockWakeParked: expect.objectContaining({ limit: 3, windowMs: 600_000 }),
-        }),
-      }),
-    ]);
-    // The unblock requests landed while the run still held the issue.
+    expect(wakes.filter((wake) => wake.runId !== null && wake.status !== "skipped")).toEqual([]);
+    expect(wakes.filter((wake) => wake.status === "deferred_issue_execution")).toEqual([]);
+    // The unblock request landed while the run still held the issue.
     const suppressed = wakes.filter((wake) => wake.reason === "issue_self_reblock_wake_suppressed");
     expect(suppressed.length).toBeGreaterThan(0);
     expect(suppressed.every((wake) => wake.status === "skipped")).toBe(true);
@@ -331,7 +324,7 @@ describeEmbeddedPostgres("ANT-3260 self re-block loop through PATCH /issues/:id"
       eq(heartbeatRuns.agentId, input.ceoId),
       sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
     ));
-    expect(runsOnIssue.length).toBe(loop.cycles());
+    expect(runsOnIssue.length).toBe(1);
   });
 
   it("stays bounded with the route's natural timing", async () => {

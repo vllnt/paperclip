@@ -17,7 +17,7 @@ export function useTaskBrowsers(issueId: string | undefined, runExpected: boolea
   return useQuery({
     queryKey: ["task-browsers", issueId],
     queryFn: () => browserUseApi.list(issueId!),
-    enabled: Boolean(issueId),
+    enabled: Boolean(issueId) && !issueId?.startsWith("chat:"),
     refetchInterval: taskBrowsersRefetchInterval(runExpected),
     retry: false,
   });

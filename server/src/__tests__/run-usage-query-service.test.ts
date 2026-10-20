@@ -18,7 +18,7 @@ function ago(ms: number): Date {
   return new Date(NOW.getTime() - ms);
 }
 
-describeEmbeddedPostgres.sequential("run usage query service", () => {
+describeEmbeddedPostgres("run usage query service", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const service = () => runUsageQueryService(db);

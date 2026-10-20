@@ -153,10 +153,12 @@ export function createRunReadRedaction(db: Db, deps: RunReadRedactionDeps = {}) 
     /**
      * Resolves the run's registered secret values and the instance's
      * current-user setting once; the returned functions are synchronous.
+     * `viewerUserId` lets a viewer with access to the run's credential see its
+     * connection name; without it the name is withheld.
      */
-    async forRun(companyId: string, runId: string): Promise<RunReadRedactor> {
+    async forRun(companyId: string, runId: string, viewerUserId: string | null = null): Promise<RunReadRedactor> {
       const [redactSecrets, userOptions] = await Promise.all([
-        registry.prepareForRun(companyId, runId),
+        registry.prepareForRun(companyId, runId, viewerUserId),
         currentUserOptions(),
       ]);
       const run = <T>(value: T): T => redactSecrets(redactCurrentUserValue(value, userOptions));

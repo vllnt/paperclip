@@ -18,7 +18,11 @@ vi.mock("./AiConnectionCredentialStep", () => ({
   },
 }));
 vi.mock("./AiConnectionManagement", () => ({ AiConnectionLegacyNotice: () => null }));
+vi.mock("./AiProviderSetup", () => ({ AiProviderSetup: () => <div>Advanced provider setup</div> }));
 vi.mock("@/pages/apps/AppLogo", () => ({ AppLogo: () => null }));
+// The field reads the company prefix for its plugin toolbar slot.
+vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ companies: [{ id: "company", issuePrefix: "PAP" }] }) }));
+vi.mock("@/plugins/slots", () => ({ PluginSlotOutlet: () => null }));
 
 let root: Root;
 let container: HTMLDivElement;
@@ -36,15 +40,26 @@ async function settle() {
     flushSync(() => {});
   }
 }
-async function mount(connections: AiManagedConnectionSummary[], canManageConnections = true) {
+async function mount(connections: AiManagedConnectionSummary[], canManageConnections = true, preferAdvanced = false) {
   mocks.list.mockResolvedValue({ currentUserId: "owner", connections, canManageConnections });
   flushSync(() => root.render(<QueryClientProvider client={client}>
     <AiConnectionField companyId="company" agentId="agent" agentName="Nova" adapterType="claude_local"
+      preferAdvanced={preferAdvanced}
       value={{ provider: "anthropic", method: "subscription", mode: "responsible_user" }} onChange={onChange} />
   </QueryClientProvider>));
   await settle();
 }
-function click(label: string) {
+async function click(label: string) {
+  if (label === "Connect another account") {
+    const trigger = document.querySelector('[role="combobox"][aria-label="Connection"]')!;
+    flushSync(() => trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })));
+    await settle();
+    const option = Array.from(document.querySelectorAll<HTMLElement>('[role="option"]')).find(item => item.textContent?.includes("Connect an account"));
+    expect(option).toBeDefined();
+    flushSync(() => option!.click());
+    await settle();
+    return;
+  }
   const button = Array.from(document.querySelectorAll("button")).find(item => item.textContent === label);
   expect(button, `Missing button: ${label}`).toBeDefined();
   flushSync(() => button!.click());
@@ -62,7 +77,7 @@ afterEach(() => { flushSync(() => root.unmount()); client.clear(); container.rem
 
 it("reconnects the unavailable personal default in place", async () => {
   await mount([account()]);
-  click("Reconnect account");
+  await click("Reconnect account");
   expect(credentialProps).toMatchObject({ connectionId: "old-connection", initialMethod: "subscription", fixedMethod: true });
   credentialProps!.onComplete({ connectionId: "old-connection", grantId: "old-grant", method: "subscription" });
   await settle();
@@ -70,9 +85,27 @@ it("reconnects the unavailable personal default in place", async () => {
   expect(onChange).toHaveBeenCalledWith({ provider: "anthropic", method: "subscription", mode: "responsible_user" });
 });
 
+it("shows existing authentication for a legacy agent that has no connection yet", async () => {
+  mocks.list.mockResolvedValue({ currentUserId: "owner", connections: [], canManageConnections: true });
+  flushSync(() => root.render(<QueryClientProvider client={client}>
+    <AiConnectionField companyId="company" agentId="agent" agentName="Nova" adapterType="claude_local" legacy onChange={onChange} />
+  </QueryClientProvider>));
+  await settle();
+  const trigger = document.querySelector('[role="combobox"][aria-label="Connection"]');
+  expect(trigger?.textContent).toContain("Existing authentication");
+  expect(onChange).not.toHaveBeenCalled();
+});
+
+it("opens provider setup directly when connecting from the advanced mode", async () => {
+  await mount([], true, true);
+  await click("Connect another account");
+  expect(document.body.textContent).toContain("Advanced provider setup");
+  expect(credentialProps).toBeUndefined();
+});
+
 it("selects the returned new grant and actual method before adopting the personal default", async () => {
   await mount([account()]);
-  click("Connect another account");
+  await click("Connect another account");
   expect(document.body.textContent).toContain("default");
   expect(credentialProps).toMatchObject({ connectionId: undefined, allAgents: true });
   let resolveDefault!: () => void;
@@ -88,7 +121,7 @@ it("selects the returned new grant and actual method before adopting the persona
 
 it("lets the owner limit a new personal connection to this agent", async () => {
   await mount([]);
-  click("Connect another account");
+  await click("Connect another account");
   const checkbox = document.querySelector<HTMLButtonElement>('[role="checkbox"]')!;
   expect(checkbox).not.toBeNull();
   expect(checkbox.getAttribute("aria-checked")).toBe("true");
@@ -98,13 +131,13 @@ it("lets the owner limit a new personal connection to this agent", async () => {
 
 it("keeps default-update failures visible and retries without another provider login", async () => {
   await mount([account()]);
-  click("Connect another account");
+  await click("Connect another account");
   mocks.setDefault.mockRejectedValueOnce(new Error("Default update failed"));
   credentialProps!.onComplete({ connectionId: "new-connection", grantId: "new-grant", method: "api_key" });
   await settle();
   expect(document.body.textContent).toContain("Default update failed");
   expect(onChange).not.toHaveBeenCalled();
-  click("Retry default selection");
+  await click("Retry default selection");
   await settle();
   expect(mocks.setDefault).toHaveBeenCalledTimes(2);
   expect(onChange).toHaveBeenCalledWith({ provider: "anthropic", method: "api_key", mode: "responsible_user" });
@@ -117,12 +150,14 @@ it("does not offer reconnection for a healthy default or another owner's account
 
 it("keeps an ordinary member's new connection scoped to the current agent by default", async () => {
   await mount([], false);
-  click("Connect another account");
+  expect(document.body.textContent).toContain("You have no default account");
+  await click("Connect another account");
+  expect(document.querySelector<HTMLButtonElement>('[role="checkbox"]')!.disabled).toBe(true);
   expect(credentialProps).toMatchObject({ allAgents: false, agentIds: ["agent"] });
 });
 
 it("uses the server's connection-manager permission for company-wide access", async () => {
   await mount([], true);
-  click("Connect another account");
+  await click("Connect another account");
   expect(credentialProps).toMatchObject({ allAgents: true });
 });

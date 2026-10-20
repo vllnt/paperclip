@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useShowAgentCreatedTasks } from "../hooks/useShowAgentCreatedTasks";
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { Link, useParams, useNavigate, useLocation, Navigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -187,6 +188,7 @@ function ProjectTilePicker({
 /* ── List (issues) tab content ── */
 
 function ProjectIssuesList({ projectId, companyId, toolbarActions }: { projectId: string; companyId: string; toolbarActions?: ReactNode }) {
+  const showAgentCreatedTasks = useShowAgentCreatedTasks(companyId, "paperclip:project-issues-view");
   const queryClient = useQueryClient();
 
   const { data: agents } = useQuery({
@@ -219,8 +221,8 @@ function ProjectIssuesList({ projectId, companyId, toolbarActions }: { projectId
   });
 
   const { data: issues, isLoading, error } = useQuery({
-    queryKey: queryKeys.issues.listByProject(companyId, projectId),
-    queryFn: () => issuesApi.list(companyId, { projectId }),
+    queryKey: [...queryKeys.issues.listByProject(companyId, projectId), showAgentCreatedTasks],
+    queryFn: () => issuesApi.listAll(companyId, { projectId, includeRoutineExecutions: true, includeAgentCreatedTasks: showAgentCreatedTasks }),
     enabled: !!companyId,
   });
   const liveIssueIds = useMemo(() => collectLiveIssueIds(liveRuns, issues), [issues, liveRuns]);
@@ -244,6 +246,7 @@ function ProjectIssuesList({ projectId, companyId, toolbarActions }: { projectId
       liveIssueIds={liveIssueIds}
       projectId={projectId}
       toolbarActions={toolbarActions}
+      enableAgentCreatedVisibilityFilter
       viewStateKey="paperclip:project-issues-view"
       onUpdateIssue={(id, data) => updateIssue.mutate({ id, data })}
     />
@@ -451,7 +454,10 @@ export function ProjectDetail() {
   const updateProject = useMutation({
     mutationFn: (data: Record<string, unknown>) =>
       projectsApi.update(projectLookupRef, data, resolvedCompanyId ?? lookupCompanyId),
-    onSuccess: invalidateProject,
+    onSuccess: (_project, data) => {
+      invalidateProject();
+      if (data.visibility !== undefined) queryClient.invalidateQueries({ queryKey: ["issues"] });
+    },
   });
 
   const archiveProject = useMutation({
@@ -582,6 +588,7 @@ export function ProjectDetail() {
     try {
       await projectsApi.update(projectLookupRef, data, resolvedCompanyId ?? lookupCompanyId);
       invalidateProject();
+      if (data.visibility !== undefined) queryClient.invalidateQueries({ queryKey: ["issues"] });
       if (fieldSaveRequestIds.current[field] !== requestId) return;
       setFieldState(field, "saved");
       scheduleFieldReset(field, 1800);
@@ -591,7 +598,7 @@ export function ProjectDetail() {
       scheduleFieldReset(field, 3000);
       throw error;
     }
-  }, [invalidateProject, lookupCompanyId, projectLookupRef, resolvedCompanyId, scheduleFieldReset, setFieldState]);
+  }, [invalidateProject, lookupCompanyId, projectLookupRef, queryClient, resolvedCompanyId, scheduleFieldReset, setFieldState]);
 
   const projectBudgetSummary = useMemo(() => {
     const matched = budgetOverview?.policies.find(
@@ -607,6 +614,8 @@ export function ProjectDetail() {
       metric: "billed_cents",
       windowKind: "lifetime",
       amount: 0,
+      unpricedEventCount: 0, pendingRunCount: 0,
+      unpricedUsagePolicy: "block",
       observedAmount: 0,
       remainingAmount: 0,
       utilizationPercent: 0,

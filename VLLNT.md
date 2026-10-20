@@ -1,9 +1,17 @@
 # VLLNT Paperclip fork
 
-Based on upstream `master` at `1c07b5903b1b11139b1e1ce052a3cd4885865d90` (after
-`canary/v2026.1004.0-canary.2`), merged in `7501843e9`. The publication guard scans only commits
-added after this upstream base; update the base in `scripts/check-public-config.py`,
+Based on upstream `master` at `24067a16b5912aee7c33b208524d7a28639cca26` (after
+`canary/v2026.1019.0-canary.12`), merged in `baf37a6ef`. The previous base was
+`1c07b5903b1b11139b1e1ce052a3cd4885865d90`, merged in `7501843e9`. The publication guard scans
+only commits added after this upstream base; update the base in `scripts/check-public-config.py`,
 `.github/workflows/security.yml` and `.githooks/pre-push` with each upstream merge.
+
+Fork database migrations come after upstream's chain. Each upstream merge keeps upstream's
+migration numbers and renumbers the fork-only migrations after upstream's last one, in their
+original order, with unchanged SQL bytes. The runtime migrator identifies applied migrations by
+the SHA-256 of the SQL file, so a database that already applied a fork migration under its old
+number does not apply it again; it applies only the new upstream migrations.
+
 `main` owns VLLNT changes; `upstream/master` remains the upstream reference.
 Upstream publishing workflows are not enabled on this fork's main branch.
 

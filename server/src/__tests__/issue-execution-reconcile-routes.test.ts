@@ -31,7 +31,7 @@ import {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
-  ? describe.sequential
+  ? describe
   : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {

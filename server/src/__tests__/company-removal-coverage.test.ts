@@ -63,6 +63,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { isLockContention } from "../db-errors.ts";
+import { configureAgentLifecycle } from "../services/agent-lifecycle.ts";
 import { companyService } from "../services/companies.ts";
 import { COMPANY_REMOVAL_LOCK_ORDER } from "../services/company-removal-cross-company.ts";
 import {
@@ -224,6 +225,8 @@ describeEmbeddedPostgres("company removal coverage", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-company-removal-coverage-");
     db = createDb(tempDb.connectionString);
+    // A company delete terminates its agents through the lifecycle worker first.
+    configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
   }, 120_000);
 
   afterAll(async () => {

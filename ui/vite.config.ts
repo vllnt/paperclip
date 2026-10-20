@@ -1,5 +1,5 @@
 import path from "path";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { createUiDevWatchOptions } from "./src/lib/vite-watch";
@@ -11,6 +11,19 @@ import { readBrowserBuildCommit } from "./src/lib/vite-build-commit";
 
 const apiProxy = createApiProxy();
 
+function preloadIssueDetail(): Plugin {
+  return {
+    name: "paperclip-preload-issue-detail",
+    apply: "build",
+    transformIndexHtml(_html, { bundle }) {
+      const issueDetail = Object.values(bundle ?? {}).find((chunk) =>
+        chunk.type === "chunk" && chunk.moduleIds.some((id) => id.endsWith("/src/pages/IssueDetail.tsx")),
+      );
+      return issueDetail ? [{ tag: "link", attrs: { rel: "modulepreload", href: `/${issueDetail.fileName}`, crossorigin: "" }, injectTo: "head" }] : [];
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => ({
   define: {
     __PAPERCLIP_BUILD_COMMIT__: JSON.stringify(
@@ -21,6 +34,7 @@ export default defineConfig(({ mode }) => ({
     react(),
     tailwindcss(),
     serviceWorkerBuildIdPlugin(),
+    preloadIssueDetail(),
     bundleBudgetPlugin(path.resolve(__dirname, "bundle-budget.json")),
     precompressAssetsPlugin(),
   ],
@@ -29,19 +43,9 @@ export default defineConfig(({ mode }) => ({
     rolldownOptions: {
       output: {
         codeSplitting: {
-          minSize: 20_000,
           groups: [
-            {
-              name: "react-vendor",
-              test: /node_modules[\\/](react|react-dom|scheduler|react-router|react-router-dom|@tanstack)[\\/]/,
-              priority: 40,
-            },
-            { name: "icons", test: /node_modules[\\/]lucide-react[\\/]/, priority: 30 },
-            {
-              name: "app-core",
-              test: /[\\/]ui[\\/]src[\\/](lib|hooks|context|api|i18n|components[\\/]ui)[\\/]/,
-              priority: 10,
-            },
+            { name: "board-startup", tags: ["$initial"], priority: 10 },
+            { name: "issue-detail", test: /\/src\/pages\/IssueDetail\.tsx$/, priority: 5 },
           ],
         },
       },

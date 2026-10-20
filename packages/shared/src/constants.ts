@@ -1,4 +1,5 @@
 export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
+export const ISSUE_SUMMARIES_MAX_IDS = 5;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
 export const DEPLOYMENT_MODES = ["local_trusted", "authenticated"] as const;
@@ -436,11 +437,9 @@ export const ISSUE_TREE_HOLD_RELEASE_POLICY_STRATEGIES = ["manual", "after_activ
 export type IssueTreeHoldReleasePolicyStrategy = (typeof ISSUE_TREE_HOLD_RELEASE_POLICY_STRATEGIES)[number];
 
 export const ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY = "continuation-summary" as const;
-export const PIPELINE_CASE_BODY_DOCUMENT_KEY = "pipeline-case-body" as const;
-export const PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE = "{{pipeline_name}} / {{stage_name}}: {{case_title}}" as const;
 export const SYSTEM_ISSUE_DOCUMENT_KEYS = [
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
-  PIPELINE_CASE_BODY_DOCUMENT_KEY,
+  "pipeline-case-body",
 ] as const;
 export type SystemIssueDocumentKey = (typeof SYSTEM_ISSUE_DOCUMENT_KEYS)[number];
 
@@ -755,7 +754,7 @@ export type SecretProviderConfigHealthStatus =
 export const SECRET_STATUSES = ["active", "disabled", "archived", "deleted"] as const;
 export type SecretStatus = (typeof SECRET_STATUSES)[number];
 
-export const SECRET_SCOPES = ["company", "user"] as const;
+export const SECRET_SCOPES = ["company", "user", "instance"] as const;
 export type SecretScope = (typeof SECRET_SCOPES)[number];
 
 export const SECRET_MANAGED_MODES = ["paperclip_managed", "external_reference"] as const;
@@ -858,7 +857,7 @@ export const BILLING_TYPES = [
 ] as const;
 export type BillingType = (typeof BILLING_TYPES)[number];
 
-export const COST_STATUSES = ["reported", "unpriced"] as const;
+export const COST_STATUSES = ["reported", "estimated", "unpriced"] as const;
 export type CostStatus = (typeof COST_STATUSES)[number];
 
 export const FINANCE_EVENT_KINDS = [
@@ -1054,7 +1053,6 @@ export const PERMISSION_KEYS = [
   "tasks:assign",
   "tasks:assign_scope",
   "tasks:manage_active_checkouts",
-  "pipelines:write",
   "joins:approve",
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
@@ -1354,6 +1352,7 @@ export type PluginCategory = (typeof PLUGIN_CATEGORIES)[number];
  * @see PLUGIN_SPEC.md §15 — Capability Model
  */
 export const PLUGIN_CAPABILITIES = [
+  "ai.connections.route",
   // Data Read
   "companies.read",
   "chat.endpoints.read",
@@ -1374,6 +1373,7 @@ export const PLUGIN_CAPABILITIES = [
   "approvals.read",
   "issue.documents.read",
   "agents.read",
+  "agents.lifecycle.manage",
   "goals.read",
   "goals.create",
   "goals.update",
@@ -1533,6 +1533,8 @@ export const PLUGIN_UI_SLOT_TYPES = [
 export type PluginUiSlotType = (typeof PLUGIN_UI_SLOT_TYPES)[number];
 
 export const WORKSPACE_OVERVIEW_DEFAULT_LIMIT = 50;
+export const HEARTBEAT_RUN_LIST_DEFAULT_LIMIT = 200;
+export const HEARTBEAT_RUN_LIST_MAX_LIMIT = 1000;
 export const WORKSPACE_OVERVIEW_MAX_LIMIT = 100;
 export const WORKSPACE_OVERVIEW_LINKED_ISSUE_LIMIT = 4;
 

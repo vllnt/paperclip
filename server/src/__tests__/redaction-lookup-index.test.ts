@@ -118,7 +118,7 @@ describeEmbeddedPostgres("secret-redaction lookup and typed issue joins", () => 
     await db.execute(sql`DROP INDEX heartbeat_runs_company_ctx_pcissue_redaction_idx`);
     const before = await planOf(db, predicate(false));
     const migration = await import("node:fs").then((fs) => fs.readFileSync(
-      new URL("../../../packages/db/src/migrations/0300_jittery_otto_octavius.sql", import.meta.url), "utf8"));
+      new URL("../../../packages/db/src/migrations/0363_jittery_otto_octavius.sql", import.meta.url), "utf8"));
     for (const stmt of migration.split("--> statement-breakpoint")) await db.execute(sql.raw(stmt));
     await db.execute(sql`ANALYZE heartbeat_runs`);
     const after = await planOf(db, predicate(true));

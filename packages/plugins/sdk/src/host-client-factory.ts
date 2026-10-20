@@ -139,6 +139,8 @@ export interface HostServices {
 
   /** Provides `events.emit` and `events.subscribe`. */
   events: {
+    listLifecycle(params: WorkerToHostMethods["events.listLifecycle"][0]): Promise<WorkerToHostMethods["events.listLifecycle"][1]>;
+    acknowledgeLifecycle(params: WorkerToHostMethods["events.acknowledgeLifecycle"][0]): Promise<void>;
     emit(params: WorkerToHostMethods["events.emit"][0]): Promise<void>;
     subscribe(params: WorkerToHostMethods["events.subscribe"][0]): Promise<void>;
   };
@@ -280,6 +282,7 @@ export interface HostServices {
   /** Provides `agents.list`, `agents.get`, `agents.pause`, `agents.resume`, `agents.invoke`. */
   agents: {
     list(params: WorkerToHostMethods["agents.list"][0]): Promise<WorkerToHostMethods["agents.list"][1]>;
+    getRuntime?(params: WorkerToHostMethods["agents.getRuntime"][0]): Promise<WorkerToHostMethods["agents.getRuntime"][1]>;
     get(params: WorkerToHostMethods["agents.get"][0]): Promise<WorkerToHostMethods["agents.get"][1]>;
     pause(params: WorkerToHostMethods["agents.pause"][0]): Promise<WorkerToHostMethods["agents.pause"][1]>;
     resume(params: WorkerToHostMethods["agents.resume"][0]): Promise<WorkerToHostMethods["agents.resume"][1]>;
@@ -414,6 +417,8 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Events
   "events.emit": "events.emit",
   "events.subscribe": "events.subscribe",
+  "events.listLifecycle": "events.subscribe",
+  "events.acknowledgeLifecycle": "events.subscribe",
 
   // HTTP
   "http.fetch": "http.outbound",
@@ -500,6 +505,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Agents
   "agents.list": "agents.read",
   "agents.get": "agents.read",
+  "agents.getRuntime": "agents.lifecycle.manage",
   "agents.pause": "agents.pause",
   "agents.resume": "agents.resume",
   "agents.invoke": "agents.invoke",
@@ -775,6 +781,8 @@ export function createHostClientHandlers(
     }),
 
     // Events
+    "events.listLifecycle": gated("events.listLifecycle", async (params) => services.events.listLifecycle(params)),
+    "events.acknowledgeLifecycle": gated("events.acknowledgeLifecycle", async (params) => services.events.acknowledgeLifecycle(params)),
     "events.emit": gated("events.emit", async (params) => {
       return services.events.emit(params);
     }),
@@ -994,6 +1002,10 @@ export function createHostClientHandlers(
     // Agents
     "agents.list": gated("agents.list", async (params) => {
       return services.agents.list(params);
+    }),
+    "agents.getRuntime": gated("agents.getRuntime", async (params) => {
+      if (!services.agents.getRuntime) throw new Error("Agent runtime state is unavailable");
+      return services.agents.getRuntime(params);
     }),
     "agents.get": gated("agents.get", async (params) => {
       return services.agents.get(params);

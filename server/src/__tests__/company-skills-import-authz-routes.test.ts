@@ -29,7 +29,7 @@ import { companySkillRoutes } from "../routes/company-skills.js";
 import { companySkillPolicyService } from "../services/company-skill-policy.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(

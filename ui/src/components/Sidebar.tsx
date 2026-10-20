@@ -99,7 +99,6 @@ export function Sidebar({ children }: { children?: ReactNode }) {
   // shell keeps its Inbox row even with the flag on.
   const combinedInboxTasks = streamlinedUiEnabled && experimentalSettings?.enableCombinedInboxTasks === true;
   const showWorkspacesLink = !chatRail && experimentalSettings?.enableIsolatedWorkspaces === true;
-  const showPipelines = experimentalSettings?.enablePipelines === true;
   const showStatusCards = experimentalSettings?.enableStatusCards === true;
   const goalsLinkPending = experimentalSettings === undefined;
   const showGoalsLink = experimentalSettings?.enableGoalsSidebarLink === true;
@@ -237,9 +236,6 @@ export function Sidebar({ children }: { children?: ReactNode }) {
           {showCases ? (
             <SidebarNavItem to="/cases" label="Cases" icon={Layers} textBadge="beta" />
           ) : null}
-          {showPipelines ? (
-            <SidebarNavItem to="/pipelines" label="Pipelines" icon={GitBranch} />
-          ) : null}
           {showGoalsLink ? (
             <SidebarNavItem to="/goals" label="Goals" icon={Target} />
           ) : goalsLinkPending ? (
@@ -253,6 +249,7 @@ export function Sidebar({ children }: { children?: ReactNode }) {
             <SidebarNavItem to="/workspaces" label="Workspaces" icon={GitBranch} />
           ) : null}
           <PluginSlotOutlet
+            errorBehavior="hidden"
             slotTypes={["sidebar"]}
             sidebarSection="work"
             context={pluginContext}
@@ -261,6 +258,7 @@ export function Sidebar({ children }: { children?: ReactNode }) {
             missingBehavior="placeholder"
           />
           <PluginLauncherOutlet
+            errorBehavior="hidden"
             placementZones={["sidebar"]}
             context={pluginContext}
             className="flex flex-col gap-0.5"
@@ -288,7 +286,7 @@ export function Sidebar({ children }: { children?: ReactNode }) {
           </SidebarSection>
         ) : null}
 
-        {children}
+        {children ?? (streamlinedUiEnabled ? <SidebarAgents streamlined /> : null)}
 
         {streamlinedUiEnabled ? (
           <SidebarRecentTasks companyId={selectedCompanyId} liveIssueIds={liveIssueIds} />
@@ -313,12 +311,14 @@ export function Sidebar({ children }: { children?: ReactNode }) {
               <SidebarNavItem to="/timeline" label="Timeline" icon={GanttChartSquare} />
               <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />
               <SidebarNavItem to="/activity" label="Activity" icon={History} />
+              <SidebarNavItem to="/activity/commentary" label="Commentary" icon={History} />
               <SidebarNavItem to="/company/settings" label="Settings" icon={Settings} />
             </SidebarSection>
           </>
         )}
 
         <PluginSlotOutlet
+          errorBehavior="hidden"
           slotTypes={["sidebarPanel"]}
           context={pluginContext}
           className="flex flex-col gap-3"

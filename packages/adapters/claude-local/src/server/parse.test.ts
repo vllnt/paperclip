@@ -664,7 +664,22 @@ describe("parseClaudeStreamJson usage extraction", () => {
       return JSON.stringify(event);
     });
     const parsed = parseClaudeStreamJson(`${withoutModelUsage.join("\n")}\n`);
-    expect(parsed.usage).toEqual({ inputTokens: 20, outputTokens: 88, cachedInputTokens: 34_108 });
+    // Per-turn input includes cache creation, so the sum equals the modelUsage totals.
+    expect(parsed.usage).toEqual({ inputTokens: 20 + 34_182, outputTokens: 88, cachedInputTokens: 34_108 });
     expect(parsed.costUsd).toBeCloseTo(0.0465983, 7);
+  });
+});
+
+describe("interrupted Claude accounting", () => {
+  it("retains partial usage and replaces repeated message snapshots", () => {
+    const events = [
+      { type: "assistant", message: { id: "m1", usage: { input_tokens: 10, cache_creation_input_tokens: 20, cache_read_input_tokens: 40, output_tokens: 3 } } },
+      { type: "assistant", message: { id: "m1", usage: { input_tokens: 10, cache_creation_input_tokens: 20, cache_read_input_tokens: 40, output_tokens: 7 } } },
+      { type: "assistant", message: { id: "m2", usage: { input_tokens: 5, output_tokens: 2 } } },
+    ];
+    const parsed = parseClaudeStreamJson(events.map((event) => JSON.stringify(event)).join("\n"));
+    expect(parsed.usage).toEqual({ inputTokens: 35, cachedInputTokens: 40, outputTokens: 9 });
+    expect(parsed.usageBasis).toBe("per_run");
+    expect(parsed.costUsd).toBeNull();
   });
 });

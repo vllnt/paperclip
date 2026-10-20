@@ -1,7 +1,9 @@
 export type {
   AdapterAgent,
+  AgentRuntimeIdentity,
   AdapterRuntime,
   UsageSummary,
+  AdapterUsageCheckpoint,
   AdapterBillingType,
   AdapterRuntimeServiceReport,
   AdapterExecutionResult,
@@ -89,7 +91,7 @@ export type {
   RuntimeStatusSink,
   RuntimeStatusUpdate,
 } from "./runtime-progress.js";
-export { inferOpenAiCompatibleBiller } from "./billing.js";
+export { inferOpenAiCompatibleBiller, resolveManagedOpenAiBilling } from "./billing.js";
 export {
   ADAPTER_STEERING_ACKNOWLEDGEMENT_KIND,
   adapterSteeringAcknowledgementEvent,
@@ -131,6 +133,8 @@ export {
   paperclipRunnerTransitionConfig,
   normalizeLegacyRunnerProvider,
   resolvePaperclipRunnerPermissionMode,
+  resolvePaperclipRunnerCursorMode,
+  resolvePaperclipRunnerPiThinkingLevel,
 } from "./paperclip-runner-permissions.js";
 export {
   PAPERCLIP_RUNNER_INGRESS_PORT,

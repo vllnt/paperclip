@@ -72,14 +72,20 @@ export async function runResourceCapacityTick(input: {
  * Starts the sampler in this process. It runs whether or not the heartbeat
  * scheduler is enabled: reads and recovery need a current reading.
  *
+ * @param shouldRun - Checked before each pass; return false to skip it (for
+ *   example on a warm standby or while the instance drains to idle).
  * @returns A function that stops it.
  */
-export function startResourceCapacitySampler(db: Db, config = resolveResourceCapacitySamplerConfig()): () => void {
+export function startResourceCapacitySampler(
+  db: Db,
+  config = resolveResourceCapacitySamplerConfig(),
+  shouldRun: () => boolean = () => true,
+): () => void {
   const service = resourceCapacityService(db);
   let lastPrunedAt: number | null = null;
   let running = false;
   const tick = () => {
-    if (running) return;
+    if (running || !shouldRun()) return;
     running = true;
     void runResourceCapacityTick({ service, retentionDays: config.retentionDays, lastPrunedAt })
       .then((result) => {

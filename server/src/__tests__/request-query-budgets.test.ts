@@ -82,16 +82,22 @@ const REQUESTS: Array<{
   { name: "issue comments", actor: "operator", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 7, rows: 12 }, // 6
   { name: "routines", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/routines`, budget: 7, rows: 3 }, // 6
   // Equal to the count, not above it. Each list request imports the bundled
-  // skills again from disk. Per listed skill (8 here), it reads the skill's row by
-  // key and its folder path (getByKey and enrichFolderPath): 3 statements. The
-  // fixed part (36) includes ensuring each bundled category folder once, in a
-  // folder-lock transaction, and one company_skill_versions read for each release
-  // in skills-releases/paperclip/releases.json (2 here), so adding a release is a
-  // deliberate budget bump. 36 + 3 * 8 = 60. The budget follows the number of
+  // skills again from disk. Per listed skill (10 here), it reads the skill
+  // sources' access scope (company_skill_sources, project_skill_sources), the
+  // skill's row by key and its folder path (getByKey and enrichFolderPath): 5
+  // statements. The fixed part (38) includes ensuring each bundled category
+  // folder once, in a folder-lock transaction, the access-scope reads for the
+  // list itself, and one company_skill_versions read for each release in
+  // skills-releases/paperclip/releases.json (2 here), so adding a release is a
+  // deliberate budget bump. 38 + 5 * 10 = 88. The budget follows the number of
   // bundled skills and keeps the count per skill from growing; it is not a target.
-  { name: "skills", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 36, perRow: 3 }, // 60
+  { name: "skills", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/skills`, budget: 38, perRow: 5 }, // 88
   { name: "plugins", actor: "operator", path: () => "/api/plugins", budget: 2, rows: 0 }, // 1
-  { name: "heartbeat runs", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 3, rows: 30 }, // 2
+  // Includes 1 statement per distinct issue of the listed runs: the run
+  // privacy check confirms the issue exists before it decides issue:read
+  // (getHeartbeatRunReadDecisions in services/heartbeat-run-privacy.ts). Each
+  // seeded run has its own issue. The budget is not a target.
+  { name: "heartbeat runs", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 3, rows: 30, perRow: 1 }, // 32
   { name: "dashboard", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/dashboard`, budget: 9 }, // 8
   { name: "sidebar badges", actor: "operator", path: ({ companyId }) => `/api/companies/${companyId}/sidebar-badges`, budget: 5 }, // 4
   // Includes 2 statements per agent: the list authorizes each agent on its own
@@ -99,8 +105,12 @@ const REQUESTS: Array<{
   { name: "agents", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/agents`, budget: 17, rows: 6 }, // 16
   { name: "issues list", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/issues`, budget: 29, rows: 40 }, // 26
   { name: "issue detail", actor: "member", path: ({ issueId }) => `/api/issues/${issueId}`, budget: 35 }, // 32
-  { name: "issue comments", actor: "member", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 9, rows: 12 }, // 8
-  { name: "heartbeat runs", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 5, rows: 30 }, // 4
+  // Includes 2 statements that read the issue's privacy for the member.
+  { name: "issue comments", actor: "member", path: ({ issueId }) => `/api/issues/${issueId}/comments`, budget: 11, rows: 12 }, // 10
+  // Includes 5 statements per distinct issue of the listed runs: the existence
+  // check and the member's issue:read decision with its privacy reads (see the
+  // operator entry). The budget is not a target.
+  { name: "heartbeat runs", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/heartbeat-runs`, budget: 5, rows: 30, perRow: 5 }, // 154
   { name: "sidebar badges", actor: "member", path: ({ companyId }) => `/api/companies/${companyId}/sidebar-badges`, budget: 7 }, // 6
 ];
 
