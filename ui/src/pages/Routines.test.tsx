@@ -983,6 +983,41 @@ describe("Routines page", () => {
     });
   });
 
+  it("opens the composer with the project chosen for a project page's New routine link, then drops the link", async () => {
+    currentSearch = "new=1&projectId=project-1&folder=unfiled";
+    routinesListMock.mockResolvedValue([]);
+    issuesListMock.mockResolvedValue([]);
+
+    const root = await renderRoutines(<Routines />);
+
+    const projectSelector = inlineEntitySelectorRenderMock.mock.calls.map(([props]) => props).filter((props) =>
+      (props.options ?? []).some((option) => option.id === "project-1")).at(-1);
+    expect(projectSelector?.value).toBe("project-1");
+    const update = setSearchParamsMock.mock.calls.at(-1)?.[0] as (current: URLSearchParams) => URLSearchParams;
+    expect(update(new URLSearchParams(currentSearch)).toString()).toBe("folder=unfiled");
+    expect(setSearchParamsMock.mock.calls.at(-1)?.[1]).toEqual({ replace: true });
+    expect(setSearchParamsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("embedded: ignores a New routine link on the host page", async () => {
+    currentSearch = "new=1&projectId=project-1";
+    routinesListMock.mockResolvedValue([]);
+    issuesListMock.mockResolvedValue([]);
+
+    const root = await renderRoutines(<Routines embedded fixedAssigneeAgentId="agent-2" />, "No routines are assigned");
+
+    expect(inlineEntitySelectorRenderMock.mock.calls.some(([props]) => props.value === "project-1")).toBe(false);
+    expect(setSearchParamsMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("keeps the last list while a filter loads, but never shows it under another company", async () => {
     issuesListMock.mockResolvedValue([]);
     routinesListMock.mockImplementation(async (companyId) =>

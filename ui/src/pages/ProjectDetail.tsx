@@ -25,6 +25,7 @@ import { IssuesList } from "../components/IssuesList";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { PageTabBar } from "../components/PageTabBar";
 import { ProjectWorkspacesContent } from "../components/ProjectWorkspacesContent";
+import { ProjectRoutinesSection } from "../components/ProjectRoutinesSection";
 import { SummarySlotCard } from "../components/SummarySlotCard";
 import { MembershipAction } from "../components/MembershipAction";
 import { StarToggle } from "../components/StarToggle";
@@ -901,6 +902,14 @@ export function ProjectDetail() {
         <div className="max-w-4xl">
           <ProjectProperties
             project={project}
+            routines={
+              <ProjectRoutinesSection
+                key={project.id}
+                companyId={project.companyId}
+                projectId={project.id}
+                canCreate={!project.archivedAt}
+              />
+            }
             onUpdate={(data) => updateProject.mutate(data)}
             onFieldUpdate={updateProjectField}
             getFieldSaveState={(field) => fieldSaveStates[field] ?? "idle"}

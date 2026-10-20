@@ -22,6 +22,7 @@ import { collectLiveIssueIds } from "../lib/liveIssueIds";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
+import { useNewRoutineLink } from "../hooks/useNewRoutineLink";
 import { EmptyState } from "../components/EmptyState";
 import { IssuesList } from "../components/IssuesList";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -747,6 +748,11 @@ export function Routines() {
     }));
     setComposerOpen(true);
   }
+
+  useNewRoutineLink((projectId) => {
+    if (projectId) setDraft((current) => ({ ...current, projectId }));
+    openCreateRoutine();
+  });
 
   async function moveSelectedRoutines(folderId: string | null) {
     const ids = selectedRoutineIds;
