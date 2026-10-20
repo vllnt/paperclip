@@ -170,7 +170,9 @@ queued and later queries from a disconnected transaction or reserved connection,
 and prevents a released, closed connection from returning to the open pool.
 It also handles a connection that dies during its startup array-type fetch:
 that failure no longer becomes an unhandled rejection, which ends the server
-process, and the next socket runs its own type fetch before the first query.
+process. When the server fails that fetch with an error, such as a FATAL, and
+closes, the first query fails with that error, and the next query opens a new
+connection, with the configured backoff, that fetches its own types.
 The patch covers both ESM and CommonJS. The regression suite terminates real
 PostgreSQL backends and checks rejection, pool recovery, and transaction isolation.
 Remove the patch when an upstream release passes these tests. Installs of the

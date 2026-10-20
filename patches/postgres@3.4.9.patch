@@ -1,5 +1,5 @@
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..6f43335660272cfb7fefe64991f46198eeae795a 100644
+index 07f6716702ac888215c86ad6e0071aaf55ae519c..6b134516cb0daea38ab088bc3bd4845ef8df0a7f 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
 @@ -438,6 +438,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -10,21 +10,21 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..6f43335660272cfb7fefe64991f46198
      socket.removeListener('data', data)
      socket.removeListener('connect', connected)
      idleTimer.cancel()
-@@ -447,10 +448,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -447,10 +448,22 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      socket.removeAllListeners()
      socket = null
  
--    if (initial)
-+    if (initial) {
-+      // The socket died while the connection started. Drop the state of
-+      // its startup query (the type or state fetch), so the next socket
-+      // runs its own startup and then sends the first query, which was
-+      // never sent.
-+      query = results = errorResponse = null
-+      result = new Result()
-+      rows = 0
-       return reconnect()
++    if (initial && errorResponse) {
++      // The server failed a startup query (the type or state fetch), for
++      // example with a FATAL error, and closed. Fail the first query with
++      // that error and close as usual, so the next query reconnects with
++      // the configured backoff instead of replaying at once.
++      queryError(initial, errorResponse)
++      initial = query = null
 +    }
++
+     if (initial)
+       return reconnect()
  
      !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
 +    query = results = errorResponse = null
@@ -33,7 +33,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..6f43335660272cfb7fefe64991f46198
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -561,7 +573,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -561,7 +574,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
  
        if (needsTypes) {
          initial.reserve && (initial = null)
@@ -109,7 +109,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..04dded5c7e2cdc34ac01b29a87cc9324
            ? queries.push(q)
            : c.execute(q) || move(c, full)
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..701eb48a9db9b444027b53365632f5ac404bdb2d 100644
+index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..b144d33642b06fe3f2cd8da271988ffec21e8091 100644
 --- a/src/connection.js
 +++ b/src/connection.js
 @@ -438,6 +438,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -120,21 +120,21 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..701eb48a9db9b444027b53365632f5ac
      socket.removeListener('data', data)
      socket.removeListener('connect', connected)
      idleTimer.cancel()
-@@ -447,10 +448,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -447,10 +448,22 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      socket.removeAllListeners()
      socket = null
  
--    if (initial)
-+    if (initial) {
-+      // The socket died while the connection started. Drop the state of
-+      // its startup query (the type or state fetch), so the next socket
-+      // runs its own startup and then sends the first query, which was
-+      // never sent.
-+      query = results = errorResponse = null
-+      result = new Result()
-+      rows = 0
-       return reconnect()
++    if (initial && errorResponse) {
++      // The server failed a startup query (the type or state fetch), for
++      // example with a FATAL error, and closed. Fail the first query with
++      // that error and close as usual, so the next query reconnects with
++      // the configured backoff instead of replaying at once.
++      queryError(initial, errorResponse)
++      initial = query = null
 +    }
++
+     if (initial)
+       return reconnect()
  
      !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
 +    query = results = errorResponse = null
@@ -143,7 +143,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..701eb48a9db9b444027b53365632f5ac
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -561,7 +573,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -561,7 +574,10 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
  
        if (needsTypes) {
          initial.reserve && (initial = null)

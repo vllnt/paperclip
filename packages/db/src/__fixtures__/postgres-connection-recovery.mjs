@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import net from "node:net";
-import { setImmediate } from "node:timers/promises";
+import { setImmediate, setTimeout as sleep } from "node:timers/promises";
 
 const postgres = process.env.DRIVER_FORMAT === "cjs"
   ? createRequire(import.meta.url)("postgres")
@@ -122,13 +122,13 @@ try {
     // Every new connection first fetches the array types. When the socket
     // dies during that fetch (a reset, or a FATAL such as a terminated backend
     // followed by a close), the driver must not raise an unhandled rejection,
-    // which ends the server process, and must not put a connection into
-    // service that skipped its own type fetch.
-    const unhandled = [];
-    const onUnhandled = (reason) => unhandled.push(reason);
-    process.on("unhandledRejection", onUnhandled);
+    // which ends this process with output on stderr. It must fail the first
+    // query once, not replay it at once in a loop while every start fails,
+    // and must not put a connection into service that skipped its own type
+    // fetch.
     const target = new URL(process.env.TEST_DATABASE_URL);
     const connections = [];
+    let faulting = true;
     let faults = 0;
     const proxy = net.createServer((client) => {
       const connection = { sent: "" };
@@ -136,7 +136,7 @@ try {
       const upstream = net.connect(Number(target.port), target.hostname);
       client.on("data", (chunk) => {
         connection.sent += chunk.toString("latin1");
-        if (faults === 0 && connection.sent.includes("typcategory")) {
+        if (faulting && connection.sent.includes("typcategory")) {
           faults += 1;
           upstream.destroy();
           if (mode === "type-fetch-reset") client.resetAndDestroy();
@@ -156,29 +156,22 @@ try {
     proxied.port = String(proxy.address().port);
     const typed = postgres(proxied.href, { max: 1, backoff: 0, onnotice() {} });
     try {
-      const first = await Promise.resolve(typed.unsafe("select 1 as value"))
-        .then((rows) => rows[0].value, (error) => error.code);
-      if (mode === "type-fetch-reset") {
-        assert.ok([1, "ECONNRESET", "CONNECTION_CLOSED"].includes(first), `first query: ${first}`);
-      } else {
-        // The first query was never sent, so the next socket replays it.
-        assert.equal(first, 1);
-      }
+      // The proxy faults every type fetch until the first query settles.
+      const first = await Promise.race([
+        Promise.resolve(typed.unsafe("select 1 as value")).then((rows) => rows[0].value, (error) => error.code),
+        sleep(5_000, "still pending", { ref: false }),
+      ]);
+      faulting = false;
+      assert.equal(first, mode === "type-fetch-reset" ? "ECONNRESET" : "57P01");
       assert.equal(faults, 1);
+      assert.equal(connections.length, 1);
+      // The next query opens a new connection that fetches its own types first.
       assert.equal((await typed.unsafe("select 42 as value"))[0].value, 42);
-      await setImmediate();
-      assert.deepEqual(unhandled, []);
-      // The faulted connection carried no query. Every connection that
-      // carried one fetched its own types first.
+      assert.equal(connections.length, 2);
       assert.ok(!connections[0].sent.includes("as value"));
-      const used = connections.filter((connection) => connection.sent.includes("as value"));
-      assert.ok(used.length >= 1);
-      for (const connection of used) {
-        const typesAt = connection.sent.indexOf("typcategory");
-        assert.ok(typesAt >= 0 && typesAt < connection.sent.indexOf("as value"), "query before the type fetch");
-      }
+      const typesAt = connections[1].sent.indexOf("typcategory");
+      assert.ok(typesAt >= 0 && typesAt < connections[1].sent.indexOf("as value"), "query before the type fetch");
     } finally {
-      process.off("unhandledRejection", onUnhandled);
       await typed.end({ timeout: 1 });
       await new Promise((resolve) => proxy.close(resolve));
     }
