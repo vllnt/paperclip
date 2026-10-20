@@ -344,8 +344,11 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
       const underRun = await s.newTask({ title: "Under a run", parentId: root.id });
       const stepTask = await s.newTask({ title: "A step" });
       await db.update(issues).set({ originKind: "routine_step", originId: routine.id }).where(eq(issues.id, stepTask.id));
+      const underStep = await s.newTask({ title: "Split off a step", parentId: stepTask.id });
+      const deepUnderStep = await s.newTask({ title: "Split off again", parentId: underStep.id });
+      const deepUnderRun = await s.newTask({ title: "Two below a run", parentId: underRun.id });
 
-      for (const task of [root, hidden, underRun, stepTask]) {
+      for (const task of [root, hidden, underRun, stepTask, underStep, deepUnderStep, deepUnderRun]) {
         expect(await s.publish(task.id)).toEqual({ stepsAttached: false, routineRunIds: [] });
       }
       expect(await s.deliveries()).toEqual([]);

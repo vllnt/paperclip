@@ -410,7 +410,7 @@ POST /api/routines/{routineId}/triggers
 
 **Recommended filter: `"created_by": "user"`.** Without it the trigger also starts steps on tasks that agents create, which is rarely what a person wants and spends the hourly budget quickly.
 
-No event is published for a hidden task, a task of origin `routine_execution`, `routine_step` or `chat_channel`, a conversation, or a task whose parent is a routine run or a routine step. A step that creates a sub-task therefore cannot start another routine.
+No event is published for a hidden task, a task of origin `routine_execution`, `routine_step` or `chat_channel`, a conversation, or a task below a routine run or a routine step (up to 50 levels up). Work that a step splits into sub-tasks, at any depth, therefore cannot start another routine.
 
 **What happens.** The task is created, then the event is published before the assignee is woken:
 

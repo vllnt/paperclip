@@ -117,8 +117,14 @@ const INTERNAL_SOURCE_MAX_NEW_ISSUES_PER_HOUR = 200;
 /** Task origins that never publish: they belong to a routine run or a conversation. */
 const UNPUBLISHED_ISSUE_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step", "chat_channel"];
 
-/** Parent origins that stop a task from publishing, so a step that creates subtasks cannot recurse. */
-const UNPUBLISHED_PARENT_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step"];
+/** Ancestor origins that stop a task from publishing, so work split off a step cannot start a routine again. */
+const UNPUBLISHED_ANCESTOR_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step"];
+
+/**
+ * How many levels above a task the ancestor check looks. A loop always passes through a routine step
+ * close above the task, so only a deep tree made by hand reaches the limit; its task then publishes.
+ */
+const UNPUBLISHED_ANCESTOR_MAX_DEPTH = 50;
 
 /** What publishing an internal event did. */
 export interface PublishInternalResult {
@@ -870,6 +876,22 @@ export function eventSourceService(
       .then((rows) => rows[0] ?? null);
   }
 
+  /** Whether the task `parentId`, or a task above it, is a routine run or a routine step. */
+  async function hasRoutineAncestor(companyId: string, parentId: string): Promise<boolean> {
+    const rows = await db.execute(sql`
+      with recursive ancestors(id, parent_id, origin_kind, depth) as (
+        select id, parent_id, origin_kind, 1 from issues where id = ${parentId} and company_id = ${companyId}
+        union all
+        select i.id, i.parent_id, i.origin_kind, a.depth + 1
+        from issues i
+        join ancestors a on i.id = a.parent_id
+        where i.company_id = ${companyId} and a.depth < ${UNPUBLISHED_ANCESTOR_MAX_DEPTH}
+      )
+      select 1 from ancestors where origin_kind in ${UNPUBLISHED_ANCESTOR_ORIGIN_KINDS} limit 1
+    `);
+    return rows.length > 0;
+  }
+
   /** The `issue.created` event of a task, or null when the task never publishes. */
   async function buildIssueCreatedEvent(companyId: string, issueId: string): Promise<NormalizedEvent | null> {
     const issue = await db
@@ -888,14 +910,7 @@ export function eventSourceService(
       .then((rows) => rows[0] ?? null);
     if (!issue || issue.hiddenAt || issue.conversationAgentId) return null;
     if (issue.originKind && UNPUBLISHED_ISSUE_ORIGIN_KINDS.includes(issue.originKind)) return null;
-    if (issue.parentId) {
-      const parent = await db
-        .select({ originKind: issues.originKind })
-        .from(issues)
-        .where(and(eq(issues.id, issue.parentId), eq(issues.companyId, companyId)))
-        .then((rows) => rows[0] ?? null);
-      if (parent?.originKind && UNPUBLISHED_PARENT_ORIGIN_KINDS.includes(parent.originKind)) return null;
-    }
+    if (issue.parentId && (await hasRoutineAncestor(companyId, issue.parentId))) return null;
 
     const names = await db
       .select({ name: issueLabelRows.name })
