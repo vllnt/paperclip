@@ -105,6 +105,7 @@ const mockRoutineService = vi.hoisted(() => ({
   update: vi.fn(),
   create: vi.fn(),
   listRevisions: vi.fn(),
+  getRevision: vi.fn(),
   restoreRevision: vi.fn(),
   listRuns: vi.fn(),
   createTrigger: vi.fn(),
@@ -127,6 +128,14 @@ const mockAnnotationService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
+}));
+
+const mockAgentService = vi.hoisted(() => ({
+  getById: vi.fn(),
+}));
+
+const mockProjectService = vi.hoisted(() => ({
+  getById: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -159,8 +168,10 @@ function registerModuleMocks() {
 
   vi.doMock("../services/index.js", () => ({
     accessService: () => mockAccessService,
+    agentService: () => mockAgentService,
     documentAnnotationService: () => mockAnnotationService,
     logActivity: mockLogActivity,
+    projectService: () => mockProjectService,
     routineService: () => mockRoutineService,
   }));
 }
@@ -214,6 +225,7 @@ describe("routine routes", () => {
     mockRoutineService.getTrigger.mockResolvedValue(trigger);
     mockRoutineService.update.mockResolvedValue({ ...routine, assigneeAgentId: otherAgentId });
     mockRoutineService.listRevisions.mockResolvedValue([revision]);
+    mockRoutineService.getRevision.mockResolvedValue(revision);
     mockRoutineService.restoreRevision.mockResolvedValue({
       routine,
       revision: { ...revision, revisionNumber: 2, restoredFromRevisionId: revision.id },
@@ -227,6 +239,8 @@ describe("routine routes", () => {
       status: "issue_created",
     });
     mockAccessService.canUser.mockResolvedValue(false);
+    mockAgentService.getById.mockResolvedValue({ id: agentId, companyId, permissions: null });
+    mockProjectService.getById.mockResolvedValue(null);
     mockLogActivity.mockResolvedValue(undefined);
     mockRoutineService.getDescriptionDocument.mockResolvedValue({
       id: "99999999-9999-4999-8999-999999999999",
@@ -682,5 +696,119 @@ describe("routine routes", () => {
       runId: null,
     });
     expect(mockTrackRoutineCreated).toHaveBeenCalledWith(expect.anything());
+  });
+
+  describe("routine steps", () => {
+    const steps = [
+      { key: "first", title: "First", after: [] },
+      { key: "second", title: "Second", after: ["first"], assigneeAgentId: otherAgentId },
+    ];
+
+    it("requires tasks:assign permission to change the steps of a routine", async () => {
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+
+      const res = await request(app).patch(`/api/routines/${routineId}`).send({ steps });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("tasks:assign");
+      expect(mockRoutineService.update).not.toHaveBeenCalled();
+    });
+
+    it("passes steps through when the board user has tasks:assign", async () => {
+      mockAccessService.canUser.mockResolvedValue(true);
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+
+      const res = await request(app).patch(`/api/routines/${routineId}`).send({ steps });
+
+      expect(res.status).toBe(200);
+      expect(mockRoutineService.update).toHaveBeenCalledWith(
+        routineId,
+        expect.objectContaining({ steps: expect.arrayContaining([expect.objectContaining({ key: "second" })]) }),
+        expect.anything(),
+      );
+    });
+
+    it("does not let an agent hand steps to another agent", async () => {
+      const app = await createApp({ type: "agent", agentId, companyId });
+
+      const patched = await request(app).patch(`/api/routines/${routineId}`).send({ steps });
+      const created = await request(app)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({ projectId, title: "Daily routine", assigneeAgentId: agentId, steps });
+
+      expect(patched.status).toBe(403);
+      expect(patched.body.error).toContain("assign routine steps to themselves");
+      expect(created.status).toBe(403);
+      expect(mockRoutineService.update).not.toHaveBeenCalled();
+      expect(mockRoutineService.create).not.toHaveBeenCalled();
+    });
+
+    it("lets an agent write steps for itself", async () => {
+      const app = await createApp({ type: "agent", agentId, companyId });
+      const ownSteps = [
+        { key: "first", title: "First", after: [] },
+        { key: "second", title: "Second", after: ["first"], assigneeAgentId: agentId },
+      ];
+
+      const res = await request(app).patch(`/api/routines/${routineId}`).send({ steps: ownSteps });
+
+      expect(res.status).toBe(200);
+      expect(mockRoutineService.update).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects an invalid step list at the boundary", async () => {
+      mockAccessService.canUser.mockResolvedValue(true);
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+
+      const res = await request(app)
+        .patch(`/api/routines/${routineId}`)
+        .send({ steps: [{ key: "loop", title: "Loop", after: ["loop"] }] });
+
+      expect(res.status).toBe(400);
+      expect(mockRoutineService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a step condition (when) on create and update", async () => {
+      mockAccessService.canUser.mockResolvedValue(true);
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+      const conditional = [
+        { key: "first", title: "First", after: [] },
+        { key: "second", title: "Second", after: [{ step: "first", when: "done" }] },
+      ];
+
+      const patched = await request(app).patch(`/api/routines/${routineId}`).send({ steps: conditional });
+      const created = await request(app)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({ projectId, title: "Daily routine", assigneeAgentId: agentId, steps: conditional });
+
+      expect(patched.status).toBe(400);
+      expect(created.status).toBe(400);
+      expect(mockRoutineService.update).not.toHaveBeenCalled();
+      expect(mockRoutineService.create).not.toHaveBeenCalled();
+    });
   });
 });

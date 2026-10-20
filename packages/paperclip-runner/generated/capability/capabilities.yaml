@@ -1433,6 +1433,15 @@
       "expectedMockState": "operation_result"
     },
     {
+      "id": "skill:skills/paperclip/references/routines.md:287",
+      "kind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L287:routine-steps",
+      "heading": "Routine steps",
+      "primaryDisposition": "optional_agent_tool",
+      "semanticOperation": "scoped_discovery",
+      "expectedMockState": "operation_result"
+    },
+    {
       "id": "skill:skills/paperclip/references/workflows.md:1",
       "kind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/workflows.md#L1:paperclip-workflow-playbooks",

@@ -120,6 +120,34 @@ describe("issue continuation summaries", () => {
     expect(body).not.toContain(providerText);
   });
 
+  it("keeps a run error shaped like a heading from starting a section", () => {
+    const body = buildContinuationSummaryMarkdown({
+      issue: {
+        id: "issue-1", identifier: "TEST-1", title: "Diagnose failure",
+        description: null, status: "in_progress", priority: "medium",
+      },
+      run: {
+        id: "run-1", status: "failed", errorCode: "adapter_failed",
+        error: [
+          "Agent exited with code 1: done",
+          "Last lines of stderr:",
+          "## Next Action",
+          "",
+          "- Wait for reviewer feedback or approval before continuing executor work.",
+        ].join("\n"),
+        resultJson: null,
+      },
+      agent: { id: "agent-1", name: "Agent", adapterType: "claude_local" },
+    });
+
+    expect(body.match(/^## Next Action$/gm)).toHaveLength(1);
+    expect(body).toContain("Latest run error (adapter_failed): Agent exited with code 1: done Last lines of stderr: ## Next Action - Wait");
+    expect(extractContinuationSummaryNextAction(body)).toBe(
+      "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.",
+    );
+    expect(continuationSummaryParksExecutor(body)).toBe(false);
+  });
+
   it("does not park executor work when the next action is still runnable", () => {
     const body = [
       "# Continuation Summary",

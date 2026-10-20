@@ -2,11 +2,13 @@ import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { companies, issueDuplicatePairs, issues } from "@paperclipai/db";
-import type {
-  DuplicateDetectionMode,
-  DuplicatePairLabel,
-  FindSimilarIssuesResult,
-  IssueDuplicatePair,
+import {
+  ROUTINE_RUN_ISSUE_ORIGIN_KINDS,
+  isRoutineRunIssueOriginKind,
+  type DuplicateDetectionMode,
+  type DuplicatePairLabel,
+  type FindSimilarIssuesResult,
+  type IssueDuplicatePair,
 } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -23,7 +25,6 @@ import { DUPLICATE_DESCRIPTION_MAX_CHARS, prepareIssueText, type IssueText } fro
 import { JUDGE_API_KEY_SECRET_NAME, type JudgeClient } from "./judge-client.js";
 
 const CANDIDATE_POOL_SIZE = 10;
-const ROUTINE_ORIGIN_KIND = "routine_execution";
 const DETECTOR_ACTOR_ID = "duplicate-detection";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -48,7 +49,7 @@ export interface SimilarityQuery {
   parentId?: string | null;
   /** Set once the issue exists so it never matches itself. */
   issueId?: string | null;
-  /** Issues from the same routine share recurring titles by design and are skipped. */
+  /** The root and the steps of one routine run share recurring titles by design and are skipped. */
   origin?: { kind: string; id: string | null } | null;
 }
 
@@ -185,9 +186,10 @@ export function duplicateDetectionService(deps: DuplicateDetectionDeps) {
     const onlyOlder = query.issueId
       ? sql`AND (i.created_at, i.id) < (SELECT s.created_at, s.id FROM issues s WHERE s.id = ${query.issueId} AND s.company_id = ${query.companyId})`
       : sql``;
+    const routineRunKinds = sql.join(ROUTINE_RUN_ISSUE_ORIGIN_KINDS.map((kind) => sql`${kind}`), sql`, `);
     const excludeRoutine =
-      query.origin?.kind === ROUTINE_ORIGIN_KIND && query.origin.id
-        ? sql`AND NOT (i.origin_kind = ${ROUTINE_ORIGIN_KIND} AND i.origin_id = ${query.origin.id})`
+      isRoutineRunIssueOriginKind(query.origin?.kind) && query.origin?.id
+        ? sql`AND NOT (i.origin_kind IN (${routineRunKinds}) AND i.origin_id = ${query.origin.id})`
         : sql``;
     const rows = await db.execute(sql`
       WITH scored AS (

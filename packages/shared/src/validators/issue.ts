@@ -875,6 +875,10 @@ export const upsertIssueWatchdogSchema = z
 
 export type UpsertIssueWatchdog = z.infer<typeof upsertIssueWatchdogSchema>;
 
+const childAcceptanceCriteriaSchema = z
+  .array(z.string().trim().min(1).max(500))
+  .max(20);
+
 export const createChildIssueSchema = withCreateIssueStatusDefault(
   createIssueBaseSchema
     .omit({
@@ -884,13 +888,27 @@ export const createChildIssueSchema = withCreateIssueStatusDefault(
     })
     .extend({
       title: z.string().optional(),
-      acceptanceCriteria: z
-        .array(z.string().trim().min(1).max(500))
-        .max(20)
-        .optional(),
+      acceptanceCriteria: childAcceptanceCriteriaSchema.optional(),
       blockParentUntilDone: z.boolean().optional().default(false),
     }),
 ).superRefine(requireBlockedStatusForUnblockDescriptor).superRefine(requireTitleOrDescription);
+
+/**
+ * The child-issue fields a routine step may set. They are the same validators as
+ * {@link createChildIssueSchema}; a step has no status, parent or blockers of its own.
+ */
+export const routineStepIssueFieldsSchema = createIssueBaseSchema
+  .pick({
+    title: true,
+    description: true,
+    assigneeAgentId: true,
+    labelIds: true,
+    executionPolicy: true,
+  })
+  .extend({
+    priority: z.enum(ISSUE_PRIORITIES).optional(),
+    acceptanceCriteria: childAcceptanceCriteriaSchema.optional(),
+  });
 
 export type CreateChildIssue = z.infer<typeof createChildIssueSchema>;
 

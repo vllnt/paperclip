@@ -87,7 +87,14 @@ export interface AdapterExecutionResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
+  /** The short error message. Failure classifiers read this text. */
   errorMessage?: string | null;
+  /**
+   * A fuller failure text for people, for example from `describeProcessExit`. A failed or timed-out
+   * run stores it as its error message in place of `errorMessage`. Classifiers keep reading
+   * `errorMessage`, so a detail never changes how a failure is classified.
+   */
+  errorDetail?: string | null;
   errorCode?: string | null;
   errorFamily?: AdapterExecutionErrorFamily | null;
   retryNotBefore?: string | null;

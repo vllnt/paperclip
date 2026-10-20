@@ -345,6 +345,7 @@ import { Badge } from "@/components/ui/badge";
 import {
   deriveOriginatingActor,
   isClosedIsolatedExecutionWorkspace,
+  isRoutineRunIssueOriginKind,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
   type AskUserQuestionsAnswer,
@@ -369,6 +370,11 @@ import {
   type WorkspaceFileRef,
   workspaceFileRefSchema,
 } from "@paperclipai/shared";
+
+function routineRunBadgeTitle(originKind: string | null | undefined, routineId: string): string {
+  const what = originKind === "routine_step" ? "Routine step" : "Routine execution";
+  return `${what} from routine ${routineId}`;
+}
 
 // Stable empty array for React Query `data` defaults. A literal `= []` default
 // creates a new array reference on every render while `data` is undefined
@@ -1001,12 +1007,12 @@ function IssueDetailLoadingState({
                   {identifier}
                 </span>
               ) : null}
-              {headerSeed.originKind === "routine_execution" &&
+              {isRoutineRunIssueOriginKind(headerSeed.originKind) &&
               headerSeed.originId ? (
                 <Badge
                   variant="outline"
                   className="border-violet-500/30 bg-violet-500/10 text-(length:--text-nano) text-violet-600 dark:text-violet-400"
-                  title={`Routine execution from routine ${headerSeed.originId}`}
+                  title={routineRunBadgeTitle(headerSeed.originKind, headerSeed.originId)}
                 >
                   <Repeat className="h-3 w-3" />
                   Routine
@@ -7130,11 +7136,11 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           </Badge>
         )}
 
-        {issue.originKind === "routine_execution" && issue.originId && (
+        {isRoutineRunIssueOriginKind(issue.originKind) && issue.originId && (
           <Link
             to={`/routines/${issue.originId}`}
             className="inline-flex items-center gap-1 rounded-full bg-violet-500/10 border border-violet-500/30 px-2 py-0.5 text-(length:--text-nano) font-medium text-violet-600 dark:text-violet-400 shrink-0 hover:bg-violet-500/20 transition-colors"
-            title={`Routine execution from routine ${issue.originId}`}
+            title={routineRunBadgeTitle(issue.originKind, issue.originId)}
           >
             <Repeat className="h-3 w-3" />
             Routine
