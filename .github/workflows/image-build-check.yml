@@ -20,17 +20,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Free disposable hosted runner disk in the background
-        # The delete takes about 95 s. Run it detached, so the checkout, the
-        # builder setup and the start of the build overlap it. The report step
-        # at the end prints when it finished and the lowest free space seen.
-        run: |
-          df -h /
-          setsid sh -c 'while sleep 5; do df --output=avail -k / | tail -n 1; done' > "$RUNNER_TEMP/avail.log" 2>&1 < /dev/null &
-          setsid sh -c 'sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/share/swift /opt/ghc; date -u +"deleted at %T"; df -h /' > "$RUNNER_TEMP/free-disk.log" 2>&1 < /dev/null &
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      # No step deletes preinstalled tools to free disk space. That took about 95 s,
+      # and the runner has far more free space than the build needs. The two df
+      # steps show the headroom in every log. If the build ever fails with "no space
+      # left on device", read them first.
+      - name: Show free disk space before the build
+        run: df -h /
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
         with:
           # moby/buildkit:buildx-stable-1 from a mirror, never anonymous Docker Hub (see Dockerfile header).
@@ -50,10 +48,6 @@ jobs:
             INSTALL_LOCAL_CLIS=false
           # Read the production cache only; pull requests never write to it.
           cache-from: type=gha,scope=paperclip-production,timeout=1m
-      - name: Report disk headroom
+      - name: Show free disk space after the build
         if: always()
-        run: |
-          date -u +%T
-          cat "$RUNNER_TEMP/free-disk.log"
-          df -h /
-          echo "lowest free space while the job ran (KiB): $(sort -n "$RUNNER_TEMP/avail.log" | head -n 1)"
+        run: df -h /
