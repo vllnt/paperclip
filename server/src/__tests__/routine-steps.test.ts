@@ -424,6 +424,77 @@ describeEmbeddedPostgres("routine steps", () => {
         expect(stalled.map((entry) => entry.status).sort()).toEqual(["blocked", "cancelled", "done"]);
       });
 
+      it("fails the run when its root is synced after a step in the middle of a chain was cancelled", async () => {
+        const fx = await seed();
+        const routine = await fx.create([
+          step("a", [], { assigneeAgentId: fx.builderId }),
+          step("b", ["a"], { assigneeAgentId: fx.builderId }),
+          step("c", ["b"], { assigneeAgentId: fx.builderId }),
+        ]);
+        const run = await fx.svc.runRoutine(routine.id, { source: "manual" });
+        await setStatuses(routine.id, { a: "done", b: "cancelled", c: "blocked" });
+
+        await fx.svc.syncRunStatusForIssue(run.linkedIssueId!);
+
+        const [stored] = await db.select().from(routineRuns).where(eq(routineRuns.id, run.id));
+        expect(stored!.status).toBe("failed");
+      });
+
+      describe("with several open roots", () => {
+        async function stallRun(runId: string) {
+          const stepIssues = await db
+            .select()
+            .from(issues)
+            .where(and(eq(issues.originRunId, runId), eq(issues.originKind, "routine_step")));
+          for (const [title, status] of [["Step a", "done"], ["Step b", "cancelled"]] as const) {
+            await db.update(issues).set({ status }).where(eq(issues.id, stepIssues.find((entry) => entry.title === title)!.id));
+          }
+        }
+
+        async function touch(issueId: string, offsetMs: number) {
+          await db.update(issues).set({ updatedAt: new Date(Date.now() + offsetMs) }).where(eq(issues.id, issueId));
+        }
+
+        it("shows the live root in the routine list when a stalled root was updated more recently", async () => {
+          const fx = await seed({ concurrencyPolicy: "always_enqueue" });
+          const routine = await fx.create([
+            step("a", [], { assigneeAgentId: fx.builderId }),
+            step("b", ["a"], { assigneeAgentId: fx.builderId }),
+          ]);
+          const stalled = await fx.svc.runRoutine(routine.id, { source: "manual" });
+          const live = await fx.svc.runRoutine(routine.id, { source: "manual" });
+          await stallRun(stalled.id);
+          await touch(stalled.linkedIssueId!, 60_000);
+
+          const item = (await fx.svc.list(fx.companyId)).find((entry) => entry.id === routine.id);
+
+          expect(item?.activeIssue?.id).toBe(live.linkedIssueId);
+        });
+
+        it("finds the live root behind more stalled roots than are read", async () => {
+          const fx = await seed();
+          const routine = await fx.create([
+            step("a", [], { assigneeAgentId: fx.builderId }),
+            step("b", ["a"], { assigneeAgentId: fx.builderId }),
+          ]);
+          const stalledRoots: string[] = [];
+          for (let index = 0; index < 27; index += 1) {
+            const run = await fx.svc.runRoutine(routine.id, { source: "manual" });
+            expect(run.status).toBe("issue_created");
+            await stallRun(run.id);
+            stalledRoots.push(run.linkedIssueId!);
+          }
+          const live = await fx.svc.runRoutine(routine.id, { source: "manual" });
+          expect(live.status).toBe("issue_created");
+          for (const rootId of stalledRoots) await touch(rootId, 60_000);
+
+          const again = await fx.svc.runRoutine(routine.id, { source: "manual" });
+
+          expect(again.status).toBe("coalesced");
+          expect(again.linkedIssueId).toBe(live.linkedIssueId);
+        }, 60_000);
+      });
+
       it("keeps the routine live while one branch of a fork still runs", async () => {
         const fx = await seed();
         const routine = await fx.create([

@@ -10,6 +10,7 @@ import {
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
 import { verifyBearerAuthorization, verifyGithubHmacSignature, verifyHmacSha256Signature } from "./webhook-auth.js";
 import { and, asc, desc, eq, exists, gt, ilike, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { alias, QueryBuilder } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -144,6 +145,26 @@ import type { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 /** Newest open roots of a routine with steps that are checked for a run that can still move. */
 const OPEN_STEP_ROOTS_CHECKED = 25;
+
+/**
+ * Whether the root in the query has a cancelled step. A run can stall only then (a cancelled step never
+ * unblocks its dependents), so a root without one is live without reading its steps.
+ */
+function rootHasCancelledStep() {
+  const cancelledStep = alias(issues, "cancelled_step");
+  return exists(
+    new QueryBuilder()
+      .select({ one: sql`1` })
+      .from(cancelledStep)
+      .where(
+        and(
+          eq(cancelledStep.parentId, issues.id),
+          eq(cancelledStep.originKind, "routine_step"),
+          eq(cancelledStep.status, "cancelled"),
+        ),
+      ),
+  );
+}
 const APPEND_MODE_STEPS_MESSAGE = "Steps are not supported with append issue mode";
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
@@ -1381,34 +1402,60 @@ export function routineService(
 
     const stillMissingRoutineIds = routineIds.filter((routineId) => !rowsByOriginId.has(routineId));
     if (stillMissingRoutineIds.length > 0) {
-      const newestStepRootRows = await db
-        .selectDistinctOn([issues.originId], {
-          originId: issues.originId,
-          originRunId: issues.originRunId,
-          id: issues.id,
-          identifier: issues.identifier,
-          title: issues.title,
-          status: issues.status,
-          priority: issues.priority,
-          updatedAt: issues.updatedAt,
-        })
+      const stepRootColumns = {
+        originId: issues.originId,
+        originRunId: issues.originRunId,
+        id: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        priority: issues.priority,
+        updatedAt: issues.updatedAt,
+      };
+      const openStepRoots = (ids: string[]) =>
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "routine_execution"),
+          inArray(issues.originId, ids),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          sql`jsonb_array_length(${routines.steps}) > 0`,
+          visibleIssueCondition(),
+        );
+      // A run is stalled only when one of its steps is cancelled, so the newest root without a cancelled
+      // step is live whatever sits above it: no step is read for it.
+      const unaffectedRoots = await db
+        .selectDistinctOn([issues.originId], stepRootColumns)
         .from(issues)
         .innerJoin(routines, sql`${routines.id}::text = ${issues.originId}`)
-        .where(
-          and(
-            eq(issues.companyId, companyId),
-            eq(issues.originKind, "routine_execution"),
-            inArray(issues.originId, stillMissingRoutineIds),
-            inArray(issues.status, OPEN_ISSUE_STATUSES),
-            sql`jsonb_array_length(${routines.steps}) > 0`,
-            visibleIssueCondition(),
-          ),
-        )
+        .where(and(openStepRoots(stillMissingRoutineIds), not(rootHasCancelledStep())))
         .orderBy(issues.originId, desc(issues.updatedAt), desc(issues.createdAt));
-      const stepRootRows = await withoutStalledStepRuns(db, companyId, newestStepRootRows);
-      for (const row of stepRootRows) {
+      for (const row of unaffectedRoots) {
         if (!row.originId) continue;
         rowsByOriginId.set(row.originId, row);
+      }
+
+      const withoutLiveRoot = stillMissingRoutineIds.filter((routineId) => !rowsByOriginId.has(routineId));
+      if (withoutLiveRoot.length > 0) {
+        const cancelledStepRoots = db
+          .select({
+            ...stepRootColumns,
+            rank: sql<number>`row_number() over (partition by ${issues.originId} order by ${issues.updatedAt} desc, ${issues.createdAt} desc)`.as(
+              "rank",
+            ),
+          })
+          .from(issues)
+          .innerJoin(routines, sql`${routines.id}::text = ${issues.originId}`)
+          .where(and(openStepRoots(withoutLiveRoot), rootHasCancelledStep()))
+          .as("cancelled_step_roots");
+        const candidates = await db
+          .select()
+          .from(cancelledStepRoots)
+          .where(lte(cancelledStepRoots.rank, OPEN_STEP_ROOTS_CHECKED))
+          .orderBy(cancelledStepRoots.originId, desc(cancelledStepRoots.updatedAt));
+        for (const row of await withoutStalledStepRuns(db, companyId, candidates)) {
+          if (!row.originId || rowsByOriginId.has(row.originId)) continue;
+          rowsByOriginId.set(row.originId, row);
+        }
       }
     }
 
@@ -1826,22 +1873,30 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
     if (heartbeatBoundIssue || !routine.steps?.length) return heartbeatBoundIssue;
 
-    const openRoots = await executor
+    const openRoot = and(
+      eq(issues.companyId, routine.companyId),
+      eq(issues.originKind, originKind),
+      eq(issues.originId, originId),
+      inArray(issues.status, OPEN_ISSUE_STATUSES),
+      visibleIssueCondition(),
+      ...(fingerprintCondition ? [fingerprintCondition] : []),
+    );
+    const unaffectedRoot = await executor
       .select()
       .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, routine.companyId),
-          eq(issues.originKind, originKind),
-          eq(issues.originId, originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          visibleIssueCondition(),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
-        ),
-      )
+      .where(and(openRoot, not(rootHasCancelledStep())))
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (unaffectedRoot) return unaffectedRoot;
+
+    const cancelledStepRoots = await executor
+      .select()
+      .from(issues)
+      .where(and(openRoot, rootHasCancelledStep()))
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(OPEN_STEP_ROOTS_CHECKED);
-    const [live] = await withoutStalledStepRuns(executor, routine.companyId, openRoots);
+    const [live] = await withoutStalledStepRuns(executor, routine.companyId, cancelledStepRoots);
     return live ?? null;
   }
 
@@ -4484,9 +4539,14 @@ export function routineService(
         });
       }
       if (issue.status === "blocked" && readRoutineStepsRunPayload(run.triggerPayload) !== null) {
-        if (await hasOpenRoutineSteps(db, issue.companyId, issue.id)) return null;
-        const readiness = await issueSvc.getDependencyReadiness(issue.id);
-        if (readiness.allBlockersDone) return null;
+        if (await hasOpenRoutineSteps(db, issue.companyId, issue.id)) {
+          // Steps still open: the run is working, unless every one of them waits for a cancelled step.
+          const [stillMoving] = await withoutStalledStepRuns(db, issue.companyId, [{ originRunId: issue.originRunId }]);
+          if (stillMoving) return null;
+        } else {
+          const readiness = await issueSvc.getDependencyReadiness(issue.id);
+          if (readiness.allBlockersDone) return null;
+        }
       }
       if (issue.status === "blocked" || issue.status === "cancelled") {
         const failureReason = executionIssueTransientFailureReason(issue.status);
