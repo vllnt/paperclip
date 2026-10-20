@@ -176,6 +176,16 @@ export function goalService(db: Db) {
       return updated ?? refuseFocusGoalOrNotFound(id);
     },
 
+    /**
+     * Refuses up front when the writer may not change this goal, for callers with side effects outside
+     * the goal write. The write itself still enforces the rule.
+     */
+    assertWritable: async (id: string, writer: GoalWriter) => {
+      if (writer === "board") return;
+      const [writable] = await db.select({ id: goals.id }).from(goals).where(and(eq(goals.id, id), writableBy(writer)));
+      if (!writable) await refuseFocusGoalOrNotFound(id);
+    },
+
     remove: async (id: string, writer: GoalWriter) => {
       const [removed] = await db.delete(goals).where(and(eq(goals.id, id), writableBy(writer))).returning();
       return removed ?? refuseFocusGoalOrNotFound(id);

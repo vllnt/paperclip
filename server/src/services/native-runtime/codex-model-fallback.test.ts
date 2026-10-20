@@ -8,17 +8,18 @@ import {
 } from "./codex-model-fallback.js";
 
 describe("bounded Codex model fallback", () => {
+  // The fork's Codex default is gpt-6.1-sol (pinned by codex-local company-model-catalog.test.ts), so it is the appended default.
   it("keeps capability classes separate and appends the stable default once", () => {
     expect(codexModelFallbackCandidates("gpt-6.1-sol")).toEqual(["gpt-6-sol", "gpt-5.6-sol"]);
-    expect(codexModelFallbackCandidates("gpt-6-luna")).toEqual(["gpt-5.6-luna", "gpt-5.6-sol"]);
-    expect(codexModelFallbackCandidates("gpt-6-astra")).toEqual(["gpt-5.6-sol"]);
-    expect(codexModelFallbackCandidates("gpt-5.6-sol")).toEqual([]);
+    expect(codexModelFallbackCandidates("gpt-6-luna")).toEqual(["gpt-5.6-luna", "gpt-6.1-sol"]);
+    expect(codexModelFallbackCandidates("gpt-6-astra")).toEqual(["gpt-6.1-sol"]);
+    expect(codexModelFallbackCandidates("gpt-5.6-sol")).toEqual(["gpt-6.1-sol"]);
   });
 
   it("uses the default after same-class candidates are unavailable, then stops", () => {
-    const compatible = vi.fn((model: string) => model === "gpt-5.6-sol");
-    expect(selectCodexModelFallback("gpt-6-luna", compatible)).toBe("gpt-5.6-sol");
-    expect(compatible.mock.calls).toEqual([["gpt-5.6-luna"], ["gpt-5.6-sol"]]);
+    const compatible = vi.fn((model: string) => model === "gpt-6.1-sol");
+    expect(selectCodexModelFallback("gpt-6-luna", compatible)).toBe("gpt-6.1-sol");
+    expect(compatible.mock.calls).toEqual([["gpt-5.6-luna"], ["gpt-6.1-sol"]]);
     const unavailable = vi.fn(() => false);
     expect(selectCodexModelFallback("gpt-6.1-sol", unavailable)).toBeNull();
     expect(unavailable.mock.calls).toEqual([["gpt-6-sol"], ["gpt-5.6-sol"]]);

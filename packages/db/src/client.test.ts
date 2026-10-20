@@ -266,6 +266,14 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
     };
   }
 
+  // The fork's later migrations add defaulted columns to these tables, so compare every column the row had before, exactly.
+  function retainedColumns(after: Record<string, Record<string, unknown> | null>, before: Record<string, Record<string, unknown> | null>) {
+    return Object.fromEntries(Object.entries(after).map(([name, row]) => {
+      const shape = before[name];
+      return [name, row && shape ? Object.fromEntries(Object.keys(shape).map(column => [column, row[column]])) : row];
+    }));
+  }
+
   it.each(["fresh", "master0346", "muse0348"] as const)("migrates %s through the normal loader without rewriting historical receipts", async baseline => {
     const referenceUrl = await createTempDatabase();
     const adminUrl = new URL(referenceUrl), databaseName = `merged_muse_${baseline.toLowerCase()}`;
@@ -319,7 +327,7 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
         const currentHash = await migrationHash(entry.file);
         expect(afterHistory.filter(row => row.hash === currentHash)).toHaveLength(1);
       }
-      if (retainedRows) expect(await retainedRows()).toEqual(beforeRows);
+      if (retainedRows && beforeRows) expect(retainedColumns(await retainedRows(), beforeRows)).toEqual(beforeRows);
       const indexes = await sql`
         SELECT c.relname, i.indisvalid, i.indisready, pg_get_indexdef(c.oid) AS definition
         FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -336,7 +344,7 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
       expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
       expect(await historyRows(sql)).toEqual(afterHistory);
       expect(await schemaShape(sql)).toEqual(finalShape);
-      if (retainedRows) expect(await retainedRows()).toEqual(beforeRows);
+      if (retainedRows && beforeRows) expect(retainedColumns(await retainedRows(), beforeRows)).toEqual(beforeRows);
     } finally {
       await Promise.all([sql.end(), reference.end()]);
     }

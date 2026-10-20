@@ -1474,7 +1474,8 @@ describe("CompanyImport", () => {
     });
     await settle();
     expect(container.textContent).toContain("Allow externally billed provider");
-    expect(container.textContent).not.toContain("Harness");
+    // The fork titles the adapter section "Harness and provider"; what must stay hidden is the Harness field itself.
+    expect(container.textContent?.replaceAll("Harness and provider", "")).not.toContain("Harness");
     await clickButton((text) => text.startsWith("Import 3 file"));
     await settle();
     expect(mockCompaniesApi.importBundleAsync).not.toHaveBeenCalled();
