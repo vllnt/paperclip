@@ -1487,8 +1487,8 @@ Terminal states: `done`, `cancelled`
 | ------ | ---- | ----------- |
 | GET    | `/api/companies/:companyId/routines` | List routines in company; optional filters `q`, `assigneeAgentId`, `projectId`, `folderId` (`none`), `status`, `trigger` (`schedule`, `webhook`, `api`, `event`, `manual`) |
 | GET    | `/api/routines/:routineId` | Routine details including triggers |
-| POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only) |
-| PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign) |
+| POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only; optional `steps`, sub-tasks each run creates, see `references/routines.md` Routine steps; CLI `routine create --steps-file <path>`) |
+| PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign; `steps` replaces the list, CLI `routine update <id> --steps-file <path>`; `GET` returns `steps`) |
 | POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`) |
 | PATCH  | `/api/routine-triggers/:triggerId` | Update trigger (e.g. disable, change cron) |
 | DELETE | `/api/routine-triggers/:triggerId` | Delete trigger |

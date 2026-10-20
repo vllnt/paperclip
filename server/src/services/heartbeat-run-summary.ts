@@ -7,9 +7,41 @@ export const HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS = 500;
 export const HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS = 4_096;
 export const HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES = 64 * 1024;
 
-/** Operator diagnostics are untrusted provider data, not model handoff prose. */
+/** The most characters of a run error that a model prompt shows. */
+export const HEARTBEAT_RUN_ERROR_FOR_MODEL_MAX_CHARS = 500;
+
+/**
+ * The run error text that failure classifiers read. When an adapter reported a fuller error detail,
+ * the run stores that detail as its error and keeps the adapter's short error message in
+ * `resultJson.errorSummary`; otherwise the stored error is the short message.
+ *
+ * @param run - The run's stored error and result JSON.
+ * @returns The short error message, or null when the run has none.
+ * @example
+ * readRunErrorSummary({ error: "Agent run failed: 429\nLast lines of stderr:\n…", resultJson: { errorSummary: "Agent run failed: 429" } });
+ * // "Agent run failed: 429"
+ */
+export function readRunErrorSummary(run: { error: string | null; resultJson?: unknown }): string | null {
+  const resultJson = run.resultJson;
+  const summary = typeof resultJson === "object" && resultJson !== null && "errorSummary" in resultJson
+    ? resultJson.errorSummary
+    : null;
+  return typeof summary === "string" && summary.length > 0 ? summary : run.error;
+}
+
+/**
+ * Operator diagnostics are untrusted provider data, not model handoff prose. The error goes into
+ * the prompt as one capped line, so a stderr line shaped like a Markdown heading cannot start a
+ * section of the prompt.
+ */
 export function summarizeRunErrorForModel(error: string | null, terminalFailureCategory?: unknown): string | null {
-  if (terminalFailureCategory == null) return error;
+  if (terminalFailureCategory == null) {
+    const line = error?.replace(/\s+/g, " ").trim();
+    if (!line) return null;
+    if (line.length <= HEARTBEAT_RUN_ERROR_FOR_MODEL_MAX_CHARS) return line;
+    // Never end on half of a surrogate pair.
+    return `${line.slice(0, HEARTBEAT_RUN_ERROR_FOR_MODEL_MAX_CHARS - 1).replace(/[\ud800-\udbff]$/, "")}…`;
+  }
   const category = typeof terminalFailureCategory === "string"
     && ["connection", "access", "limit", "service", "request", "unknown"].includes(terminalFailureCategory)
     ? terminalFailureCategory

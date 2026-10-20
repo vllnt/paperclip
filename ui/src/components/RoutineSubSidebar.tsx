@@ -7,6 +7,7 @@ import {
   History as HistoryIcon,
   KeyRound,
   LayoutGrid,
+  ListOrdered,
   Play,
   Send,
   SlidersHorizontal,
@@ -46,6 +47,7 @@ const NAV_GROUPS: NavGroup[] = [
     label: "Routine",
     items: [
       { key: "overview", label: "Overview", icon: Circle },
+      { key: "steps", label: "Steps", icon: ListOrdered },
       { key: "triggers", label: "Triggers", icon: Clock3 },
       { key: "variables", label: "Variables", icon: LayoutGrid },
       { key: "secrets", label: "Secrets", icon: KeyRound },

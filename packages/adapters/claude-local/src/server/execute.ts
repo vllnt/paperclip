@@ -55,6 +55,7 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
 } from "@paperclipai/adapter-utils/server-utils";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
+import { describeProcessExit } from "@paperclipai/adapter-utils/process-exit-cause";
 import {
   parseLocalProcessFilesystemScope,
   parseLocalProcessSandboxExtraPaths,
@@ -1037,6 +1038,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: proc.signal,
         timedOut: true,
         errorMessage: `Timed out after ${timeoutSec}s`,
+        errorDetail: describeProcessExit("Claude", proc, { timeoutSec }),
         errorCode: "timeout",
         errorMeta,
         clearSession: Boolean(opts.clearSessionOnMissingSession),
@@ -1088,6 +1090,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: proc.signal,
         timedOut: false,
         errorMessage: fallbackErrorMessage,
+        // Output that does not parse is a failure whatever the exit code, so the detail always
+        // carries the stderr tail. A clean exit has no exit line of its own to name the cause, so
+        // the parse failure leads. A signal kill has no exit code; the exit line names the signal.
+        errorDetail: describeProcessExit("Claude", proc, {
+          resultError: (proc.exitCode ?? 0) === 0 && !proc.signal ? fallbackErrorMessage : null,
+        }),
         errorCode,
         errorFamily,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
@@ -1173,8 +1181,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
       } as Record<string, unknown>)
       : null;
+    const parsedFailure = failed ? describeClaudeFailure(parsed) : null;
     const errorMessage = failed
-      ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
+      ? parsedFailure ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : stoppedLingeringBackgroundTask
       ? "Claude finished its turn successfully, but a background task it started was still running, " +
         `so Paperclip stopped the process (${proc.signal ?? `exit code ${proc.exitCode ?? -1}`}).`
@@ -1258,6 +1267,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       signal: proc.signal,
       timedOut: false,
       errorMessage,
+      // The server marks a run failed when the exit code is not zero or a signal ended the process,
+      // even when the result event reported success, so the detail covers those exits too.
+      errorDetail: failed || (proc.exitCode ?? 0) !== 0 || proc.signal
+        ? describeProcessExit("Claude", proc, { resultError: parsedFailure })
+        : null,
       errorCode: resolvedErrorCode,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
