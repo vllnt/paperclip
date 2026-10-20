@@ -791,8 +791,19 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    // Steps without their own agent go to the run's assignee, so an override hands them out like a
+    // step write does: an agent may only give them to itself.
+    const assigneeOverride = req.body.assigneeAgentId ?? null;
+    if (
+      req.actor.type === "agent" &&
+      routine.steps.length > 0 &&
+      assigneeOverride !== null &&
+      assigneeOverride !== req.actor.agentId
+    ) {
+      throw forbidden("Agents can only assign routine steps to themselves");
+    }
     const targetIssueId: string | null = req.body.targetIssueId ?? null;
-    if (targetIssueId) await assertCanStartStepsOnTask(req, routine, targetIssueId, req.body.assigneeAgentId ?? null);
+    if (targetIssueId) await assertCanStartStepsOnTask(req, routine, targetIssueId, assigneeOverride);
     const run = await svc.runRoutine(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,

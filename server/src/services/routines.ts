@@ -149,24 +149,38 @@ import type { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 /** Newest open roots of a routine with steps that are checked for a run that can still move. */
 const OPEN_STEP_ROOTS_CHECKED = 25;
 
+/** Whether the root in the query has a step child, in the given status when one is given. */
+function rootHasStepIn(status?: string) {
+  const step = alias(issues, "root_step");
+  return exists(
+    new QueryBuilder()
+      .select({ one: sql`1` })
+      .from(step)
+      .where(
+        and(
+          eq(step.companyId, issues.companyId),
+          eq(step.parentId, issues.id),
+          eq(step.originKind, "routine_step"),
+          status ? eq(step.status, status) : undefined,
+        ),
+      ),
+  );
+}
+
+/**
+ * Whether the root in the query has a step. Only such a root stays live without a heartbeat run: an
+ * open task from before the routine had steps does not.
+ */
+function rootHasStep() {
+  return rootHasStepIn();
+}
+
 /**
  * Whether the root in the query has a cancelled step. A run can stall only then (a cancelled step never
  * unblocks its dependents), so a root without one is live without reading its steps.
  */
 function rootHasCancelledStep() {
-  const cancelledStep = alias(issues, "cancelled_step");
-  return exists(
-    new QueryBuilder()
-      .select({ one: sql`1` })
-      .from(cancelledStep)
-      .where(
-        and(
-          eq(cancelledStep.parentId, issues.id),
-          eq(cancelledStep.originKind, "routine_step"),
-          eq(cancelledStep.status, "cancelled"),
-        ),
-      ),
-  );
+  return rootHasStepIn("cancelled");
 }
 const APPEND_MODE_STEPS_MESSAGE = "Steps are not supported with append issue mode";
 const EVENT_ISSUE_SOURCE_MESSAGE =
@@ -1438,13 +1452,15 @@ export function routineService(
           inArray(issues.status, OPEN_ISSUE_STATUSES),
           sql`jsonb_array_length(${routines.steps}) > 0`,
           visibleIssueCondition(),
+          rootHasStep(),
         );
+      const routineOfRoot = and(eq(routines.companyId, companyId), sql`${routines.id}::text = ${issues.originId}`);
       // A run is stalled only when one of its steps is cancelled, so the newest root without a cancelled
       // step is live whatever sits above it: no step is read for it.
       const unaffectedRoots = await db
         .selectDistinctOn([issues.originId], stepRootColumns)
         .from(issues)
-        .innerJoin(routines, sql`${routines.id}::text = ${issues.originId}`)
+        .innerJoin(routines, routineOfRoot)
         .where(and(openStepRoots(stillMissingRoutineIds), not(rootHasCancelledStep())))
         .orderBy(issues.originId, desc(issues.updatedAt), desc(issues.createdAt));
       for (const row of unaffectedRoots) {
@@ -1462,7 +1478,7 @@ export function routineService(
             ),
           })
           .from(issues)
-          .innerJoin(routines, sql`${routines.id}::text = ${issues.originId}`)
+          .innerJoin(routines, routineOfRoot)
           .where(and(openStepRoots(withoutLiveRoot), rootHasCancelledStep()))
           .as("cancelled_step_roots");
         const candidates = await db
@@ -1897,6 +1913,7 @@ export function routineService(
       eq(issues.originId, originId),
       inArray(issues.status, OPEN_ISSUE_STATUSES),
       visibleIssueCondition(),
+      rootHasStep(),
       ...(fingerprintCondition ? [fingerprintCondition] : []),
     );
     const unaffectedRoot = await executor
@@ -4300,6 +4317,17 @@ export function routineService(
         }
       }
       await assertProject(routine.companyId, input.projectId ?? null);
+      // Steps without their own agent go to the run's assignee, so an override hands them out like a
+      // step write does: an agent may only give them to itself. The check reads the routine row that
+      // the dispatch below uses, so a concurrent edit cannot add steps between the check and the run.
+      if (
+        actor?.agentId &&
+        routine.steps.length > 0 &&
+        input.assigneeAgentId &&
+        input.assigneeAgentId !== actor.agentId
+      ) {
+        throw forbidden("Agents can only assign routine steps to themselves");
+      }
       const assigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
       await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
       if (input.targetIssueId) {

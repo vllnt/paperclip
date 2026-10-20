@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
+import { and, asc, eq, exists, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -26,7 +26,11 @@ import { assertAssignableAgent } from "./agent-assignability.js";
 import { evaluateAgentInvokability } from "./agent-invokability.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { issueExecutionWorkspaceModeForPersistedWorkspace } from "./execution-workspace-policy.js";
-import { isClosedExecutionWorkspaceStatus } from "./execution-workspaces.js";
+import {
+  CLOSED_EXECUTION_WORKSPACE_STATUSES,
+  acquireExecutionWorkspaceLifecycleLock,
+  isClosedExecutionWorkspaceStatus,
+} from "./execution-workspaces.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { MAX_CHILD_ISSUES_CREATED_BY_HELPER, type DbTransaction, type issueService } from "./issues.js";
@@ -71,7 +75,7 @@ function withStepKey(error: unknown, stepKey: string): unknown {
  * agent (its own or the default), and that agent must be assignable work; the
  * agents named in review stages and the labels must belong to the company.
  * @param defaultAssigneeAgentId The agent a step without `assigneeAgentId` runs as.
- * @throws HttpError (422 or 409) whose message starts with the key of the first step that cannot run.
+ * @throws HttpError (404 for an unknown agent, else 422 or 409) whose message starts with the key of the first step that cannot run.
  */
 export async function assertRoutineStepReferences(
   db: Db,
@@ -209,7 +213,7 @@ export interface RoutineRunRoot {
 export interface CreateRoutineRunIssuesInput<TRoot extends RoutineRunRoot> {
   /** The dispatch transaction; the root and the steps are created in one savepoint of it. */
   tx: Db;
-  issueSvc: Pick<IssueService, "createChild">;
+  issueSvc: Pick<IssueService, "createChild" | "addBlockedByIssueIds">;
   /** Creates the root issue, in status `blocked`, on the savepoint it is given. */
   createRoot: (savepoint: DbTransaction) => Promise<TRoot>;
   /** The routine run that owns the steps. */
@@ -290,7 +294,8 @@ export async function createRoutineRunIssues<TRoot extends RoutineRunRoot>(
             labelIds: step.labelIds,
             ...(policy ? { executionPolicy: { ...policy } } : {}),
             blockedByIssueIds: predecessorIds,
-            blockParentUntilDone: true,
+            // The root waits for every step; its blockers are set once after the loop.
+            blockParentUntilDone: false,
             responsibleUserId: root.responsibleUserId,
             trustExplicitResponsibleUserId: true,
             idempotencyKey: `routine-run:${run.id}:${step.key}`,
@@ -330,6 +335,10 @@ export async function createRoutineRunIssues<TRoot extends RoutineRunRoot>(
       );
     }
 
+    // One blocker write for the root, not one per step: each write replaces all of the root's blocker
+    // rows and checks the company's blockers for cycles while the issue-counter lock is held.
+    await issueSvc.addBlockedByIssueIds(root.id, root.companyId, Object.values(stepIssueIds), savepoint);
+
     const recorded: RoutineStepsRunPayload = { steps, stepIssueIds };
     await savepoint
       .update(routineRuns)
@@ -348,7 +357,7 @@ export type RoutineStepTargetIssue = typeof issues.$inferSelect;
 export interface AttachRoutineStepsToIssueInput {
   /** The dispatch transaction; the lock, the guards and the steps are one savepoint of it. */
   tx: Db;
-  issueSvc: Pick<IssueService, "createChild">;
+  issueSvc: Pick<IssueService, "createChild" | "addBlockedByIssueIds">;
   companyId: string;
   /** The existing task the steps go under. */
   issueId: string;
@@ -570,7 +579,10 @@ export async function inheritRoutineStepWorkspace(
         eq(issueRelations.companyId, companyId),
         eq(issueRelations.relatedIssueId, step.id),
         eq(issueRelations.type, "blocks"),
+        eq(issues.companyId, companyId),
         eq(issues.originKind, "routine_step"),
+        // Only a step of the same run: a blocker added by hand from another run must not hand over its checkout.
+        step.originRunId ? eq(issues.originRunId, step.originRunId) : undefined,
         step.projectId ? eq(issues.projectId, step.projectId) : undefined,
       ),
     )
@@ -609,6 +621,8 @@ export async function inheritRoutineStepWorkspace(
       : new Set<string | null>();
     const predecessor = open.find((candidate) => !heldBySiblings.has(candidate.executionWorkspaceId));
     if (!predecessor?.executionWorkspaceId) return false;
+    // An archive holds this lock until it commits, so the open check in the update sees its result.
+    await acquireExecutionWorkspaceLifecycleLock(tx, predecessor.executionWorkspaceId);
 
     const updated = await tx
       .update(issues)
@@ -621,7 +635,26 @@ export async function inheritRoutineStepWorkspace(
         },
         ...(step.projectWorkspaceId ? {} : { projectWorkspaceId: predecessor.projectWorkspaceId }),
       })
-      .where(and(eq(issues.id, step.id), eq(issues.companyId, companyId), isNull(issues.executionWorkspaceId)))
+      .where(
+        and(
+          eq(issues.id, step.id),
+          eq(issues.companyId, companyId),
+          isNull(issues.executionWorkspaceId),
+          // The workspace was read as open before the locks: it must still be open now.
+          exists(
+            tx
+              .select({ one: sql`1` })
+              .from(executionWorkspaces)
+              .where(
+                and(
+                  eq(executionWorkspaces.id, predecessor.executionWorkspaceId),
+                  isNull(executionWorkspaces.closedAt),
+                  notInArray(executionWorkspaces.status, [...CLOSED_EXECUTION_WORKSPACE_STATUSES]),
+                ),
+              ),
+          ),
+        ),
+      )
       .returning({ id: issues.id });
     return updated.length > 0;
   });
