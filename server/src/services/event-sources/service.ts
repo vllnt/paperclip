@@ -1193,7 +1193,8 @@ export function eventSourceService(
             updatedByUserId: actor.userId ?? null,
           })
           .returning();
-        return { source: toApiSource(row!), created: true };
+        if (!row) throw new Error("The built-in event source was not created");
+        return { source: toApiSource(row), created: true };
       }),
 
     /**

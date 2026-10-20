@@ -15,6 +15,3 @@ export interface RoutineStepWarning {
    */
   reason: string;
 }
-
-/** A response body that carries the step warnings of the save or run it answers; empty when there are none. */
-export type WithRoutineStepWarnings<T> = T & { warnings: RoutineStepWarning[] };

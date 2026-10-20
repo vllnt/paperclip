@@ -40,7 +40,7 @@ import { MAX_CHILD_ISSUES_CREATED_BY_HELPER, type DbTransaction, type issueServi
 export const ROUTINE_STEP_ACTOR_ID = "routine-steps";
 
 /** Heartbeat run statuses in which a run still owns, or is about to own, the task it works on. */
-export const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
+export const LIVE_HEARTBEAT_RUN_STATUSES: readonly string[] = ["queued", "running", "scheduled_retry"];
 
 /**
  * Statuses of a task that steps can be attached to. A task in any other status is being worked on or
