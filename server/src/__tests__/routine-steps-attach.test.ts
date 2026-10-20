@@ -550,4 +550,36 @@ describeEmbeddedPostgres("attaching routine steps to an existing task", () => {
     await expect(attaching).resolves.toMatchObject({ root: { id: task.id } });
     expect(await childrenOf(task.id)).toHaveLength(3);
   }, 30_000);
+
+  it("lets a task blocked by the task be created while the steps are attached, without a deadlock", async () => {
+    const fx = await seed();
+    const task = await fx.newTask();
+    let counterTaken!: () => void;
+    const counterHeld = new Promise<void>((resolve) => {
+      counterTaken = resolve;
+    });
+    let letBlockerGo!: () => void;
+    const blockerMayGo = new Promise<void>((resolve) => {
+      letBlockerGo = resolve;
+    });
+    // As a create with blockedByIssueIds does: the company issue counter first, then FOR UPDATE on the blocker.
+    const blockedCreate = db.transaction(async (tx) => {
+      await tx
+        .update(companies)
+        .set({ issueCounter: sql`${companies.issueCounter} + 1` })
+        .where(eq(companies.id, fx.companyId));
+      counterTaken();
+      await blockerMayGo;
+      await tx.execute(sql`select ${issues.id} from ${issues} where ${issues.id} = ${task.id} for update`);
+    });
+    await counterHeld;
+
+    const attaching = fx.attach(task.id);
+    await untilAStatementWaitsForALock(db);
+    letBlockerGo();
+
+    await expect(blockedCreate).resolves.toBeUndefined();
+    await expect(attaching).resolves.toMatchObject({ root: { id: task.id } });
+    expect(await childrenOf(task.id)).toHaveLength(2);
+  }, 30_000);
 });

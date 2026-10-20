@@ -2,6 +2,7 @@ import { and, asc, eq, exists, inArray, isNull, ne, notInArray, sql } from "driz
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  companies,
   executionWorkspaces,
   heartbeatRuns,
   issueRelations,
@@ -396,8 +397,9 @@ async function hasLiveHeartbeatRun(executor: Db, companyId: string, issueId: str
  * Attaches the steps of a routine to a task that already exists, instead of to a new root: the task
  * waits for every step, as the root of a routine run does.
  *
- * The task row is locked first, so two attaches on one task (an event and a manual run, say) take
- * turns and the second sees the first one's steps. Under that lock a task is refused when it is
+ * The company's issue counter row and then the task row are locked first, in the order issue creation
+ * takes them, so two attaches on one task (an event and a manual run, say) take turns and the second
+ * sees the first one's steps. Under that lock a task is refused when it is
  * hidden or in another company (404), belongs to a routine run or a conversation (422), is not in
  * backlog, todo or blocked (409), has a run in progress (409), already has routine steps in
  * progress (409), or would end up with more subtasks than a helper may create (422). A task an agent
@@ -426,13 +428,17 @@ export async function attachRoutineStepsToIssue(
     }),
     createRoot: async (savepoint) => {
       const savepointDb = savepoint as unknown as Db;
+      // Issue creation takes the company issue counter before it locks a parent or a blocker, so the
+      // attach takes the counter row first too: holding the task while it waited for the counter would
+      // deadlock with a create that holds the counter and waits for the task.
+      await savepoint.execute(
+        sql`select ${companies.id} from ${companies} where ${companies.id} = ${companyId} for no key update`,
+      );
       const locked = await savepoint
         .select()
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
-        // Not FOR UPDATE: a subtask insert takes a key-share lock on its parent, which FOR UPDATE blocks.
-        // That insert holds the company issue counter the steps need next, so the two would deadlock.
-        .for("no key update")
+        .for("update")
         .then((rows) => rows[0] ?? null);
       if (!locked || locked.hiddenAt) throw notFound("Task not found");
       if (
