@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_ROUTINE_STEPS,
   ROUTINE_STEPS_RUN_PAYLOAD_KEY,
+  isRoutineRunIssueOriginKind,
   isRoutineStepRunStalled,
   orderRoutineStepsTopologically,
   readRoutineStepsRunPayload,
@@ -21,6 +22,17 @@ function issueMessages(input: unknown): string[] {
   const parsed = routineStepsSchema.safeParse(input);
   return parsed.success ? [] : parsed.error.issues.map((issue) => issue.message);
 }
+
+describe("isRoutineRunIssueOriginKind", () => {
+  it("is true for the root and the steps of a routine run and for nothing else", () => {
+    expect(isRoutineRunIssueOriginKind("routine_execution")).toBe(true);
+    expect(isRoutineRunIssueOriginKind("routine_step")).toBe(true);
+    expect(isRoutineRunIssueOriginKind("manual")).toBe(false);
+    expect(isRoutineRunIssueOriginKind("plugin:acme:operation")).toBe(false);
+    expect(isRoutineRunIssueOriginKind(null)).toBe(false);
+    expect(isRoutineRunIssueOriginKind(undefined)).toBe(false);
+  });
+});
 
 describe("routineStepsSchema", () => {
   it("accepts a fork and join and defaults after to empty", () => {

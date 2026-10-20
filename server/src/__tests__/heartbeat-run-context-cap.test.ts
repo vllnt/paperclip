@@ -61,13 +61,17 @@ describe("resolveRunContextSettings", () => {
   }, 30000);
   afterAll(async () => { await database?.cleanup(); });
 
-  async function seed(opts: { comments: number; body?: (i: number) => string; origin?: { routineId: string } }) {
+  async function seed(opts: {
+    comments: number;
+    body?: (i: number) => string;
+    origin?: { routineId: string; kind?: "routine_execution" | "routine_step" };
+  }) {
     const companyId = randomUUID(), issueId = randomUUID(), agentId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Cap", defaultResponsibleUserId: "board", issuePrefix: `C${companyId.slice(0, 6)}` });
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", status: "idle", adapterType: "process" });
     await db.insert(issues).values({
       id: issueId, companyId, title: "Thread", description: "Brief", status: "in_progress",
-      ...(opts.origin ? { originKind: "routine_execution", originId: opts.origin.routineId } : {}),
+      ...(opts.origin ? { originKind: opts.origin.kind ?? "routine_execution", originId: opts.origin.routineId } : {}),
     });
     const base = Date.parse("2026-09-11T00:00:00Z");
     const ids = Array.from({ length: opts.comments }, () => randomUUID());
@@ -131,6 +135,14 @@ describe("resolveRunContextSettings", () => {
     await db.update(routines).set({ runContextPolicy: { maxComments: 15, byWakeReason: { issue_commented: { maxComments: 2 } } } }).where(eq(routines.id, routineId));
     expect((await wake(s, "issue_commented"))?.comments.map((c) => c.id)).toEqual(s.ids.slice(-2));
   });
+
+  it("applies the routine's policy to the issues of its steps as well as to its root", async () => {
+    const routineId = randomUUID();
+    const s = await seed({ comments: 40, origin: { routineId, kind: "routine_step" } });
+    await db.insert(routines).values({ id: routineId, companyId: s.companyId, title: "R", responsibleUserId: "board", runContextPolicy: { maxComments: 15 } });
+    expect((await wake(s, "other"))?.comments).toHaveLength(15);
+  });
+
   it("ignores an agent or routine policy that belongs to another company", async () => {
     const other = await seed({ comments: 1 });
     await db.update(agents).set({ runtimeConfig: { runContext: { maxComments: 2 } } }).where(eq(agents.id, other.agentId));

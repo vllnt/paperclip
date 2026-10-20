@@ -1,4 +1,11 @@
-import { RUN_CONTEXT_DEFAULTS, resolveCompanyEnvironmentDefault, resolveTransientRetryPolicy, type ResolvedTransientRetryPolicy } from "@paperclipai/shared";
+import {
+  ROUTINE_RUN_ISSUE_ORIGIN_KINDS,
+  RUN_CONTEXT_DEFAULTS,
+  isRoutineRunIssueOriginKind,
+  resolveCompanyEnvironmentDefault,
+  resolveTransientRetryPolicy,
+  type ResolvedTransientRetryPolicy,
+} from "@paperclipai/shared";
 import { issueIdEqualsText } from "./issue-id-match.js";
 import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
@@ -16674,7 +16681,7 @@ export function heartbeatService(
             and(
               eq(issues.id, input.issueId),
               eq(issues.companyId, input.companyId),
-              eq(issues.originKind, "routine_execution"),
+              inArray(issues.originKind, [...ROUTINE_RUN_ISSUE_ORIGIN_KINDS]),
             ),
           )
           .then((rows) => rows[0]?.policy ?? null)
@@ -18166,7 +18173,7 @@ export function heartbeatService(
         .where(eq(companies.id, agent.companyId))
         .then((rows) => rows[0]?.settings ?? null),
       routine:
-        issue?.originKind === "routine_execution" && issue.originId
+        isRoutineRunIssueOriginKind(issue?.originKind) && issue?.originId
           ? await dbOrTx
               .select({ settings: routines.automationWakeSettings })
               .from(routines)

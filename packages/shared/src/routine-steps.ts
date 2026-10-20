@@ -4,6 +4,17 @@ import { routineStepIssueFieldsSchema } from "./validators/issue.js";
 /** Most steps one routine may define; the same cap as the child-issue helper. */
 export const MAX_ROUTINE_STEPS = 25;
 
+/**
+ * Origin kinds of the issues one routine run creates: its root and each of its steps. Both carry the
+ * routine's id as `originId`, so anything a routine configures for its run applies to both.
+ */
+export const ROUTINE_RUN_ISSUE_ORIGIN_KINDS = ["routine_execution", "routine_step"] as const;
+
+/** Whether an issue with this origin kind was created by a routine run, as its root or as one of its steps. */
+export function isRoutineRunIssueOriginKind(originKind: string | null | undefined): boolean {
+  return ROUTINE_RUN_ISSUE_ORIGIN_KINDS.some((kind) => kind === originKind);
+}
+
 /** The run payload key that holds the steps a run was created from and the issues it made. */
 export const ROUTINE_STEPS_RUN_PAYLOAD_KEY = "routineSteps";
 
