@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import {
@@ -7,6 +8,7 @@ import {
   createRoutineTriggerSchema,
   parseListRoutinesQuery,
   rotateRoutineTriggerSecretSchema,
+  routineStepSchema,
   runRoutineSchema,
   updateDocumentAnnotationThreadSchema,
   updateRoutineSchema,
@@ -15,7 +17,15 @@ import {
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
-import { accessService, documentAnnotationService, logActivity, routineService } from "../services/index.js";
+import {
+  accessService,
+  agentService,
+  documentAnnotationService,
+  logActivity,
+  projectService,
+  routineService,
+} from "../services/index.js";
+import { agentTrustService } from "../services/agent-trust.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, unauthorized, unsupportedMediaType } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -31,6 +41,7 @@ export function routineRoutes(
   });
   const documentAnnotationsSvc = documentAnnotationService(db);
   const access = accessService(db);
+  const agentTrust = agentTrustService(db, { agents: agentService(db), projects: projectService(db) });
   const routineDocumentKey = "description";
 
   function parseBooleanQuery(value: unknown) {
@@ -125,6 +136,32 @@ export function routineRoutes(
     }
   }
 
+  /**
+   * Steps an agent writes become tasks it never creates itself, so they keep its containment the way
+   * a task the agent creates does: a low-trust author's trust preset and boundary are written into
+   * each step's execution policy. Steps a board user writes are returned as given.
+   */
+  async function containAgentSteps(
+    req: Request,
+    companyId: string,
+    projectId: string | null,
+    steps: RoutineStep[] | undefined,
+  ): Promise<RoutineStep[] | undefined> {
+    if (req.actor.type !== "agent" || !steps?.length) return steps;
+    const author = { agentId: req.actor.agentId, runId: req.actor.runId };
+    return Promise.all(
+      steps.map(async (step) => {
+        const executionPolicy = await agentTrust.containCreatedExecutionPolicy(
+          author,
+          companyId,
+          projectId,
+          step.executionPolicy,
+        );
+        return executionPolicy ? routineStepSchema.parse({ ...step, executionPolicy }) : step;
+      }),
+    );
+  }
+
   async function assertCanManageExistingRoutine(req: Request, routineId: string) {
     const routine = await svc.get(routineId);
     if (!routine || !hasCompanyAccess(req, routine.companyId)) return null;
@@ -178,7 +215,8 @@ export function routineRoutes(
     await assertBoardCanAssignTasks(req, companyId);
     assertCanManageCompanyRoutine(req, companyId, req.body.assigneeAgentId);
     await assertCanAssignRoutineSteps(req, companyId, req.body.steps);
-    const created = await svc.create(companyId, req.body, {
+    const steps = await containAgentSteps(req, companyId, req.body.projectId ?? null, req.body.steps);
+    const created = await svc.create(companyId, steps ? { ...req.body, steps } : req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
@@ -406,8 +444,19 @@ export function routineRoutes(
     ) {
       throw forbidden("Agents can only assign routines to themselves");
     }
-    await assertCanAssignRoutineSteps(req, routine.companyId, req.body.steps);
-    const updated = await svc.update(routine.id, req.body, {
+    const stepsWillChange = req.body.steps !== undefined && !isDeepStrictEqual(req.body.steps, routine.steps);
+    let patch = req.body;
+    if (stepsWillChange) {
+      await assertCanAssignRoutineSteps(req, routine.companyId, req.body.steps);
+      const steps = await containAgentSteps(
+        req,
+        routine.companyId,
+        req.body.projectId === undefined ? routine.projectId : req.body.projectId,
+        req.body.steps,
+      );
+      if (steps) patch = { ...req.body, steps };
+    }
+    const updated = await svc.update(routine.id, patch, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
