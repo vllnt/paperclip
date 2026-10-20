@@ -32,7 +32,7 @@ Not built: new tables, a general workflow engine, OR-joins, loops over lists, da
 A step reuses the child-issue fields (`title`, `description`, `assigneeAgentId`, `priority`, `labelIds`, `executionPolicy`, `acceptanceCriteria`) and adds:
 
 - `key`: a lowercase slug, unique in the routine
-- `after`: `Array<string | { step, when }>`. PR 1 accepts only plain keys; the `when` form exists in the type and is rejected with "Step conditions (when) are not supported yet".
+- `after`: `string[]`, the keys of the steps it waits for. Conditions on an edge (`when`) arrive in PR 3, which changes this field then; PR 1 has no `when` form in the type, the schema or the API.
 
 Validation: unique keys, `after` points at existing keys, no cycles, at most 25 steps, every step resolves to an agent (its own or the routine's; there are no unowned or user-owned steps because they would never be woken), agents and labels belong to the company. `{{variables}}` work through `interpolateRoutineTemplate`, and a variable that appears only in a step is added to the routine's variables.
 
@@ -46,11 +46,11 @@ Validation: unique keys, `after` points at existing keys, no cycles, at most 25 
 
 `attachRoutineSteps` in `server/src/services/routine-steps.ts` is the single function that builds the graph. `dispatchRoutineRun` and the event dispatcher (for a new event group) both call it. Repeat, recovery and append events never attach steps.
 
-1. The run's task and all steps are created inside one savepoint of the dispatch transaction, before any wake. A failure rolls the savepoint back and the existing failed-run handling records the run. No issue is left behind.
+1. The run's task and all steps are created inside one savepoint of the dispatch transaction, before any wake. A failure in creating them rolls the savepoint back and the existing failed-run handling records the run. A later database failure of the same dispatch rolls back the whole dispatch, with no run row (accepted).
 2. The run's task is created `blocked` and is not woken. It is woken once by the existing wakes after the last step.
-3. Steps are created in dependency order through `createChild(root.id, ..., tx)`: `blockParentUntilDone`, blockers from `after`, `todo` without `after` and `blocked` otherwise, idempotency key `routine-run:{runId}:{stepKey}`, `originKind: "routine_step"`.
+3. Steps are created in layers (first those with nothing to wait for, then those whose predecessors are all created, each layer in written order) through `createChild(root.id, ..., tx)`: `blockParentUntilDone`, blockers from `after`, `todo` without `after` and `blocked` otherwise, idempotency key `routine-run:{runId}:{stepKey}`, `originKind: "routine_step"`.
 4. After commit, only the steps without predecessors are woken.
-5. For a routine with steps, an open, visible run task of an earlier run counts as live for `skip_if_active` and `coalesce_if_active`.
+5. For a routine with steps, an open, visible run task of an earlier run counts as live for `skip_if_active` and `coalesce_if_active`, unless `isRoutineStepRunStalled` (`packages/shared/src/routine-steps.ts`) says the run cannot move on its own: a cancelled step never resolves its dependents, so a run whose remaining steps are all blocked behind a cancelled one is not live. PR 3 reuses the same function for skipped steps.
 6. Routine env and secrets stay on the `routine_execution` run task. Step agents do not inherit them (least privilege; can be extended if a real workflow needs it).
 
 Steps use `routine_step`, not `routine_execution`, because the unique index on open routine executions would make parallel steps collide and `findLiveExecutionIssue` would mistake a step for the routine's live run.
@@ -98,7 +98,7 @@ No new trigger kind. The existing `event` trigger does the work: `eventMatch`, g
 
 ## Verification (PR 1)
 
-- Unit: step validator (cycles, unknown `after`, duplicate keys, more than 25, conditions rejected), topological order, UI step helpers, CLI `--steps-file`.
+- Unit: step validator (cycles, unknown `after`, duplicate keys, more than 25), layered order, stalled-run check, UI step helpers, CLI `--steps-file`.
 - Integration (embedded Postgres): run task `blocked` with correct parent, blockers, statuses and origin; fork and join; only starting steps woken; atomic rollback with a failed run; coalesce, skip and always-enqueue; workspace handoff; event-triggered routine (new group gets steps, repeat adds none); a routine without steps behaves exactly as before.
 - Surfaces: `openapi-routes.test.ts`, route permission tests, and a UI check in a real browser at desktop and mobile widths with no console errors.
 - Full check: `pnpm -r typecheck`, `pnpm test:run`, `pnpm build`, `pnpm check:token-gates`.
@@ -106,6 +106,7 @@ No new trigger kind. The existing `event` trigger does the work: `eventMatch`, g
 ## Risks
 
 - Migration numbering can collide with another open migration; renumber and regenerate.
-- A run task left open keeps the routine "live" until it is done or cancelled.
+- A run task left open keeps the routine "live" until it is done or cancelled, except a stalled run (see Dispatch, item 5).
+- A rollback to a previous image runs a routine with steps as one plain task and cannot restore a revision that holds steps (see `doc/DATABASE.md`).
 - Step wakes on the event path are queued after commit and are best effort; the stranded sweep recovers a lost wake.
 - `routineSteps` is a reserved key in a run's trigger payload.

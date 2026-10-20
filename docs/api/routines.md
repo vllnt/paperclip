@@ -130,25 +130,33 @@ A step has these fields:
 | `executionPolicy` | no | Review and approval stages for the step, as on any task |
 | `acceptanceCriteria` | no | Checklist lines. `{{variables}}` work here too |
 
+A `skill://<skillId>` mention in a step description gives the step's agent that company skill for the run. It applies on adapters that sync skills and on `paperclip_runner`; it is ignored on `cursor_cloud`, `openclaw_gateway`, `http` and `process`.
+
 Rules checked when you save: keys are unique, `after` points at other steps, there are no cycles, at most 25 steps, and every agent and label belongs to the company. Variables that appear only in a step are added to the routine's variables, so manual runs ask for them.
 
-**What a run creates**, atomically (if anything fails, no task is left behind and the run is recorded as `failed`):
+**What a run creates.** The run's task and its steps are created together in one savepoint of the dispatch transaction:
 
 1. The run's task, as today, but in status `blocked`. It is not woken at the start.
-2. One child task per step, with origin kind `routine_step` and the root as parent. A step with no `after` is `todo`; the others are `blocked` by the steps they wait for.
-3. Only the steps with no `after` are woken. Paperclip's existing blocker wakes start the others as their predecessors finish (`issue_blockers_resolved`). A step that waits for several steps starts after all of them are done (a join).
+2. One child task per step, with origin kind `routine_step` and the root as parent. Steps are created in layers: first the steps with no `after`, then the steps whose predecessors are all created, and so on, each layer in the order the steps were written. A step with no `after` is `todo`; the others are `blocked` by the steps they wait for.
+3. Only the steps with no `after` are woken, after the dispatch commits. Paperclip's existing blocker wakes start the others as their predecessors finish (`issue_blockers_resolved`). A step that waits for several steps starts after all of them are done (a join).
 4. The root's agent is woken once, after the last step finishes, to wrap up the run.
 
-The run record keeps `routineSteps: { steps, stepIssueIds }` in its trigger payload, so later edits to the routine never change a run in flight. To stop a run, cancel its task with the existing tree controls.
+If creating the task or any step fails, none of them is kept and the run is recorded as `failed`. If a later database write of the same dispatch fails, the whole dispatch rolls back: no task and no run row remain, and the caller gets the error (accepted; the next trigger starts again).
 
-**Concurrency.** For a routine with steps, an open root of an earlier run counts as live: `skip_if_active` and `coalesce_if_active` act on it until it is done or cancelled. `always_enqueue` is unchanged.
+The run record keeps `routineSteps: { steps, stepIssueIds }` in its trigger payload, so later edits to the routine never change a run in flight. To stop a run, cancel its task with the existing tree control (cancel the task and its sub-tasks): the root and every step are cancelled, and the routine is free for the next run.
+
+**A cancelled step.** A cancelled step never counts as done, so the steps that wait for it stay `blocked` and the run's task stays blocked. Nothing cascades: the blocked steps stay visible so a person can decide. Once every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled*. A stalled run no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run where another branch is still running stays live. To clean up a stalled run, cancel its task with the tree control.
+
+**Concurrency.** For a routine with steps, an open root of an earlier run counts as live: `skip_if_active` and `coalesce_if_active` act on it until it is done or cancelled, or until the run is stalled (see above). `always_enqueue` is unchanged.
 
 **Workspaces.** Steps are siblings, so a step that has no workspace of its own reuses the execution workspace of the earliest step it waited for in the same project, right before it first runs. A reviewer therefore sees the implementer's checkout.
 
 **Limits.**
 
 - Routine environment variables and secrets apply to the run's task only. Step agents do not inherit them.
-- `after` entries are step keys. Conditional entries (`{ "step": "...", "when": "..." }`) are rejected with `Step conditions (when) are not supported yet`.
+- `after` entries are plain step keys.
+- Steps are not supported with append issue mode (`appendToIssueId`); the API returns `422` with `Steps are not supported with append issue mode`.
+- For an event-triggered routine, the storm breaker counts alert groups, not issues, and each group can create up to 26 issues (the task plus 25 steps). Lower the source's `maxNewIssuesPerHour` if that is too many.
 - Steps are an API, CLI and UI feature of the routine. The routine UI edits key, title, instructions, agent, priority and `after`; `labelIds`, `executionPolicy` and `acceptanceCriteria` are set through the API or CLI. The UI keeps them when you edit a step.
 
 **Permissions.** Writing steps needs the same rights as assigning tasks. A board user needs `tasks:assign`. **An agent can only assign steps to itself**; naming another agent returns `403`.

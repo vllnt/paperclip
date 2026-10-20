@@ -182,7 +182,8 @@ function interpolateText(text: string, variables: Record<string, unknown>): stri
  * Creates the root issue of a routine run and one child issue per step under it, and records the
  * steps on the run.
  *
- * Steps are created in dependency order. Each waits (`blockedByIssueIds`) for the steps in its `after`,
+ * Steps are created in layers: those with nothing to wait for first, then those whose predecessors are
+ * all created, and so on, each layer in written order. Each waits (`blockedByIssueIds`) for the steps in its `after`,
  * and the root waits for every step. A step with nothing to wait for starts in `todo`; the others start
  * `blocked` and are woken by the usual blocker-resolved wake. All of it runs in one savepoint of `tx`
  * and every read on it uses that savepoint's connection: if the root or any step fails, no issue,
