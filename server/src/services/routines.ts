@@ -4074,6 +4074,17 @@ export function routineService(
       if (!routine) throw notFound("Routine not found");
       if (routine.status === "archived") throw conflict("Routine is archived");
       await assertProject(routine.companyId, input.projectId ?? null);
+      // Steps without their own agent go to the run's assignee, so an override hands them out like a
+      // step write does: an agent may only give them to itself. The check reads the routine row that
+      // the dispatch below uses, so a concurrent edit cannot add steps between the check and the run.
+      if (
+        actor?.agentId &&
+        routine.steps.length > 0 &&
+        input.assigneeAgentId &&
+        input.assigneeAgentId !== actor.agentId
+      ) {
+        throw forbidden("Agents can only assign routine steps to themselves");
+      }
       const assigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
       await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
       const trigger = input.triggerId ? await getTriggerById(input.triggerId) : null;

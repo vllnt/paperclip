@@ -16,7 +16,11 @@ import { logger } from "../middleware/logger.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { issueExecutionWorkspaceModeForPersistedWorkspace } from "./execution-workspace-policy.js";
-import { CLOSED_EXECUTION_WORKSPACE_STATUSES, isClosedExecutionWorkspaceStatus } from "./execution-workspaces.js";
+import {
+  CLOSED_EXECUTION_WORKSPACE_STATUSES,
+  acquireExecutionWorkspaceLifecycleLock,
+  isClosedExecutionWorkspaceStatus,
+} from "./execution-workspaces.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import type { DbTransaction, issueService } from "./issues.js";
@@ -408,6 +412,8 @@ export async function inheritRoutineStepWorkspace(
       : new Set<string | null>();
     const predecessor = open.find((candidate) => !heldBySiblings.has(candidate.executionWorkspaceId));
     if (!predecessor?.executionWorkspaceId) return false;
+    // An archive holds this lock until it commits, so the open check in the update sees its result.
+    await acquireExecutionWorkspaceLifecycleLock(tx, predecessor.executionWorkspaceId);
 
     const updated = await tx
       .update(issues)
@@ -425,7 +431,7 @@ export async function inheritRoutineStepWorkspace(
           eq(issues.id, step.id),
           eq(issues.companyId, companyId),
           isNull(issues.executionWorkspaceId),
-          // The workspace was read as open before the lock: it must still be open now.
+          // The workspace was read as open before the locks: it must still be open now.
           exists(
             tx
               .select({ one: sql`1` })

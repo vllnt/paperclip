@@ -24,6 +24,7 @@ import {
 } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture, wireEvent } from "./helpers/event-source-fixture.js";
+import { acquireExecutionWorkspaceLifecycleLock } from "../services/execution-workspaces.ts";
 import { MAX_CHILD_ISSUES_CREATED_BY_HELPER, issueService } from "../services/issues.ts";
 import { inheritRoutineStepWorkspace } from "../services/routine-steps.ts";
 import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
@@ -230,6 +231,42 @@ describeEmbeddedPostgres("routine steps", () => {
         await db.execute(sql`drop function routine_steps_test_count_relation_write()`);
         await db.execute(sql`drop table routine_steps_test_relation_writes`);
       }
+    });
+
+    it("lets an agent hand the steps of a run only to itself, on the routine row the run uses", async () => {
+      const fx = await seed();
+      const routine = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));
+
+      await expect(
+        fx.svc.runRoutine(routine.id, { source: "manual", assigneeAgentId: fx.builderId }, { agentId: fx.leadId }),
+      ).rejects.toMatchObject({ status: 403, message: "Agents can only assign routine steps to themselves" });
+      expect(await stepIssuesOf(routine.id)).toHaveLength(0);
+
+      const own = await fx.svc.runRoutine(
+        routine.id,
+        { source: "manual", assigneeAgentId: fx.leadId },
+        { agentId: fx.leadId },
+      );
+      expect(own.status).toBe("issue_created");
+    });
+
+    it("still lets an agent run a routine without steps for another agent, and a board user name any agent", async () => {
+      const fx = await seed({ concurrencyPolicy: "always_enqueue" });
+      const stepped = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));
+
+      const plain = await fx.svc.runRoutine(
+        fx.routine.id,
+        { source: "manual", assigneeAgentId: fx.builderId },
+        { agentId: fx.leadId },
+      );
+      const byBoard = await fx.svc.runRoutine(
+        stepped.id,
+        { source: "manual", assigneeAgentId: fx.builderId },
+        { userId: "board-user" },
+      );
+
+      expect(plain.status).toBe("issue_created");
+      expect(byBoard.status).toBe("issue_created");
     });
 
     it("wakes only the steps that start the run, never the root", async () => {
@@ -975,6 +1012,47 @@ describeEmbeddedPostgres("routine steps", () => {
       const { fx, issueOf } = await seedForkedRun({ workspaceStatus });
 
       expect(await inherit(fx.companyId, issueOf("left").id)).toBe(false);
+      const [left] = await db.select().from(issues).where(eq(issues.id, issueOf("left").id));
+      expect(left!.executionWorkspaceId).toBeNull();
+    });
+
+    it("waits for an archive in progress and then leaves the step without the workspace", async () => {
+      const { fx, issueOf, workspaceId } = await seedForkedRun();
+      let archiveMayCommit!: () => void;
+      const commitGate = new Promise<void>((resolve) => {
+        archiveMayCommit = resolve;
+      });
+      let archiveHoldsLock!: () => void;
+      const lockGate = new Promise<void>((resolve) => {
+        archiveHoldsLock = resolve;
+      });
+      const archive = db.transaction(async (tx) => {
+        await acquireExecutionWorkspaceLifecycleLock(tx, workspaceId);
+        await tx
+          .update(executionWorkspaces)
+          .set({ status: "archived", closedAt: new Date() })
+          .where(eq(executionWorkspaces.id, workspaceId));
+        archiveHoldsLock();
+        await commitGate;
+      });
+      await lockGate;
+
+      let settled = false;
+      const inherited = inherit(fx.companyId, issueOf("left").id);
+      inherited.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      const waitsOnLock = async () =>
+        (await db.execute(sql`select 1 from pg_locks where locktype = 'advisory' and not granted limit 1`)).length > 0;
+      const startedAt = performance.now();
+      while (!settled && !(await waitsOnLock()) && performance.now() - startedAt < 5_000) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      archiveMayCommit();
+      await archive;
+
+      expect(await within(inherited, 10_000, "workspace inheritance after the archive")).toBe(false);
       const [left] = await db.select().from(issues).where(eq(issues.id, issueOf("left").id));
       expect(left!.executionWorkspaceId).toBeNull();
     });
