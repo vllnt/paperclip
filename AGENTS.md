@@ -163,6 +163,16 @@ Every user-facing capability ships on all three surfaces: the web UI, the REST A
   - a purely visual UI affordance (layout, animation, theme, a hover or focus effect)
   - a CLI command that exists only for local development (for example `worktree` or `doctor`)
 
+9. Keep behavior generic and company-agnostic.
+One instance runs many companies, and each instance has a different setup. Product code must behave the same for every company, every agent setup, and every instance. Reason: a fix that fits one deployment can break or do nothing on all the others.
+
+- Do not hardcode or special-case one company, instance, routine, monitor, skill, agent, provider, model name, or credential pool.
+- Get behavior from data and settings that already exist. Examples: the issue priority enum, the agent runtime config, the provider and model that the adapter reports, and work-product records.
+- Put a tunable value in a named constant with a safe default, or in an existing setting. Do not tune a value to one deployment.
+- Classify an external error by its structure (status code, error code, retry or reset headers) when the source supplies it. Do not match the exact wording of one vendor or one proxy.
+- Use neutral names in tests, fixtures, docs, and pull request text. Describe production evidence in general terms. Do not name a company, an instance, or a host.
+- Company-agnostic does not mean cross-company. Data stays company-scoped (rule 1).
+
 ## 6. Database Change Workflow
 
 When changing data model:
@@ -275,6 +285,7 @@ A change is done when all are true:
 3. Contracts are synced across db/shared/server/ui
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
+6. Behavior is generic and company-agnostic (rule 9 in section 5)
 
 ## Design system
 
