@@ -3244,11 +3244,12 @@ export function buildHostServices(
             "plugin_grants_update",
           );
         } else {
-          const membership = await access.getMembership(companyId, params.principalType as PrincipalType, params.principalId);
-          if (!membership) throw new Error("Principal is not a member of this company");
           // Member grant routes (`PATCH /companies/:companyId/members/:memberId/permissions`
           // and `/role-and-grants`) refuse every non-board actor in `assertCanManageCompanyMember`.
+          // Refuse first, so an agent-started call cannot learn who is a member.
           if (currentPluginHostCallAgent()) throw forbidden("Board access required");
+          const membership = await access.getMembership(companyId, params.principalType as PrincipalType, params.principalId);
+          if (!membership) throw new Error("Principal is not a member of this company");
         }
         await access.setPrincipalGrants(
           companyId,

@@ -562,6 +562,18 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
     expect(await grantKeys(companyId, userId)).toEqual([]);
   });
 
+  it("refuses an agent-started grant update for a non-member with the same 403, so the answer does not reveal who is a member", async () => {
+    const { companyId, services, peerId } = await seed();
+    const strangerId = `user-${randomUUID()}`;
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+        setGrants(services, companyId, "user", strangerId)),
+    ).rejects.toMatchObject({ status: 403 });
+
+    await expect(setGrants(services, companyId, "user", strangerId)).rejects.toThrow("Principal is not a member of this company");
+  });
+
   it("still sets grants for a call that no agent started, and for an agent holding company-wide agents:configure on another agent", async () => {
     const { companyId, services, managedAgentId, peerId } = await seed();
     const userId = `user-${randomUUID()}`;
