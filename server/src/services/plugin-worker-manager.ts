@@ -1179,6 +1179,10 @@ export function createPluginWorkerHandle(
       source = params.actorContext;
     } else if (method === "executeTool" && isRecord(params.runContext)) {
       source = params.runContext;
+    } else if (method === "handleApiRequest" && isRecord(params.actor) && params.actor.actorType === "agent") {
+      // The plugin API route built `actor` from the authenticated request. The
+      // company is the route's own, not a field of the actor.
+      source = { agentId: params.actor.agentId, runId: params.actor.runId, companyId: params.companyId };
     }
     if (!source) return null;
     const agentId = readNonEmptyString(source.agentId);

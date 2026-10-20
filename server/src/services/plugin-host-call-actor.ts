@@ -3,9 +3,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 /**
  * The agent behind a plugin call. The worker calls the host back as the
  * plugin, so the original caller is lost unless the host keeps it. The host
- * records the agent when it starts a `performAction` or `executeTool` call
- * (from the authenticated request or run context, never from the worker) and
- * exposes it while it serves that call's worker-to-host requests.
+ * records the agent when it starts a `performAction`, `executeTool`, or
+ * `handleApiRequest` call (from the authenticated request or run context, never
+ * from the worker) and exposes it while it serves that call's worker-to-host
+ * requests.
  */
 export type PluginHostCallAgent = {
   agentId: string;
