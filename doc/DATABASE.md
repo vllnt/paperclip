@@ -168,6 +168,9 @@ reconnects.
 Source builds carry `patches/postgres@3.4.9.patch` for this behavior. It rejects
 queued and later queries from a disconnected transaction or reserved connection,
 and prevents a released, closed connection from returning to the open pool.
+It also handles a connection that dies during its startup array-type fetch:
+that failure no longer becomes an unhandled rejection, which ends the server
+process, and the next socket runs its own type fetch before the first query.
 The patch covers both ESM and CommonJS. The regression suite terminates real
 PostgreSQL backends and checks rejection, pool recovery, and transaction isolation.
 Remove the patch when an upstream release passes these tests. Installs of the

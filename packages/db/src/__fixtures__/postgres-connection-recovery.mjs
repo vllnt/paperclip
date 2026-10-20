@@ -20,6 +20,14 @@ const capture = (query) => Promise.resolve(query).then(
   () => { throw new Error("Expected the closed connection to reject"); },
   (error) => error,
 );
+/** A Postgres ErrorResponse message with severity FATAL. */
+const fatalErrorResponse = (code, message) => {
+  const fields = Buffer.from(`SFATAL\0VFATAL\0C${code}\0M${message}\0\0`, "latin1");
+  const header = Buffer.alloc(5);
+  header.write("E", 0, "latin1");
+  header.writeInt32BE(fields.length + 4, 1);
+  return Buffer.concat([header, fields]);
+};
 const terminate = async (pid) => {
   await control.unsafe("select pg_terminate_backend($1)", [pid]);
   await closed.promise;
@@ -110,32 +118,30 @@ try {
     await task;
     await Promise.all(pending);
     reserved?.release();
-  } else if (mode === "type-fetch") {
-    // Every new connection first fetches the array types. A connection that
-    // dies during that fetch must fail or replay the first query; it must not
-    // also raise an unhandled rejection, which ends the server process.
+  } else if (mode === "type-fetch-reset" || mode === "type-fetch-fatal") {
+    // Every new connection first fetches the array types. When the socket
+    // dies during that fetch (a reset, or a FATAL such as a terminated backend
+    // followed by a close), the driver must not raise an unhandled rejection,
+    // which ends the server process, and must not put a connection into
+    // service that skipped its own type fetch.
     const unhandled = [];
-    process.on("unhandledRejection", (reason) => unhandled.push(reason));
+    const onUnhandled = (reason) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
     const target = new URL(process.env.TEST_DATABASE_URL);
-    let connections = 0;
-    let typeFetches = 0;
-    let resets = 0;
-    const queriesByConnection = [];
+    const connections = [];
+    let faults = 0;
     const proxy = net.createServer((client) => {
-      const id = connections++;
-      queriesByConnection[id] = 0;
+      const connection = { sent: "" };
+      connections.push(connection);
       const upstream = net.connect(Number(target.port), target.hostname);
       client.on("data", (chunk) => {
-        if (chunk.includes("typcategory")) {
-          typeFetches += 1;
-          if (resets === 0) {
-            resets += 1;
-            client.resetAndDestroy();
-            upstream.destroy();
-            return;
-          }
-        } else if (chunk.includes("as value")) {
-          queriesByConnection[id] += 1;
+        connection.sent += chunk.toString("latin1");
+        if (faults === 0 && connection.sent.includes("typcategory")) {
+          faults += 1;
+          upstream.destroy();
+          if (mode === "type-fetch-reset") client.resetAndDestroy();
+          else client.end(fatalErrorResponse("57P01", "terminating connection due to administrator command"));
+          return;
         }
         upstream.write(chunk);
       });
@@ -152,18 +158,27 @@ try {
     try {
       const first = await Promise.resolve(typed.unsafe("select 1 as value"))
         .then((rows) => rows[0].value, (error) => error.code);
-      assert.ok([1, "ECONNRESET", "CONNECTION_CLOSED"].includes(first), `first query: ${first}`);
-      assert.equal(resets, 1);
+      if (mode === "type-fetch-reset") {
+        assert.ok([1, "ECONNRESET", "CONNECTION_CLOSED"].includes(first), `first query: ${first}`);
+      } else {
+        // The first query was never sent, so the next socket replays it.
+        assert.equal(first, 1);
+      }
+      assert.equal(faults, 1);
       assert.equal((await typed.unsafe("select 42 as value"))[0].value, 42);
       await setImmediate();
-      // No unhandled rejection; the reset connection never carried a query,
-      // and the next query ran on a new connection that fetched its types.
       assert.deepEqual(unhandled, []);
-      assert.equal(queriesByConnection[0], 0);
-      assert.ok(connections >= 2, `connections: ${connections}`);
-      assert.equal(typeFetches, connections);
-      assert.ok(queriesByConnection.slice(1).reduce((sum, count) => sum + count, 0) >= 1);
+      // The faulted connection carried no query. Every connection that
+      // carried one fetched its own types first.
+      assert.ok(!connections[0].sent.includes("as value"));
+      const used = connections.filter((connection) => connection.sent.includes("as value"));
+      assert.ok(used.length >= 1);
+      for (const connection of used) {
+        const typesAt = connection.sent.indexOf("typcategory");
+        assert.ok(typesAt >= 0 && typesAt < connection.sent.indexOf("as value"), "query before the type fetch");
+      }
     } finally {
+      process.off("unhandledRejection", onUnhandled);
       await typed.end({ timeout: 1 });
       await new Promise((resolve) => proxy.close(resolve));
     }
