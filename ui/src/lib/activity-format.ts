@@ -81,6 +81,7 @@ const ACTIVITY_ROW_VERBS: Record<string, string> = {
   "heartbeat.cancelled": "cancelled heartbeat for",
   "heartbeat.provider_quota_cap_exemption_exhausted": "spent the daily provider quota cap exemption for",
   "heartbeat.provider_quota_exhausted": "stopped provider capacity retries on",
+  "heartbeat.daily_cap_dispatch_held": "held dispatch until the daily cap resets for",
   "heartbeat.output_stale_source_resolved": "system-folded stale run on",
   "heartbeat.output_stale_recovery_recursion_refused": "refused recovery-on-recovery for",
   "approval.created": "requested approval",
