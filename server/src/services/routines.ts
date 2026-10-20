@@ -74,6 +74,7 @@ import {
   ROUTINE_GATE_UNAVAILABLE_REASON,
   ROUTINE_GATE_UNCHANGED_REASON,
   WORKSPACE_BRANCH_ROUTINE_VARIABLE,
+  eventGroupingSchema,
   getBuiltinRoutineVariableValues,
   extractRoutineVariableNames,
   interpolateRoutineTemplate,
@@ -149,6 +150,16 @@ import type { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 /** Newest open roots of a routine with steps that are checked for a run that can still move. */
 const OPEN_STEP_ROOTS_CHECKED = 25;
 
+/**
+ * A trigger's grouping with the schema's defaults filled in, so a row saved without them compares equal
+ * to the same grouping read back from a revision. A value the schema refuses is compared as stored.
+ */
+function normalizedEventGrouping(grouping: unknown) {
+  if (grouping == null) return null;
+  const parsed = eventGroupingSchema.safeParse(grouping);
+  return parsed.success ? parsed.data : grouping;
+}
+
 /** Whether the root in the query has a step child, in the given status when one is given. */
 function rootHasStepIn(status?: string) {
   const step = alias(issues, "root_step");
@@ -194,6 +205,8 @@ const INTERNAL_SOURCE_ISSUE_MODE_MESSAGE =
 const INTERNAL_SOURCE_FALLBACK_MESSAGE = "Triggers on the built-in Paperclip event source cannot be fallbacks";
 const EVENT_ISSUE_BOARD_ONLY_MESSAGE =
   'Only board users can create, enable, restore or change an issueMode "event_issue" trigger: it starts the routine\'s steps on every matching task of the company';
+const EVENT_ISSUE_STEPS_BOARD_ONLY_MESSAGE =
+  'Only board users can change the steps or the agent of a routine with an enabled issueMode "event_issue" trigger: its steps start on every matching task of the company';
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
@@ -2262,6 +2275,64 @@ export function routineService(
     if (actor.agentId) throw forbidden(EVENT_ISSUE_BOARD_ONLY_MESSAGE);
   }
 
+  /**
+   * Refuses an agent's trigger patch that switches on, brings back or changes what an `event_issue`
+   * trigger matches. Switching it off, archiving or relabelling it stays open to the agent.
+   */
+  function assertCanPatchEventIssueTrigger(
+    actor: Actor,
+    trigger: typeof routineTriggers.$inferSelect,
+    patch: UpdateRoutineTrigger,
+  ) {
+    if (trigger.kind !== "event") return;
+    const nextGrouping = patch.eventGrouping === undefined ? trigger.eventGrouping : patch.eventGrouping;
+    const eventIssue = trigger.eventGrouping?.issueMode === "event_issue" || nextGrouping?.issueMode === "event_issue";
+    const enabling = patch.enabled === true && !trigger.enabled;
+    const unarchiving = patch.archived === false && trigger.archived;
+    const touchesEventFields = patch.eventSourceId !== undefined
+      || patch.eventMatch !== undefined
+      || patch.eventGrouping !== undefined
+      || patch.fallback !== undefined;
+    if (eventIssue && (enabling || unarchiving || touchesEventFields)) assertCanWriteEventIssueTrigger(actor);
+  }
+
+  /** Whether the routine has an enabled, unarchived `event_issue` trigger. */
+  async function hasEnabledEventIssueTrigger(executor: Db, companyId: string, routineId: string) {
+    const rows = await executor
+      .select({ eventGrouping: routineTriggers.eventGrouping })
+      .from(routineTriggers)
+      .where(
+        and(
+          eq(routineTriggers.companyId, companyId),
+          eq(routineTriggers.routineId, routineId),
+          eq(routineTriggers.kind, "event"),
+          eq(routineTriggers.enabled, true),
+          eq(routineTriggers.archived, false),
+        ),
+      );
+    return rows.some((row) => row.eventGrouping?.issueMode === "event_issue");
+  }
+
+  /**
+   * While an `event_issue` trigger is on, the routine's steps start on every matching task of the
+   * company, so only a board user may change the steps or the agent that runs a step without its own.
+   * Call it under the routine lock: trigger writes take that lock too, so the answer cannot go stale.
+   */
+  async function assertCanChangeEventIssueSteps(
+    executor: Db,
+    actor: Actor,
+    routine: { id: string; companyId: string; steps: RoutineStep[] | null; assigneeAgentId: string | null },
+    next: { steps: RoutineStep[]; assigneeAgentId: string | null; enablesEventIssueTrigger?: boolean },
+  ) {
+    if (!actor.agentId) return;
+    const changed = !isDeepStrictEqual(routine.steps ?? [], next.steps)
+      || (routine.assigneeAgentId ?? null) !== (next.assigneeAgentId ?? null);
+    if (!changed) return;
+    if (next.enablesEventIssueTrigger || (await hasEnabledEventIssueTrigger(executor, routine.companyId, routine.id))) {
+      throw forbidden(EVENT_ISSUE_STEPS_BOARD_ONLY_MESSAGE);
+    }
+  }
+
   /** Finalizes a parked run only while it is still `gating`, so a late caller never overwrites a settled run. */
   async function finalizeGatingRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>) {
     return db
@@ -3610,6 +3681,12 @@ export function routineService(
             currentRevisionId: locked.latestRevisionId,
           });
         }
+        if (patch.steps !== undefined || patch.assigneeAgentId !== undefined) {
+          await assertCanChangeEventIssueSteps(txDb, actor, locked, {
+            steps: patch.steps ?? locked.steps ?? [],
+            assigneeAgentId: patch.assigneeAgentId === undefined ? locked.assigneeAgentId : patch.assigneeAgentId,
+          });
+        }
 
         // Automation-wake settings are operational tuning, not routine content: they
         // apply immediately and are not versioned in routine revisions.
@@ -3877,10 +3954,7 @@ export function routineService(
         const nextEventGrouping = patch.eventGrouping === undefined ? existing.eventGrouping : patch.eventGrouping;
         const enabling = patch.enabled === true && !existing.enabled;
         const nextFallback = patch.fallback ?? existing.fallback;
-        const eventIssue = existing.eventGrouping?.issueMode === "event_issue"
-          || nextEventGrouping?.issueMode === "event_issue";
-        const unarchiving = patch.archived === false && existing.archived === true;
-        if (eventIssue && (enabling || unarchiving || touchesEventFields)) assertCanWriteEventIssueTrigger(actor);
+        assertCanPatchEventIssueTrigger(actor, existing, patch);
         if (
           nextEventSourceId
           && (enabling || patch.eventSourceId !== undefined || patch.eventGrouping !== undefined || patch.fallback === true)
@@ -3920,24 +3994,33 @@ export function routineService(
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existing.routineId} for update`);
+        // Every trigger write holds the routine lock, so this is the row the update replaces: the
+        // board-only check and the fields the patch leaves alone come from it, not from the read above.
+        const current = await txDb
+          .select()
+          .from(routineTriggers)
+          .where(eq(routineTriggers.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!current) return null;
+        assertCanPatchEventIssueTrigger(actor, current, patch);
         const [updated] = await txDb
           .update(routineTriggers)
           .set({
-            label: patch.label === undefined ? existing.label : patch.label,
-            enabled: patch.enabled ?? existing.enabled,
+            label: patch.label === undefined ? current.label : patch.label,
+            enabled: patch.enabled ?? current.enabled,
             ...(patch.setupPending === false ? { setupPending: false } : {}),
             ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
             cronExpression,
             timezone,
             nextRunAt,
-            signingMode: patch.signingMode === undefined ? existing.signingMode : patch.signingMode,
-            replayWindowSec: patch.replayWindowSec === undefined ? existing.replayWindowSec : patch.replayWindowSec,
-            ...(existing.kind === "event"
+            signingMode: patch.signingMode === undefined ? current.signingMode : patch.signingMode,
+            replayWindowSec: patch.replayWindowSec === undefined ? current.replayWindowSec : patch.replayWindowSec,
+            ...(current.kind === "event"
               ? {
-                eventSourceId: patch.eventSourceId ?? existing.eventSourceId,
-                eventMatch: patch.eventMatch === undefined ? existing.eventMatch : patch.eventMatch,
-                eventGrouping: patch.eventGrouping === undefined ? existing.eventGrouping : patch.eventGrouping,
-                fallback: patch.fallback ?? existing.fallback,
+                eventSourceId: patch.eventSourceId ?? current.eventSourceId,
+                eventMatch: patch.eventMatch === undefined ? current.eventMatch : patch.eventMatch,
+                eventGrouping: patch.eventGrouping === undefined ? current.eventGrouping : patch.eventGrouping,
+                fallback: patch.fallback ?? current.fallback,
               }
               : {}),
             updatedByAgentId: actor.agentId ?? null,
@@ -4105,34 +4188,6 @@ export function routineService(
           await assertGateConfig(existingRoutine.companyId, routineSnapshot.assigneeAgentId, routineSnapshot.gate);
         }
       }
-      const restoredEventIssueTriggers = snapshot.triggers.filter(
-        (trigger) => trigger.kind === "event" && trigger.enabled && trigger.eventGrouping?.issueMode === "event_issue",
-      );
-      if (actor.agentId && restoredEventIssueTriggers.length > 0) {
-        const liveTriggers = await db
-          .select()
-          .from(routineTriggers)
-          .where(
-            and(
-              eq(routineTriggers.companyId, existingRoutine.companyId),
-              eq(routineTriggers.routineId, existingRoutine.id),
-              inArray(routineTriggers.id, restoredEventIssueTriggers.map((trigger) => trigger.id)),
-            ),
-          );
-        const liveById = new Map(liveTriggers.map((trigger) => [trigger.id, trigger]));
-        for (const restored of restoredEventIssueTriggers) {
-          const live = liveById.get(restored.id);
-          const unchanged = live !== undefined
-            && live.kind === "event"
-            && live.enabled
-            && !live.archived
-            && live.eventSourceId === (restored.eventSourceId ?? null)
-            && live.fallback === (restored.fallback ?? false)
-            && isDeepStrictEqual(live.eventMatch ?? null, restored.eventMatch ?? null)
-            && isDeepStrictEqual(live.eventGrouping ?? null, restored.eventGrouping ?? null);
-          if (!unchanged) assertCanWriteEventIssueTrigger(actor);
-        }
-      }
       for (const triggerSnapshot of snapshot.triggers) {
         if (triggerSnapshot.kind !== "event" || !triggerSnapshot.enabled) continue;
         if (!triggerSnapshot.eventSourceId) throw unprocessable("Event trigger snapshot has no event source");
@@ -4160,6 +4215,43 @@ export function routineService(
         if (locked.latestRevisionId === targetRevision.id) {
           throw conflict("Selected revision is already the latest revision", {
             currentRevisionId: locked.latestRevisionId,
+          });
+        }
+        if (actor.agentId) {
+          // Under the routine lock, which every trigger write takes, so the live triggers cannot change
+          // between this check and the restore below.
+          const restoredEventIssueTriggers = snapshot.triggers.filter(
+            (trigger) => trigger.kind === "event" && trigger.enabled && trigger.eventGrouping?.issueMode === "event_issue",
+          );
+          const liveTriggers = restoredEventIssueTriggers.length === 0
+            ? []
+            : await txDb
+              .select()
+              .from(routineTriggers)
+              .where(
+                and(
+                  eq(routineTriggers.companyId, locked.companyId),
+                  eq(routineTriggers.routineId, locked.id),
+                  inArray(routineTriggers.id, restoredEventIssueTriggers.map((trigger) => trigger.id)),
+                ),
+              );
+          const liveById = new Map(liveTriggers.map((trigger) => [trigger.id, trigger]));
+          for (const restored of restoredEventIssueTriggers) {
+            const live = liveById.get(restored.id);
+            const unchanged = live !== undefined
+              && live.kind === "event"
+              && live.enabled
+              && !live.archived
+              && live.eventSourceId === (restored.eventSourceId ?? null)
+              && live.fallback === (restored.fallback ?? false)
+              && isDeepStrictEqual(live.eventMatch ?? null, restored.eventMatch ?? null)
+              && isDeepStrictEqual(normalizedEventGrouping(live.eventGrouping), normalizedEventGrouping(restored.eventGrouping));
+            if (!unchanged) assertCanWriteEventIssueTrigger(actor);
+          }
+          await assertCanChangeEventIssueSteps(txDb, actor, locked, {
+            steps: routineSnapshot.steps ?? [],
+            assigneeAgentId: routineSnapshot.assigneeAgentId ?? null,
+            enablesEventIssueTrigger: restoredEventIssueTriggers.length > 0,
           });
         }
 

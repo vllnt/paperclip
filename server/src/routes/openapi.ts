@@ -5102,7 +5102,8 @@ registry.registerPath({
   summary: "Update a routine",
   description:
     "The response carries `warnings`: one entry per step whose agent cannot take work now (for example paused). " +
-    "A warning never blocks the save.",
+    "A warning never blocks the save. While the routine has an enabled `eventGrouping.issueMode: \"event_issue\"` " +
+    "trigger, an agent that changes the steps or the routine's agent gets 403: only a board user may.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateRoutineSchema),

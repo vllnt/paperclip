@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -13,9 +13,10 @@ import {
   routines,
   routineTriggers,
 } from "@paperclipai/db";
-import type { RoutineStep } from "@paperclipai/shared";
+import { eventGroupingSchema, type RoutineStep } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture } from "./helpers/event-source-fixture.js";
+import { untilAStatementWaitsForALock } from "./helpers/lock-wait.js";
 
 // Lets a test make the routine dispatch throw after the delivery is claimed, before or after the run.
 const dispatchFault = vi.hoisted(() => ({ when: null as "before_run" | "after_run" | null }));
@@ -67,6 +68,28 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
   afterAll(async () => {
     await tempDb?.cleanup();
   });
+
+  /**
+   * Switches a trigger off in a board transaction that holds the routine lock and commits on
+   * `release()`: a board write that lands between another call's first read and its own lock.
+   */
+  function switchOffUnderRoutineLock(routineId: string, triggerId: string) {
+    let held!: () => void;
+    const holding = new Promise<void>((resolve) => {
+      held = resolve;
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const done = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routineId} for update`);
+      await tx.update(routineTriggers).set({ enabled: false }).where(eq(routineTriggers.id, triggerId));
+      held();
+      await released;
+    });
+    return { holding, release, done };
+  }
 
   async function seed() {
     const fx = await seedEventFixture(db);
@@ -577,6 +600,90 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
       await svc.update(routine.id, { title: "Release check, renamed" } as never, board);
       const restored = await svc.restoreRevision(routine.id, withTrigger!.id, agent);
       expect(restored.routine.title).toBe("Release check");
+    });
+
+    it("keeps an agent from changing the steps or the agent of the routine while the trigger is on", async () => {
+      const s = await seed();
+      const ownSteps = [step("build", [], { assigneeAgentId: s.leadId })];
+      const routine = await s.createRoutine();
+      const svc = s.fx.routinesSvc;
+      const board = { userId: "board-user" };
+      const agent = { agentId: s.leadId };
+      await svc.update(routine.id, { steps: ownSteps } as never, board);
+      const [withOwnSteps] = await svc.listRevisions(routine.id);
+      await svc.update(routine.id, { steps: s.steps } as never, board);
+      const trigger = await s.listen(routine);
+
+      await expect(svc.update(routine.id, { steps: ownSteps } as never, agent)).rejects.toMatchObject({
+        status: 403,
+        message: expect.stringContaining("steps"),
+      });
+      await expect(svc.update(routine.id, { assigneeAgentId: s.builderId } as never, agent)).rejects.toMatchObject({
+        status: 403,
+      });
+      await expect(svc.restoreRevision(routine.id, withOwnSteps!.id, agent)).rejects.toMatchObject({ status: 403 });
+      const [unchanged] = await db.select().from(routines).where(eq(routines.id, routine.id));
+      expect(unchanged).toMatchObject({ steps: s.steps, assigneeAgentId: s.leadId });
+      expect((await svc.update(routine.id, { title: "Release check, renamed" } as never, agent))?.title).toBe(
+        "Release check, renamed",
+      );
+
+      await svc.updateTrigger(trigger.id, { enabled: false } as never, agent);
+      expect((await svc.update(routine.id, { steps: ownSteps } as never, agent))?.steps).toMatchObject(ownSteps);
+    });
+
+    it("keeps a trigger the board switched off while an agent relabelled it switched off", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const trigger = await s.listen(routine);
+      const { holding, release, done } = switchOffUnderRoutineLock(routine.id, trigger.id);
+      await holding;
+
+      const relabel = s.fx.routinesSvc.updateTrigger(trigger.id, { label: "Renamed" } as never, { agentId: s.leadId });
+      await untilAStatementWaitsForALock(db);
+      release();
+      await done;
+      await relabel;
+
+      const [after] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+      expect(after).toMatchObject({ label: "Renamed", enabled: false });
+    });
+
+    it("lets an agent restore a trigger saved without the grouping defaults, when it is unchanged", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const svc = s.fx.routinesSvc;
+      const trigger = await s.listen(routine, { grouping: EVENT_ISSUE });
+      const [withTrigger] = await svc.listRevisions(routine.id);
+      await svc.update(routine.id, { title: "Release check, renamed" } as never, { userId: "board-user" });
+
+      const restored = await svc.restoreRevision(routine.id, withTrigger!.id, { agentId: s.leadId });
+
+      expect(restored.routine.title).toBe("Release check");
+      const [after] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+      expect(after?.enabled).toBe(true);
+    });
+
+    it("refuses an agent's restore that would switch back on a trigger the board just switched off", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const svc = s.fx.routinesSvc;
+      // Saved with the grouping defaults, as the API saves it, so only the race can make it differ.
+      const trigger = await s.listen(routine, { grouping: eventGroupingSchema.parse(EVENT_ISSUE) });
+      const [withTrigger] = await svc.listRevisions(routine.id);
+      await svc.update(routine.id, { title: "Release check, renamed" } as never, { userId: "board-user" });
+      const { holding, release, done } = switchOffUnderRoutineLock(routine.id, trigger.id);
+      await holding;
+
+      const restore = svc.restoreRevision(routine.id, withTrigger!.id, { agentId: s.leadId });
+      const refused = expect(restore).rejects.toMatchObject({ status: 403 });
+      await untilAStatementWaitsForALock(db);
+      release();
+      await done;
+      await refused;
+
+      const [after] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+      expect(after?.enabled).toBe(false);
     });
 
     it("lets a routine with a disabled trigger lose its steps", async () => {
