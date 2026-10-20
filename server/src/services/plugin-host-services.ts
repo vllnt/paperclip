@@ -1166,6 +1166,12 @@ export function buildHostServices(
     });
   };
 
+  /** The agent behind the current plugin call, in the shape `logPluginActivity` takes, so the audit entry names it. */
+  const callerActivityActor = () => {
+    const caller = currentPluginHostCallAgent();
+    return { actorAgentId: caller?.agentId ?? null, actorRunId: caller?.runId ?? null };
+  };
+
   const collectIssueSubtreeIds = async (companyId: string, rootIssueId: string) => {
     const seen = new Set<string>([rootIssueId]);
     let frontier = [rootIssueId];
@@ -3257,6 +3263,7 @@ export function buildHostServices(
           entityType: "principal_permission_grants",
           entityId: `${params.principalType}:${params.principalId}`,
           details: { grantCount: params.grants.length },
+          actor: callerActivityActor(),
         });
         return access
           .listPrincipalGrants(companyId, params.principalType as PrincipalType, params.principalId)
@@ -3339,6 +3346,7 @@ export function buildHostServices(
           entityType: params.resourceType,
           entityId: params.resourceId,
           details: { hasPolicy: Boolean(policy) },
+          actor: callerActivityActor(),
         });
         const updated = await readAuthorizationPolicy(companyId, params.resourceType, params.resourceId);
         if (!updated) throw new Error("Policy resource not found");

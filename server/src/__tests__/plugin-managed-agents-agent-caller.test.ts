@@ -602,4 +602,39 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
 
     expect(await grantKeys(companyId, peerId)).toEqual(["agents:configure"]);
   });
+
+  async function pluginAudit(companyId: string, action: string, entityId: string) {
+    return db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, action), eq(activityLog.entityId, entityId)));
+  }
+
+  it("names the agent behind an allowed policy or grant update in the activity log, and no agent for a call that none started", async () => {
+    const { companyId, services, managedAgentId, peerId } = await seed();
+    await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "agent", principalId: peerId, permissionKey: "agents:configure", scope: null, grantedByUserId: null,
+    });
+
+    await runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, async () => {
+      await updateAgentPolicy(services, companyId, managedAgentId);
+      await setGrants(services, companyId, "agent", managedAgentId);
+    });
+
+    const [policyEntry] = await pluginAudit(companyId, "authorization.policy_updated_by_plugin", managedAgentId);
+    const [grantEntry] = await pluginAudit(companyId, "authorization.grants_updated_by_plugin", `agent:${managedAgentId}`);
+    for (const entry of [policyEntry, grantEntry]) {
+      expect(entry).toMatchObject({
+        actorType: "plugin",
+        agentId: peerId,
+        details: { sourcePluginKey: MANIFEST.id, initiatingActorType: "agent", initiatingAgentId: peerId },
+      });
+    }
+
+    await services.authorization.updatePolicy({ companyId, resourceType: "agent", resourceId: managedAgentId, policy: null });
+    const entries = await pluginAudit(companyId, "authorization.policy_updated_by_plugin", managedAgentId);
+    expect(entries).toHaveLength(2);
+    expect(entries.filter((entry) => entry.agentId === null)).toHaveLength(1);
+    expect(entries.find((entry) => entry.agentId === null)?.details).toMatchObject({ initiatingAgentId: null });
+  });
 });
