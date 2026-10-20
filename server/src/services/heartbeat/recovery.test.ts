@@ -132,7 +132,8 @@ describe("heartbeat recovery module callbacks", () => {
     const database = guardedDatabase();
     const deps = callbacks(database.db);
     expect(await createHeartbeatRecovery(database.db, deps).drainRunningRunsForShutdown("SIGINT", new Date(), [])).toEqual({
-      interrupted: 0, interruptedRunIds: [], retryRunIds: [], restartSuspendedRunIds: [],
+      // `outcomes` is the fork's per-run shutdown budget report (#119); empty here.
+      interrupted: 0, interruptedRunIds: [], retryRunIds: [], restartSuspendedRunIds: [], outcomes: [],
     });
     expect(database.access).not.toHaveBeenCalled();
     expect(deps.cancelHeartbeatNativeRun).not.toHaveBeenCalled();
