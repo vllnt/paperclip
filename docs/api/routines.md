@@ -217,7 +217,7 @@ What happens to the task:
 - **Owned by a person, or by nobody:** its status does not change. It only gains the blocker edges, so it shows what it waits for.
 - **A step fails to create:** the steps created for this run are removed and the status goes back. The task itself is never deleted.
 
-Two starts on one task (an event and a manual run, say) take turns on the task's row lock, so the task ends up with one tree of steps. A second run on a task whose first run's steps are still open is refused with `409`; after those steps close, the routine can run on the task again. To retry a manual run safely, send an `idempotencyKey`: the same key returns the same run.
+Two starts on one task (an event and a manual run, say) take turns on the task's row lock, so the task ends up with one tree of steps. A second run on a task whose first run's steps are still open is refused with `409`; after those steps close, the routine can run on the task again. To retry a manual run safely, send an `idempotencyKey`: the same key returns the same run. A key that was already used for a run on another task, or for a run without a task, answers `409`.
 
 In the text of a step on such a run, `{{issue.title}}` and `{{issue.identifier}}` are the task's title and identifier. On any other run they are left as written.
 
@@ -229,7 +229,7 @@ Routine create and update (`POST /api/companies/{companyId}/routines`, `PATCH /a
 { "warnings": [{ "code": "step_agent_unavailable", "stepKey": "build", "agentId": "{agentId}", "reason": "paused" }] }
 ```
 
-`reason` is why the agent cannot take work now, for example `paused`, `pending_approval`, `error`, `terminated` or `not_invokable`. A warning never blocks the save or the run; it tells you a step may not start until the agent is available again. The CLI prints each warning to stderr as `warning: step "{stepKey}": agent {agentId} is {reason}` and keeps the response on stdout.
+`reason` is why the agent cannot take work now, one of `missing`, `paused`, `terminated`, `pending_approval`, `unknown_status`, `manager_missing`, `manager_company_mismatch`, `manager_terminated`, `reporting_cycle` or `reporting_chain_too_deep`. A warning never blocks the save or the run; it tells you a step may not start until the agent is available again. The CLI prints each warning to stderr as `warning: step "{stepKey}": agent {agentId} is {reason}` and keeps the response on stdout.
 
 ## Add Trigger
 
@@ -336,7 +336,7 @@ POST /api/routines/{routineId}/run
 { "targetIssueId": "{issueId}" }
 ```
 
-For a routine with steps, `targetIssueId` (a UUID) attaches the steps to that task instead of opening a new one. The answer is `202` with the run (`linkedIssueId` is the task) and `warnings` (see [Step warnings](#step-warnings)). The answers `404`, `409` and `422` and what happens to the task are in [Start the steps on a task](#start-the-steps-on-a-task). A routine without steps is `422`, and so is a request that also names a `triggerId`. A step that starts at once needs an agent that can be woken (`409` otherwise). You need the routine permissions and the right to update the task (`403` for an agent that may not); the activity entry records `targetIssueId`.
+For a routine with steps, `targetIssueId` (a UUID) attaches the steps to that task instead of opening a new one. The answer is `202` with the run (`linkedIssueId` is the task) and `warnings` (see [Step warnings](#step-warnings)). The answers `404`, `409` and `422` and what happens to the task are in [Start the steps on a task](#start-the-steps-on-a-task). A routine without steps is `422`, and so is a request that also names a `triggerId`, a `projectId`, a `projectWorkspaceId` or an execution workspace field (the steps go under the task). A step that starts at once needs an agent that can be woken (`409` otherwise). You need the routine permissions and the right to update the task (`403` for an agent that may not); the activity entry records `targetIssueId`.
 
 CLI: `paperclipai routine run {routineId} --target-issue {uuid-or-identifier}`. An identifier such as `PC-12` is looked up with the issue API first.
 
@@ -419,7 +419,7 @@ GET /api/routines/{routineId}/event-groups?open=true&limit=50
 
 Lists the alert groups of the routine, newest activity first: the group's issue, `repeatCount`, `lastSeverity` and `lastState`. `open` defaults to `true`; `limit` is 1-200. Event runs appear in run history with `source` `event` and the statuses `issue_created`, `grouped` (comment on the open issue) and `recovered`.
 
-A trigger with `eventGrouping.issueMode: "event_issue"` has no event groups. Its event is a task being created, and the routine's steps start on that task (see [Start the steps on a task](#start-the-steps-on-a-task)). It is allowed only on the built-in Paperclip event source, with `fallback: false`, for a routine that has steps; otherwise the save is `422`. A routine gate script that applies to event triggers cannot be combined with it (`422` at both the trigger save and the gate save).
+A trigger with `eventGrouping.issueMode: "event_issue"` has no event groups. Its event is a task being created, and the routine's steps start on that task (see [Start the steps on a task](#start-the-steps-on-a-task)). It is allowed only on the built-in Paperclip event source, with `fallback: false`, for a routine that has steps; otherwise the save is `422`. Only a board user can create, enable, restore or change one (`403` for an agent, even on its own routine); an agent can still disable, archive or relabel it. A routine gate script that applies to event triggers cannot be combined with it (`422` at both the trigger save and the gate save).
 
 ## List Runs
 

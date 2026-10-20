@@ -88,6 +88,7 @@ No new trigger kind. The existing `event` trigger does the work: `eventMatch`, t
 
 ### `issueMode: "event_issue"`
 
+- Board only: an agent that creates, enables, un-archives, restores from a revision or changes the event fields of such a trigger gets 403, even on its own routine. The trigger starts steps on every matching task of the company, including tasks of other agents and people. An agent can still disable, archive or relabel it.
 - Valid only on a trigger of the built-in source (422 on any other), with `fallback: false`, for a routine that has steps (422 otherwise; a routine update that would empty the steps while such a trigger is enabled is 422 too).
 - A routine gate script that applies to event triggers cannot combine with an `event_issue` trigger (422 at the trigger save and at the gate save). The start is synchronous and a gate would have to park it. Dispatch fails permanently if it still meets the pair.
 - The event's subject task is the root. No `routine_event_groups` row is written. The storm limiter still spends a slot: when the budget is gone the delivery is `storm_folded` with note `new_issue_budget_spent` and nothing is attached.
@@ -121,11 +122,11 @@ Two attaches on one task (an event and a manual run) take turns on the row lock,
 
 ### Manual run
 
-`POST /routines/:id/run` takes `targetIssueId` (a UUID). It answers 202 with the run, `linkedIssueId` the task, and `warnings`. Errors: 404 (task not in the routine's company), 409 and 422 as above, 409 when a step that starts at once has an agent that cannot be woken, 422 when the routine has no steps, and 422 when the request also names a `triggerId`. A second run on a task whose first run's steps are still open is refused with 409 by the open-steps check; after those steps close, the routine can run on the task again. A caller `idempotencyKey` returns the same run on a repeat. Permissions: the existing routine rules plus the right to update the target task (403 for an agent that may not). The activity entry records `targetIssueId`.
+`POST /routines/:id/run` takes `targetIssueId` (a UUID). It answers 202 with the run, `linkedIssueId` the task, and `warnings`. Errors: 404 (task not in the routine's company), 409 and 422 as above, 409 when a step that starts at once has an agent that cannot be woken, 422 when the routine has no steps, and 422 when the request also names a `triggerId`. A second run on a task whose first run's steps are still open is refused with 409 by the open-steps check; after those steps close, the routine can run on the task again. A caller `idempotencyKey` returns the same run on a repeat, and 409 when it was used for another task or for a run without a task. The request cannot also name `projectId`, `projectWorkspaceId` or execution workspace fields (422). Permissions: the existing routine rules plus the right to update the target task (403 for an agent that may not). The activity entry records `targetIssueId`.
 
 ### Warnings
 
-Routine create, update and run responses carry `warnings: RoutineStepWarning[]` (always present, often empty): `{ code: "step_agent_unavailable", stepKey, agentId, reason }`. The reason is the one the agent-invokability check reports (`paused`, `pending_approval`, `error`, `terminated`, ...). A warning never blocks the save or the run.
+Routine create, update and run responses carry `warnings: RoutineStepWarning[]` (always present, often empty): `{ code: "step_agent_unavailable", stepKey, agentId, reason }`. The reason is the one the agent-invokability check reports (`missing`, `paused`, `terminated`, `pending_approval`, `unknown_status`, `manager_missing`, `manager_company_mismatch`, `manager_terminated`, `reporting_cycle` or `reporting_chain_too_deep`). A warning never blocks the save or the run.
 
 ### Surfaces
 

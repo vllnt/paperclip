@@ -360,6 +360,7 @@ Lifecycle for one group (the oldest open, visible issue of the routine with this
 - `appendToIssueId` rules above.
 - `issueMode: "event_issue"` on a trigger of any other source, with `fallback: true`, or on a routine with no steps. A routine update that would empty the steps while such a trigger is enabled is `422` too.
 - A routine gate script that applies to event triggers on a routine with an `event_issue` trigger, at the trigger save and at the gate save.
+- `403`: an agent that creates, enables, un-archives, restores from a revision or changes the event fields (`eventSourceId`, `eventMatch`, `eventGrouping`, `fallback`) of an `event_issue` trigger. An `event_issue` trigger starts steps on every matching task of the company, so only a board user sets it up. An agent can still disable, archive or relabel it.
 - A malformed `eventMatch`, `eventGrouping` or an unknown `groupKey` placeholder fails request validation with `400`.
 - `PATCH` with event fields on a trigger that is not of kind `event`.
 
@@ -421,7 +422,7 @@ No event is published for a hidden task, a task of origin `routine_execution`, `
 
 **Outcome.** The delivery outcome for a routine is `issue_created` with `issueId` the task, the `runId`, and `note: "steps_attached"`. A task refused by a guard is `failed_permanent` with the guard's message (for example, a task already in progress). A spent budget is `storm_folded` (see [Storm breaker](#storm-breaker)). The run appears in the routine's run history with the task as its linked issue.
 
-**Limits.** The trigger needs a routine with steps and `fallback: false`. A routine gate script that applies to event triggers cannot be combined with it, because the steps start in the create request and cannot wait for a gate.
+**Limits.** Only a board user can set up the trigger (`403` for an agent). The trigger needs a routine with steps and `fallback: false`. A routine gate script that applies to event triggers cannot be combined with it, because the steps start in the create request and cannot wait for a gate.
 
 ## Untrusted content rendering
 
