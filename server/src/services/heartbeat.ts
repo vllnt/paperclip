@@ -10125,7 +10125,7 @@ export function heartbeatService(
       return getHeartbeatDailyCapBlock(agent, policy);
     },
     // One entry per agent and cap window, however many sweeps or issues the
-    // cap holds back; the window's first record after the reset writes again.
+    // cap holds back; the next window writes its own entry.
     recordDailyCapDispatchHold: async ({ companyId, agentId, issueId, block }) => {
       const windowStart = block.windowStart.toISOString();
       await logActivityOnce({
@@ -10148,7 +10148,7 @@ export function heartbeatService(
           limit: block.limit ?? null,
           windowStart,
           resetsAt: block.resetsAt.toISOString(),
-          issueId,
+          firstHeldIssueId: issueId,
         },
       });
     },

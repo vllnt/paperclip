@@ -940,6 +940,12 @@ export interface OnDemandWakePolicyBlock {
   resetsAt?: Date;
 }
 
+/** A daily cap block, with the window that the hold lasts for. */
+export type DailyCapDispatchHold = OnDemandWakePolicyBlock & {
+  windowStart: Date;
+  resetsAt: Date;
+};
+
 export function recoveryService(
   db: Db,
   deps: {
@@ -974,8 +980,9 @@ export function recoveryService(
     recordDailyCapDispatchHold?: (input: {
       companyId: string;
       agentId: string;
+      /** The issue whose dispatch was held first in the window. */
       issueId: string;
-      block: OnDemandWakePolicyBlock & { windowStart: Date; resetsAt: Date };
+      block: DailyCapDispatchHold;
     }) => Promise<void>;
     /**
      * Run slots the agent has free now (its concurrency limit minus its
@@ -2340,7 +2347,7 @@ export function recoveryService(
   async function recordDailyCapDispatchHold(
     issue: typeof issues.$inferSelect,
     agentId: string,
-    block: OnDemandWakePolicyBlock & { windowStart: Date; resetsAt: Date },
+    block: DailyCapDispatchHold,
   ) {
     const windowKey = block.windowStart.toISOString();
     if (
@@ -4733,27 +4740,31 @@ export function recoveryService(
 
     // On-demand policy blocks per agent for this sweep: read once, so an agent
     // at its daily cap costs one indexed run count per sweep, not one per issue.
+    // A dispatch forgets the agent's entry, since its run can reach the cap.
     const onDemandWakePolicyBlocks = new Map<
       string,
-      Promise<OnDemandWakePolicyBlock | null>
+      OnDemandWakePolicyBlock | null
     >();
     /**
-     * Whether the agent's own heartbeat policy (wakeOnDemand off, daily run or
-     * cost cap reached) would turn a dispatch into a skipped receipt. The
-     * dispatch stays pending with no receipt; a daily cap is recorded once per
-     * agent and window, and the first sweep after the window resets dispatches.
+     * Holds the dispatch when the agent's own heartbeat policy (wakeOnDemand
+     * off, daily run or cost cap reached) would turn it into a skipped receipt.
+     * The issue stays assigned with no receipt. A daily cap hold is recorded
+     * once per agent and window; the first sweep after the reset dispatches.
+     *
+     * @returns True when the dispatch is held.
      */
-    async function isOnDemandDispatchHeld(
+    async function holdOnDemandDispatch(
       issue: typeof issues.$inferSelect,
       agentId: string,
     ) {
       if (!deps.getOnDemandWakePolicyBlock) return false;
-      let pending = onDemandWakePolicyBlocks.get(agentId);
-      if (!pending) {
-        pending = deps.getOnDemandWakePolicyBlock(agentId);
-        onDemandWakePolicyBlocks.set(agentId, pending);
+      if (!onDemandWakePolicyBlocks.has(agentId)) {
+        onDemandWakePolicyBlocks.set(
+          agentId,
+          await deps.getOnDemandWakePolicyBlock(agentId),
+        );
       }
-      const block = await pending;
+      const block = onDemandWakePolicyBlocks.get(agentId);
       if (block == null) return false;
       const { windowStart, resetsAt } = block;
       if (windowStart && resetsAt) {
@@ -5325,7 +5336,7 @@ export function recoveryService(
             result.skipped += 1;
           } else if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
             result.skipped += 1;
-          } else if (await isOnDemandDispatchHeld(issue, participantAgentId)) {
+          } else if (await holdOnDemandDispatch(issue, participantAgentId)) {
             // The reviewer's own policy (wakeOnDemand off, daily cap reached)
             // would turn this wake into a skipped receipt on every sweep.
             // Leave the dispatch pending, with no receipt, until it changes.
@@ -5335,6 +5346,7 @@ export function recoveryService(
               issue,
               pendingExecutionState,
             );
+            onDemandWakePolicyBlocks.delete(participantAgentId);
             if (queued) {
               result.reviewParticipantRequeued += 1;
               result.issueIds.push(issue.id);
@@ -5550,7 +5562,7 @@ export function recoveryService(
           // Same policy gate as the other no-run dispatch lanes: an agent at
           // its daily cap would skip this wake on every sweep until the cap
           // window resets, so hold it, assigned, until the first sweep after.
-          if (await isOnDemandDispatchHeld(issue, agentId)) {
+          if (await holdOnDemandDispatch(issue, agentId)) {
             result.assignmentDispatchDeferred += 1;
             return;
           }
@@ -5559,6 +5571,7 @@ export function recoveryService(
             issue,
             agentId,
           );
+          onDemandWakePolicyBlocks.delete(agentId);
           if (queued) {
             result.assignmentDispatched += 1;
             result.issueIds.push(issue.id);
@@ -5677,7 +5690,7 @@ export function recoveryService(
           result.skipped += 1;
           return;
         }
-        if (await isOnDemandDispatchHeld(issue, agentId)) {
+        if (await holdOnDemandDispatch(issue, agentId)) {
           result.skipped += 1;
           return;
         }
@@ -5697,6 +5710,7 @@ export function recoveryService(
             requestedByActorId: STRANDED_ISSUE_RECOVERY_ACTOR_ID,
           });
         } finally {
+          onDemandWakePolicyBlocks.delete(agentId);
           if (!queued) releaseAgentRunSlot(agentId);
         }
         if (queued) {

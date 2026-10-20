@@ -215,6 +215,11 @@ describeEmbeddedPostgres("liveness dispatch for an agent at its daily run cap", 
         resetsAt: nextDayStart.toISOString(),
       }),
     });
+    // A restarted process has no in-memory record of the hold; the stored entry
+    // still keeps the window at one.
+    const restarted = heartbeatService(db);
+    expect((await restarted.reconcileStrandedAssignedIssues()).assignmentDispatchDeferred).toBe(ISSUE_COUNT);
+    expect(await capHoldEntries(agentId)).toHaveLength(1);
     const stillAssigned = await db.select().from(issues).where(inArray(issues.id, issueIds));
     expect(stillAssigned.every((issue) => issue.status === "todo" && issue.assigneeAgentId === agentId)).toBe(true);
 
@@ -258,4 +263,19 @@ describeEmbeddedPostgres("liveness dispatch for an agent at its daily run cap", 
       nextDayStart.toISOString(),
     ]);
   }, 600_000);
+
+  it("holds dispatch with no receipt and no cap record when wakeOnDemand is off", async () => {
+    const { agentId, issueIds } = await seedCappedAgent(utcDayStart(new Date()));
+    await db.update(agents)
+      .set({ runtimeConfig: { heartbeat: { wakeOnDemand: false } } })
+      .where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    for (let sweep = 0; sweep < 3; sweep += 1) {
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(result.assignmentDispatched).toBe(0);
+      expect(result.assignmentDispatchDeferred).toBe(issueIds.length);
+    }
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toEqual([]);
+    expect(await capHoldEntries(agentId)).toEqual([]);
+  });
 });
