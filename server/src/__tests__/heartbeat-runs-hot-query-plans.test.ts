@@ -127,6 +127,7 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
         seqScans: nodes.filter((node) => node["Node Type"] === "Seq Scan" && node["Relation Name"] === "heartbeat_runs"),
         usesIssueIndex: nodes.some((node) => node["Index Name"] === ISSUE_OR_TASK_INDEX),
         usesNoIssueIndex: nodes.some((node) => node["Index Name"] === NO_ISSUE_INDEX),
+        noIssueIndexConds: nodes.filter((node) => node["Index Name"] === NO_ISSUE_INDEX).map((node) => String(node["Index Cond"] ?? "")),
         // A filter evaluates on every run the scan visits, so a context expression there reads
         // (detoasts) the context of each visited run, matching or not.
         contextFilters: nodes.filter((node) => node["Relation Name"] === "heartbeat_runs" && node.Filter?.includes("context_snapshot")).map((node) => node.Filter),
@@ -257,14 +258,22 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
 
   /** A newer-run check uses its index, reads no run context, and stays within the bound. */
   async function expectNewerRunCheckPlans(statement: Captured) {
-    const issueCheck = !statement.query.includes(" is null");
+    const issueCheck = statement.query.includes("= candidate.issue_id");
     for (const genericPlan of [false, true]) {
       const plan = await explain(statement, genericPlan);
       const label = `${issueCheck ? "issue" : "no-issue"} check, ${genericPlan ? "generic" : "custom"} plan (${plan.shape})`;
       expect(plan.generic, `${label}: plan kind`).toBe(genericPlan);
       expect(plan.seqScans, `${label}: sequential scan of heartbeat_runs`).toEqual([]);
-      if (issueCheck) expect(plan.usesIssueIndex, `${label}: does not use ${ISSUE_OR_TASK_INDEX}`).toBe(true);
-      else expect(plan.usesNoIssueIndex, `${label}: does not use ${NO_ISSUE_INDEX}`).toBe(true);
+      if (issueCheck) {
+        expect(plan.usesIssueIndex, `${label}: does not use ${ISSUE_OR_TASK_INDEX}`).toBe(true);
+      } else {
+        expect(plan.usesNoIssueIndex, `${label}: does not use ${NO_ISSUE_INDEX}`).toBe(true);
+        // Without both bounds, the scan reads every older run of the agent without an issue,
+        // or every such run of the company.
+        for (const cond of plan.noIssueIndexConds) {
+          expect(cond, `${label}: the no-issue index scan does not range over agent_id and created_at`).toMatch(/agent_id.*created_at/);
+        }
+      }
       expect(plan.contextFilters, `${label}: reads the context of every run it visits`).toEqual([]);
       expect(plan.buffers, `${label}: shared buffers`).toBeLessThan(QUERY_2_BUFFER_BOUND);
     }

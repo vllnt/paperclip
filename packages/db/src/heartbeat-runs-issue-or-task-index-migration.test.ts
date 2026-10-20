@@ -15,8 +15,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
  */
 const ISSUE_OR_TASK = `coalesce("context_snapshot"->>'issueId', "context_snapshot"->>'taskId')`;
 const ISSUE_OR_TASK_DEF = "COALESCE((context_snapshot ->> 'issueId'::text), (context_snapshot ->> 'taskId'::text))";
-const QUALIFIED_ISSUE_OR_TASK = `coalesce("heartbeat_runs"."context_snapshot"->>'issueId', "heartbeat_runs"."context_snapshot"->>'taskId')`;
-const NO_ISSUE = `(${QUALIFIED_ISSUE_OR_TASK} is null or ${QUALIFIED_ISSUE_OR_TASK} = '')`;
+const NO_ISSUE = `(coalesce("heartbeat_runs"."context_snapshot"->>'issueId', "heartbeat_runs"."context_snapshot"->>'taskId') > '') is not true`;
 const NOBODY = "00000000-0000-0000-0000-000000000000";
 
 const INDEXES = [
@@ -34,7 +33,7 @@ const INDEXES = [
     columns: ["company_id", "agent_id", "created_at"],
     where: NO_ISSUE.replaceAll(`"heartbeat_runs".`, ""),
     statement: `CREATE INDEX IF NOT EXISTS "heartbeat_runs_company_agent_no_issue_created_idx" ON "heartbeat_runs" USING btree ("company_id","agent_id","created_at") WHERE ${NO_ISSUE};`,
-    definition: `CREATE INDEX heartbeat_runs_company_agent_no_issue_created_idx ON public.heartbeat_runs USING btree (company_id, agent_id, created_at) WHERE ((${ISSUE_OR_TASK_DEF} IS NULL) OR (${ISSUE_OR_TASK_DEF} = ''::text))`,
+    definition: `CREATE INDEX heartbeat_runs_company_agent_no_issue_created_idx ON public.heartbeat_runs USING btree (company_id, agent_id, created_at) WHERE ((${ISSUE_OR_TASK_DEF} > ''::text) IS NOT TRUE)`,
     // The later runs of one agent without an issue.
     query: `select id from heartbeat_runs where company_id = '${NOBODY}' and agent_id = '${NOBODY}' and created_at >= now() and ${NO_ISSUE}`,
   },
@@ -179,4 +178,81 @@ describe.each(INDEXES)("heartbeat_runs index $name", (spec) => {
       expect(await usesIndex()).toBe(true);
     }, 120_000);
   });
+});
+
+/**
+ * The no-issue predicate holds when issueId, else taskId, is null or empty. It
+ * computes that expression once, where `X is null or X = ''` computes it twice
+ * for each run that has an issue. Both must agree on every context shape.
+ */
+describePostgres("heartbeat_runs no-issue predicate", () => {
+  const X = `coalesce("heartbeat_runs"."context_snapshot"->>'issueId', "heartbeat_runs"."context_snapshot"->>'taskId')`;
+  const TWICE = `(${X} is null or ${X} = '')`;
+  // A context (JSON text, or null for SQL NULL) and whether the run has no issue.
+  const SHAPES: Array<[context: string | null, noIssue: boolean]> = [
+    [null, true],
+    ["null", true],
+    ["[]", true],
+    ['"issue"', true],
+    ["{}", true],
+    ['{"issueid": "issue"}', true],
+    ['{"issueId": null}', true],
+    ['{"issueId": ""}', true],
+    ['{"taskId": ""}', true],
+    ['{"issueId": null, "taskId": null}', true],
+    ['{"issueId": null, "taskId": ""}', true],
+    ['{"issueId": "", "taskId": "task"}', true], // an empty issueId wins over taskId
+    ['{"issueId": "issue"}', false],
+    ['{"taskId": "task"}', false],
+    ['{"issueId": null, "taskId": "task"}', false],
+    ['{"issueId": "issue", "taskId": ""}', false],
+    ['{"issueId": "0"}', false],
+    ['{"issueId": 42}', false], // ->> reads a non-string as its JSON text
+    ['{"issueId": false}', false],
+    ['{"issueId": {}}', false],
+    ['{"issueId": []}', false],
+    // Whitespace, zero-width, and control characters are not empty, even where a collation
+    // ignores them.
+    ['{"issueId": " "}', false],
+    ['{"issueId": "\\t\\n"}', false],
+    ['{"issueId": "\\u200b"}', false],
+    ['{"taskId": "\\u200b\\u200d\\ufeff"}', false],
+    ['{"issueId": "\\u0001"}', false],
+    ['{"issueId": "\\u007f\\u00ad\\u2060"}', false],
+  ];
+
+  async function database() {
+    const started = await startEmbeddedPostgresTestDatabase("paperclip-run-no-issue-predicate-");
+    cleanups.push(started.cleanup);
+    const sql = postgres(started.connectionString, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => { await sql.end(); });
+    return sql;
+  }
+
+  it("agrees with `X is null or X = ''` on every context shape, and in every deterministic collation present", async () => {
+    const sql = await database();
+    const rows = await sql.unsafe<Array<{ issue: string | null; once: boolean; twice: boolean }>>(
+      `select ${X} as issue, ${NO_ISSUE} as once, ${TWICE} as twice
+      from (values ${SHAPES.map((_, index) => `(${index}, $${index + 1}::text::jsonb)`).join(", ")}) as "heartbeat_runs"(ord, "context_snapshot")
+      order by ord`,
+      SHAPES.map(([context]) => context),
+    );
+    expect(rows.map(({ once, twice }) => ({ once, twice })))
+      .toEqual(SHAPES.map(([, noIssue]) => ({ once: noIssue, twice: noIssue })));
+
+    // The predicate relies on '' sorting before every other string, as it does in a
+    // deterministic collation: a tie is broken bytewise. Check each issue the shapes hold.
+    const issues = rows.filter((_, index) => !SHAPES[index]![1]).map(({ issue }) => issue);
+    const collations = await sql<Array<{ name: string }>>`
+      select collname as name from pg_collation
+      where collisdeterministic and collencoding in (-1, pg_char_to_encoding(getdatabaseencoding()))
+        and collname in ('default', 'C', 'POSIX', 'C.UTF-8', 'und-x-icu', 'en-x-icu', 'en_US.UTF-8', 'en_US.utf8')`;
+    expect(collations.map(({ name }) => name)).toContain("C");
+    for (const { name } of collations) {
+      const [result] = await sql.unsafe<Array<{ sorted: boolean }>>(
+        `select bool_and(issue collate "${name}" > '') as sorted from unnest($1::text[]) as issue`, [issues],
+      );
+      expect(result?.sorted, `collation ${name}: a non-empty issue does not sort after ''`).toBe(true);
+    }
+  }, 120_000);
 });

@@ -246,7 +246,7 @@ On a large instance, build the indexes before you deploy, without blocking write
 
 ```sql
 CREATE INDEX CONCURRENTLY IF NOT EXISTS "heartbeat_runs_company_issue_or_task_idx" ON "heartbeat_runs" USING btree ("company_id", (coalesce("context_snapshot"->>'issueId', "context_snapshot"->>'taskId')));
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "heartbeat_runs_company_agent_no_issue_created_idx" ON "heartbeat_runs" USING btree ("company_id","agent_id","created_at") WHERE (coalesce("heartbeat_runs"."context_snapshot"->>'issueId', "heartbeat_runs"."context_snapshot"->>'taskId') is null or coalesce("heartbeat_runs"."context_snapshot"->>'issueId', "heartbeat_runs"."context_snapshot"->>'taskId') = '');
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "heartbeat_runs_company_agent_no_issue_created_idx" ON "heartbeat_runs" USING btree ("company_id","agent_id","created_at") WHERE (coalesce("heartbeat_runs"."context_snapshot"->>'issueId', "heartbeat_runs"."context_snapshot"->>'taskId') > '') is not true;
 SELECT indexrelid::regclass, indisvalid FROM pg_index
 WHERE indexrelid IN ('heartbeat_runs_company_issue_or_task_idx'::regclass, 'heartbeat_runs_company_agent_no_issue_created_idx'::regclass);
 ```

@@ -26257,7 +26257,7 @@
             }
           ],
           "isUnique": false,
-          "where": "(coalesce(\"heartbeat_runs\".\"context_snapshot\"->>'issueId', \"heartbeat_runs\".\"context_snapshot\"->>'taskId') is null or coalesce(\"heartbeat_runs\".\"context_snapshot\"->>'issueId', \"heartbeat_runs\".\"context_snapshot\"->>'taskId') = '')",
+          "where": "(coalesce(\"heartbeat_runs\".\"context_snapshot\"->>'issueId', \"heartbeat_runs\".\"context_snapshot\"->>'taskId') > '') is not true",
           "concurrently": false,
           "method": "btree",
           "with": {}

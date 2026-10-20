@@ -178,12 +178,15 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       sql`(coalesce(${table.contextSnapshot}->>'issueId', ${table.contextSnapshot}->>'taskId'))`,
     ),
-    // An agent's runs without an issue (that expression is null or empty), by creation
-    // time: the attention feed's newer-run check for an exhausted run without an issue.
-    // A query must state this exact predicate for the planner to use the index.
+    // An agent's runs without an issue, by creation time: the attention feed's newer-run
+    // check for an exhausted run without an issue. `(expression > '') is not true` holds
+    // when the expression is null or empty ('' sorts first in a deterministic collation).
+    // It computes the expression once per run (`is null or = ''` computes it twice for each
+    // run with an issue), and the planner estimates it from the index above. A query must
+    // state this exact predicate.
     companyAgentNoIssueCreatedIdx: index("heartbeat_runs_company_agent_no_issue_created_idx")
       .on(table.companyId, table.agentId, table.createdAt)
-      .where(sql`(coalesce(${table.contextSnapshot}->>'issueId', ${table.contextSnapshot}->>'taskId') is null or coalesce(${table.contextSnapshot}->>'issueId', ${table.contextSnapshot}->>'taskId') = '')`),
+      .where(sql`(coalesce(${table.contextSnapshot}->>'issueId', ${table.contextSnapshot}->>'taskId') > '') is not true`),
     companyCtxTaskCreatedIdx: index("heartbeat_runs_company_ctx_task_created_idx").on(
       table.companyId,
       sql`(${table.contextSnapshot} ->> 'taskId')`,

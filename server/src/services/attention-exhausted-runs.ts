@@ -11,12 +11,17 @@ const SUPERSEDED_CHECK_CHUNK = 500;
 const runIssueOrTask = sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId')`;
 
 /**
- * A run without an issue (readRunIssueId reads an empty issue as none), as the
- * predicate of heartbeat_runs_company_agent_no_issue_created_idx states it. Keep
- * this exact expression: the planner uses a partial index only when the query
- * implies its predicate.
+ * A run without an issue: its issue is null or empty (readRunIssueId reads an
+ * empty issue as none). `> ''` is null for a null issue, false for an empty one,
+ * and true for any other ('' sorts first in a deterministic collation), so
+ * `is not true` equals `is null or = ''`. It computes the issue once per run
+ * (`is null or = ''` computes it twice for each run with an issue), and the
+ * planner estimates it from the issue index's statistics.
+ * This is the predicate of heartbeat_runs_company_agent_no_issue_created_idx.
+ * Keep this exact expression: the planner uses a partial index only when the
+ * query implies its predicate.
  */
-const runHasNoIssue = sql`(${runIssueOrTask} is null or ${runIssueOrTask} = '')`;
+const runHasNoIssue = sql`(${runIssueOrTask} > '') is not true`;
 
 /**
  * The exhausted runs that a newer run of the same agent on the same issue
