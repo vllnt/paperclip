@@ -440,6 +440,18 @@ function applyStringChecks(
   }
 }
 
+function applyArrayChecks(
+  jsonSchema: JsonSchema,
+  checks: ReadonlyArray<unknown>,
+) {
+  for (const check of checks) {
+    const def = checkDef(check);
+    if (!def) continue;
+    if (def.check === "min_length") jsonSchema.minItems = def.minimum;
+    else if (def.check === "max_length") jsonSchema.maxItems = def.maximum;
+  }
+}
+
 function applyNumberChecks(
   jsonSchema: JsonSchema,
   checks: ReadonlyArray<unknown>,
@@ -506,10 +518,12 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
   }
 
   if (typeName === "array") {
-    return {
+    const jsonSchema: JsonSchema = {
       type: "array",
       items: zodToOpenApiSchema(def.element as z.ZodTypeAny),
     };
+    applyArrayChecks(jsonSchema, (def.checks as unknown[]) ?? []);
+    return jsonSchema;
   }
 
   if (typeName === "record") {
@@ -5028,7 +5042,14 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createRoutineSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({
@@ -5049,7 +5070,14 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     body: jsonBody(updateRoutineSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({
@@ -5074,6 +5102,8 @@ registry.registerPath({
     200: r.ok(),
     400: r.badRequest,
     401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
     422: r.unprocessable,
   },
 });
@@ -5107,7 +5137,14 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     body: jsonBody(createRoutineTriggerSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({
@@ -5119,7 +5156,14 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     body: jsonBody(updateRoutineTriggerSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({

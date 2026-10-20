@@ -340,9 +340,12 @@ describe("deriveRunUsageRecord", () => {
     expect(record).toMatchObject({ providerWorkStarted: false, queueWaitMs: null, durationMs: null });
   });
 
-  it("derives the routine from a routine-execution issue with an id-shaped origin", () => {
+  it("derives the routine from a routine root or step issue with an id-shaped origin", () => {
     const routine = deriveRunUsageRecord(makeInput({
       issue: { id: ISSUE_ID, projectId: null, originKind: "routine_execution", originId: ROUTINE_ID },
+    }));
+    const step = deriveRunUsageRecord(makeInput({
+      issue: { id: ISSUE_ID, projectId: null, originKind: "routine_step", originId: ROUTINE_ID },
     }));
     const badOrigin = deriveRunUsageRecord(makeInput({
       issue: { id: ISSUE_ID, projectId: null, originKind: "routine_execution", originId: "not-a-uuid" },
@@ -352,6 +355,7 @@ describe("deriveRunUsageRecord", () => {
     }));
 
     expect(routine?.routineId).toBe(ROUTINE_ID);
+    expect(step?.routineId).toBe(ROUTINE_ID);
     expect(badOrigin?.routineId).toBeNull();
     expect(manual?.routineId).toBeNull();
   });
