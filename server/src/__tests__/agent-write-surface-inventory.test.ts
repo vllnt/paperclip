@@ -5,8 +5,8 @@ import { describe, expect, it } from "vitest";
 
 /**
  * Every server source file that can write an agent row (it uses `agentService`,
- * writes the `agents` table directly, or calls the agent lifecycle or the
- * configuration write helper) must be listed here with how an agent
+ * writes the `agents` table directly, or calls the agent lifecycle, the
+ * configuration write helper, or the monthly spend projection) must be listed here with how an agent
  * caller is kept from using it to set protected fields (caps, model, budget,
  * bypass flags, role, permissions, leaving `paused`). A new file that writes
  * agents fails this test until someone classifies it. A `guarded` entry names
@@ -77,6 +77,8 @@ const SURFACES: Record<string, Surface> = {
   "services/agent-instruction-revisions.ts": { kind: "guarded", how: "writes instruction keys only; instruction routes check the instruction permission", tests: ["agent-instructions-routes.test.ts"] },
   "services/budgets.ts": { kind: "system", how: "budget enforcement pauses and resumes; the policy routes are board-only" },
   "services/companies.ts": { kind: "system", how: "company lifecycle (archive, pause, delete)" },
+  "services/costs.ts": { kind: "system", how: "spend accounting; the monthly spend projection is computed from the cost ledger" },
+  "services/billing-reconciliation.ts": { kind: "board-only", how: "invoice reconciliation corrects ledger spend behind the board-only accounting routes" },
   "services/execution-control-reconciliation.ts": { kind: "system", how: "run reconciliation" },
   "app.ts": { kind: "system", how: "starts the agent lifecycle worker at boot; no request input" },
   "modules/agent-lifecycle/index.ts": { kind: "owner", how: "the agent lifecycle module (hire, configure, pause, resume, terminate, purge); every caller is classified in this table" },
@@ -109,7 +111,7 @@ const SOURCE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const TEST_ROOT = path.resolve(SOURCE_ROOT, "__tests__");
 // Upstream moved agent writes behind the lifecycle module and the configuration write helper.
 const AGENT_WRITE_PATTERN =
-  /\bagentService\b|\.(update|insert|delete)\((agents|agentsTable)\)|\b(createAgentLifecycle|configureAgentLifecycle|startAgentLifecycle|updateAgentConfiguration|updateAgentConfigurationInTransaction)\b/;
+  /\bagentService\b|\.(update|insert|delete)\((agents|agentsTable)\)|\b(createAgentLifecycle|configureAgentLifecycle|startAgentLifecycle|updateAgentConfiguration|updateAgentConfigurationInTransaction|updateMonthlySpendProjections)\b/;
 
 function listSourceFiles(directory: string): string[] {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
