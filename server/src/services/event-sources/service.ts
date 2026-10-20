@@ -1264,8 +1264,10 @@ export function eventSourceService(
         );
         return {
           // A manual run on the task may have attached its steps first and so refused this event's;
-          // the assignee must stay asleep all the same.
-          stepsAttached: attachedHere || (await hasOpenRoutineSteps(db, companyId, input.issueId)),
+          // the assignee must stay asleep all the same. The delivery is settled: a failed check must
+          // not record it as failed.
+          stepsAttached:
+            attachedHere || (await hasOpenRoutineSteps(db, companyId, input.issueId).catch(() => false)),
           routineRunIds: settled.flatMap((outcome) => outcome.runId ?? []),
         };
       } catch (err) {

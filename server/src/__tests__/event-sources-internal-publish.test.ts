@@ -41,6 +41,20 @@ vi.mock("../services/routines.js", async (importOriginal) => {
   };
 });
 
+// Lets a test make the open-steps check of the publish throw.
+const openStepsFault = vi.hoisted(() => ({ broken: false }));
+
+vi.mock("../services/routine-steps.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/routine-steps.js")>();
+  return {
+    ...actual,
+    hasOpenRoutineSteps: async (...input: Parameters<typeof actual.hasOpenRoutineSteps>) => {
+      if (openStepsFault.broken) throw new Error("the open-steps check broke");
+      return actual.hasOpenRoutineSteps(...input);
+    },
+  };
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -496,6 +510,21 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
   describe("a publish that breaks after the delivery is claimed", () => {
     afterEach(() => {
       dispatchFault.when = null;
+      openStepsFault.broken = false;
+    });
+
+    it("keeps a settled delivery as it is when the open-steps check after it breaks", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      await s.listen(routine, { grouping: EVENT_ISSUE, match: { labels: { label_needs_review: "true" } } });
+      const task = await s.newTask();
+      openStepsFault.broken = true;
+
+      const result = await s.publish(task.id);
+
+      expect(result).toEqual({ stepsAttached: false, routineRunIds: [] });
+      const [delivery] = await s.deliveries();
+      expect(delivery).toMatchObject({ status: "unrouted", error: null });
     });
 
     it("records the failure on the delivery and reports no steps, so the caller wakes the assignee", async () => {
