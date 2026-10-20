@@ -196,10 +196,11 @@ export function RoutineTriggerWizard({
   const event = draft.kind === "event";
   const webhook = draft.kind === "webhook";
   const github = draft.sender === "github";
+  const eventIssue = event && draft.event.issueMode === "event_issue";
   const labels = schedule
     ? ["Choose trigger", "Set schedule", "Review schedule"]
     : event
-      ? ["Choose trigger", "Match events", "Group alerts"]
+      ? ["Choose trigger", "Match events", eventIssue ? "Review trigger" : "Group alerts"]
       : ["Choose trigger", "Connect your app", "Check connection"];
   const eventCheck = validateEventDraft(draft.event);
   // Which fields each Event step owns, so a step only blocks on its own errors.
@@ -259,7 +260,9 @@ export function RoutineTriggerWizard({
         : event
           ? draft.step === 1
             ? "Choose which events to react to"
-            : "Group repeated alerts"
+            : eventIssue
+              ? "Review the trigger"
+              : "Group repeated alerts"
         : draft.step === 1
           ? `Connect ${github ? "GitHub" : "your app"}`
           : "Check your connection";
@@ -272,8 +275,10 @@ export function RoutineTriggerWizard({
           : "This schedule starts the routine automatically. You can pause or change it later."
         : event
           ? draft.step === 1
-            ? "Pick the event source and describe the alerts that should wake this routine’s agent."
-            : "Decide how repeats, recoveries and new issues are handled."
+            ? "Pick the event source and describe the events that should start this routine."
+            : eventIssue
+              ? "Check what happens to each matching task before you add the trigger."
+              : "Decide how repeats, recoveries and new issues are handled."
         : draft.step === 1
           ? "Copy these details into the sending app, then save its webhook settings."
           : "Test that events arrive and authentication works. This won’t start the routine.";
@@ -323,7 +328,7 @@ export function RoutineTriggerWizard({
                   kind: "event",
                   label: "When a monitoring alert arrives",
                   detail:
-                    "Wake this agent for alerts from Gatus, Wazuh or a script. Repeats are grouped into one issue.",
+                    "Wake this agent for alerts from Gatus, Wazuh or a script. Repeats are grouped into one issue. Or start the routine’s steps when a task is created.",
                   Icon: BellRing,
                 },
               ] as const
