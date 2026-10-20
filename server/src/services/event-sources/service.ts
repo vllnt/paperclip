@@ -750,15 +750,20 @@ export function eventSourceService(
         for (const id of subscriber.triggerIds) triggerIds.add(id);
         // A re-claimed delivery only dispatches the routines that have no success yet.
         if (isSuccessfulOutcome(outcomes[subscriber.routine.id])) continue;
-        const outcome = await dispatchGate.run(() =>
-          routinesSvc.dispatchEvent({
-            routine: subscriber.routine,
-            trigger: subscriber.trigger,
-            event,
-            deliveryId: claim.deliveryId,
-            ...stormSlotFor(source.id),
-            now: new Date(now()),
-          }),
+        // The built-in source dispatches inside a task create request, so it goes ahead of queued
+        // external deliveries instead of waiting out a burst of them. It keeps the shared cap, which
+        // bounds the pooled connections.
+        const outcome = await dispatchGate.run(
+          () =>
+            routinesSvc.dispatchEvent({
+              routine: subscriber.routine,
+              trigger: subscriber.trigger,
+              event,
+              deliveryId: claim.deliveryId,
+              ...stormSlotFor(source.id),
+              now: new Date(now()),
+            }),
+          { first: isInternalSource(source) },
         );
         outcomes[subscriber.routine.id] = outcome;
         if (!(await mergeOutcome(claim, subscriber.routine.id, outcome))) superseded = true;

@@ -44,6 +44,30 @@ describe("event dispatch semaphore", () => {
     expect(semaphore.waiting).toBe(0);
   });
 
+  it("starts a task run with first ahead of the waiting tasks, keeping the limit", async () => {
+    const semaphore = createSemaphore(1);
+    const gates = [deferred(), deferred(), deferred(), deferred()];
+    const started: string[] = [];
+    const run = (name: string, gate: ReturnType<typeof deferred>, first = false) =>
+      semaphore.run(async () => {
+        started.push(name);
+        await gate.promise;
+      }, { first });
+    const tasks = [run("busy", gates[0]!), run("queued", gates[1]!), run("first-a", gates[2]!, true), run("first-b", gates[3]!, true)];
+    await Promise.resolve();
+    expect(semaphore.waiting).toBe(3);
+
+    for (const gate of gates) {
+      gate.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(semaphore.active).toBeLessThanOrEqual(1);
+    }
+    await Promise.all(tasks);
+    expect(started).toEqual(["busy", "first-a", "first-b", "queued"]);
+    expect(semaphore.active).toBe(0);
+  });
+
   it("frees its slot when a task throws", async () => {
     const semaphore = createSemaphore(1);
     await expect(semaphore.run(async () => { throw new Error("boom"); })).rejects.toThrow("boom");

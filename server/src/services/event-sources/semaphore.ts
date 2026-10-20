@@ -5,7 +5,11 @@
  * park every connection in a transaction that is waiting for another.
  */
 export interface Semaphore {
-  run<T>(task: () => Promise<T>): Promise<T>;
+  /**
+   * Runs `task` once a slot is free. A task run with `first` waits ahead of every waiting task run
+   * without it; tasks of each kind start in the order they came.
+   */
+  run<T>(task: () => Promise<T>, options?: { first?: boolean }): Promise<T>;
   readonly active: number;
   readonly waiting: number;
 }
@@ -13,19 +17,20 @@ export interface Semaphore {
 export function createSemaphore(limit: number): Semaphore {
   const capacity = Math.max(1, Math.floor(limit));
   let active = 0;
+  const firstQueue: Array<() => void> = [];
   const queue: Array<() => void> = [];
 
   const release = () => {
-    const next = queue.shift();
+    const next = firstQueue.shift() ?? queue.shift();
     if (next) next();
     else active -= 1;
   };
 
   return {
-    async run<T>(task: () => Promise<T>): Promise<T> {
+    async run<T>(task: () => Promise<T>, options: { first?: boolean } = {}): Promise<T> {
       if (active >= capacity) {
         // The releasing task hands its slot straight to the next waiter, so `active` stays at capacity.
-        await new Promise<void>((resolve) => queue.push(resolve));
+        await new Promise<void>((resolve) => (options.first ? firstQueue : queue).push(resolve));
       } else {
         active += 1;
       }
@@ -39,7 +44,7 @@ export function createSemaphore(limit: number): Semaphore {
       return active;
     },
     get waiting() {
-      return queue.length;
+      return firstQueue.length + queue.length;
     },
   };
 }
