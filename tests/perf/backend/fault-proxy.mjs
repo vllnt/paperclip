@@ -78,6 +78,7 @@ function emptyStats() {
     refused: 0,
     peakOpen: 0,
     peakInFlight: 0,
+    resetLifetimesMs: [],
   };
 }
 
@@ -113,6 +114,7 @@ export async function startFaultProxy({ targetHost = "127.0.0.1", targetPort, li
   /** A fault: both sockets end with a TCP reset. */
   function reset(connection) {
     if (!forget(connection)) return;
+    stats.resetLifetimesMs.push(performance.now() - connection.acceptedAt);
     connection.client.resetAndDestroy();
     connection.upstream?.resetAndDestroy();
   }
@@ -158,6 +160,7 @@ export async function startFaultProxy({ targetHost = "127.0.0.1", targetPort, li
   const server = net.createServer({ pauseOnConnect: true }, (client) => {
     const connection = {
       client,
+      acceptedAt: performance.now(),
       upstream: null,
       queued: [],
       closed: false,
@@ -254,7 +257,11 @@ export async function startFaultProxy({ targetHost = "127.0.0.1", targetPort, li
     /** Counters since the last `resetStats`. */
     stats() {
       const busiest = (map) => Math.max(0, ...map.values());
+      const lifetimes = [...stats.resetLifetimesMs].sort((a, b) => a - b);
       return {
+        resets: lifetimes.length,
+        // The time from accept to reset of a failed connection: the failed-attempt time of the F4 auth bound.
+        medianResetLifetimeMs: lifetimes.length === 0 ? null : lifetimes[Math.floor((lifetimes.length - 1) / 2)],
         statements: stats.statements,
         busiestStatementSecond: busiest(stats.statementsPerSecond),
         accepted: stats.accepted,

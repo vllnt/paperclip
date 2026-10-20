@@ -23,6 +23,7 @@
  * [5000], --stall ms [3000] (0 skips the slow-failure case), --query
  * ["select pg_sleep(0.003)"].
  */
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -30,6 +31,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
 import { startFaultProxy } from "./fault-proxy.mjs";
+import { startServer } from "./lib/server.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "../../..");
@@ -227,8 +229,333 @@ async function f1(argv) {
   process.stderr.write(`F1 report: ${values.out}\n`);
 }
 
+/** F4 fault values (plan section 8), fixed before the first run and the same for every arm. */
+const F4_FLAP = { lifeMs: 100, holdMs: 300 };
+const F4_CLOUD_STACK = "perf-f4";
+const F4_WAKE_SETTLE_MS = 30_000;
+
+function cloudHeaders(token, userId, role) {
+  return {
+    "x-paperclip-cloud-tenant-token": token,
+    "x-paperclip-cloud-user-id": userId,
+    "x-paperclip-cloud-user-email": `${userId}@example.com`,
+    "x-paperclip-cloud-stack-id": F4_CLOUD_STACK,
+    "x-paperclip-cloud-stack-role": role,
+  };
+}
+
+async function request(base, method, route, { headers = {}, body, timeoutMs = 30_000 } = {}) {
+  const response = await fetch(base + route, {
+    method,
+    headers: body ? { ...headers, "content-type": "application/json" } : headers,
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await response.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // Not JSON.
+  }
+  return { status: response.status, json };
+}
+
+async function must(pending, what) {
+  const response = await pending;
+  if (response.status >= 300) throw new Error(`${what}: HTTP ${response.status} ${JSON.stringify(response.json).slice(0, 300)}`);
+  return response.json;
+}
+
+/**
+ * The `auth` server: authenticated mode with the cloud-tenant trust token, so
+ * every request runs the actor lookup. Returns the request senders.
+ */
+async function seedAuth(url, token) {
+  const owner = cloudHeaders(token, "perf-owner", "owner");
+  const me = await must(request(url, "GET", "/api/cli-auth/me", { headers: owner }), "owner lookup");
+  const companyId = me.companyIds?.[0];
+  if (!companyId) throw new Error(`no company for the cloud stack: ${JSON.stringify(me).slice(0, 300)}`);
+  for (let index = 0; index < 20; index += 1) {
+    await must(request(url, "POST", `/api/companies/${companyId}/issues`, { headers: owner, body: { title: `[perf] issue ${index}`, status: "todo" } }), "seed issue");
+  }
+  const dashboard = cloudHeaders(token, "perf-dashboard", "member");
+  const reader = cloudHeaders(token, "perf-reader", "member");
+  return {
+    dashboard: () => request(url, "GET", `/api/companies/${companyId}/dashboard`, { headers: dashboard }),
+    auth: () => request(url, "GET", "/api/auth/get-session", { headers: reader }),
+  };
+}
+
+/**
+ * The `wake` server: local_trusted, so no actor lookup runs. Every assignment
+ * assigns an unassigned `todo` issue, so each 2xx answer must queue one wake.
+ */
+async function seedWake(url, assignments) {
+  const company = await must(request(url, "POST", "/api/companies", { body: { name: "Perf F4" } }), "seed company");
+  const agent = await must(request(url, "POST", `/api/companies/${company.id}/agents`, {
+    body: {
+      name: "Perf F4 agent",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: { command: "/usr/bin/true" },
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+    },
+  }), "seed agent");
+  const issues = [];
+  for (let index = 0; index < assignments; index += 1) {
+    issues.push(await must(request(url, "POST", `/api/companies/${company.id}/issues`, { body: { title: `[perf] wake ${index}`, status: "todo" } }), "seed issue"));
+  }
+  let next = 0;
+  return {
+    dashboard: () => request(url, "GET", `/api/companies/${company.id}/dashboard`),
+    assign: async () => {
+      const issue = issues[next];
+      next += 1;
+      if (!issue) throw new Error("ran out of seeded issues");
+      const response = await request(url, "PATCH", `/api/issues/${issue.id}`, { body: { assigneeAgentId: agent.id } });
+      return { ...response, wakeKeyPrefix: `issue-assignment:${issue.id}:${agent.id}:` };
+    },
+  };
+}
+
+/**
+ * The statements one healthy request of each route sends, counted at the
+ * proxy with nothing else running, minus the server's idle background rate.
+ */
+async function statementCensus(proxy, senders, samples) {
+  // The first request of a user runs the full actor sync; keep it out of the count.
+  for (const send of Object.values(senders)) await send();
+  proxy.resetStats();
+  const idleStarted = performance.now();
+  await sleep(3_000);
+  const idlePerMs = proxy.stats().statements / (performance.now() - idleStarted);
+  const routes = {};
+  for (const [name, send] of Object.entries(senders)) {
+    proxy.resetStats();
+    const started = performance.now();
+    for (let index = 0; index < samples; index += 1) {
+      const response = await send();
+      if (response.status >= 300) throw new Error(`census ${name}: HTTP ${response.status}`);
+    }
+    // The wake is delivered after the response.
+    await sleep(1_000);
+    const statements = proxy.stats().statements - idlePerMs * (performance.now() - started);
+    routes[name] = Math.max(0, statements / samples);
+  }
+  return { idleStatementsPerSecond: idlePerMs * 1000, statementsPerRequest: routes };
+}
+
+/** Sends `send()` at a fixed rate from `startAt` to `endAt` (open loop) and records each request. */
+async function openLoop({ name, rate, startAt, endAt, send, records }) {
+  if (!(rate > 0)) return;
+  const pending = [];
+  for (let index = 0; ; index += 1) {
+    const at = startAt + (index * 1000) / rate;
+    if (at >= endAt) break;
+    await sleep(at - performance.now());
+    const record = { route: name, startedAt: performance.now() };
+    records.push(record);
+    pending.push(send().then(
+      (response) => {
+        record.status = response.status;
+        record.ok = response.status < 400;
+        record.wakeKeyPrefix = response.wakeKeyPrefix;
+      },
+      (error) => {
+        record.status = 0;
+        record.ok = false;
+        record.code = errorCode(error);
+      },
+    ).finally(() => { record.durationMs = performance.now() - record.startedAt; }));
+  }
+  await Promise.all(pending);
+}
+
+/** Switches the proxy at each phase boundary and reads its counters at each phase end. */
+async function drivePhases(proxy, phases, startAt) {
+  const results = [];
+  let at = startAt;
+  for (const phase of phases) {
+    await sleep(at - performance.now());
+    proxy.resetStats();
+    const startEpoch = Date.now();
+    await proxy.setMode(phase.mode, phase.mode === "flap" ? F4_FLAP : {});
+    const startPerf = at;
+    at += phase.ms;
+    await sleep(at - performance.now());
+    results.push({ name: phase.name, startPerf, endPerf: at, startEpoch, endEpoch: Date.now(), proxy: proxy.stats() });
+  }
+  await proxy.setMode("pass");
+  return results;
+}
+
+function phaseReport(phase, records, census, budgetWarnings, wakeKeys) {
+  const seconds = (phase.endPerf - phase.startPerf) / 1000;
+  const routes = {};
+  for (const record of records) {
+    if (record.startedAt < phase.startPerf || record.startedAt >= phase.endPerf) continue;
+    const route = (routes[record.route] ??= { requests: 0, failed: 0, longestMs: 0, statuses: {} });
+    route.requests += 1;
+    if (!record.ok) route.failed += 1;
+    route.longestMs = Math.max(route.longestMs, Math.round(record.durationMs));
+    const status = record.code ?? record.status;
+    route.statuses[status] = (route.statuses[status] ?? 0) + 1;
+    if (record.route === "assign" && record.ok) {
+      route.answered2xx = (route.answered2xx ?? 0) + 1;
+      if (wakeKeys && [...wakeKeys].some((key) => key.startsWith(record.wakeKeyPrefix))) route.woken = (route.woken ?? 0) + 1;
+    }
+  }
+  if (routes.assign) routes.assign.wakeShare = routes.assign.answered2xx ? (routes.assign.woken ?? 0) / routes.assign.answered2xx : null;
+  // The bound of the budget itself (plan section 8, F4): at most 2 × the calls
+  // plus 10 a second attempts, converted to statements with the census. The
+  // census counts a request, which is an upper bound of one attempt.
+  const perRequest = census.statementsPerRequest;
+  const largest = Math.max(0, ...Object.values(perRequest));
+  const statementBound = Object.entries(routes).reduce((sum, [name, route]) => sum + 2 * route.requests * (perRequest[name] ?? largest), 0)
+    + 10 * seconds * largest + census.idleStatementsPerSecond * seconds;
+  const refusedRetries = budgetWarnings
+    .filter((warning) => warning.time >= phase.startEpoch && warning.time < phase.endEpoch)
+    .reduce((sum, warning) => sum + (warning.refusedRetries ?? 0), 0);
+  return {
+    name: phase.name,
+    seconds,
+    statements: phase.proxy.statements,
+    statementsPerSecond: phase.proxy.statements / seconds,
+    busiestStatementSecond: phase.proxy.busiestStatementSecond,
+    acceptedPerSecond: phase.proxy.accepted / seconds,
+    busiestAcceptSecond: phase.proxy.busiestAcceptSecond,
+    peakOpen: phase.proxy.peakOpen,
+    peakInFlight: phase.proxy.peakInFlight,
+    resets: phase.proxy.resets,
+    medianResetLifetimeMs: phase.proxy.medianResetLifetimeMs,
+    statementBound: Math.round(statementBound),
+    withinBound: phase.proxy.statements <= statementBound,
+    refusedRetries,
+    routes,
+  };
+}
+
+/** One server run of one arm and one configuration on a new embedded database. */
+async function runF4({ arm, config, phases, rates, censusSamples, importers }) {
+  const { startEmbeddedPostgresTestDatabase, postgres } = importers;
+  const database = await startEmbeddedPostgresTestDatabase("paperclip-perf-f4-");
+  const proxy = await startFaultProxy({ targetPort: Number(new URL(database.connectionString).port) });
+  const control = postgres(database.connectionString, { max: 1, onnotice() {} });
+  const token = config === "auth" ? randomBytes(24).toString("hex") : undefined;
+  const totalMs = phases.reduce((sum, phase) => sum + phase.ms, 0);
+  let server = null;
+  try {
+    server = await startServer({
+      checkout: arm.checkout,
+      databaseUrl: database.connectionString.replace(/:(\d+)\//, `:${proxy.port}/`),
+      // Boot-time migration checks go straight to the database, off the proxy counters.
+      migrationUrl: database.connectionString,
+      mode: config === "auth" ? "authenticated" : "local_trusted",
+      cloudTenantToken: token,
+    });
+    const assignments = Math.ceil((rates.assign * totalMs) / 1000) + censusSamples + 10;
+    const senders = config === "auth" ? await seedAuth(server.url, token) : await seedWake(server.url, assignments);
+    const census = await statementCensus(proxy, senders, censusSamples);
+    const records = [];
+    const startAt = performance.now() + 200;
+    const endAt = startAt + totalMs;
+    const [phaseResults] = await Promise.all([
+      drivePhases(proxy, phases, startAt),
+      ...Object.entries(senders).map(([name, send]) => openLoop({ name, rate: rates[name], startAt, endAt, send, records })),
+    ]);
+    let wakeKeys = null;
+    if (config === "wake") {
+      await sleep(F4_WAKE_SETTLE_MS);
+      const rows = await control.unsafe("select idempotency_key from agent_wakeup_requests where idempotency_key like 'issue-assignment:%'");
+      wakeKeys = new Set(rows.map((row) => row.idempotency_key));
+    }
+    return {
+      arm: arm.name,
+      config,
+      census,
+      serverExit: server.exited(),
+      serverErrorLines: server.log.errors,
+      phases: phaseResults.map((phase) => phaseReport(phase, records, census, server.log.budgetWarnings, wakeKeys)),
+    };
+  } finally {
+    await server?.stop();
+    await control.end({ timeout: 1 });
+    await proxy.close();
+    await database.cleanup();
+  }
+}
+
+async function f4(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      arm: { type: "string", multiple: true },
+      configs: { type: "string", default: "auth,wake" },
+      pairs: { type: "string", default: "5" },
+      steady: { type: "string", default: "20000" },
+      flap: { type: "string", default: "10000" },
+      recover: { type: "string", default: "20000" },
+      blackout: { type: "string", default: "10000" },
+      tail: { type: "string", default: "10000" },
+      "dashboard-rate": { type: "string", default: "19" },
+      "auth-rate": { type: "string", default: "20" },
+      "assign-rate": { type: "string", default: "5" },
+      census: { type: "string", default: "20" },
+      out: { type: "string", default: path.join(root, "tmp/perf/f4.json") },
+    },
+  });
+  if (!values.arm || values.arm.length < 1) throw new Error("--arm name=/abs/path/to/checkout is required");
+  const arms = values.arm.map((spec) => {
+    const split = spec.indexOf("=");
+    return { name: spec.slice(0, split), checkout: path.resolve(spec.slice(split + 1)) };
+  });
+  const phases = [
+    { name: "steady", mode: "pass", ms: Number(values.steady) },
+    { name: "flap", mode: "flap", ms: Number(values.flap) },
+    { name: "recover", mode: "pass", ms: Number(values.recover) },
+    { name: "blackout", mode: "refuse", ms: Number(values.blackout) },
+    { name: "tail", mode: "pass", ms: Number(values.tail) },
+  ].filter((phase) => phase.ms > 0);
+  const rates = { dashboard: Number(values["dashboard-rate"]), auth: Number(values["auth-rate"]), assign: Number(values["assign-rate"]) };
+  const configs = values.configs.split(",").map((item) => item.trim()).filter(Boolean);
+  const pairs = Number(values.pairs);
+  const { startEmbeddedPostgresTestDatabase } = await importFromServer("@paperclipai/db");
+  const importers = { startEmbeddedPostgresTestDatabase, postgres: dbRequire("postgres") };
+  const runs = [];
+  const startedAt = new Date().toISOString();
+  for (let pair = 0; pair < pairs; pair += 1) {
+    const order = pair % 2 === 0 ? arms : [...arms].reverse();
+    for (const config of configs) {
+      for (const arm of order) {
+        const run = { pair, ...(await runF4({ arm, config, phases, rates, censusSamples: Number(values.census), importers })) };
+        runs.push(run);
+        for (const phase of run.phases) {
+          const routes = Object.entries(phase.routes)
+            .map(([name, route]) => `${name} ${route.failed}/${route.requests} failed, longest ${route.longestMs} ms${route.wakeShare == null ? "" : `, woken ${(route.wakeShare * 100).toFixed(1)}%`}`)
+            .join("; ");
+          process.stderr.write(`F4 pair=${pair} ${config} ${arm.name} ${phase.name}: ${phase.statements} statements (bound ${phase.statementBound}), peak open ${phase.peakOpen}, peak in flight ${phase.peakInFlight}, refused ${phase.refusedRetries}; ${routes}\n`);
+        }
+        if (run.serverExit) process.stderr.write(`F4 pair=${pair} ${config} ${arm.name}: the server exited during the run ${JSON.stringify(run.serverExit)}\n`);
+      }
+    }
+  }
+  const report = {
+    kind: "f4",
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    node: process.version,
+    arms,
+    settings: { configs, pairs, phases, rates, flap: F4_FLAP, wakeSettleMs: F4_WAKE_SETTLE_MS, censusSamples: Number(values.census) },
+    runs,
+  };
+  fs.mkdirSync(path.dirname(values.out), { recursive: true });
+  fs.writeFileSync(values.out, `${JSON.stringify(report, null, 2)}\n`);
+  process.stderr.write(`F4 report: ${values.out}\n`);
+}
+
 const [command, ...rest] = process.argv.slice(2);
-const commands = { f1 };
+const commands = { f1, f4 };
 if (!commands[command]) {
   process.stderr.write(`usage: faults.mjs <${Object.keys(commands).join("|")}> [options]\n`);
   process.exit(2);
