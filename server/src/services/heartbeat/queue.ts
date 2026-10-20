@@ -21,6 +21,7 @@ import {
 } from "@paperclipai/shared";
 import { nonIdleSlackIssueCondition } from "../slack-conversation-state.js";
 import { readQueuedInteractionResponse } from "../queued-interaction-response.js";
+import { orderQueuedRunsForClaim, selectAgentQueuedRuns } from "../queued-run-claim-order.js";
 import {
   isConversation,
   isConversationExecutionWake,
@@ -903,21 +904,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .then((rows) => rows[0] ?? null);
     if (!claimed) return null;
     return { wasFirstHeartbeat: !agent.lastHeartbeatAt };
-  }
-
-  function issueRunPriorityRank(priority: string | null | undefined) {
-    switch (priority) {
-      case "critical":
-        return 0;
-      case "high":
-        return 1;
-      case "medium":
-        return 2;
-      case "low":
-        return 3;
-      default:
-        return 4;
-    }
   }
 
   async function listQueuedRunDependencyReadiness(
@@ -2844,17 +2830,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       );
       if (availableSlots <= 0) return [];
 
-      const queuedRuns = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
-            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-          ),
-        )
-        .orderBy(asc(heartbeatRuns.createdAt));
+      const queuedRuns = await selectAgentQueuedRuns(db, {
+        companyId: agent.companyId,
+        agentId,
+        cutoff,
+      });
       if (queuedRuns.length === 0) return [];
       if (queuedRuns.every(run => !run.startedAt) && !await canStartNewExternalBotWork(agent)) return [];
 
@@ -2888,48 +2868,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         );
       const issueById = new Map(issueRows.map((row) => [row.id, row]));
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
-      const prioritizedRuns = [...queuedRuns].sort((left, right) => {
-        const leftIssueId = readNonEmptyString(
-          parseObject(left.contextSnapshot).issueId,
-        );
-        const rightIssueId = readNonEmptyString(
-          parseObject(right.contextSnapshot).issueId,
-        );
-        const leftReadiness = leftIssueId
-          ? dependencyReadiness.get(leftIssueId)
-          : null;
-        const rightReadiness = rightIssueId
-          ? dependencyReadiness.get(rightIssueId)
-          : null;
-        const leftReady = leftIssueId
-          ? (leftReadiness?.isDependencyReady ?? true)
-          : true;
-        const rightReady = rightIssueId
-          ? (rightReadiness?.isDependencyReady ?? true)
-          : true;
-        const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
-        const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
-        const leftRank = leftIssueId
-          ? leftReady
-            ? leftIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
-        const rightRank = rightIssueId
-          ? rightReady
-            ? rightIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
-        if (leftRank !== rightRank) return leftRank - rightRank;
-        const leftPriorityRank = issueRunPriorityRank(leftIssue?.priority);
-        const rightPriorityRank = issueRunPriorityRank(rightIssue?.priority);
-        if (leftPriorityRank !== rightPriorityRank)
-          return leftPriorityRank - rightPriorityRank;
-        return left.createdAt.getTime() - right.createdAt.getTime();
-      });
+      const prioritizedRuns = orderQueuedRunsForClaim(
+        queuedRuns,
+        (run) => {
+          const issueId = readNonEmptyString(
+            parseObject(run.contextSnapshot).issueId,
+          );
+          if (!issueId) return null;
+          const issue = issueById.get(issueId);
+          return {
+            priority: issue?.priority,
+            inProgress: issue?.status === "in_progress",
+            dependencyReady:
+              dependencyReadiness.get(issueId)?.isDependencyReady ?? true,
+          };
+        },
+        new Date(),
+      );
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
