@@ -507,6 +507,7 @@ import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
 import { isRetryableMonitorWakeBlock, monitorWakeRetryDelayMs } from "./issue-monitor-wake-block.js";
 import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { orderQueuedRunsForClaim, selectAgentQueuedRuns } from "./queued-run-claim-order.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON,
@@ -2165,6 +2166,7 @@ const PROVIDER_QUOTA_RETRY_JITTER_RATIO = 0.2;
 const PROVIDER_QUOTA_CAP_EXEMPTION_EXHAUSTED_ACTION =
   "heartbeat.provider_quota_cap_exemption_exhausted";
 const PROVIDER_QUOTA_EXHAUSTED_ACTION = "heartbeat.provider_quota_exhausted";
+const DAILY_CAP_DISPATCH_HELD_ACTION = "heartbeat.daily_cap_dispatch_held";
 
 export interface ProviderQuotaRetryPolicy {
   /** False restores the default transient retry budget and charges every quota failure. */
@@ -10127,8 +10129,36 @@ export function heartbeatService(
       const agent = await getAgent(agentId);
       if (!agent) return null;
       const policy = parseHeartbeatPolicy(agent);
-      if (!policy.wakeOnDemand) return "heartbeat.wakeOnDemand.disabled";
-      return (await getHeartbeatDailyCapBlock(agent, policy))?.reason ?? null;
+      if (!policy.wakeOnDemand) return { reason: "heartbeat.wakeOnDemand.disabled" };
+      return getHeartbeatDailyCapBlock(agent, policy);
+    },
+    // One entry per agent and cap window, however many sweeps or issues the
+    // cap holds back; the next window writes its own entry.
+    recordDailyCapDispatchHold: async ({ companyId, agentId, issueId, block }) => {
+      const windowStart = block.windowStart.toISOString();
+      await logActivityOnce({
+        lockKey: `daily-cap-dispatch-hold:${agentId}:${windowStart}`,
+        alreadyRecorded: and(
+          eq(activityLog.entityType, "agent"),
+          eq(activityLog.entityId, agentId),
+          sql`${activityLog.details} ->> 'windowStart' = ${windowStart}`,
+        ),
+        companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId,
+        action: DAILY_CAP_DISPATCH_HELD_ACTION,
+        entityType: "agent",
+        entityId: agentId,
+        details: {
+          reason: block.reason,
+          observed: block.observed ?? null,
+          limit: block.limit ?? null,
+          windowStart,
+          resetsAt: block.resetsAt.toISOString(),
+          firstHeldIssueId: issueId,
+        },
+      });
     },
     // The same slot count as the deferred-wake sweep: running runs against
     // the agent's limit. Queued work waits its turn and does not starve
@@ -18793,6 +18823,8 @@ export function heartbeatService(
           reason: "heartbeat.daily_run_limit",
           observed,
           limit: policy.maxDailyRuns,
+          windowStart: start,
+          resetsAt: end,
         };
       }
     }
@@ -18817,6 +18849,8 @@ export function heartbeatService(
           reason: "heartbeat.daily_cost_limit",
           observed,
           limit: policy.maxDailyCostCents,
+          windowStart: start,
+          resetsAt: end,
         };
       }
     }
@@ -18974,21 +19008,6 @@ export function heartbeatService(
         Math.min(MAX_TURN_CONTINUATION_MAX_DELAY_MS, rawDelayMs),
       ),
     };
-  }
-
-  function issueRunPriorityRank(priority: string | null | undefined) {
-    switch (priority) {
-      case "critical":
-        return 0;
-      case "high":
-        return 1;
-      case "medium":
-        return 2;
-      case "low":
-        return 3;
-      default:
-        return 4;
-    }
   }
 
   async function listQueuedRunDependencyReadiness(
@@ -22709,17 +22728,11 @@ export function heartbeatService(
       );
       if (availableSlots <= 0) return [];
 
-      const queuedRuns = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
-            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-          ),
-        )
-        .orderBy(asc(heartbeatRuns.createdAt));
+      const queuedRuns = await selectAgentQueuedRuns(db, {
+        companyId: agent.companyId,
+        agentId,
+        cutoff,
+      });
       if (queuedRuns.length === 0) return [];
 
       const dependencyReadiness = await listQueuedRunDependencyReadiness(
@@ -22752,48 +22765,23 @@ export function heartbeatService(
         );
       const issueById = new Map(issueRows.map((row) => [row.id, row]));
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
-      const prioritizedRuns = [...queuedRuns].sort((left, right) => {
-        const leftIssueId = readNonEmptyString(
-          parseObject(left.contextSnapshot).issueId,
-        );
-        const rightIssueId = readNonEmptyString(
-          parseObject(right.contextSnapshot).issueId,
-        );
-        const leftReadiness = leftIssueId
-          ? dependencyReadiness.get(leftIssueId)
-          : null;
-        const rightReadiness = rightIssueId
-          ? dependencyReadiness.get(rightIssueId)
-          : null;
-        const leftReady = leftIssueId
-          ? (leftReadiness?.isDependencyReady ?? true)
-          : true;
-        const rightReady = rightIssueId
-          ? (rightReadiness?.isDependencyReady ?? true)
-          : true;
-        const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
-        const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
-        const leftRank = leftIssueId
-          ? leftReady
-            ? leftIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
-        const rightRank = rightIssueId
-          ? rightReady
-            ? rightIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
-        if (leftRank !== rightRank) return leftRank - rightRank;
-        const leftPriorityRank = issueRunPriorityRank(leftIssue?.priority);
-        const rightPriorityRank = issueRunPriorityRank(rightIssue?.priority);
-        if (leftPriorityRank !== rightPriorityRank)
-          return leftPriorityRank - rightPriorityRank;
-        return left.createdAt.getTime() - right.createdAt.getTime();
-      });
+      const prioritizedRuns = orderQueuedRunsForClaim(
+        queuedRuns,
+        (run) => {
+          const issueId = readNonEmptyString(
+            parseObject(run.contextSnapshot).issueId,
+          );
+          if (!issueId) return null;
+          const issue = issueById.get(issueId);
+          return {
+            priority: issue?.priority,
+            inProgress: issue?.status === "in_progress",
+            dependencyReady:
+              dependencyReadiness.get(issueId)?.isDependencyReady ?? true,
+          };
+        },
+        new Date(),
+      );
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
