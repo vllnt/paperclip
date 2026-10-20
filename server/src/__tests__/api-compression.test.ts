@@ -2,7 +2,7 @@ import express from "express";
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { deflateSync, gunzipSync, inflateSync } from "node:zlib";
+import { brotliDecompressSync, deflateSync, gunzipSync, inflateSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import { apiCompression } from "../middleware/api-compression.js";
 
@@ -144,6 +144,48 @@ describe("API compression middleware", () => {
     expect(compressed.body.byteLength).toBeLessThan(uncompressed.body.byteLength / 5);
   });
 
+  it("uses brotli for the issue list when the client lists br, and sends fewer bytes than gzip", async () => {
+    const gzipped = await requestRaw(buildApp(), "/api/companies/company-1/issues?limit=500", {
+      "accept-encoding": "gzip",
+    });
+    // The header a current browser sends.
+    const res = await requestRaw(buildApp(), "/api/companies/company-1/issues?limit=500", {
+      "accept-encoding": "gzip, deflate, br, zstd",
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-encoding"]).toBe("br");
+    expect(res.headers["vary"]).toContain("Accept-Encoding");
+    expect(res.headers["content-length"]).toBe(String(res.body.byteLength));
+    expect(JSON.parse(brotliDecompressSync(res.body).toString("utf8"))).toHaveLength(500);
+    expect(res.body.byteLength).toBeLessThan(gzipped.body.byteLength);
+  });
+
+  it.each([
+    ["br;q=0.5, gzip", "gzip"],
+    ["br;q=0, gzip", "gzip"],
+    ["gzip;q=0.8, br", "br"],
+    ["deflate, br;q=0.9", "deflate"],
+    ["*", "gzip"],
+    ["gzip;q=0, *", "deflate"],
+    ["br;q=0, gzip;q=0, deflate;q=0", undefined],
+  ])("chooses the encoding by q-value for %s", async (acceptEncoding, expected) => {
+    const res = await requestRaw(buildApp(), "/api/companies/company-1/issues?limit=500", {
+      "accept-encoding": acceptEncoding,
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-encoding"]).toBe(expected);
+    const decoded = expected === "br"
+      ? brotliDecompressSync(res.body)
+      : expected === "gzip"
+        ? gunzipSync(res.body)
+        : expected === "deflate"
+          ? inflateSync(res.body)
+          : res.body;
+    expect(JSON.parse(decoded.toString("utf8"))).toHaveLength(500);
+  });
+
   it("uses deflate when that is the supported content encoding", async () => {
     const res = await requestRaw(buildApp(), "/api/companies/company-1/issues?limit=500", {
       "accept-encoding": "deflate",
@@ -183,6 +225,27 @@ describe("API compression middleware", () => {
     expect(res.headers["content-encoding"]).toBe("gzip");
     expect(res.headers.etag).toBe("W/\"fixture-etag\"");
     expect(JSON.parse(gunzipSync(res.body).toString("utf8"))).toHaveLength(500);
+  });
+
+  it("weakens strong ETag validators on brotli responses too", async () => {
+    const res = await requestRaw(buildApp(), "/api/etag", {
+      "accept-encoding": "br",
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-encoding"]).toBe("br");
+    expect(res.headers.etag).toBe("W/\"fixture-etag\"");
+    expect(JSON.parse(brotliDecompressSync(res.body).toString("utf8"))).toHaveLength(500);
+  });
+
+  it("keeps small JSON responses uncompressed for brotli clients", async () => {
+    const res = await requestRaw(buildApp(), "/api/small", {
+      "accept-encoding": "gzip, deflate, br",
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-encoding"]).toBeUndefined();
+    expect(JSON.parse(res.body.toString("utf8"))).toEqual({ ok: true });
   });
 
   it("passes streamed non-JSON responses through without compression", async () => {

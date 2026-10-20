@@ -3,7 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { applyOnboardingSeedSchema } from "@paperclipai/shared";
 import { validate } from "../middleware/index.js";
 import { onboardingSeedService } from "../services/onboarding-seed.js";
-import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 
 /**
  * Receiver for the onboarding seed Paperclip Cloud collects at signup and
@@ -11,8 +11,10 @@ import { assertCompanyAccess, getActorInfo } from "./authz.js";
  *
  * Authentication is the trusted Cloud envelope, resolved exactly as it is for
  * `POST /api/companies/:companyId/logo`: the `x-paperclip-cloud-*` headers
- * produce a company-scoped actor and `assertCompanyAccess` fails closed for
- * anyone else. The seed itself is customer free text and rides the JSON body
+ * produce a company-scoped board actor and `assertCompanyAccess` fails closed
+ * for anyone else. The route is board-only: the seed creates the company's lead
+ * (`ceo`) agent outside the hire and approval flow, so an agent key is refused.
+ * The seed itself is customer free text and rides the JSON body
  * only — it is never read from a header. Every `x-paperclip-cloud-*` value is
  * derived server-side from the host plus verified domain records, which is
  * what makes that set trustworthy; customer free text must not be mixed into
@@ -39,6 +41,7 @@ export function onboardingSeedRoutes(db: Db) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      assertBoard(req);
 
       // The audit entry is written inside `apply`'s own transaction, so it
       // commits with the seed or not at all. A logging failure therefore rolls

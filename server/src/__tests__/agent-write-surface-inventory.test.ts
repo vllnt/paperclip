@@ -39,8 +39,10 @@ const SURFACES: Record<string, Surface> = {
   "routes/costs.ts": { kind: "board-only", how: "agent budget and budget policy routes call assertBoard" },
   "routes/issues.ts": { kind: "read-only", how: "reads agents for assignment checks" },
   "routes/llms.ts": { kind: "read-only", how: "reads agents for the llms listing" },
+  "routes/routines.ts": { kind: "read-only", how: "hands the agent service to the trust check, which only reads the assignee" },
   "routes/teams-catalog.ts": { kind: "read-only", how: "reads agents; installs go through the portability service" },
-  "services/agents.ts": { kind: "owner", how: "the agent service; every caller is classified in this table" },
+  "services/agent-trust.ts": { kind: "read-only", how: "takes only getById from the agent service to read the assignee's trust" },
+  "services/agents.ts":{ kind: "owner", how: "the agent service; every caller is classified in this table" },
   "services/approvals.ts": { kind: "board-only", how: "approve and reject routes call assertBoard and apply a payload the board reviewed" },
   "services/built-in-agents.ts": {
     kind: "guarded",
@@ -58,10 +60,10 @@ const SURFACES: Record<string, Surface> = {
   "services/index.ts": { kind: "read-only", how: "barrel export" },
   "services/native-runtime/agent-instruction-tools.ts": { kind: "read-only", how: "reads the target agent" },
   "services/native-runtime/paperclip-runner-tool-authority.ts": { kind: "read-only", how: "reads agents for tool authority checks" },
-  "services/onboarding-seed.ts": { kind: "board-only", how: "runs from the board onboarding flow" },
+  "services/onboarding-seed.ts": { kind: "board-only", how: "the onboarding-seed route calls assertBoard" },
   "services/plugin-host-services.ts": {
     kind: "guarded",
-    how: "managed reconcile and reset, pause, and resume check the agent behind the plugin call",
+    how: "managed reconcile and reset, pause, resume, and agent authorization policy updates check the agent behind the plugin call; grant and project or issue policy updates refuse it",
     tests: ["plugin-managed-agents-agent-caller.test.ts", "plugin-worker-manager.test.ts"],
   },
   "services/plugin-managed-agents.ts": {

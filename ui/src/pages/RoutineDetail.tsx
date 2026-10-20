@@ -36,6 +36,7 @@ import {
 import { RunButton } from "../components/AgentActionButtons";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
+import { routineStepsEqual } from "../lib/routine-steps";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { RoutineOverview } from "../components/RoutineOverview";
@@ -58,6 +59,7 @@ import {
 } from "../components/routine-sections/context";
 import {
   OverviewSection,
+  StepsSection,
   TriggersSection,
   VariablesSection,
   SecretsSection,
@@ -89,6 +91,7 @@ export function buildRoutineProjectOptions(
 
 const SECTION_TITLES: Record<RoutineSectionKey, string> = {
   overview: "Overview",
+  steps: "Steps",
   triggers: "Triggers",
   variables: "Variables",
   secrets: "Secrets",
@@ -157,6 +160,7 @@ export function RoutineDetail() {
     activityGatePolicy: "always",
     activityGateScope: "company",
     variables: [],
+    steps: [],
     env: null,
     automationWakeSettings: {},
     runContextPolicy: null,
@@ -264,6 +268,7 @@ export function RoutineDetail() {
             activityGatePolicy: routine.activityGatePolicy,
             activityGateScope: routine.activityGateScope,
             variables: routine.variables,
+            steps: routine.steps ?? [],
             env: routine.env ?? null,
             automationWakeSettings: readAutomationWakeSettings(routine.automationWakeSettings),
             runContextPolicy: routine.runContextPolicy ?? null,
@@ -301,6 +306,9 @@ export function RoutineDetail() {
     }
     if (JSON.stringify(editDraft.variables) !== JSON.stringify(routineDefaults.variables)) {
       result.push({ key: "variables", label: "the variables" });
+    }
+    if (!routineStepsEqual(editDraft.steps, routineDefaults.steps)) {
+      result.push({ key: "steps", label: "the steps" });
     }
     if (JSON.stringify(editDraft.env ?? null) !== JSON.stringify(routineDefaults.env ?? null)) {
       result.push({ key: "env", label: "the secrets" });
@@ -688,6 +696,7 @@ export function RoutineDetail() {
         activityGatePolicy: response.routine.activityGatePolicy,
         activityGateScope: response.routine.activityGateScope,
         variables: response.routine.variables as RoutineVariable[],
+        steps: response.routine.steps ?? [],
         env: (response.routine.env ?? null) as RoutineEnvConfig | null,
         automationWakeSettings: readAutomationWakeSettings(response.routine.automationWakeSettings),
         runContextPolicy: response.routine.runContextPolicy ?? null,
@@ -953,6 +962,7 @@ export function RoutineDetail() {
             </h2>
 
             {section === "overview" && (overviewEditing ? <OverviewSection /> : <RoutineOverview />)}
+            {section === "steps" && <StepsSection />}
             {section === "triggers" && <TriggersSection />}
             {section === "variables" && <VariablesSection />}
             {section === "secrets" && <SecretsSection />}
