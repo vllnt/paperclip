@@ -49,6 +49,8 @@ import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { runPeriodicHeartbeatRecovery } from "./services/periodic-heartbeat-recovery.js";
+import { executeIssuePostCommitActions } from "./services/issues.js";
+import { routineStepConditionsBackstop } from "./services/routine-steps.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
   StartupRefusalError,
@@ -1385,6 +1387,11 @@ async function startServerWithDatabaseTeardown(
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);
     const issues = issueService(db as any);
+    const routineStepConditions = routineStepConditionsBackstop(db as any, {
+      issueSvc: issues,
+      heartbeat,
+      executePostCommitActions: (actions) => executeIssuePostCommitActions(db as any, actions),
+    });
     const mergedPullRequestConfirmations = issueThreadInteractionService(db as any, {
       wakeup: heartbeat.wakeup,
     });
@@ -1863,7 +1870,7 @@ async function startServerWithDatabaseTeardown(
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
-          trackHeartbeatSchedulerWork(runPeriodicHeartbeatRecovery(heartbeat));
+          trackHeartbeatSchedulerWork(runPeriodicHeartbeatRecovery(heartbeat, routineStepConditions));
         }
       })().catch((err) => {
         logger.error({ err }, "heartbeat scheduler tick failed");
