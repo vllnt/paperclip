@@ -1922,9 +1922,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
               await db.update(issues).set({ checkoutRunId }).where(eq(issues.id, issueId));
               expect(await svc.clearExecutionRunIfTerminal(issueId)).toBe(false);
               expect(await svc.clearCheckoutRunIfTerminal(issueId)).toBe(false);
-              await expect(svc.checkout(issueId, other!.id, ["in_progress"], actorRunId)).rejects.toMatchObject({ status: 409 });
+              // The fork's checkout names its actor (agents keep a human-owned block).
+              await expect(svc.checkout(issueId, other!.id, ["in_progress"], actorRunId, { kind: "agent", agentId: other!.id }))
+                .rejects.toMatchObject({ status: 409 });
               await expect(svc.assertCheckoutOwner(issueId, other!.id, actorRunId)).rejects.toMatchObject({ status: 409 });
-              await expect(svc.checkout(issueId, agentId, ["in_progress"], actorRunId)).rejects.toMatchObject({ status: 409 });
+              await expect(svc.checkout(issueId, agentId, ["in_progress"], actorRunId, { kind: "agent", agentId }))
+                .rejects.toMatchObject({ status: 409 });
               await expect(svc.assertCheckoutOwner(issueId, agentId, actorRunId)).rejects.toMatchObject({ status: 409 });
               expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.executionRunId).toBe(runId);
             }

@@ -8400,7 +8400,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const transactions = vi.spyOn(db, "transaction");
     try {
       expect(await resolveConnectorAssignments(db, binding)).toEqual(assignments);
-      expect(transactions).toHaveBeenCalledTimes(2);
+      // Only the Slack authority transaction: the fork reads a running run's settled
+      // identity without a transaction (captureSettledRunIdentity in run-identity.ts).
+      expect(transactions).toHaveBeenCalledTimes(1);
     } finally { transactions.mockRestore(); }
 
     await expect(resolveSlackTaskAuthority(db, binding)).resolves.toMatchObject({ conversation: null, userId: "owner-user", slackUserId: "UROUTINE" });

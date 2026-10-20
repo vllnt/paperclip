@@ -988,6 +988,10 @@ describe("persistent agent directories", () => {
       await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
       const sshTarget = { kind: "remote" as const, transport: "ssh" as const, environmentId: randomUUID(), remoteCwd,
         spec: { host: "unused.invalid", port: 22, username: "test", remoteCwd } };
+      // A remote copy is collected only while its run holds the environment's active lease.
+      await db.insert(environments).values({ id: sshTarget.environmentId, name: "Fixture SSH host", driver: "ssh" });
+      await db.insert(environmentLeases).values({ id: randomUUID(), companyId, environmentId: sshTarget.environmentId,
+        heartbeatRunId: runId, provider: "ssh", providerLeaseId: "fixture-ssh-lease" });
       const copy = (await copies.prepare({ companyId, agentId, runId, cwd: home, target: sshTarget }))!;
       expect(await fs.readFile(path.join(copy.executionRoot, ".cache", "tool.md"), "utf8")).toBe("v1\n");
       await fs.writeFile(path.join(copy.executionRoot, ".cache", "tool.md"), "v2 from SSH\n");

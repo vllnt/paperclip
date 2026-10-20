@@ -43,7 +43,7 @@ function callbacks(db: Db) {
       admitWakeBehindIssueExecution: vi.fn<ReturnType<typeof createWakeQueue>["admitWakeBehindIssueExecution"]>(),
       countRecentSelfReblockWakeRuns: vi.fn<ReturnType<typeof createWakeQueue>["countRecentSelfReblockWakeRuns"]>(async () => 0),
       findParkedWakeAnchorRun: vi.fn<ReturnType<typeof createWakeQueue>["findParkedWakeAnchorRun"]>(async () => null),
-      retireClosedIssueDeferredWakes: vi.fn<ReturnType<typeof createWakeQueue>["retireClosedIssueDeferredWakes"]>(),
+      retireClosedIssueDeferredWakes: vi.fn<ReturnType<typeof createWakeQueue>["retireClosedIssueDeferredWakes"]>(async () => []),
       listOrphanedDeferredWakes: vi.fn<ReturnType<typeof createWakeQueue>["listOrphanedDeferredWakes"]>(),
       claimDeferredWakeExamination: vi.fn<ReturnType<typeof createWakeQueue>["claimDeferredWakeExamination"]>(),
       getDeferredWakeAgentStats: vi.fn<ReturnType<typeof createWakeQueue>["getDeferredWakeAgentStats"]>(),
