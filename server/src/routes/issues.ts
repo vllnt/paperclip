@@ -3643,6 +3643,8 @@ export function issueRoutes(
    * that listen to it, so the caller knows whether a routine attached its steps. Then the assignee must
    * stay asleep: the steps' own agents are woken instead, and the task is `blocked` until they finish.
    * It never throws, and costs one query when no event trigger listens.
+   * @param creatingRunId the heartbeat run of the request: a task made while working on a routine's task
+   * does not publish.
    * @returns the task as the response should show it (its status, status version and blockers changed when
    * steps were attached).
    */
@@ -3658,9 +3660,13 @@ export function issueRoutes(
     },
   >(
     issue: T,
+    creatingRunId: string | null,
   ): Promise<{ issue: T; stepsAttached: boolean }> => {
     if (!opts.eventSources) return { issue, stepsAttached: false };
-    const { stepsAttached } = await opts.eventSources.publishInternal(issue.companyId, { issueId: issue.id });
+    const { stepsAttached } = await opts.eventSources.publishInternal(issue.companyId, {
+      issueId: issue.id,
+      creatingRunId,
+    });
     if (!stepsAttached) return { issue, stepsAttached };
     try {
       const [fresh, relations] = await Promise.all([svc.getById(issue.id), svc.getRelationSummaries(issue.id)]);
@@ -12394,7 +12400,7 @@ export function issueRoutes(
       // through the normal comment path. Every other create path keeps its wake, unless a routine
       // attached its steps to the task: then the steps' agents are woken and the task waits for them.
       if (!isOnboardingFirstTask) {
-        const published = await publishCreatedTask(issue);
+        const published = await publishCreatedTask(issue, actor.runId ?? null);
         issue = published.issue;
         if (!published.stepsAttached) {
           void queueIssueAssignmentWakeup({
@@ -12662,7 +12668,7 @@ export function issueRoutes(
       });
       let createdChild = issue;
       if (!serializationContext || !currentSerializedChild) {
-        const published = await publishCreatedTask(createdChild);
+        const published = await publishCreatedTask(createdChild, actor.runId ?? null);
         createdChild = published.issue;
         if (!published.stepsAttached) {
           void queueIssueAssignmentWakeup({

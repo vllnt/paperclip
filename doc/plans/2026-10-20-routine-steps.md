@@ -84,7 +84,7 @@ No new trigger kind. The existing `event` trigger does the work: `eventMatch`, t
   - `project`: the project id, only when the task has one
   - `created_by`: `user` or `agent`
   - `label_<slug>`: `"true"` for each label of the task. The slug is the label name lowercased, every run of characters outside `[a-z0-9_]` turned into one `_`, trimmed of `_`, and cut so the key stays within 64 characters. At most 30 task labels, sorted by slug; the rest are dropped.
-- No event for hidden tasks, tasks of origin `routine_execution`, `routine_step` or `chat_channel`, conversations, or tasks below a `routine_execution` or `routine_step` task (up to 50 levels up). A step that splits its work into subtasks, at any depth, therefore cannot start a loop.
+- No event for hidden tasks, tasks of origin `routine_execution`, `routine_step` or `chat_channel`, conversations, tasks below a `routine_execution` or `routine_step` task, or tasks created in a heartbeat run whose task is one of those or below one (`contextSnapshot.issueId` or `taskId`; the create routes pass the request's run). The walk covers 50 levels and fails closed beyond them. A step's agent therefore cannot start a loop with the tasks it creates, wherever it puts them.
 
 ### `issueMode: "event_issue"`
 

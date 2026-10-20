@@ -6,6 +6,7 @@ import {
   createDb,
   eventDeliveries,
   eventSources,
+  heartbeatRuns,
   issueLabels,
   issues,
   labels,
@@ -352,6 +353,53 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
         expect(await s.publish(task.id)).toEqual({ stepsAttached: false, routineRunIds: [] });
       }
       expect(await s.deliveries()).toEqual([]);
+    });
+
+    it("skips the tasks a step's agent creates beside the steps or at the top level", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      await s.listen(routine);
+      const task = await s.newTask();
+      await s.publish(task.id);
+      const [stepTask] = await s.childrenOf(task.id);
+      const runOn = async (issueId: string) => {
+        const id = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id,
+          companyId: s.fx.companyId,
+          agentId: s.builderId,
+          invocationSource: "assignment",
+          status: "running",
+          responsibleUserId: randomUUID(),
+          contextSnapshot: { issueId },
+        });
+        return id;
+      };
+      const stepRun = await runOn(stepTask!.id);
+      const plainRun = await runOn((await s.newTask({ title: "Plain work" })).id);
+      const beside = await s.newTask({ title: "Beside the steps", parentId: task.id });
+      const topLevel = await s.newTask({ title: "Top level" });
+      const byPlainRun = await s.newTask({ title: "From plain work" });
+      const byPerson = await s.newTask({ title: "From a person" });
+      const publishIn = (issueId: string, creatingRunId: string) =>
+        s.fx.sources.publishInternal(s.fx.companyId, { issueId, creatingRunId });
+
+      expect(await publishIn(beside.id, stepRun)).toEqual({ stepsAttached: false, routineRunIds: [] });
+      expect(await publishIn(topLevel.id, stepRun)).toEqual({ stepsAttached: false, routineRunIds: [] });
+      expect((await publishIn(byPlainRun.id, plainRun)).stepsAttached).toBe(true);
+      expect((await s.publish(byPerson.id)).stepsAttached).toBe(true);
+    });
+
+    it("skips a task whose parent chain does not end within the depth limit", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      await s.listen(routine);
+      const first = await s.newTask({ title: "First" });
+      const second = await s.newTask({ title: "Second", parentId: first.id });
+      await db.update(issues).set({ parentId: second.id }).where(eq(issues.id, first.id));
+      const below = await s.newTask({ title: "Below a loop", parentId: second.id });
+
+      expect(await s.publish(below.id)).toEqual({ stepsAttached: false, routineRunIds: [] });
     });
 
     it("does not publish the steps it attached, so the tree cannot start itself again", async () => {

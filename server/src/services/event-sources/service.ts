@@ -5,6 +5,7 @@ import type { Db } from "@paperclipai/db";
 import {
   eventDeliveries,
   eventSources,
+  heartbeatRuns,
   issueLabels,
   issues,
   labels as issueLabelRows,
@@ -18,6 +19,7 @@ import {
   PAPERCLIP_INTERNAL_EVENT_SOURCE_NAME,
   PAPERCLIP_ISSUE_CREATED_EVENT_TYPE,
   PAPERCLIP_ISSUE_EVENT_MAX_LABELS,
+  isUuidLike,
   matchesEvent,
   paperclipIssueLabelEventKey,
   validateEventSourceNormalizerConfig,
@@ -117,14 +119,14 @@ const INTERNAL_SOURCE_MAX_NEW_ISSUES_PER_HOUR = 200;
 /** Task origins that never publish: they belong to a routine run or a conversation. */
 const UNPUBLISHED_ISSUE_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step", "chat_channel"];
 
-/** Ancestor origins that stop a task from publishing, so work split off a step cannot start a routine again. */
-const UNPUBLISHED_ANCESTOR_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step"];
+/** Origins of a routine's own tasks: work under them, or made while working on them, does not publish. */
+const ROUTINE_TREE_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step"];
 
 /**
- * How many levels above a task the ancestor check looks. A loop always passes through a routine step
- * close above the task, so only a deep tree made by hand reaches the limit; its task then publishes.
+ * How many levels the routine tree check walks up, the task itself included. A tree deeper than this
+ * counts as a routine tree, so the check fails closed.
  */
-const UNPUBLISHED_ANCESTOR_MAX_DEPTH = 50;
+const ROUTINE_TREE_MAX_DEPTH = 50;
 
 /** What publishing an internal event did. */
 export interface PublishInternalResult {
@@ -876,24 +878,54 @@ export function eventSourceService(
       .then((rows) => rows[0] ?? null);
   }
 
-  /** Whether the task `parentId`, or a task above it, is a routine run or a routine step. */
-  async function hasRoutineAncestor(companyId: string, parentId: string): Promise<boolean> {
+  /**
+   * Whether the task, or a task above it, is a routine run or a routine step. A chain longer than
+   * `ROUTINE_TREE_MAX_DEPTH` counts as one too.
+   */
+  async function isInRoutineTree(companyId: string, taskId: string): Promise<boolean> {
     const rows = await db.execute(sql`
-      with recursive ancestors(id, parent_id, origin_kind, depth) as (
-        select id, parent_id, origin_kind, 1 from issues where id = ${parentId} and company_id = ${companyId}
+      with recursive tree(id, parent_id, origin_kind, depth) as (
+        select id, parent_id, origin_kind, 1 from issues where id = ${taskId} and company_id = ${companyId}
         union all
-        select i.id, i.parent_id, i.origin_kind, a.depth + 1
+        select i.id, i.parent_id, i.origin_kind, t.depth + 1
         from issues i
-        join ancestors a on i.id = a.parent_id
-        where i.company_id = ${companyId} and a.depth < ${UNPUBLISHED_ANCESTOR_MAX_DEPTH}
+        join tree t on i.id = t.parent_id
+        where i.company_id = ${companyId} and t.depth < ${ROUTINE_TREE_MAX_DEPTH}
       )
-      select 1 from ancestors where origin_kind in ${UNPUBLISHED_ANCESTOR_ORIGIN_KINDS} limit 1
+      select 1 from tree
+      where origin_kind in ${ROUTINE_TREE_ORIGIN_KINDS}
+        or (depth = ${ROUTINE_TREE_MAX_DEPTH} and parent_id is not null)
+      limit 1
     `);
     return rows.length > 0;
   }
 
-  /** The `issue.created` event of a task, or null when the task never publishes. */
-  async function buildIssueCreatedEvent(companyId: string, issueId: string): Promise<NormalizedEvent | null> {
+  /**
+   * Whether the heartbeat run that created a task works on a task of a routine tree. A step's agent
+   * can create a task anywhere, beside the steps or at the top level, so its ancestors alone do not
+   * show that it came from a routine.
+   */
+  async function isCreatedInRoutineRun(companyId: string, runId: string): Promise<boolean> {
+    if (!isUuidLike(runId)) return false;
+    const run = await db
+      .select({
+        taskId: sql<string | null>`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId')`,
+      })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    return Boolean(run?.taskId && isUuidLike(run.taskId) && (await isInRoutineTree(companyId, run.taskId)));
+  }
+
+  /**
+   * The `issue.created` event of a task, or null when the task never publishes.
+   * @param creatingRunId the heartbeat run the task was created in, if any.
+   */
+  async function buildIssueCreatedEvent(
+    companyId: string,
+    issueId: string,
+    creatingRunId: string | null,
+  ): Promise<NormalizedEvent | null> {
     const issue = await db
       .select({
         id: issues.id,
@@ -910,7 +942,8 @@ export function eventSourceService(
       .then((rows) => rows[0] ?? null);
     if (!issue || issue.hiddenAt || issue.conversationAgentId) return null;
     if (issue.originKind && UNPUBLISHED_ISSUE_ORIGIN_KINDS.includes(issue.originKind)) return null;
-    if (issue.parentId && (await hasRoutineAncestor(companyId, issue.parentId))) return null;
+    if (issue.parentId && (await isInRoutineTree(companyId, issue.parentId))) return null;
+    if (creatingRunId && (await isCreatedInRoutineRun(companyId, creatingRunId))) return null;
 
     const names = await db
       .select({ name: issueLabelRows.name })
@@ -1203,13 +1236,16 @@ export function eventSourceService(
      * throws: a failure is logged, recorded on the delivery, and reported as no steps attached.
      * A company with no enabled event trigger on its internal source costs one query and writes nothing.
      */
-    publishInternal: async (companyId: string, input: { issueId: string }): Promise<PublishInternalResult> => {
+    publishInternal: async (
+      companyId: string,
+      input: { issueId: string; creatingRunId?: string | null },
+    ): Promise<PublishInternalResult> => {
       const nothing: PublishInternalResult = { stepsAttached: false, routineRunIds: [] };
       let claim: Extract<Claim, { kind: "claimed" }> | null = null;
       try {
         const source = await findListenedInternalSource(companyId);
         if (!source) return nothing;
-        const event = await buildIssueCreatedEvent(companyId, input.issueId);
+        const event = await buildIssueCreatedEvent(companyId, input.issueId, input.creatingRunId ?? null);
         if (!event) return nothing;
         const startedAt = now();
         const attempt = await claimDelivery(

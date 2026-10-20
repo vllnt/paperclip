@@ -1,8 +1,9 @@
+import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { createDb, eventDeliveries, issues } from "@paperclipai/db";
+import { createDb, eventDeliveries, heartbeatRuns, issues } from "@paperclipai/db";
 import type { RoutineStep } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture } from "./helpers/event-source-fixture.js";
@@ -86,12 +87,12 @@ describeEmbeddedPostgres("creating a task while a routine listens for new tasks"
     const listen = (trigger: Parameters<typeof fx.subscribe>[2] = { grouping: EVENT_ISSUE }) =>
       fx.subscribe(routine.id, source.id, trigger);
 
+    /** The request actor; a test sets `runId` to create tasks as if in that heartbeat run. */
+    const actor: Record<string, unknown> = { type: "board", userId: "local-board", isInstanceAdmin: true, source: "local_implicit" };
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
-      Object.assign(req, {
-        actor: { type: "board", userId: "local-board", isInstanceAdmin: true, source: "local_implicit" },
-      });
+      Object.assign(req, { actor: { ...actor } });
       next();
     });
     app.use("/api", issueRoutes(db, {} as never, { eventSources: fx.sources }));
@@ -112,7 +113,7 @@ describeEmbeddedPostgres("creating a task while a routine listens for new tasks"
         .mocked(queueIssueAssignmentWakeup)
         .mock.calls.filter(([input]) => ROUTE_WAKE_SOURCES.has(input.contextSource) && input.issue.id === taskId);
 
-    return { fx, leadId, builderId, reviewerId, listen, create, createChild, childrenOf, deliveries, routeWakesFor };
+    return { fx, actor, leadId, builderId, reviewerId, listen, create, createChild, childrenOf, deliveries, routeWakesFor };
   }
 
   describe("a task the routine takes", () => {
@@ -211,6 +212,38 @@ describeEmbeddedPostgres("creating a task while a routine listens for new tasks"
       });
 
       const response = await s.createChild(stepTask.id, { assigneeAgentId: s.leadId });
+
+      expect(response.status).toBe(201);
+      expect(await s.childrenOf(response.body.id)).toEqual([]);
+      expect(s.routeWakesFor(response.body.id)).toHaveLength(1);
+      expect(await s.deliveries()).toEqual([]);
+    });
+
+    it("wakes the assignee of a task created in a routine step's run as before, wherever the task is", async () => {
+      const s = await seed();
+      await s.listen();
+      const stepTask = await s.fx.issueSvc.create(s.fx.companyId, {
+        title: "A step",
+        status: "in_progress",
+        priority: "medium",
+        projectId: s.fx.projectId,
+        assigneeAgentId: s.builderId,
+        originKind: "routine_step",
+        createdByUserId: "board-user",
+      });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId: s.fx.companyId,
+        agentId: s.builderId,
+        invocationSource: "assignment",
+        status: "running",
+        responsibleUserId: randomUUID(),
+        contextSnapshot: { issueId: stepTask.id },
+      });
+      s.actor.runId = runId;
+
+      const response = await s.create({ assigneeAgentId: s.leadId });
 
       expect(response.status).toBe(201);
       expect(await s.childrenOf(response.body.id)).toEqual([]);
