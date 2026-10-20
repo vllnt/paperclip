@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, HelpCircle } from "lucide-react";
-import { isValidRoutineDateString, syncRoutineVariablesWithTemplate, type RoutineVariable } from "@paperclipai/shared";
+import {
+  isValidRoutineDateString,
+  routineStepTemplateTexts,
+  syncRoutineVariablesWithTemplate,
+  type RoutineStep,
+  type RoutineVariable,
+} from "@paperclipai/shared";
 import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
@@ -50,21 +56,26 @@ function defaultValueForType(type: RoutineVariable["type"], current: RoutineVari
   return current;
 }
 
+const NO_STEPS: readonly RoutineStep[] = [];
+
 export function RoutineVariablesEditor({
   title,
   description,
+  steps = NO_STEPS,
   value,
   onChange,
 }: {
   title: string;
   description: string;
+  /** The routine's steps: a placeholder in a step's text is a variable too. */
+  steps?: readonly RoutineStep[];
   value: RoutineVariable[];
   onChange: (value: RoutineVariable[]) => void;
 }) {
   const [open, setOpen] = useState(true);
   const syncedVariables = useMemo(
-    () => syncRoutineVariablesWithTemplate([title, description], value),
-    [description, title, value],
+    () => syncRoutineVariablesWithTemplate([title, description, ...routineStepTemplateTexts(steps)], value),
+    [description, steps, title, value],
   );
   const syncedSignature = serializeVariables(syncedVariables);
   const currentSignature = serializeVariables(value);

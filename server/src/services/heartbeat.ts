@@ -1,4 +1,11 @@
-import { RUN_CONTEXT_DEFAULTS, resolveCompanyEnvironmentDefault, resolveTransientRetryPolicy, type ResolvedTransientRetryPolicy } from "@paperclipai/shared";
+import {
+  ROUTINE_RUN_ISSUE_ORIGIN_KINDS,
+  RUN_CONTEXT_DEFAULTS,
+  isRoutineRunIssueOriginKind,
+  resolveCompanyEnvironmentDefault,
+  resolveTransientRetryPolicy,
+  type ResolvedTransientRetryPolicy,
+} from "@paperclipai/shared";
 import { issueIdEqualsText } from "./issue-id-match.js";
 import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
@@ -507,10 +514,8 @@ import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
 import { isRetryableMonitorWakeBlock, monitorWakeRetryDelayMs } from "./issue-monitor-wake-block.js";
 import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import {
-  orderQueuedRunsForClaim,
-  selectAgentQueuedRuns,
-} from "./queued-run-claim-order.js";
+import { inheritRoutineStepWorkspace } from "./routine-steps.js";
+import { orderQueuedRunsForClaim, selectAgentQueuedRuns } from "./queued-run-claim-order.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   ISSUE_SELF_REBLOCK_WAKE_SUPPRESSED_REASON,
@@ -16722,7 +16727,7 @@ export function heartbeatService(
             and(
               eq(issues.id, input.issueId),
               eq(issues.companyId, input.companyId),
-              eq(issues.originKind, "routine_execution"),
+              inArray(issues.originKind, [...ROUTINE_RUN_ISSUE_ORIGIN_KINDS]),
             ),
           )
           .then((rows) => rows[0]?.policy ?? null)
@@ -18214,7 +18219,7 @@ export function heartbeatService(
         .where(eq(companies.id, agent.companyId))
         .then((rows) => rows[0]?.settings ?? null),
       routine:
-        issue?.originKind === "routine_execution" && issue.originId
+        isRoutineRunIssueOriginKind(issue?.originKind) && issue?.originId
           ? await dbOrTx
               .select({ settings: routines.automationWakeSettings })
               .from(routines)
@@ -23382,6 +23387,13 @@ export function heartbeatService(
       let issueContext = issueId
         ? await getIssueExecutionContext(agent.companyId, issueId)
         : null;
+      if (issueId && issueContext) {
+        const inherited = await inheritRoutineStepWorkspace(db, agent.companyId, issueContext).catch((error) => {
+          logger.warn({ err: error, issueId }, "failed to inherit the workspace of a routine step's predecessor");
+          return false;
+        });
+        if (inherited) issueContext = await getIssueExecutionContext(agent.companyId, issueId);
+      }
       const issueDependencyReadiness = issueId
         ? await issuesSvc
             .listDependencyReadiness(agent.companyId, [issueId])

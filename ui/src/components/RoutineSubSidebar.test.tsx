@@ -67,12 +67,13 @@ function renderSidebar(overrides?: {
 }
 
 describe("RoutineSubSidebar", () => {
-  it("renders all eight sections grouped under ROUTINE and OPERATE", () => {
+  it("renders all nine sections grouped under ROUTINE and OPERATE", () => {
     renderSidebar();
     const links = Array.from(container.querySelectorAll("a"));
     const labels = links.map((link) => link.textContent?.trim());
     expect(labels).toEqual([
       "Overview",
+      "Steps",
       "Triggers",
       "Variables",
       "Secrets",
@@ -126,6 +127,7 @@ describe("RoutineSubSidebar", () => {
     const links = Array.from(container.querySelectorAll("a"));
     expect(links.map((link) => link.textContent?.trim())).toEqual([
       "Overview",
+      "Steps",
       "Triggers",
       "Variables",
       "Secrets",
