@@ -170,6 +170,7 @@ function registerModuleMocks() {
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
     documentAnnotationService: () => mockAnnotationService,
+    issueService: () => ({ getById: vi.fn() }),
     logActivity: mockLogActivity,
     projectService: () => mockProjectService,
     routineService: () => mockRoutineService,
