@@ -560,6 +560,21 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
       for (const shown of lead.shown) expect(shown.linkedIssue).toMatchObject({ id: outside.id, title: "Quarterly figures" });
     });
 
+    it("cannot hand the steps on a task to another agent", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine({ steps: [step("build")] });
+      const task = await s.newTask();
+
+      const response = await request(appFor(agentActor(s.companyId, s.leadId)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: task.id, assigneeAgentId: s.builderId });
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toBe("Agents can only assign routine steps to themselves");
+      expect(await s.childrenOf(task.id)).toEqual([]);
+      expect(await s.runsOf(routine.id)).toEqual([]);
+    });
+
     it("cannot run a routine assigned to another agent", async () => {
       const s = await seed();
       const routine = await s.createRoutine();

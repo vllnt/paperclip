@@ -395,9 +395,13 @@ describeEmbeddedPostgres("attaching routine steps to an existing task", () => {
         contextSnapshot: {},
       });
       await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, task.id));
+      const checkedOut = await fx.newTask();
+      await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, checkedOut.id));
 
       expect((await refusal(fx.attach(task.id))).status).toBe(409);
+      expect((await refusal(fx.attach(checkedOut.id))).status).toBe(409);
       expect(await childrenOf(task.id)).toHaveLength(0);
+      expect(await childrenOf(checkedOut.id)).toHaveLength(0);
     });
 
     it("answers 409 for a task a queued run is about to work on, and allows it once the run finished", async () => {
