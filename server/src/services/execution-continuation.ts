@@ -3,15 +3,18 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle
 import { z } from "zod";
 import {
   agentWakeupRequests,
+  documents,
   heartbeatRuns,
   issueComments,
+  issueDocuments,
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
   type Db,
 } from "@paperclipai/db";
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
-import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
+import { isLowTrustQuarantined, sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
+import { applyContinuationWindow, CONTINUATION_DOCUMENT_INDEX_MAX_ENTRIES } from "./continuation-window.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
@@ -283,11 +286,18 @@ export async function buildExecutionContinuation(input: {
   const deliveredMessages = Array.isArray(priorEnvelope.messages)
     ? priorEnvelope.messages.map(object)
     : null;
-  const resumeDelta =
-    deliveredMessages && input.previousContextRunId
+  const deliveredIds = new Set(
+    [...(deliveredMessages ?? []), ...(Array.isArray(priorEnvelope.olderMessages) ? priorEnvelope.olderMessages.map(object) : [])]
+      .flatMap((entry) => (typeof entry.id === "string" ? [entry.id] : [])),
+  );
+  // The delta is taken from the bounded window, so a resumed wake stays bounded too.
+  const resumeDeltaFor = (bounded: Pick<ExecutionContinuationEnvelope, "messages" | "olderMessages">) => {
+    const newOlder = (bounded.olderMessages ?? []).filter((entry) => !deliveredIds.has(entry.id));
+    return deliveredMessages && input.previousContextRunId
       ? {
           baseRunId: input.previousContextRunId,
-          messages: messages.filter(
+          ...(newOlder.length > 0 ? { olderMessages: newOlder } : {}),
+          messages: bounded.messages.filter(
             (message) =>
               originCommentIds.includes(message.id) ||
               !deliveredMessages.some(
@@ -304,6 +314,7 @@ export async function buildExecutionContinuation(input: {
           ),
         }
       : undefined;
+  };
   const latestRequest = messages.findLast(
     (row) =>
       row.authorType === "user" && !row.createdByRunId && !row.deleted && row.body.trim().length > 0,
@@ -411,9 +422,23 @@ export async function buildExecutionContinuation(input: {
     (hasConversationContinuationPolicy(lastTerminal.result) ||
       lastTerminal.status === "interrupted" || lastTerminal.errorCode === "process_lost")
     ? lastTerminal.id : undefined);
-  return {
-    ...(interruptedRunId ? { interruptedRunId } : {}),
-    ...(resumeDelta ? { resumeDelta } : {}),
+  const documentIndex = await db
+    .select({
+      key: issueDocuments.key,
+      title: documents.title,
+      revisionNumber: documents.latestRevisionNumber,
+      updatedAt: documents.updatedAt,
+      chars: sql<number>`char_length(${documents.latestBody})`,
+      sourceTrust: documents.sourceTrust,
+    })
+    .from(issueDocuments)
+    .innerJoin(documents, and(eq(documents.id, issueDocuments.documentId), eq(documents.companyId, companyId)))
+    .where(and(eq(issueDocuments.companyId, companyId), eq(issueDocuments.issueId, issueId)))
+    .orderBy(desc(documents.updatedAt), asc(issueDocuments.key))
+    .limit(CONTINUATION_DOCUMENT_INDEX_MAX_ENTRIES);
+  // Comments that woke the run and the latest human request stay in the window.
+  const pinnedIds = new Set([...originCommentIds, ...(latestRequest ? [latestRequest.id] : [])]);
+  const bounded = applyContinuationWindow({
     recoveryOutcomes: reconciliations
       .filter((row) => row.evidence.executionReconciliation)
       .map((row) => ({
@@ -454,10 +479,27 @@ export async function buildExecutionContinuation(input: {
     unresolvedInteractionIds: interactions
       .filter((row) => row.status === "pending")
       .map((row) => row.id),
+    ...(documentIndex.length > 0
+      ? {
+          documents: documentIndex.map((row) => ({
+            key: row.key,
+            title: !input.exposeLowTrustRaw && isLowTrustQuarantined(row.sourceTrust) ? null : row.title,
+            revisionNumber: row.revisionNumber,
+            updatedAt: row.updatedAt.toISOString(),
+            chars: Number(row.chars),
+          })),
+        }
+      : {}),
     coverage: {
       kind: "full_task_history",
       throughCommentId: messages.at(-1)?.id ?? null,
       summaryThroughCommentId: null,
     },
+  }, { pinnedIds });
+  const resumeDelta = resumeDeltaFor(bounded);
+  return {
+    ...(interruptedRunId ? { interruptedRunId } : {}),
+    ...(resumeDelta ? { resumeDelta } : {}),
+    ...bounded,
   };
 }

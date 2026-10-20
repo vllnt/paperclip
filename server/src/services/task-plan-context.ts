@@ -7,8 +7,16 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { redactQuarantinedBodyForHigherTrust } from "./source-trust.js";
+import { cutText } from "./continuation-window.js";
 
-/** Read the task's durable plan before constructing any provider's assignment. */
+/** Characters of the plan body that a wake's task brief carries. */
+export const TASK_PLAN_BODY_MAX_CHARS = 32_000;
+
+/**
+ * Read the task's durable plan before constructing any provider's assignment.
+ * The body is cut at {@link TASK_PLAN_BODY_MAX_CHARS}, with a line that says
+ * where the full revision is.
+ */
 export async function getTaskPlanContext(input: {
   db: Db;
   companyId: string;
@@ -49,7 +57,17 @@ export async function getTaskPlanContext(input: {
       ),
     )
     .then((rows) => rows[0] ?? null);
-  return plan && !input.exposeLowTrustRaw
+  const visible = plan && !input.exposeLowTrustRaw
     ? redactQuarantinedBodyForHigherTrust(plan)
     : plan;
+  return visible
+    ? {
+        ...visible,
+        body: cutText(
+          visible.body,
+          TASK_PLAN_BODY_MAX_CHARS,
+          `read revision ${visible.revisionNumber} with GET /api/issues/${issueId}/documents/plan/revisions`,
+        ),
+      }
+    : visible;
 }

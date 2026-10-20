@@ -24,6 +24,30 @@ export const RUN_CONTEXT_DEFAULTS = {
   truncationMarker: false,
 } as const satisfies ResolvedRunContextSettings;
 
+/** Bounds of the issue-history window that a wake's continuation context carries. */
+export interface ThreadWindowLimits {
+  /** Most comments kept in `messages`, newest first, pinned ones included. */
+  maxComments: number;
+  /** Characters kept of one comment body that is not pinned. */
+  maxCommentChars: number;
+  /** Characters of all kept comment bodies together. */
+  maxTotalChars: number;
+  /** Most older comments listed in the one-line `olderMessages` index. */
+  maxIndexEntries: number;
+}
+
+/**
+ * Default history window: the newest 20 comments, 4,000 characters each and
+ * 48,000 in total, plus an index of up to 50 older comments. The comments that
+ * woke the run and the latest human request are always kept.
+ */
+export const THREAD_WINDOW_DEFAULTS = {
+  maxComments: 20,
+  maxCommentChars: 4_000,
+  maxTotalChars: 48_000,
+  maxIndexEntries: 50,
+} as const satisfies ThreadWindowLimits;
+
 const boundedInt = (limits: { min: number; max: number }) =>
   z.number().int().min(limits.min).max(limits.max);
 
