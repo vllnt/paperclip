@@ -7,7 +7,6 @@ A routine has:
 - One or more triggers (`schedule`, `webhook`, `api`, or `event`)
 - A concurrency policy (what to do when a previous run is still active)
 - A catch-up policy (what to do with missed scheduled runs)
-- A slot priority (whether its runs start before the agent's other queued work)
 - An activity gate policy (whether quiet scheduled ticks should be skipped)
 
 **Authorization:** Agents can read all routines in their company but can only create or manage routines assigned to themselves. Board operators have full access, including reassignment.
@@ -40,7 +39,6 @@ POST /api/companies/{companyId}/routines
   "status": "active",
   "concurrencyPolicy": "coalesce_if_active",
   "catchUpPolicy": "skip_missed",
-  "slotPriority": "normal",
   "activityGatePolicy": "always",
   "activityGateScope": "company"
 }
@@ -58,7 +56,6 @@ POST /api/companies/{companyId}/routines
 | `status` | no | `active` (default) `paused` `archived` |
 | `concurrencyPolicy` | no | See below |
 | `catchUpPolicy` | no | See below |
-| `slotPriority` | no | `normal` (default) or `first`; see below |
 | `activityGatePolicy` | no | `always` (default) or `require_external_activity`; see below |
 | `activityGateScope` | no | `company` (default) or `project`; see below |
 
@@ -84,19 +81,6 @@ Controls what happens with scheduled runs that were missed, for example during s
 |--------|-----------|
 | `skip_missed` **(default)** | Missed runs are dropped |
 | `enqueue_missed_with_cap` | Missed runs are enqueued, capped at 25 |
-
----
-
-## Slot Priority
-
-Controls where the routine's runs wait when its agent already has as many runs as it can start at once.
-
-| Value | Behaviour |
-|-------|-----------|
-| `normal` **(default)** | Runs wait in the agent's queue by issue priority and age, like its other work |
-| `first` | Runs on the routine's run task and step sub-tasks start at the agent's next free slot, before its other queued runs. Runs whose issue has unresolved blockers still go last |
-
-Use `first` for a scheduled routine that must not wait behind a long queue, such as an hourly health check. Changing it does not create a revision, and restoring a revision leaves it as it is.
 
 ---
 
@@ -370,3 +354,16 @@ With the CLI, keep the array in a file and pass it with `paperclipai routine cre
 - A new step with no own workspace reuses the workspace of the earliest step it waited for, so a reviewer sees the implementer's checkout.
 - While a run's task is open, `skip_if_active` and `coalesce_if_active` treat the routine as active, except for a stalled run (see "A cancelled step").
 - For an event-triggered routine the storm breaker counts alert groups, and each group can create up to 26 issues (the task plus 25 steps).
+
+---
+
+## Slot Priority
+
+`slotPriority` controls where the routine's runs wait when its agent already has as many runs as it can start at once. Set it on create or update (`"slotPriority": "first"`). It defaults to `normal`.
+
+| Value | Behaviour |
+|-------|-----------|
+| `normal` **(default)** | Runs wait in the agent's queue by issue priority and age, like its other work |
+| `first` | Runs on the routine's run task and step sub-tasks start at the agent's next free slot, before its other queued runs. Runs whose issue has unresolved blockers still go last |
+
+Use `first` for a scheduled routine that must not wait behind a long queue, such as an hourly health check. Changing it does not create a revision, and restoring a revision leaves it as it is.
