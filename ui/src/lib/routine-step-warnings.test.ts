@@ -20,7 +20,9 @@ describe("describeStepWarning", () => {
     expect(describeStepWarning(warning({ reason: "pending_approval" }), names)).toBe(
       "Step “build”: Builder is waiting for approval.",
     );
-    expect(describeStepWarning(warning({ reason: "not_invokable" }), names)).toContain("adapter");
+    expect(describeStepWarning(warning({ reason: "manager_terminated" }), names)).toBe(
+      "Step “build”: Builder reports to a terminated manager.",
+    );
   });
 
   it("falls back to a short agent ID and to the raw reason", () => {
@@ -36,7 +38,7 @@ describe("stepWarningsToast", () => {
   });
 
   it("joins every warning into one warn toast", () => {
-    const toast = stepWarningsToast([warning(), warning({ stepKey: "ship", reason: "error" })]);
+    const toast = stepWarningsToast([warning(), warning({ stepKey: "ship", reason: "terminated" })]);
     expect(toast?.tone).toBe("warn");
     expect(toast?.title).toBe("2 steps may not start");
     expect(toast?.body).toContain("Step “build”");

@@ -5,13 +5,18 @@ import type { RoutineStepWarning } from "@paperclipai/shared";
  * routine runs return. Saving or running still succeeded; these say which step may not start.
  */
 
+/** One entry per reason the server's agent-invokability check reports. */
 const REASON_TEXT: Record<string, string> = {
-  paused: "is paused",
-  pending_approval: "is waiting for approval",
-  error: "is in an error state",
-  terminated: "was terminated",
   missing: "no longer exists",
-  not_invokable: "has an adapter that cannot be started",
+  paused: "is paused",
+  terminated: "was terminated",
+  pending_approval: "is waiting for approval",
+  unknown_status: "has a status that cannot take work",
+  manager_missing: "reports to a manager that no longer exists",
+  manager_company_mismatch: "reports to a manager in another company",
+  manager_terminated: "reports to a terminated manager",
+  reporting_cycle: "is in a reporting loop",
+  reporting_chain_too_deep: "has a reporting chain that is too deep",
 };
 
 /** The agent the board sees: its name when known, else a short ID. */
