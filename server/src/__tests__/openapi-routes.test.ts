@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
+import { MAX_ROUTINE_STEPS } from "@paperclipai/shared";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
 import { buildOpenApiSpec, CONVEX_PLUGIN_ACTIONS, CONVEX_PLUGIN_SCHEMAS, openApiRoutes } from "../routes/openapi.js";
@@ -370,6 +371,15 @@ describe("openapi routes", () => {
       Object.keys(operation.requestBody.content["application/json"]!.schema.properties);
     expect(routineBodyProperties(res.body.paths["/api/companies/{companyId}/routines"].post)).toContain("steps");
     expect(routineBodyProperties(res.body.paths["/api/routines/{id}"].patch)).toContain("steps");
+    for (const operation of [
+      res.body.paths["/api/companies/{companyId}/routines"].post,
+      res.body.paths["/api/routines/{id}"].patch,
+    ]) {
+      const steps = operation.requestBody.content["application/json"].schema.properties.steps;
+      expect(steps.maxItems).toBe(MAX_ROUTINE_STEPS);
+      expect(steps.items.properties.after.maxItems).toBe(MAX_ROUTINE_STEPS);
+      expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["403", "404", "409", "422"]));
+    }
     expect(res.body.paths["/api/companies"].get.responses["403"]).toBeDefined();
     expect(res.body.paths["/api/companies"].get.responses["400"]).toBeDefined();
     expect(
