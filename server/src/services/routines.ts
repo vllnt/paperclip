@@ -3830,6 +3830,23 @@ export function routineService(
       return rows.map(mapRoutineRevision);
     },
 
+    getRevision: async (routineId: string, revisionId: string): Promise<RoutineRevision | null> => {
+      const routine = await getRoutineById(routineId);
+      if (!routine) throw notFound("Routine not found");
+      const row = await db
+        .select()
+        .from(routineRevisions)
+        .where(
+          and(
+            eq(routineRevisions.companyId, routine.companyId),
+            eq(routineRevisions.routineId, routine.id),
+            eq(routineRevisions.id, revisionId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      return row ? mapRoutineRevision(row) : null;
+    },
+
     restoreRevision: async (
       routineId: string,
       revisionId: string,

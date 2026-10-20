@@ -162,6 +162,26 @@ export function routineRoutes(
     );
   }
 
+  /**
+   * A restore writes the steps of an old revision back as they were, so an agent that restores one
+   * meets the rules for steps it writes itself: it may only give steps to itself, and a low-trust
+   * author's containment must already be in them. A board user is covered by the route's
+   * `tasks:assign` check.
+   * @throws HttpError 403 when the revision's steps break one of those rules.
+   */
+  async function assertAgentMayRestoreSteps(req: Request, companyId: string, routineId: string, revisionId: string) {
+    if (req.actor.type !== "agent") return;
+    const snapshotRoutine = (await svc.getRevision(routineId, revisionId))?.snapshot.routine;
+    const steps = snapshotRoutine?.steps;
+    if (!snapshotRoutine || !steps?.length) return;
+    await assertCanAssignRoutineSteps(req, companyId, steps);
+    const contained = await containAgentSteps(req, companyId, snapshotRoutine.projectId ?? null, steps);
+    // Steps are JSON: a field that is `undefined` on one side and absent on the other is no difference.
+    if (!isDeepStrictEqual(JSON.parse(JSON.stringify(contained)), JSON.parse(JSON.stringify(steps)))) {
+      throw forbidden("The steps of this revision lack your containment; update the routine steps instead of restoring");
+    }
+  }
+
   async function assertCanManageExistingRoutine(req: Request, routineId: string) {
     const routine = await svc.get(routineId);
     if (!routine || !hasCompanyAccess(req, routine.companyId)) return null;
@@ -495,6 +515,7 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    await assertAgentMayRestoreSteps(req, routine.companyId, routine.id, req.params.revisionId as string);
     const result = await svc.restoreRevision(routine.id, req.params.revisionId as string, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,

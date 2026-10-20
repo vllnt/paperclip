@@ -223,4 +223,81 @@ describeEmbeddedPostgres("routine steps routes", () => {
       expect(res.body.error).toContain("tasks:assign");
     });
   });
+
+  describe("a revision with steps restored by an agent", () => {
+    async function seedRevisionWithSteps(lowTrust: boolean, stepsOf: (otherAgentId: string) => RoutineStep[]) {
+      const fx = await seed();
+      const agentId = await fx.newAgent("Restorer", lowTrust ? fx.lowTrustPermissions : {});
+      const otherAgentId = await fx.newAgent("Other");
+      const routine = await fx.svc.create(
+        fx.companyId,
+        { title: "Release", assigneeAgentId: agentId, projectId: fx.projectId, priority: "medium" } as never,
+        {},
+      );
+      const withSteps = await fx.svc.update(routine.id, { steps: stepsOf(otherAgentId) }, {});
+      await fx.svc.update(routine.id, { steps: [] }, {});
+      return { fx, agentId, routine, revisionId: withSteps!.latestRevisionId! };
+    }
+
+    it("is refused when its steps name another agent", async () => {
+      const { fx, agentId, routine, revisionId } = await seedRevisionWithSteps(false, (otherAgentId) => [
+        step("build", [], { assigneeAgentId: otherAgentId }),
+      ]);
+
+      const res = await request(appFor(agentActor(fx.companyId, agentId)))
+        .post(`/api/routines/${routine.id}/revisions/${revisionId}/restore`)
+        .send({});
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("assign routine steps to themselves");
+      expect((await fx.svc.get(routine.id))?.steps).toEqual([]);
+    });
+
+    it("is refused for a low-trust agent when its steps lack the agent's containment", async () => {
+      const { fx, agentId, routine, revisionId } = await seedRevisionWithSteps(true, () => [step("build")]);
+
+      const res = await request(appFor(agentActor(fx.companyId, agentId)))
+        .post(`/api/routines/${routine.id}/revisions/${revisionId}/restore`)
+        .send({});
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("containment");
+      expect((await fx.svc.get(routine.id))?.steps).toEqual([]);
+    });
+
+    it("is restored when its steps belong to the agent and need no further containment", async () => {
+      const { fx, agentId, routine, revisionId } = await seedRevisionWithSteps(false, () => [
+        step("build"),
+        step("ship", ["build"]),
+      ]);
+
+      const res = await request(appFor(agentActor(fx.companyId, agentId)))
+        .post(`/api/routines/${routine.id}/revisions/${revisionId}/restore`)
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect((await fx.svc.get(routine.id))?.steps).toHaveLength(2);
+    });
+
+    it("is restored for a low-trust agent when the agent wrote the contained steps itself", async () => {
+      const fx = await seed();
+      const agentId = await fx.newAgent("Author", fx.lowTrustPermissions);
+      const routine = await fx.svc.create(
+        fx.companyId,
+        { title: "Release", assigneeAgentId: agentId, projectId: fx.projectId, priority: "medium" } as never,
+        {},
+      );
+      const app = appFor(agentActor(fx.companyId, agentId));
+      const written = await request(app).patch(`/api/routines/${routine.id}`).send({ steps: [step("build")] });
+      expect(written.status).toBe(200);
+      await request(app).patch(`/api/routines/${routine.id}`).send({ steps: [] });
+
+      const res = await request(app)
+        .post(`/api/routines/${routine.id}/revisions/${written.body.latestRevisionId}/restore`)
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect((await fx.svc.get(routine.id))?.steps).toHaveLength(1);
+    });
+  });
 });

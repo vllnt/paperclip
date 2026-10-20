@@ -105,6 +105,7 @@ const mockRoutineService = vi.hoisted(() => ({
   update: vi.fn(),
   create: vi.fn(),
   listRevisions: vi.fn(),
+  getRevision: vi.fn(),
   restoreRevision: vi.fn(),
   listRuns: vi.fn(),
   createTrigger: vi.fn(),
@@ -224,6 +225,7 @@ describe("routine routes", () => {
     mockRoutineService.getTrigger.mockResolvedValue(trigger);
     mockRoutineService.update.mockResolvedValue({ ...routine, assigneeAgentId: otherAgentId });
     mockRoutineService.listRevisions.mockResolvedValue([revision]);
+    mockRoutineService.getRevision.mockResolvedValue(revision);
     mockRoutineService.restoreRevision.mockResolvedValue({
       routine,
       revision: { ...revision, revisionNumber: 2, restoredFromRevisionId: revision.id },
