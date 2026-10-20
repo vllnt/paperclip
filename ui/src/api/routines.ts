@@ -79,9 +79,15 @@ export const routinesApi = {
     api.post<RotateRoutineTriggerResponse>(`/routine-triggers/${id}/rotate-secret`, {}),
   run: (id: string, data?: Record<string, unknown>) =>
     api.post<RoutineRunResponse>(`/routines/${id}/run`, data ?? {}),
-  /** Attaches the routine's steps to an existing task instead of opening a new run task. */
-  runOnIssue: (id: string, targetIssueId: string) =>
-    api.post<RoutineRunResponse>(`/routines/${id}/run`, { targetIssueId }),
+  /**
+   * Attaches the routine's steps to an existing task instead of opening a new run task.
+   * `variables` fills the routine's required variables, as on any manual run.
+   */
+  runOnIssue: (id: string, targetIssueId: string, variables?: Record<string, string | number | boolean>) =>
+    api.post<RoutineRunResponse>(`/routines/${id}/run`, {
+      targetIssueId,
+      ...(variables && Object.keys(variables).length > 0 ? { variables } : {}),
+    }),
   activity: async (
     companyId: string,
     routineId: string,

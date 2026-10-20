@@ -2,10 +2,16 @@
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { RoutineListItem, RoutineStepWarning } from "@paperclipai/shared";
+import type { RoutineListItem, RoutineStepWarning, RoutineVariable } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { ApiError } from "@/api/client";
-import { RunRoutineOnIssueDialog, routinesWithSteps, runOnIssueErrorMessage } from "./RunRoutineOnIssueDialog";
+import {
+  RunRoutineOnIssueDialog,
+  enteredVariableValues,
+  routinesWithSteps,
+  runOnIssueErrorMessage,
+  variablesToAsk,
+} from "./RunRoutineOnIssueDialog";
 
 const { list, runOnIssue, agentsList, pushToast } = vi.hoisted(() => ({
   list: vi.fn(),
@@ -33,11 +39,27 @@ function routine(overrides: Partial<RoutineListItem>): RoutineListItem {
   return { id: "r", title: "Routine", status: "active", steps: [], ...overrides } as unknown as RoutineListItem;
 }
 
+function variable(overrides: Partial<RoutineVariable>): RoutineVariable {
+  return { name: "target", label: null, type: "text", defaultValue: null, required: true, options: [], ...overrides };
+}
+
 const ROUTINES = [
   routine({ id: "r-plain", title: "Plain routine" }),
   routine({ id: "r-release", title: "Release", steps: [STEP, { ...STEP, key: "ship", after: ["build"] }] as never }),
   routine({ id: "r-paused", title: "Paused review", status: "paused", steps: [STEP] as never }),
   routine({ id: "r-old", title: "Archived flow", status: "archived", steps: [STEP] as never }),
+  routine({
+    id: "r-vars",
+    title: "Deploy",
+    steps: [STEP] as never,
+    variables: [
+      variable({ name: "environment", label: "Target environment" }),
+      variable({ name: "replicas", type: "number" }),
+      variable({ name: "region", defaultValue: "eu" }),
+      variable({ name: "note", required: false }),
+      variable({ name: "date" }),
+    ],
+  }),
 ];
 
 let root: Root;
@@ -87,6 +109,17 @@ function choose(title: string) {
   return act(async () => match.click());
 }
 
+/** Type into a text or number input the way a user does, so React sees the change. */
+async function typeInto(selector: string, text: string) {
+  const input = document.body.querySelector<HTMLInputElement>(selector);
+  if (!input) throw new Error(`No field ${selector}`);
+  const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  await act(async () => {
+    setValue?.call(input, text);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   list.mockReset().mockResolvedValue(ROUTINES);
@@ -107,7 +140,7 @@ afterEach(async () => {
 
 describe("routinesWithSteps", () => {
   it("keeps only routines that have steps and are not archived", () => {
-    expect(routinesWithSteps(ROUTINES).map((item) => item.id)).toEqual(["r-release", "r-paused"]);
+    expect(routinesWithSteps(ROUTINES).map((item) => item.id)).toEqual(["r-release", "r-paused", "r-vars"]);
     expect(routinesWithSteps(undefined)).toEqual([]);
   });
 });
@@ -128,7 +161,7 @@ describe("RunRoutineOnIssueDialog", () => {
     await choose("Release");
     await submit();
 
-    expect(runOnIssue).toHaveBeenCalledWith("r-release", ISSUE.id);
+    expect(runOnIssue).toHaveBeenCalledWith("r-release", ISSUE.id, {});
     expect(onStarted).toHaveBeenCalledTimes(1);
     expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Routine started on this task" }));
     expect(onOpenChange).toHaveBeenCalledWith(false);
@@ -169,12 +202,73 @@ describe("RunRoutineOnIssueDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("asks for the required variables and runs with the typed values", async () => {
+    runOnIssue.mockResolvedValue({ id: "run-1", warnings: [] });
+    await renderDialog();
+    await choose("Deploy");
+
+    expect(document.body.textContent).toContain("Target environment");
+    expect(document.body.querySelector("#run-on-task-variable-environment")).not.toBeNull();
+    expect(document.body.querySelector("#run-on-task-variable-replicas")).not.toBeNull();
+    expect(document.body.querySelector("#run-on-task-variable-region")).toBeNull();
+    expect(document.body.querySelector("#run-on-task-variable-note")).toBeNull();
+    expect(document.body.querySelector("#run-on-task-variable-date")).toBeNull();
+    expect(dialogButton("Run routine").disabled).toBe(true);
+
+    await typeInto("#run-on-task-variable-environment", "staging");
+    expect(dialogButton("Run routine").disabled).toBe(true);
+    await typeInto("#run-on-task-variable-replicas", "3");
+    expect(dialogButton("Run routine").disabled).toBe(false);
+
+    await submit();
+    expect(runOnIssue).toHaveBeenCalledWith("r-vars", ISSUE.id, { environment: "staging", replicas: 3 });
+  });
+
+  it("clears the entered values when another routine is chosen", async () => {
+    await renderDialog();
+    await choose("Deploy");
+    await typeInto("#run-on-task-variable-environment", "staging");
+    await choose("Release");
+    expect(document.body.querySelector("#run-on-task-variable-environment")).toBeNull();
+    await choose("Deploy");
+    const field = document.body.querySelector<HTMLInputElement>("#run-on-task-variable-environment");
+    expect(field?.value).toBe("");
+  });
+
   it("points to the routine page when no routine has steps", async () => {
     list.mockResolvedValue([routine({ id: "r-plain", title: "Plain routine" })]);
     await renderDialog();
     expect(document.body.textContent).toContain("No routine has steps yet");
     expect(document.body.querySelector('a[href="/routines"]')).not.toBeNull();
     expect(dialogButton("Run routine").disabled).toBe(true);
+  });
+});
+
+describe("variablesToAsk", () => {
+  it("asks only for required variables without a default that Paperclip does not fill in", () => {
+    const deploy = ROUTINES.find((item) => item.id === "r-vars");
+    expect(variablesToAsk(deploy).map((item) => item.name)).toEqual(["environment", "replicas"]);
+    expect(variablesToAsk(undefined)).toEqual([]);
+    expect(
+      variablesToAsk(routine({ variables: [variable({ name: "branch", defaultValue: "   " })] })).map((item) => item.name),
+    ).toEqual(["branch"]);
+  });
+});
+
+describe("enteredVariableValues", () => {
+  it("sends numbers and booleans in their own type and leaves blanks out", () => {
+    const variables = [
+      variable({ name: "count", type: "number" }),
+      variable({ name: "dry", type: "boolean" }),
+      variable({ name: "name" }),
+      variable({ name: "empty" }),
+      variable({ name: "bad", type: "number" }),
+    ];
+    expect(enteredVariableValues(variables, { count: "4", dry: "false", name: "x", empty: "  ", bad: "abc" })).toEqual({
+      count: 4,
+      dry: false,
+      name: "x",
+    });
   });
 });
 
