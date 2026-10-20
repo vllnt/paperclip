@@ -322,13 +322,16 @@ async function seedWake(url, assignments) {
 /**
  * The statements one healthy request of each route sends, counted at the
  * proxy with nothing else running, minus the server's idle background rate.
+ * The background is bursty, so the idle rate is taken over 10 s and each
+ * route needs enough samples for its window to average the bursts out.
+ * `settleMs` waits for work that a route does after its response (the wake).
  */
-async function statementCensus(proxy, senders, samples) {
+async function statementCensus(proxy, senders, samples, settleMs = {}) {
   // The first request of a user runs the full actor sync; keep it out of the count.
   for (const send of Object.values(senders)) await send();
   proxy.resetStats();
   const idleStarted = performance.now();
-  await sleep(3_000);
+  await sleep(10_000);
   const idlePerMs = proxy.stats().statements / (performance.now() - idleStarted);
   const routes = {};
   for (const [name, send] of Object.entries(senders)) {
@@ -338,8 +341,7 @@ async function statementCensus(proxy, senders, samples) {
       const response = await send();
       if (response.status >= 300) throw new Error(`census ${name}: HTTP ${response.status}`);
     }
-    // The wake is delivered after the response.
-    await sleep(1_000);
+    await sleep(settleMs[name] ?? 0);
     const statements = proxy.stats().statements - idlePerMs * (performance.now() - started);
     routes[name] = Math.max(0, statements / samples);
   }
@@ -456,7 +458,8 @@ async function runF4({ arm, config, phases, rates, censusSamples, importers }) {
     });
     const assignments = Math.ceil((rates.assign * totalMs) / 1000) + censusSamples + 10;
     const senders = config === "auth" ? await seedAuth(server.url, token) : await seedWake(server.url, assignments);
-    const census = await statementCensus(proxy, senders, censusSamples);
+    // The wake is delivered after the assignment's response.
+    const census = await statementCensus(proxy, senders, censusSamples, { assign: 1_000 });
     const records = [];
     const startAt = performance.now() + 200;
     const endAt = startAt + totalMs;
@@ -554,8 +557,116 @@ async function f4(argv) {
   process.stderr.write(`F4 report: ${values.out}\n`);
 }
 
+/** Routes of the census (the read routes of the production B0, plan section 4.7). {c} = company id, {i} = issue id. */
+const CENSUS_ROUTES = [
+  ["dashboard", "/api/companies/{c}/dashboard"],
+  ["sidebar-badges", "/api/companies/{c}/sidebar-badges"],
+  ["live-runs", "/api/companies/{c}/live-runs"],
+  ["activity", "/api/companies/{c}/activity"],
+  ["heartbeat-runs", "/api/companies/{c}/heartbeat-runs?limit=200"],
+  ["agents", "/api/companies/{c}/agents"],
+  ["skills", "/api/companies/{c}/skills"],
+  ["attention", "/api/companies/{c}/attention"],
+  ["issues-default", "/api/companies/{c}/issues"],
+  ["issues-compact", "/api/companies/{c}/issues?view=compact&limit=100"],
+  ["issue-by-id", "/api/issues/{i}"],
+  ["issue-comments", "/api/issues/{i}/comments"],
+];
+
+/** A company with `size` issues, two comments each, and one agent per ten issues that the issues are assigned to. */
+async function seedCensus(url, size) {
+  const company = await must(request(url, "POST", "/api/companies", { body: { name: `Perf census ${size}` } }), "seed company");
+  const agents = [];
+  for (let index = 0; index < Math.max(1, Math.round(size / 10)); index += 1) {
+    agents.push(await must(request(url, "POST", `/api/companies/${company.id}/agents`, {
+      body: {
+        name: `Perf census agent ${index}`,
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: { command: "/usr/bin/true" },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+      },
+    }), "seed agent"));
+  }
+  let issue = null;
+  for (let index = 0; index < size; index += 1) {
+    issue = await must(request(url, "POST", `/api/companies/${company.id}/issues`, {
+      body: { title: `[perf] census ${index}`, status: "todo", assigneeAgentId: agents[index % agents.length].id },
+    }), "seed issue");
+    for (let comment = 0; comment < 2; comment += 1) {
+      await must(request(url, "POST", `/api/issues/${issue.id}/comments`, { body: { body: `[perf] comment ${comment}` } }), "seed comment");
+    }
+  }
+  return Object.fromEntries(CENSUS_ROUTES.map(([name, route]) => [
+    name,
+    () => request(url, "GET", route.replace("{c}", company.id).replace("{i}", issue.id)),
+  ]));
+}
+
+/**
+ * The per-route statement census (plan step 2b, section 14.5): the statements
+ * one healthy request of each route sends, at two or more data sizes, on a
+ * local_trusted server behind the fault proxy in pass mode. A route whose
+ * count grows with the number of issues reads as N+1 shaped.
+ */
+async function census(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      checkout: { type: "string", default: root },
+      sizes: { type: "string", default: "10,100" },
+      samples: { type: "string", default: "30" },
+      out: { type: "string", default: path.join(root, "tmp/perf/census.json") },
+    },
+  });
+  const sizes = values.sizes.split(",").map(Number).filter((size) => size > 0).sort((a, b) => a - b);
+  const { startEmbeddedPostgresTestDatabase } = await importFromServer("@paperclipai/db");
+  const bySize = {};
+  for (const size of sizes) {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-perf-census-");
+    const proxy = await startFaultProxy({ targetPort: Number(new URL(database.connectionString).port) });
+    let server = null;
+    try {
+      server = await startServer({
+        checkout: path.resolve(values.checkout),
+        databaseUrl: database.connectionString.replace(/:(\d+)\//, `:${proxy.port}/`),
+        migrationUrl: database.connectionString,
+        mode: "local_trusted",
+      });
+      bySize[size] = await statementCensus(proxy, await seedCensus(server.url, size), Number(values.samples));
+      process.stderr.write(`census size=${size}: ${JSON.stringify(Object.fromEntries(Object.entries(bySize[size].statementsPerRequest).map(([name, count]) => [name, Math.round(count * 10) / 10])))}\n`);
+    } finally {
+      await server?.stop();
+      await proxy.close();
+      await database.cleanup();
+    }
+  }
+  const [small, large] = [sizes[0], sizes.at(-1)];
+  const routes = Object.fromEntries(CENSUS_ROUTES.map(([name]) => {
+    const counts = Object.fromEntries(sizes.map((size) => [size, bySize[size].statementsPerRequest[name]]));
+    // Extra statements per extra issue between the smallest and the largest size.
+    const perIssue = large > small ? (counts[large] - counts[small]) / (large - small) : null;
+    return [name, { statementsPerRequest: counts, perIssue, nPlusOneShaped: perIssue !== null && perIssue >= 0.5 }];
+  }));
+  const report = {
+    kind: "census",
+    finishedAt: new Date().toISOString(),
+    node: process.version,
+    checkout: path.resolve(values.checkout),
+    settings: { sizes, samples: Number(values.samples), commentsPerIssue: 2, issuesPerAgent: 10 },
+    idleStatementsPerSecond: Object.fromEntries(sizes.map((size) => [size, bySize[size].idleStatementsPerSecond])),
+    routes,
+  };
+  fs.mkdirSync(path.dirname(values.out), { recursive: true });
+  fs.writeFileSync(values.out, `${JSON.stringify(report, null, 2)}\n`);
+  for (const [name, route] of Object.entries(routes)) {
+    process.stderr.write(`census ${name}: ${sizes.map((size) => `${size}: ${route.statementsPerRequest[size]?.toFixed(1)}`).join(", ")}; per issue ${route.perIssue?.toFixed(2)}${route.nPlusOneShaped ? " (N+1 shaped)" : ""}\n`);
+  }
+  process.stderr.write(`census report: ${values.out}\n`);
+}
+
 const [command, ...rest] = process.argv.slice(2);
-const commands = { f1, f4 };
+const commands = { f1, f4, census };
 if (!commands[command]) {
   process.stderr.write(`usage: faults.mjs <${Object.keys(commands).join("|")}> [options]\n`);
   process.exit(2);
