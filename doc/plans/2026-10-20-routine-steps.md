@@ -167,6 +167,6 @@ Routine create, update and run responses carry `warnings: RoutineStepWarning[]` 
 - A run task left open keeps the routine "live" until it is done or cancelled, except a stalled run (see Dispatch, item 5).
 - A rollback to a previous image runs a routine with steps as one plain task and cannot restore a revision that holds steps (see `doc/DATABASE.md`).
 - Step wakes on the event path are queued after commit and are best effort; the stranded sweep recovers a lost wake.
-- `routineSteps` is a reserved key in a run's trigger payload.
+- `routineSteps` and `targetIssueId` are reserved keys in a run's trigger payload: a caller's payload loses them, so a run without a task cannot pass for a run on a task.
 - An `event_issue` trigger without a `created_by: "user"` filter also fires for tasks that agents create; the storm limiter is the only brake. The UI suggests the filter and warns without it.
 - The start is synchronous in the task-create request. The work is small (one savepoint), but a slow attach slows that create; a failure never fails it.

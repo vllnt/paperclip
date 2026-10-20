@@ -447,6 +447,25 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
       expect(plain.status).toBe(409);
       expect(await s.runsOf(routine.id)).toHaveLength(1);
     });
+
+    it("keeps a task id in a caller's payload from passing for a run on a task", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const task = await s.newTask();
+      const app = appFor(boardActor(s.companyId));
+      const plainRun = { idempotencyKey: "k-1", payload: { targetIssueId: task.id } };
+
+      const first = await request(app).post(`/api/routines/${routine.id}/run`).send(plainRun);
+      const repeat = await request(app).post(`/api/routines/${routine.id}/run`).send(plainRun);
+      const onTask = await request(app).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: task.id, idempotencyKey: "k-1" });
+
+      expect(first.status).toBe(202);
+      expect(repeat.status).toBe(202);
+      expect(repeat.body.id).toBe(first.body.id);
+      expect(onTask.status).toBe(409);
+      expect(await s.childrenOf(task.id)).toEqual([]);
+      expect(await s.runsOf(routine.id)).toHaveLength(1);
+    });
   });
 
   describe("for a board member", () => {

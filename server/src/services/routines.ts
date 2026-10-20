@@ -680,12 +680,17 @@ function resolveRoutineVariableValues(
   return resolved;
 }
 
-/** The key a run uses to record its steps belongs to dispatch: a caller's payload never carries it. */
+/**
+ * The keys a run uses to record its steps and the task it started them on belong to dispatch: a
+ * caller's payload never carries them, so a plain run cannot pass for a run on a task.
+ */
+const RESERVED_RUN_PAYLOAD_KEYS: readonly string[] = [ROUTINE_STEPS_RUN_PAYLOAD_KEY, "targetIssueId"];
+
 function withoutReservedRunPayloadKeys(
   payload: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> | null | undefined {
-  if (!payload || !(ROUTINE_STEPS_RUN_PAYLOAD_KEY in payload)) return payload;
-  return Object.fromEntries(Object.entries(payload).filter(([key]) => key !== ROUTINE_STEPS_RUN_PAYLOAD_KEY));
+  if (!payload || !RESERVED_RUN_PAYLOAD_KEYS.some((key) => key in payload)) return payload;
+  return Object.fromEntries(Object.entries(payload).filter(([key]) => !RESERVED_RUN_PAYLOAD_KEYS.includes(key)));
 }
 
 function mergeRoutineRunPayload(
