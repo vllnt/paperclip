@@ -307,9 +307,9 @@ Use `steps` when the same multi-stage work repeats (for example implement, revie
 - The run's task, in status `blocked` and not woken at the start.
 - One child task per step (origin kind `routine_step`), `todo` when it has no `after` and `blocked` by its predecessors otherwise. Steps are created in layers: steps with nothing to wait for first, then the steps whose predecessors are all created, each layer in the order written.
 - Only the steps with no predecessors are woken. Each step that finishes wakes the steps that were waiting for it. The run's task is woken once, after the last step is done, to wrap up.
-- The run records `routineSteps` (`steps` and `stepIssueIds`) in its trigger payload, so editing the routine never changes a run in flight. Cancel the run's task with the tree control (the task and its sub-tasks) to stop the whole tree and free the routine.
+- The run records `routineSteps` (`steps` and `stepIssueIds`) in its trigger payload, so editing the routine never changes a run in flight. The `routineSteps` key is reserved: a trigger payload you send with that key loses it. Cancel the run's task with the tree control (the task and its sub-tasks) to stop the whole tree and free the routine.
 
-**A cancelled step.** A cancelled step never counts as done: the steps that wait for it, and the run's task, stay `blocked`. Nothing cascades, so a person decides. When every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled* and no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run with another branch still running stays live. Clean up a stalled run by cancelling its task with the tree control.
+**A cancelled step.** A cancelled step never counts as done: the steps that wait for it, and the run's task, stay `blocked`. Nothing cascades, so a person decides. When every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled* and no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run with another branch still running stays live. When the run's task is next updated, a stalled run is recorded as `failed`. Clean up a stalled run by cancelling its task with the tree control.
 
 **Fork and join.** Several steps with the same `after` run in parallel. A step that lists several keys in `after` starts only after all of them are done.
 
@@ -347,7 +347,7 @@ With the CLI, keep the array in a file and pass it with `paperclipai routine cre
 
 - At most 25 steps. Keys must be unique, `after` must name other steps, and there can be no cycles.
 - Every step needs an agent, and agents and labels must belong to the company.
-- You need permission to assign tasks to write steps, and an agent can only assign steps to itself.
+- You need permission to assign tasks to write steps, and an agent can only assign steps to itself. An agent restoring a revision with steps follows the same rule, and a low-trust agent can restore only steps that already carry its containment (`403` otherwise).
 - Routine environment variables and secrets apply to the run's task only. Step agents do not inherit them.
 - `after` takes plain step keys.
 - Steps are not supported with `appendToIssueId` (append issue mode); the API returns `422`.

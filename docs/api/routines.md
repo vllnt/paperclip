@@ -143,9 +143,9 @@ Rules checked when you save: keys are unique, `after` points at other steps, the
 
 If creating the task or any step fails, none of them is kept and the run is recorded as `failed`. If a later database write of the same dispatch fails, the whole dispatch rolls back: no task and no run row remain, and the caller gets the error (accepted; the next trigger starts again).
 
-The run record keeps `routineSteps: { steps, stepIssueIds }` in its trigger payload, so later edits to the routine never change a run in flight. To stop a run, cancel its task with the existing tree control (cancel the task and its sub-tasks): the root and every step are cancelled, and the routine is free for the next run.
+The run record keeps `routineSteps: { steps, stepIssueIds }` in its trigger payload, so later edits to the routine never change a run in flight. The `routineSteps` key is reserved: a trigger payload you send with that key loses it. To stop a run, cancel its task with the existing tree control (cancel the task and its sub-tasks): the root and every step are cancelled, and the routine is free for the next run.
 
-**A cancelled step.** A cancelled step never counts as done, so the steps that wait for it stay `blocked` and the run's task stays blocked. Nothing cascades: the blocked steps stay visible so a person can decide. Once every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled*. A stalled run no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run where another branch is still running stays live. To clean up a stalled run, cancel its task with the tree control.
+**A cancelled step.** A cancelled step never counts as done, so the steps that wait for it stay `blocked` and the run's task stays blocked. Nothing cascades: the blocked steps stay visible so a person can decide. Once every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled*. A stalled run no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run where another branch is still running stays live. When the run's task is next updated, a stalled run is recorded as `failed`. To clean up a stalled run, cancel its task with the tree control.
 
 **Concurrency.** For a routine with steps, an open root of an earlier run counts as live: `skip_if_active` and `coalesce_if_active` act on it until it is done or cancelled, or until the run is stalled (see above). `always_enqueue` is unchanged.
 
@@ -159,7 +159,7 @@ The run record keeps `routineSteps: { steps, stepIssueIds }` in its trigger payl
 - For an event-triggered routine, the storm breaker counts alert groups, not issues, and each group can create up to 26 issues (the task plus 25 steps). Lower the source's `maxNewIssuesPerHour` if that is too many.
 - Steps are an API, CLI and UI feature of the routine. The routine UI edits key, title, instructions, agent, priority and `after`; `labelIds`, `executionPolicy` and `acceptanceCriteria` are set through the API or CLI. The UI keeps them when you edit a step.
 
-**Permissions.** Writing steps needs the same rights as assigning tasks. A board user needs `tasks:assign`. **An agent can only assign steps to itself**; naming another agent returns `403`.
+**Permissions.** Writing steps needs the same rights as assigning tasks. A board user needs `tasks:assign`. **An agent can only assign steps to itself**; naming another agent returns `403`. Restoring a revision that holds steps follows the same rules for an agent: the steps must be assigned to the agent, and a low-trust agent can restore only steps that already carry its containment (otherwise `403`; update the steps instead).
 
 CLI:
 
