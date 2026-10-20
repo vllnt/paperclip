@@ -95,6 +95,16 @@ async function grantSelfConfigure(f: { companyId: string; agentId: string }) {
   await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId, permissionKey: "agents:configure", scope: { agentIds: [f.agentId] } });
 }
 
+/**
+ * An agent that sets a protected field, such as the model, on a new hire needs
+ * a company-wide agents:configure grant, and so does the user it runs for.
+ */
+async function grantCompanyConfigure(f: { companyId: string; agentId: string; userId: string }) {
+  await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+  await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId, membershipRole: "member", status: "active" });
+  await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId, permissionKey: "agents:configure", scope: null });
+}
+
 function hired(response: request.Response) {
   expect(response.status, JSON.stringify(response.body)).toBe(201);
   return response.body.agent ?? response.body;
@@ -164,12 +174,14 @@ describe("agent-created hires use managed AI connections", () => {
 
   it.each([
     ["opencode_local", {}, "PAPERCLIP_OPENCODE_PROVIDERS"],
-    ["opencode_local", { model: "anthropic/claude-sonnet-5" }, "OPENCODE_AUTH_JSON"],
+    // The fork refuses Anthropic models on every non-Claude harness, and the agent choosing the model needs a company-wide grant.
+    ["opencode_local", { model: "openai/gpt-5.6-sol" }, "OPENCODE_AUTH_JSON"],
     ["paperclip_runner", { provider: "opencode", model: "anthropic/claude-sonnet-5" }, "OPENCODE_CONFIG_CONTENT"],
   ] as const)("%s hires with %j apply the host boundary to explicit %s auth", async (adapterType, config, key) => {
     const f = await fixture("openai");
     const p = await poolFixture(f);
     await db.update(agents).set({ runtimeConfig: { aiConnection: p.binding } }).where(eq(agents.id, f.agentId));
+    if (adapterType === "opencode_local" && "model" in config) await grantCompanyConfigure(f);
     const provider = { npm: "@ai-sdk/anthropic", options: { apiKey: "fixture-explicit-key" }, models: { "claude-sonnet-5": { name: "Claude fixture" } } };
     const value = JSON.stringify(key === "PAPERCLIP_OPENCODE_PROVIDERS" ? { anthropic: provider }
       : key === "OPENCODE_CONFIG_CONTENT" ? { provider: { anthropic: provider } }
@@ -208,6 +220,8 @@ describe("agent-created hires use managed AI connections", () => {
     const p = await poolFixture(f);
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
     await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.account.connectionId));
+    // The agent changes its own aiConnection, a protected self change in the fork.
+    await grantSelfConfigure(f);
     const response = await request(f.app).patch(`/api/agents/${f.agentId}`).send({ runtimeConfig: { aiConnection: p.binding } });
     expect(response.status, JSON.stringify(response.body)).toBe(422);
     expect(response.body.details).toMatchObject({ code: "ai_connection_pool_no_eligible_member" });
@@ -241,6 +255,8 @@ describe("agent-created hires use managed AI connections", () => {
     const p = await poolFixture(f, extra);
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
     await db.update(agents).set({ runtimeConfig: { aiConnection: p.binding } }).where(eq(agents.id, f.agentId));
+    // The agent changes its own harness and model, a protected self change in the fork.
+    await grantSelfConfigure(f);
     const response = await request(f.app).patch(`/api/agents/${f.agentId}`).send({ adapterType: "claude_local", adapterConfig: { model: "claude-sonnet-5" } });
     expect(response.status, JSON.stringify(response.body)).toBe(compatible ? 200 : 422);
     const [saved] = await db.select().from(agents).where(eq(agents.id, f.agentId));

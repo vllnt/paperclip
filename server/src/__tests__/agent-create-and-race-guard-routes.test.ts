@@ -58,6 +58,8 @@ function boardActor(companyId: string): Express.Request["actor"] {
 }
 
 const LARGE_ADAPTER_CONFIG = { model: "large-model", cwd: "/tmp/agent-guard" };
+// Upstream refuses agent keys any process adapter config, so agent-authored cases use an http adapter.
+const AGENT_CONFIGURABLE_ADAPTER = "http";
 
 describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot race", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -96,7 +98,7 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
         companyId,
         name: `Creator ${randomUUID().slice(0, 8)}`,
         role: "engineer",
-        adapterType: "process",
+        adapterType: AGENT_CONFIGURABLE_ADAPTER,
         adapterConfig: input.adapterConfig ?? LARGE_ADAPTER_CONFIG,
         runtimeConfig: {},
         budgetMonthlyCents: 1_000,
@@ -186,7 +188,7 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
 
       const res = await request(createApp(db, agentActor(companyId, creatorId)))
         .post(path(companyId))
-        .send({ name: "Child", adapterType: "process", ...body });
+        .send({ name: "Child", adapterType: AGENT_CONFIGURABLE_ADAPTER, ...body });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.details).toMatchObject({ code: "agent_self_protected_config_change", fields });
@@ -211,7 +213,7 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
           name: "Child",
           role: "engineer",
           title: "Builder",
-          adapterType: "process",
+          adapterType: AGENT_CONFIGURABLE_ADAPTER,
           adapterConfig: { cwd: "/tmp/child" },
         });
 
@@ -230,7 +232,7 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
         .post(path(companyId))
         .send({
           name: "Child",
-          adapterType: "process",
+          adapterType: AGENT_CONFIGURABLE_ADAPTER,
           adapterConfig: { model: "huge-model" },
           runtimeConfig: { heartbeat: { maxDailyRuns: 100_000 } },
           budgetMonthlyCents: 9_999_999,
@@ -264,7 +266,7 @@ describeEmbeddedPostgres("agent-authored creates and the PATCH stale-snapshot ra
 
     const res = await request(createApp(db, agentActor(companyId, creatorId)))
       .post(`/api/companies/${companyId}/agent-hires`)
-      .send({ name: "Child", adapterType: "process", adapterConfig: { model: "huge-model" }, budgetMonthlyCents: 9_999_999 });
+      .send({ name: "Child", adapterType: AGENT_CONFIGURABLE_ADAPTER, adapterConfig: { model: "huge-model" }, budgetMonthlyCents: 9_999_999 });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect((res.body.agent ?? res.body).status).toBe("pending_approval");

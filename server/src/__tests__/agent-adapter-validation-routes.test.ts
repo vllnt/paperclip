@@ -854,7 +854,9 @@ describe("agent routes adapter validation", () => {
     mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableNativeRunner: true });
     mockAgentService.getById.mockResolvedValue({ ...(await mockAgentService.getById()), adapterType: "paperclip_runner",
       adapterConfig: { provider: "codex", model: "gpt-6.1-sol", homeMode: "preconfigured" }, permissions: { canCreateAgents: true } });
+    // A stored revision snapshot is complete; the fork reads the whole snapshot before the adapter guards.
     mockAgentService.getConfigRevision.mockResolvedValue({ afterConfig: {
+      name: "Codex", role: "engineer", budgetMonthlyCents: 0,
       adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-6.1-sol" },
     } });
     const app = await createApp({ type: "agent", agentId: "11111111-1111-4111-8111-111111111111", companyId: "company-1", source: "agent_jwt" });

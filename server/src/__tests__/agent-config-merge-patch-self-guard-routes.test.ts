@@ -7,6 +7,7 @@ import {
   activityLog,
   agentConfigRevisions,
   agents,
+  budgetPolicies,
   companies,
   companyMemberships,
   createDb,
@@ -80,7 +81,8 @@ async function seedAgent(db: Db, input: { role?: string; companyId?: string; ada
       name: `Worker ${randomUUID().slice(0, 8)}`,
       role: input.role ?? "engineer",
       status: "idle",
-      adapterType: "process",
+      // Upstream refuses agent keys any process adapter config change, so the agent is not a process agent.
+      adapterType: "http",
       adapterConfig: input.adapterConfig ?? STORED_ADAPTER_CONFIG,
       runtimeConfig: STORED_RUNTIME_CONFIG,
       budgetMonthlyCents: 1_000,
@@ -169,6 +171,8 @@ describeEmbeddedPostgres("merge-patch PATCH keeps the agent self-config guard", 
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(agents);
+    // A budget change now also writes the agent's budget policy.
+    await db.delete(budgetPolicies);
     await db.delete(companies);
   });
 
