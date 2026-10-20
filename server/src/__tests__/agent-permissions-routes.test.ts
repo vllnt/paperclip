@@ -1094,7 +1094,8 @@ describe("agent permission routes", () => {
   it("blocks agent-authenticated rollback into process adapter configuration", async () => {
     mockAgentService.getConfigRevision.mockResolvedValue({
       id: "33333333-3333-4333-8333-333333333333",
-      afterConfig: { adapterType: "process", adapterConfig: { command: "sh" }, runtimeConfig: {} },
+      // A stored revision snapshot is complete; the fork reads the whole snapshot before the adapter guards.
+      afterConfig: { name: "Builder", role: "engineer", budgetMonthlyCents: 0, adapterType: "process", adapterConfig: { command: "sh" }, runtimeConfig: {} },
     });
     const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
     const res = await requestApp(app, (baseUrl) => request(baseUrl)
@@ -1109,7 +1110,8 @@ describe("agent permission routes", () => {
     const revisionId = "33333333-3333-4333-8333-333333333333";
     mockAgentService.getConfigRevision.mockResolvedValue({
       id: revisionId,
-      afterConfig: { adapterType: "claude_local", adapterConfig: { engine: "cli", command: "/tmp/untrusted" }, runtimeConfig: {} },
+      // A stored revision snapshot is complete; the fork reads the whole snapshot before the adapter guards.
+      afterConfig: { name: "Builder", role: "engineer", budgetMonthlyCents: 0, adapterType: "claude_local", adapterConfig: { engine: "cli", command: "/tmp/untrusted" }, runtimeConfig: {} },
     });
     const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
     const res = await requestApp(app, (baseUrl) => request(baseUrl)

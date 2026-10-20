@@ -4500,6 +4500,14 @@ export function agentRoutes(
     if (!rollbackConfig) {
       throw unprocessable("Invalid revision snapshot");
     }
+    if (req.actor.type === "agent" && req.actor.agentId === existing.id) {
+      await assertCanChangeOwnProtectedAgentFields(
+        req,
+        existing,
+        collectAgentConfigRollbackChanges(existing, configPatchFromSnapshot(rollbackConfig)),
+        "config_rollback",
+      );
+    }
     assertProviderTraceSettingTransition(
       req,
       rollbackConfig.runtimeConfig,
@@ -4537,15 +4545,6 @@ export function agentRoutes(
       rollbackAdapterType,
       true,
     );
-    // After the agent-key adapter guards, which deny without parsing the whole snapshot.
-    if (req.actor.type === "agent" && req.actor.agentId === existing.id) {
-      await assertCanChangeOwnProtectedAgentFields(
-        req,
-        existing,
-        collectAgentConfigRollbackChanges(existing, configPatchFromSnapshot(rollbackConfig)),
-        "config_rollback",
-      );
-    }
     assertExternalInstructionsAdmin(req, existing);
     assertExternalInstructionsAdmin(req, {
       ...existing,
