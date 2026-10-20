@@ -206,7 +206,7 @@ const INTERNAL_SOURCE_FALLBACK_MESSAGE = "Triggers on the built-in Paperclip eve
 const EVENT_ISSUE_BOARD_ONLY_MESSAGE =
   'Only board users can create, enable, restore or change an issueMode "event_issue" trigger: it starts the routine\'s steps on every matching task of the company';
 const EVENT_ISSUE_STEPS_BOARD_ONLY_MESSAGE =
-  'Only board users can change the steps or the agent of a routine with an enabled issueMode "event_issue" trigger: its steps start on every matching task of the company';
+  'Only board users can change the steps, the variables or the agent of a routine with an enabled issueMode "event_issue" trigger: its steps start on every matching task of the company';
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
@@ -2315,17 +2315,30 @@ export function routineService(
 
   /**
    * While an `event_issue` trigger is on, the routine's steps start on every matching task of the
-   * company, so only a board user may change the steps or the agent that runs a step without its own.
+   * company, so only a board user may change the steps, the variables whose defaults fill in their text,
+   * or the agent that runs a step without its own.
    * Call it under the routine lock: trigger writes take that lock too, so the answer cannot go stale.
    */
   async function assertCanChangeEventIssueSteps(
     executor: Db,
     actor: Actor,
-    routine: { id: string; companyId: string; steps: RoutineStep[] | null; assigneeAgentId: string | null },
-    next: { steps: RoutineStep[]; assigneeAgentId: string | null; enablesEventIssueTrigger?: boolean },
+    routine: {
+      id: string;
+      companyId: string;
+      steps: RoutineStep[] | null;
+      variables: RoutineVariable[] | null;
+      assigneeAgentId: string | null;
+    },
+    next: {
+      steps: RoutineStep[];
+      variables: RoutineVariable[];
+      assigneeAgentId: string | null;
+      enablesEventIssueTrigger?: boolean;
+    },
   ) {
     if (!actor.agentId) return;
     const changed = !isDeepStrictEqual(routine.steps ?? [], next.steps)
+      || !isDeepStrictEqual(routine.variables ?? [], next.variables)
       || (routine.assigneeAgentId ?? null) !== (next.assigneeAgentId ?? null);
     if (!changed) return;
     if (next.enablesEventIssueTrigger || (await hasEnabledEventIssueTrigger(executor, routine.companyId, routine.id))) {
@@ -3685,9 +3698,10 @@ export function routineService(
             currentRevisionId: locked.latestRevisionId,
           });
         }
-        if (patch.steps !== undefined || patch.assigneeAgentId !== undefined) {
+        if (patch.steps !== undefined || patch.variables !== undefined || patch.assigneeAgentId !== undefined) {
           await assertCanChangeEventIssueSteps(txDb, actor, locked, {
             steps: patch.steps ?? locked.steps ?? [],
+            variables: patch.variables === undefined ? locked.variables : nextVariables,
             assigneeAgentId: patch.assigneeAgentId === undefined ? locked.assigneeAgentId : patch.assigneeAgentId,
           });
         }
@@ -4254,6 +4268,7 @@ export function routineService(
           }
           await assertCanChangeEventIssueSteps(txDb, actor, locked, {
             steps: routineSnapshot.steps ?? [],
+            variables: routineSnapshot.variables ?? [],
             assigneeAgentId: routineSnapshot.assigneeAgentId ?? null,
             enablesEventIssueTrigger: restoredEventIssueTriggers.length > 0,
           });

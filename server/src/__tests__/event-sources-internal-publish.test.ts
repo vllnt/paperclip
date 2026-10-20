@@ -714,6 +714,36 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
       expect((await svc.update(routine.id, { steps: ownSteps } as never, agent))?.steps).toMatchObject(ownSteps);
     });
 
+    it("keeps an agent from changing the variable defaults that fill in the steps while the trigger is on", async () => {
+      const s = await seed();
+      const variable = (defaultValue: string) => ({ name: "target", label: null, type: "text", defaultValue, required: false, options: [] });
+      const routine = await s.createRoutine({ steps: [step("deploy", [], { assigneeAgentId: s.builderId, title: "Deploy to {{target}}" })] });
+      const svc = s.fx.routinesSvc;
+      const board = { userId: "board-user" };
+      const agent = { agentId: s.leadId };
+      await svc.update(routine.id, { variables: [variable("production")] } as never, board);
+      const [withProduction] = await svc.listRevisions(routine.id);
+      await svc.update(routine.id, { variables: [variable("staging")] } as never, board);
+      const trigger = await s.listen(routine);
+
+      await expect(svc.update(routine.id, { variables: [variable("production")] } as never, agent)).rejects.toMatchObject({
+        status: 403,
+        message: expect.stringContaining("variables"),
+      });
+      await expect(svc.restoreRevision(routine.id, withProduction!.id, agent)).rejects.toMatchObject({ status: 403 });
+      expect((await svc.update(routine.id, { variables: [variable("staging")] } as never, agent))?.variables).toMatchObject([
+        { defaultValue: "staging" },
+      ]);
+      const task = await s.newTask();
+      await s.publish(task.id);
+      expect((await s.childrenOf(task.id)).map((child) => child.title)).toEqual(["Deploy to staging"]);
+
+      await svc.updateTrigger(trigger.id, { enabled: false } as never, agent);
+      expect((await svc.update(routine.id, { variables: [variable("production")] } as never, agent))?.variables).toMatchObject([
+        { defaultValue: "production" },
+      ]);
+    });
+
     it("keeps a trigger the board switched off while an agent relabelled it switched off", async () => {
       const s = await seed();
       const routine = await s.createRoutine();
