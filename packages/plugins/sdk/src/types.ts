@@ -1960,6 +1960,10 @@ export interface PluginAuthorizationAuditEntry {
 export interface PluginAuthorizationClient {
   grants: {
     list(input: { companyId: string; principalType?: PrincipalType; principalId?: string }): Promise<PrincipalPermissionGrant[]>;
+    /**
+     * Replaces the grants of a member or agent. Board-only, as on the routes:
+     * the host refuses it with 403 when an agent started the call that led here.
+     */
     set(input: {
       companyId: string;
       principalType: PrincipalType;
@@ -1971,6 +1975,12 @@ export interface PluginAuthorizationClient {
   policies: {
     summary(companyId: string): Promise<PluginAuthorizationPolicySummary>;
     get(input: { companyId: string; resourceType: PluginAuthorizationPolicyRecord["resourceType"]; resourceId: string }): Promise<PluginAuthorizationPolicyRecord | null>;
+    /**
+     * Replaces the authorization policy of an agent, project, or issue. When an
+     * agent started the call that led here, the host refuses a project or issue
+     * policy with 403, and an agent policy unless that agent holds
+     * `agents:configure` for the target.
+     */
     update(input: {
       companyId: string;
       resourceType: PluginAuthorizationPolicyRecord["resourceType"];

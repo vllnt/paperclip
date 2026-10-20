@@ -17,6 +17,7 @@ import {
   resetClaudeCliCapabilitiesCacheForTests,
   sessionCodec,
 } from "@paperclipai/adapter-claude-local/server";
+import { classifyQuotaFailure, reclassifyProviderQuotaResult } from "../services/harness-fallback.js";
 
 async function writeFailingClaudeCommand(
   commandPath: string,
@@ -1994,5 +1995,244 @@ describe("claude execute", () => {
       restore();
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+// A CLI stand-in that fails like a real agent CLI: it writes stderr (and
+// optional stdout), then exits with a code, dies by a signal, or hangs until
+// Paperclip's timeout stops it.
+async function writeStderrClaudeCommand(
+  commandPath: string,
+  options: { stdout?: string; stderr: string; end: number | NodeJS.Signals | "hang" },
+): Promise<void> {
+  const end = options.end === "hang"
+    ? "setInterval(() => {}, 1000)"
+    : typeof options.end === "number"
+    ? `process.exit(${options.end})`
+    : `process.kill(process.pid, ${JSON.stringify(options.end)})`;
+  const script = `#!/usr/bin/env node
+if (process.argv.includes("--version")) { process.stdout.write("2.1.280 (Claude Code)\\n"); process.exit(0); }
+process.stdout.write(${JSON.stringify(options.stdout ?? "")}, () => {
+  process.stderr.write(${JSON.stringify(options.stderr)}, () => { ${end}; });
+});
+`;
+  await fs.writeFile(commandPath, script, "utf8");
+  await fs.chmod(commandPath, 0o755);
+}
+
+describe("claude execute failure exit cause", () => {
+  const WARNING = "Warning: no input received on stdin, continuing without it\n";
+  const TAIL = "\nLast lines of stderr:\n";
+
+  async function runFailingClaude(
+    options: Parameters<typeof writeStderrClaudeCommand>[1],
+    config: Record<string, unknown> = {},
+  ) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exit-cause-"));
+    const { workspace, commandPath, restore } = await setupExecuteEnv(root, {
+      commandWriter: (commandPath) => writeStderrClaudeCommand(commandPath, options),
+    });
+    try {
+      return await execute({
+        runId: "run-exit-cause",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { engine: "cli", command: commandPath, cwd: workspace, promptTemplate: "Do work.", ...config },
+        context: {},
+        authToken: "tok",
+        onLog: async () => {},
+      });
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("puts the auth error that follows a leading warning on the first line", async () => {
+    const authError = "Error: 401 Unauthorized: invalid credentials";
+    const result = await runFailingClaude({ stderr: `${WARNING}${authError}\n`, end: 1 });
+
+    expect(result).toMatchObject({
+      errorMessage: `Claude exited with code 1: ${WARNING.trim()}`,
+      errorCode: "claude_auth_required",
+      errorFamily: null,
+      retryNotBefore: null,
+    });
+    expect(result.errorDetail).toBe(`Claude exited with code 1: ${authError}${TAIL}${WARNING}${authError}`);
+  });
+
+  it("adds the exit code to a rate-limit result error", async () => {
+    const resultError = "API Error: 429 Too Many Requests: rate limit exceeded, retry later";
+    const resultEvent = {
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: resultError,
+      session_id: "11111111-1111-4111-8111-111111111111",
+    };
+    const result = await runFailingClaude({ stdout: `${JSON.stringify(resultEvent)}\n`, stderr: WARNING, end: 1 });
+
+    expect(result).toMatchObject({
+      errorMessage: `Claude run failed: subtype=success: ${resultError}`,
+      errorCode: "claude_transient_upstream",
+      errorFamily: "transient_upstream",
+      retryNotBefore: null,
+    });
+    expect(result.errorDetail).toBe(
+      `Claude run failed: subtype=success: ${resultError}\nClaude exited with code 1: ${WARNING.trim()}`,
+    );
+  });
+
+  it("classifies a quota or capacity word in the stderr tail as before", async () => {
+    // The structured result names a plain tool failure; only stderr mentions a quota and capacity.
+    const resultEvent = {
+      type: "result",
+      subtype: "success",
+      is_error: true,
+      result: "Tool execution failed",
+      session_id: "11111111-1111-4111-8111-111111111111",
+    };
+    const stderr = `${WARNING}upstream said insufficient_quota for a probe request\nAPI Error: 529 overloaded_error\n`;
+    const result = await runFailingClaude({ stdout: `${JSON.stringify(resultEvent)}\n`, stderr, end: 1 });
+
+    const classified = {
+      errorMessage: "Claude run failed: subtype=success: Tool execution failed",
+      errorCode: "claude_transient_upstream",
+      errorFamily: "transient_upstream",
+      retryNotBefore: null,
+    };
+    expect(result).toMatchObject(classified);
+    expect(result.errorDetail).toContain("insufficient_quota");
+    expect(result.errorDetail).toContain("529 overloaded_error");
+    // The server reads errorMessage, so the stderr tail in errorDetail changes neither the safety
+    // net nor the cooldown decision. Read from errorDetail, both would turn into a quota failure.
+    expect(reclassifyProviderQuotaResult(result, new Date(), "claude_local")).toMatchObject(classified);
+    const quotaInput = { status: "failed", errorCode: result.errorCode!, errorFamily: result.errorFamily!, retryNotBefore: null, usefulWork: false };
+    expect(classifyQuotaFailure({ ...quotaInput, errorMessage: result.errorMessage! })).toEqual({ trigger: false, reason: "not_quota" });
+    expect(classifyQuotaFailure({ ...quotaInput, errorMessage: result.errorDetail! })).toMatchObject({ trigger: true });
+  });
+
+  it("keeps a crash stack trace", async () => {
+    const cli = "file:///opt/agent-cli/cli.js";
+    const crash = [
+      `${cli}:4521`,
+      "    const text = message.content.map((block) => block.text);",
+      "                         ^",
+      "",
+      "TypeError: Cannot read properties of undefined (reading 'map')",
+      ...Array.from({ length: 10 }, (_, i) => `    at frame${i} (${cli}:${4521 + i * 7}:${11 + i})`),
+      "",
+      "Node.js v22.11.0",
+    ];
+    const result = await runFailingClaude({ stderr: `${WARNING}${crash.join("\n")}\n`, end: 1 });
+
+    expect(result).toMatchObject({
+      errorMessage: `Claude exited with code 1: ${WARNING.trim()}`,
+      errorCode: null,
+      errorFamily: null,
+      retryNotBefore: null,
+    });
+    expect(result.errorDetail).toBe(
+      `Claude exited with code 1: Node.js v22.11.0${TAIL}` +
+        `${[WARNING, ...crash].map((line) => line.trim()).filter(Boolean).join("\n")}`,
+    );
+  });
+
+  it("keeps a warning when stderr holds nothing else", async () => {
+    const result = await runFailingClaude({ stderr: WARNING, end: 1 });
+
+    expect(result.errorMessage).toBe(`Claude exited with code 1: ${WARNING.trim()}`);
+    expect(result.errorDetail).toBe(`Claude exited with code 1: ${WARNING.trim()}`);
+  });
+
+  it("reports a kill by signal as a failed exit", async () => {
+    const result = await runFailingClaude({
+      stderr: "FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory\n",
+      end: "SIGKILL",
+    });
+
+    expect(result).toMatchObject({
+      exitCode: null,
+      signal: "SIGKILL",
+      errorMessage: "Failed to parse claude JSON output",
+      errorCode: null,
+      errorFamily: null,
+      retryNotBefore: null,
+    });
+    expect(result.errorDetail).toBe(
+      "Claude exited with signal SIGKILL: FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory",
+    );
+  });
+
+  it("keeps the stderr tail when the output does not parse and the exit is clean", async () => {
+    const closed = "Error: the output stream closed before a result event";
+    const result = await runFailingClaude({ stderr: `${WARNING}${closed}\n`, end: 0 });
+
+    expect(result).toMatchObject({ exitCode: 0, signal: null, errorMessage: "Failed to parse claude JSON output" });
+    expect(result.errorDetail).toBe(
+      `Failed to parse claude JSON output\nClaude exited with code 0: ${closed}${TAIL}${WARNING}${closed}`,
+    );
+  });
+
+  it("names a non-zero exit after a result event that reported success", async () => {
+    const resultEvent = {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Done.",
+      session_id: "11111111-1111-4111-8111-111111111111",
+    };
+    const crash = "Error: the process crashed while it shut down";
+    const result = await runFailingClaude({ stdout: `${JSON.stringify(resultEvent)}\n`, stderr: `${WARNING}${crash}\n`, end: 1 });
+
+    // The server marks the run failed because of the exit code, with no message from the adapter.
+    expect(result).toMatchObject({ exitCode: 1, errorMessage: null });
+    expect(result.errorDetail).toBe(`Claude exited with code 1: ${crash}${TAIL}${WARNING}${crash}`);
+  });
+
+  it("reports the timeout with the signal and the stderr tail", async () => {
+    const result = await runFailingClaude(
+      { stderr: `${WARNING}Retrying request (attempt 7/10) after a connection error\n`, end: "hang" },
+      { timeoutSec: 1, graceSec: 1 },
+    );
+
+    expect(result).toMatchObject({ timedOut: true, errorMessage: "Timed out after 1s", errorCode: "timeout" });
+    expect(result.signal).toMatch(/^SIG(TERM|KILL)$/);
+    const retryLine = "Retrying request (attempt 7/10) after a connection error";
+    expect(result.errorDetail).toBe(
+      `Timed out after 1s\nClaude exited with signal ${result.signal}: ${retryLine}${TAIL}${WARNING}${retryLine}`,
+    );
+  });
+
+  it("keeps at most the last 20 lines and 2 KB of stderr", async () => {
+    const lines = Array.from({ length: 30 }, (_, i) => `debug line ${String(i + 1).padStart(2, "0")} ${"x".repeat(120)}`);
+    const result = await runFailingClaude({ stderr: `${lines.join("\n")}\n`, end: 1 });
+
+    expect(result.errorMessage).toBe(`Claude exited with code 1: ${lines[0]}`);
+    const prefix = `Claude exited with code 1: ${lines[29]}${TAIL}…`;
+    expect(result.errorDetail?.startsWith(prefix)).toBe(true);
+    const tail = result.errorDetail!.slice(prefix.length);
+    expect(tail.length).toBeLessThanOrEqual(2048);
+    expect(tail.split("\n").length).toBeLessThanOrEqual(20);
+    expect(tail.endsWith(lines[29]!)).toBe(true);
+    expect(tail).not.toContain("debug line 10 ");
+  });
+
+  it("redacts secrets in the stderr tail", async () => {
+    // Built at runtime so the source holds no secret-shaped literal.
+    const apiKey = ["fixture", "Key", "Value", "0123"].join("");
+    const bearer = "opaqueBearerValue8f3k2m9q7z";
+    const password = "pr0xyPassw0rdValue";
+    const result = await runFailingClaude({
+      stderr:
+        `${WARNING}request failed with api_key=${apiKey}\n` +
+        `Authorization: Bearer ${bearer}\n` +
+        `proxy https://agent:${password}@proxy.example.test:8443 refused the connection\n`,
+      end: 1,
+    });
+
+    expect(result.errorDetail).toContain("***REDACTED***");
+    expect(result.errorDetail).toContain("refused the connection");
+    for (const secret of [apiKey, bearer, password]) expect(result.errorDetail).not.toContain(secret);
   });
 });

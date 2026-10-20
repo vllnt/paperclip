@@ -663,7 +663,7 @@ If the plan needs explicit approval before implementation, update the `plan` doc
 
 When asked to convert a plan into executable Paperclip tasks — depth, assignment, dependencies, parallelization — use the companion skill `paperclip-converting-plans-to-tasks`.
 
-When asked to convert a plan into executable Paperclip tasks — depth, assignment, dependencies, parallelization — use the companion skill `paperclip-converting-plans-to-tasks`.
+When asked to design or repair a recurring workflow (a lane: issue shape, ownership, waiting, routines, lane metrics), use the companion skill `paperclip-designing-lanes` if it is installed (it ships in the company skill library).
 
 Recommended API flow:
 
