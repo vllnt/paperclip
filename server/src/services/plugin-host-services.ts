@@ -80,6 +80,7 @@ import { accessService } from "./access.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
+import { collectAgentPermissionChanges } from "./agent-self-config-authz.js";
 import { currentPluginHostCallAgent } from "./plugin-host-call-actor.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
 import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
@@ -717,15 +718,18 @@ export function buildHostServices(
   const agents = agentService(db);
 
   /**
-   * Pausing or resuming an agent is board-only on the routes, and resuming one
-   * needs `agents:configure` for an agent caller. A plugin call started by an
-   * agent keeps that rule: the agent behind the call needs `agents:configure`
-   * for the target, so a plugin cannot resume a budget-paused agent (including
-   * the caller) for it. Board, user, and system calls keep their access.
+   * A plugin call started by an agent keeps the rules the routes apply to that
+   * agent: the agent behind the call needs `agents:configure` for the target to
+   * change its protected fields. Pausing or resuming an agent is board-only on
+   * the routes, so a plugin cannot resume a budget-paused agent (including the
+   * caller) for it; an agent's permissions, which hold its authorization policy,
+   * follow the same rule. Board, user, and system calls keep their access.
    */
-  async function assertAgentCallerMayChangeStatus(
+  async function assertAgentCallerMayChangeProtectedFields(
     agent: { id: string; companyId: string },
-    change: "pause" | "resume",
+    fields: string[],
+    surface: "plugin_status_change" | "plugin_policy_update",
+    details: Record<string, unknown> = {},
   ) {
     const caller = currentPluginHostCallAgent();
     if (!caller) return;
@@ -746,9 +750,9 @@ export function buildHostServices(
         });
       },
       target: agent,
-      fields: ["status"],
-      surface: "plugin_status_change",
-      details: { sourcePluginKey: pluginKey, change },
+      fields,
+      surface,
+      details: { sourcePluginKey: pluginKey, ...details },
     });
   }
 
@@ -2945,7 +2949,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
-        await assertAgentCallerMayChangeStatus({ id: params.agentId, companyId }, "pause");
+        await assertAgentCallerMayChangeProtectedFields({ id: params.agentId, companyId }, ["status"], "plugin_status_change", { change: "pause" });
         return (await agents.pause(params.agentId)) as Agent;
       },
       async resume(params) {
@@ -2953,7 +2957,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
-        await assertAgentCallerMayChangeStatus({ id: params.agentId, companyId }, "resume");
+        await assertAgentCallerMayChangeProtectedFields({ id: params.agentId, companyId }, ["status"], "plugin_status_change", { change: "resume" });
         return (await agents.resume(params.agentId)) as Agent;
       },
       async invoke(params) {
@@ -3261,6 +3265,11 @@ export function buildHostServices(
             : {};
           if (policy) permissions.authorizationPolicy = policy;
           else delete permissions.authorizationPolicy;
+          await assertAgentCallerMayChangeProtectedFields(
+            agent,
+            collectAgentPermissionChanges(agent.permissions, permissions),
+            "plugin_policy_update",
+          );
           await db
             .update(agentsTable)
             .set({ permissions, updatedAt: new Date() })

@@ -414,4 +414,54 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
     expect(paused.status).toBe("paused");
     expect(await deniedActivity(managedAgentId)).toHaveLength(0);
   });
+
+  const POLICY = { trustPreset: "standard" };
+
+  function updateAgentPolicy(services: Awaited<ReturnType<typeof seed>>["services"], companyId: string, agentId: string) {
+    return services.authorization.updatePolicy({ companyId, resourceType: "agent", resourceId: agentId, policy: POLICY });
+  }
+
+  it.each([
+    { label: "a peer agent", caller: "peer" as const },
+    { label: "the agent itself", caller: "self" as const },
+  ])("refuses an agent policy update started by $label without agents:configure, and logs it", async ({ caller }) => {
+    const { companyId, services, managedAgentId, peerId } = await seed();
+    const before = await readAgent(managedAgentId);
+    const callerId = caller === "self" ? managedAgentId : peerId;
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: callerId, runId: null, companyId }, () =>
+        updateAgentPolicy(services, companyId, managedAgentId)),
+    ).rejects.toMatchObject({
+      status: 403,
+      details: { code: "agent_self_protected_config_change", fields: ["permissions.authorizationPolicy"] },
+    });
+
+    expect((await readAgent(managedAgentId)).permissions).toEqual(before.permissions);
+    expect((await deniedActivity(managedAgentId))[0]).toMatchObject({
+      actorId: callerId,
+      details: { surface: "plugin_policy_update", sourcePluginKey: MANIFEST.id },
+    });
+  });
+
+  it("still updates an agent policy for a call that no agent started, and for an agent holding agents:configure", async () => {
+    const { companyId, services, managedAgentId, peerId } = await seed();
+
+    const updated = await updateAgentPolicy(services, companyId, managedAgentId);
+    expect(updated.policy).toEqual(POLICY);
+
+    await services.authorization.updatePolicy({ companyId, resourceType: "agent", resourceId: managedAgentId, policy: null });
+    await db.insert(principalPermissionGrants).values({
+      companyId,
+      principalType: "agent",
+      principalId: peerId,
+      permissionKey: "agents:configure",
+      scope: null,
+      grantedByUserId: null,
+    });
+    const granted = await runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+      updateAgentPolicy(services, companyId, managedAgentId));
+    expect(granted.policy).toEqual(POLICY);
+    expect(await deniedActivity(managedAgentId)).toHaveLength(0);
+  });
 });

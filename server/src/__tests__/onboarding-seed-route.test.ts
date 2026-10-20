@@ -317,6 +317,24 @@ describeEmbeddedPostgres("POST /api/companies/:companyId/onboarding-seed", () =>
     expect(await ctx.db.select().from(companyOnboardingSeeds)).toHaveLength(0);
   });
 
+  it("refuses an agent key and applies nothing", async () => {
+    const { companyId } = await seedCompany();
+    const agentId = randomUUID();
+    await ctx.db.insert(agents).values({
+      id: agentId, companyId, name: "Writer", role: "engineer", status: "idle",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    const agentApp = routeApp(ctx.db, { type: "agent", source: "agent_key", companyId, agentId } as never, onboardingSeedRoutes);
+
+    const response = await post(agentApp, companyId, SEED);
+
+    expect(response.status).toBe(403);
+    const companyAgents = await ctx.db.select().from(agents).where(eq(agents.companyId, companyId));
+    expect(companyAgents.map((agent) => agent.id)).toEqual([agentId]);
+    expect(await ctx.db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(0);
+    expect(await ctx.db.select().from(companyOnboardingSeeds)).toHaveLength(0);
+  });
+
   describe("company focus", () => {
     async function seedCompanyGoalAndAgent(companyId: string, horizon: "short" | "long") {
       const [goal] = await ctx.db
@@ -347,16 +365,6 @@ describeEmbeddedPostgres("POST /api/companies/:companyId/onboarding-seed", () =>
 
       expect(applied.status).toBe(200);
       expect(applied.body.goalId).toBe(goalId);
-      expect((await ctx.db.select().from(goals).where(eq(goals.id, goalId)))[0]?.title).toBe(SEED.mission);
-    });
-
-    it("still lets an agent apply a seed when the company goal is outside the focus", async () => {
-      const { companyId } = await seedCompany();
-      const { goalId, agentApp } = await seedCompanyGoalAndAgent(companyId, "long");
-
-      const applied = await post(agentApp, companyId, SEED);
-
-      expect(applied.status).toBe(200);
       expect((await ctx.db.select().from(goals).where(eq(goals.id, goalId)))[0]?.title).toBe(SEED.mission);
     });
   });
