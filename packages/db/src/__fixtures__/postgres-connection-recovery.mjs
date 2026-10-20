@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import net from "node:net";
 import { setImmediate } from "node:timers/promises";
 
 const postgres = process.env.DRIVER_FORMAT === "cjs"
@@ -109,6 +110,63 @@ try {
     await task;
     await Promise.all(pending);
     reserved?.release();
+  } else if (mode === "type-fetch") {
+    // Every new connection first fetches the array types. A connection that
+    // dies during that fetch must fail or replay the first query; it must not
+    // also raise an unhandled rejection, which ends the server process.
+    const unhandled = [];
+    process.on("unhandledRejection", (reason) => unhandled.push(reason));
+    const target = new URL(process.env.TEST_DATABASE_URL);
+    let connections = 0;
+    let typeFetches = 0;
+    let resets = 0;
+    const queriesByConnection = [];
+    const proxy = net.createServer((client) => {
+      const id = connections++;
+      queriesByConnection[id] = 0;
+      const upstream = net.connect(Number(target.port), target.hostname);
+      client.on("data", (chunk) => {
+        if (chunk.includes("typcategory")) {
+          typeFetches += 1;
+          if (resets === 0) {
+            resets += 1;
+            client.resetAndDestroy();
+            upstream.destroy();
+            return;
+          }
+        } else if (chunk.includes("as value")) {
+          queriesByConnection[id] += 1;
+        }
+        upstream.write(chunk);
+      });
+      upstream.on("data", (chunk) => client.write(chunk));
+      client.on("error", () => upstream.destroy());
+      upstream.on("error", () => client.destroy());
+      client.on("close", () => upstream.destroy());
+      upstream.on("close", () => client.destroy());
+    });
+    await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const proxied = new URL(target);
+    proxied.port = String(proxy.address().port);
+    const typed = postgres(proxied.href, { max: 1, backoff: 0, onnotice() {} });
+    try {
+      const first = await Promise.resolve(typed.unsafe("select 1 as value"))
+        .then((rows) => rows[0].value, (error) => error.code);
+      assert.ok([1, "ECONNRESET", "CONNECTION_CLOSED"].includes(first), `first query: ${first}`);
+      assert.equal(resets, 1);
+      assert.equal((await typed.unsafe("select 42 as value"))[0].value, 42);
+      await setImmediate();
+      // No unhandled rejection; the reset connection never carried a query,
+      // and the next query ran on a new connection that fetched its types.
+      assert.deepEqual(unhandled, []);
+      assert.equal(queriesByConnection[0], 0);
+      assert.ok(connections >= 2, `connections: ${connections}`);
+      assert.equal(typeFetches, connections);
+      assert.ok(queriesByConnection.slice(1).reduce((sum, count) => sum + count, 0) >= 1);
+    } finally {
+      await typed.end({ timeout: 1 });
+      await new Promise((resolve) => proxy.close(resolve));
+    }
   } else {
     throw new Error("Unknown recovery case");
   }
