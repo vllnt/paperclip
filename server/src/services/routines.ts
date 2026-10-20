@@ -2620,6 +2620,10 @@ export function routineService(
           if (input.rejectIdempotencyReplay) {
             throw conflict("Webhook replay detected");
           }
+          // That key started the steps on a task: this run is not a repeat of it.
+          if (existing.triggerPayload?.targetIssueId) {
+            throw conflict("This idempotency key was already used for a run of this routine on a task");
+          }
           reusedExistingRun = true;
           return existing;
         }

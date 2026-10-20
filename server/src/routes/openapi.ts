@@ -5137,9 +5137,11 @@ registry.registerPath({
     "root task: 404 when the task is missing, hidden or belongs to another company; 403 when an agent may not change " +
     "the task or assign the steps under it; 409 when the task is not in backlog, todo or blocked, has a checkout or a " +
     "live run, still has open routine steps, or a starting step's agent cannot be woken, or when the idempotency key " +
-    "was used for another task; 422 when the routine has no steps, the task is a routine, step or conversation task, " +
+    "was used for another task or for a run without a task; 422 when the routine has no steps, the task is a routine, step or conversation task, " +
     "its subtasks plus the steps would pass 25, or the request also names a trigger, a project or a workspace. " +
-    "The response carries `warnings` for steps whose agent cannot start work now.",
+    "The response carries `warnings` for steps whose agent cannot start work now. For any run, an agent gets 403 " +
+    "when it names another agent as `assigneeAgentId` on a routine with steps, and a run without a task gets 409 " +
+    "when its idempotency key was used for a run on a task.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(runRoutineSchema),

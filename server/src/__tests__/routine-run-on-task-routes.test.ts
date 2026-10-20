@@ -420,6 +420,20 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
       expect(await s.childrenOf(second.id)).toEqual([]);
       expect(await s.runsOf(routine.id)).toHaveLength(1);
     });
+
+    it("answers 409 for a run without a task that reuses the key of a run on a task", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const task = await s.newTask();
+      const app = appFor(boardActor(s.companyId));
+
+      const onTask = await request(app).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: task.id, idempotencyKey: "k-1" });
+      const plain = await request(app).post(`/api/routines/${routine.id}/run`).send({ idempotencyKey: "k-1" });
+
+      expect(onTask.status).toBe(202);
+      expect(plain.status).toBe(409);
+      expect(await s.runsOf(routine.id)).toHaveLength(1);
+    });
   });
 
   describe("for an agent", () => {
