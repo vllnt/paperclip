@@ -132,6 +132,17 @@ export function registerRoutineApiCommands(program: Command): void {
 
 const STEPS_FILE_DESCRIPTION = "Read the routine steps (a JSON array) from a file; replaces steps in the payload";
 
+/** Reads the JSON in a steps file; a parse error names the file, because the parser's message does not. */
+async function readStepsFile(file: string): Promise<unknown> {
+  const text = await readFile(file, "utf8");
+  try {
+    return parseJson(text);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`${file} is not valid JSON: ${reason}`);
+  }
+}
+
 /**
  * Builds the create or update payload. `--steps-file` supplies `steps` from a file so a long
  * step list does not have to be quoted inside `--payload-json`; the server validates the steps.
@@ -141,7 +152,7 @@ async function routineWritePayload(opts: RoutineWriteOptions): Promise<unknown> 
   if (!opts.stepsFile) return payload;
   if (!isJsonObject(payload)) throw new Error("--payload-json must be a JSON object when --steps-file is used.");
   if ("steps" in payload) throw new Error("Pass steps either in --payload-json or with --steps-file, not both.");
-  const steps = parseJson(await readFile(opts.stepsFile, "utf8"));
+  const steps = await readStepsFile(opts.stepsFile);
   if (!Array.isArray(steps)) throw new Error(`${opts.stepsFile} must contain a JSON array of steps.`);
   return { ...payload, steps };
 }

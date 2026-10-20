@@ -32,6 +32,7 @@ describe("routine --steps-file", () => {
   let dir: string;
   let stepsPath: string;
   let notAnArrayPath: string;
+  let invalidJsonPath: string;
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeAll(() => {
@@ -40,6 +41,8 @@ describe("routine --steps-file", () => {
     notAnArrayPath = path.join(dir, "not-an-array.json");
     writeFileSync(stepsPath, JSON.stringify(STEPS));
     writeFileSync(notAnArrayPath, JSON.stringify({ key: "build" }));
+    invalidJsonPath = path.join(dir, "invalid.json");
+    writeFileSync(invalidJsonPath, '[{ "key": "build", ');
   });
 
   afterAll(() => {
@@ -105,5 +108,14 @@ describe("routine --steps-file", () => {
   it("refuses a steps file that is not an array", async () => {
     await expect(run(["routine", "update", ROUTINE_ID, "--steps-file", notAnArrayPath])).rejects.toThrow();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("names the steps file in the error when it is not valid JSON", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(run(["routine", "update", ROUTINE_ID, "--steps-file", invalidJsonPath])).rejects.toThrow();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining(invalidJsonPath));
   });
 });
