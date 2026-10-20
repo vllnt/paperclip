@@ -58,10 +58,10 @@ const SURFACES: Record<string, Surface> = {
   "services/index.ts": { kind: "read-only", how: "barrel export" },
   "services/native-runtime/agent-instruction-tools.ts": { kind: "read-only", how: "reads the target agent" },
   "services/native-runtime/paperclip-runner-tool-authority.ts": { kind: "read-only", how: "reads agents for tool authority checks" },
-  "services/onboarding-seed.ts": { kind: "board-only", how: "runs from the board onboarding flow" },
+  "services/onboarding-seed.ts": { kind: "board-only", how: "the onboarding-seed route calls assertBoard" },
   "services/plugin-host-services.ts": {
     kind: "guarded",
-    how: "managed reconcile and reset, pause, and resume check the agent behind the plugin call",
+    how: "managed reconcile and reset, pause, resume, and agent authorization policy updates check the agent behind the plugin call; grant and project or issue policy updates refuse it",
     tests: ["plugin-managed-agents-agent-caller.test.ts", "plugin-worker-manager.test.ts"],
   },
   "services/plugin-managed-agents.ts": {

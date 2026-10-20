@@ -1646,6 +1646,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications",
   "GET /api/chat-endpoints/{endpointId}/conversations/{conversationId}/publications/{publicationId}/status",
   "GET /api/issues/{issueId}/chat-binding",
+  "POST /api/companies/{companyId}/onboarding-seed",
 ]);
 
 const INSTANCE_ADMIN_OPERATIONS = new Set([
@@ -8358,7 +8359,7 @@ registry.registerPath({
   tags: ["companies"],
   summary: "Apply the onboarding seed Paperclip Cloud collected at signup",
   request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 422: r.unprocessable },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
 });
 
 registry.registerPath({
