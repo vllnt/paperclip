@@ -430,7 +430,9 @@ export async function attachRoutineStepsToIssue(
         .select()
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
-        .for("update")
+        // Not FOR UPDATE: a subtask insert takes a key-share lock on its parent, which FOR UPDATE blocks.
+        // That insert holds the company issue counter the steps need next, so the two would deadlock.
+        .for("no key update")
         .then((rows) => rows[0] ?? null);
       if (!locked || locked.hiddenAt) throw notFound("Task not found");
       if (

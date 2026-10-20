@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -16,6 +16,7 @@ import {
 import { readRoutineStepsRunPayload, type RoutineStep } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { untilAStatementWaitsForALock } from "./helpers/lock-wait.js";
 import { MAX_CHILD_ISSUES_CREATED_BY_HELPER, issueService } from "../services/issues.ts";
 import { attachRoutineStepsToIssue } from "../services/routine-steps.ts";
 import { routineService } from "../services/routines.ts";
@@ -515,5 +516,38 @@ describeEmbeddedPostgres("attaching routine steps to an existing task", () => {
     }
     expect(await childrenOf(task.id)).toHaveLength(2);
     expect((await taskRow(task.id)).status).toBe("blocked");
+  }, 30_000);
+
+  it("lets a subtask be created by hand while the steps are attached, without a deadlock", async () => {
+    const fx = await seed();
+    const task = await fx.newTask();
+    let counterTaken!: () => void;
+    const counterHeld = new Promise<void>((resolve) => {
+      counterTaken = resolve;
+    });
+    let letChildGo!: () => void;
+    const childMayGo = new Promise<void>((resolve) => {
+      letChildGo = resolve;
+    });
+    // As a subtask create does: the company issue counter first, then the key-share lock on the parent.
+    const handMade = db.transaction(async (tx) => {
+      await tx
+        .update(companies)
+        .set({ issueCounter: sql`${companies.issueCounter} + 1` })
+        .where(eq(companies.id, fx.companyId));
+      counterTaken();
+      await childMayGo;
+      await tx.insert(issues).values({ companyId: fx.companyId, title: "Hand-made subtask", parentId: task.id });
+    });
+    await counterHeld;
+
+    // The attach locks the task, then waits for the counter to number its first step.
+    const attaching = fx.attach(task.id);
+    await untilAStatementWaitsForALock(db);
+    letChildGo();
+
+    await expect(handMade).resolves.toBeUndefined();
+    await expect(attaching).resolves.toMatchObject({ root: { id: task.id } });
+    expect(await childrenOf(task.id)).toHaveLength(3);
   }, 30_000);
 });
