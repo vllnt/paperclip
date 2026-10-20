@@ -57,6 +57,7 @@ import type {
   RoutineRevision,
   RoutineRevisionSnapshotV1,
   RoutineRunSummary,
+  RoutineStepsRunPayload,
   RoutineTrigger,
   RoutineTriggerSecretMaterial,
   RoutineVariable,
@@ -75,6 +76,7 @@ import {
   interpolateRoutineTemplate,
   isValidRoutineDateString,
   normalizeAgentUrlKey,
+  isRoutineStepRunStalled,
   pluginOperationIssueOriginKind,
   readRoutineStepsRunPayload,
   routineStepTemplateTexts,
@@ -137,6 +139,8 @@ import { createGateWorker, type GateProcessContext, type GateWorkerHandlers } fr
 import type { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
+/** Newest open roots of a routine with steps that are checked for a run that can still move. */
+const OPEN_STEP_ROOTS_CHECKED = 25;
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
@@ -1364,9 +1368,10 @@ export function routineService(
 
     const stillMissingRoutineIds = routineIds.filter((routineId) => !rowsByOriginId.has(routineId));
     if (stillMissingRoutineIds.length > 0) {
-      const stepRootRows = await db
+      const newestStepRootRows = await db
         .selectDistinctOn([issues.originId], {
           originId: issues.originId,
+          originRunId: issues.originRunId,
           id: issues.id,
           identifier: issues.identifier,
           title: issues.title,
@@ -1387,6 +1392,7 @@ export function routineService(
           ),
         )
         .orderBy(issues.originId, desc(issues.updatedAt), desc(issues.createdAt));
+      const stepRootRows = await withoutStalledStepRuns(db, companyId, newestStepRootRows);
       for (const row of stepRootRows) {
         if (!row.originId) continue;
         rowsByOriginId.set(row.originId, row);
@@ -1705,6 +1711,48 @@ export function routineService(
     );
   }
 
+  /**
+   * Keeps the roots a routine may still be running and drops the roots of step runs that cannot move
+   * on their own ({@link isRoutineStepRunStalled}): a cancelled step never unblocks its dependents, so
+   * without this the routine would stay live until someone cancelled the root. A root whose run
+   * recorded no steps is always kept. The dropped root and its steps stay open and visible.
+   */
+  async function withoutStalledStepRuns<T extends { originRunId: string | null }>(
+    executor: Db,
+    companyId: string,
+    roots: T[],
+  ): Promise<T[]> {
+    const runIds = roots.flatMap((root) => (root.originRunId ? [root.originRunId] : []));
+    if (runIds.length === 0) return roots;
+    const runs = await executor
+      .select({ id: routineRuns.id, triggerPayload: routineRuns.triggerPayload })
+      .from(routineRuns)
+      .where(and(eq(routineRuns.companyId, companyId), inArray(routineRuns.id, runIds)));
+    const recordedByRunId = new Map<string, RoutineStepsRunPayload>();
+    for (const run of runs) {
+      const recorded = readRoutineStepsRunPayload(run.triggerPayload);
+      if (recorded) recordedByRunId.set(run.id, recorded);
+    }
+    if (recordedByRunId.size === 0) return roots;
+
+    const stepIssueIds = [...recordedByRunId.values()].flatMap((recorded) => Object.values(recorded.stepIssueIds));
+    const statusRows = await executor
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, stepIssueIds)));
+    const statusById = new Map(statusRows.map((row) => [row.id, row.status]));
+    return roots.filter((root) => {
+      const recorded = root.originRunId ? recordedByRunId.get(root.originRunId) : undefined;
+      if (!recorded) return true;
+      const statusesByKey: Record<string, string> = {};
+      for (const [key, issueId] of Object.entries(recorded.stepIssueIds)) {
+        const status = statusById.get(issueId);
+        if (status) statusesByKey[key] = status;
+      }
+      return !isRoutineStepRunStalled(recorded.steps, statusesByKey);
+    });
+  }
+
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
@@ -1765,7 +1813,7 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
     if (heartbeatBoundIssue || !routine.steps?.length) return heartbeatBoundIssue;
 
-    return executor
+    const openRoots = await executor
       .select()
       .from(issues)
       .where(
@@ -1779,8 +1827,9 @@ export function routineService(
         ),
       )
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+      .limit(OPEN_STEP_ROOTS_CHECKED);
+    const [live] = await withoutStalledStepRuns(executor, routine.companyId, openRoots);
+    return live ?? null;
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {

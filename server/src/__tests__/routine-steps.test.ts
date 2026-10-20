@@ -364,6 +364,75 @@ describeEmbeddedPostgres("routine steps", () => {
       expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
     });
 
+    describe("a cancelled step", () => {
+      async function setStatuses(routineId: string, statuses: Record<string, string>) {
+        const stepIssues = await stepIssuesOf(routineId);
+        for (const [key, status] of Object.entries(statuses)) {
+          const issue = stepIssues.find((entry) => entry.title === `Step ${key}`)!;
+          await db.update(issues).set({ status }).where(eq(issues.id, issue.id));
+        }
+      }
+
+      it("lets the next run dispatch once a step in the middle of a chain was cancelled", async () => {
+        const fx = await seed();
+        const routine = await fx.create([
+          step("a", [], { assigneeAgentId: fx.builderId }),
+          step("b", ["a"], { assigneeAgentId: fx.builderId }),
+          step("c", ["b"], { assigneeAgentId: fx.builderId }),
+        ]);
+        const first = await fx.svc.runRoutine(routine.id, { source: "manual" });
+        expect((await fx.svc.runRoutine(routine.id, { source: "manual" })).status).toBe("coalesced");
+
+        await setStatuses(routine.id, { a: "done", b: "cancelled", c: "blocked" });
+        const detail = await fx.svc.getDetail(routine.id);
+        const second = await fx.svc.runRoutine(routine.id, { source: "manual" });
+
+        expect(detail?.activeIssue).toBeNull();
+        expect(second.status).toBe("issue_created");
+        expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
+        const [oldRoot] = await db.select().from(issues).where(eq(issues.id, first.linkedIssueId!));
+        expect(oldRoot!.status).toBe("blocked");
+        const stalled = (await stepIssuesOf(routine.id)).filter((entry) => entry.originRunId === first.id);
+        expect(stalled.map((entry) => entry.status).sort()).toEqual(["blocked", "cancelled", "done"]);
+      });
+
+      it("keeps the routine live while one branch of a fork still runs", async () => {
+        const fx = await seed();
+        const routine = await fx.create([
+          step("a", [], { assigneeAgentId: fx.builderId }),
+          step("b", ["a"], { assigneeAgentId: fx.builderId }),
+          step("c", ["a"], { assigneeAgentId: fx.builderId }),
+          step("d", ["b", "c"], { assigneeAgentId: fx.builderId }),
+        ]);
+        const first = await fx.svc.runRoutine(routine.id, { source: "manual" });
+
+        await setStatuses(routine.id, { a: "done", b: "cancelled", c: "in_progress", d: "blocked" });
+        const running = await fx.svc.runRoutine(routine.id, { source: "manual" });
+        expect(running.status).toBe("coalesced");
+        expect(running.linkedIssueId).toBe(first.linkedIssueId);
+        expect((await fx.svc.getDetail(routine.id))?.activeIssue?.id).toBe(first.linkedIssueId);
+
+        await setStatuses(routine.id, { c: "done" });
+        const settled = await fx.svc.runRoutine(routine.id, { source: "manual" });
+        expect(settled.status).toBe("issue_created");
+        expect(settled.linkedIssueId).not.toBe(first.linkedIssueId);
+      });
+
+      it("shows no active issue for a stalled run in the routine list", async () => {
+        const fx = await seed();
+        const routine = await fx.create([
+          step("a", [], { assigneeAgentId: fx.builderId }),
+          step("b", ["a"], { assigneeAgentId: fx.builderId }),
+        ]);
+        await fx.svc.runRoutine(routine.id, { source: "manual" });
+        expect((await fx.svc.list(fx.companyId)).find((item) => item.id === routine.id)?.activeIssue).not.toBeNull();
+
+        await setStatuses(routine.id, { a: "cancelled" });
+
+        expect((await fx.svc.list(fx.companyId)).find((item) => item.id === routine.id)?.activeIssue).toBeNull();
+      });
+    });
+
     it("reports the open root as the routine's active issue", async () => {
       const fx = await seed();
       const routine = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));
