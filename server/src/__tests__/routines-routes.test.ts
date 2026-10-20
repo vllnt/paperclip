@@ -23,6 +23,7 @@ const routine = {
   concurrencyPolicy: "coalesce_if_active",
   catchUpPolicy: "skip_missed",
   variables: [],
+  steps: [],
   latestRevisionId: revisionId,
   latestRevisionNumber: 1,
   createdByAgentId: null,
@@ -753,6 +754,36 @@ describe("routine routes", () => {
       expect(created.status).toBe(403);
       expect(mockRoutineService.update).not.toHaveBeenCalled();
       expect(mockRoutineService.create).not.toHaveBeenCalled();
+    });
+
+    it("does not let an agent run a routine with steps for another agent", async () => {
+      mockRoutineService.get.mockResolvedValue({ ...routine, steps: [steps[0]] });
+      const app = await createApp({ type: "agent", agentId, companyId });
+
+      const res = await request(app).post(`/api/routines/${routineId}/run`).send({ assigneeAgentId: otherAgentId });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("assign routine steps to themselves");
+      expect(mockRoutineService.runRoutine).not.toHaveBeenCalled();
+    });
+
+    it("lets an agent run a routine with steps for itself", async () => {
+      mockRoutineService.get.mockResolvedValue({ ...routine, steps: [steps[0]] });
+      const app = await createApp({ type: "agent", agentId, companyId });
+
+      const res = await request(app).post(`/api/routines/${routineId}/run`).send({ assigneeAgentId: agentId });
+
+      expect(res.status).toBe(202);
+      expect(mockRoutineService.runRoutine).toHaveBeenCalledTimes(1);
+    });
+
+    it("still lets an agent run a routine without steps for another agent", async () => {
+      const app = await createApp({ type: "agent", agentId, companyId });
+
+      const res = await request(app).post(`/api/routines/${routineId}/run`).send({ assigneeAgentId: otherAgentId });
+
+      expect(res.status).toBe(202);
+      expect(mockRoutineService.runRoutine).toHaveBeenCalledTimes(1);
     });
 
     it("lets an agent write steps for itself", async () => {

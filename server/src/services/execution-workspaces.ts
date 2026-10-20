@@ -138,8 +138,11 @@ export function bumpExecutionWorkspaceLifecycleGeneration(
   };
 }
 
+/** Workspace statuses that mean the workspace can no longer be used. */
+export const CLOSED_EXECUTION_WORKSPACE_STATUSES = ["archived", "cleanup_failed"] as const;
+
 export function isClosedExecutionWorkspaceStatus(status: string | null | undefined): boolean {
-  return status === "archived" || status === "cleanup_failed";
+  return (CLOSED_EXECUTION_WORKSPACE_STATUSES as readonly (string | null | undefined)[]).includes(status);
 }
 
 // The metadata key that marks a workspace as reopened for a source issue that is

@@ -205,6 +205,33 @@ describeEmbeddedPostgres("routine steps", () => {
       expect(await blockersOf(root!.id)).toEqual(stepIssues.map((issue) => issue.id).sort());
     });
 
+    it("writes the root's blockers once per run, not once per step", async () => {
+      const fx = await seed();
+      const steps = releaseSteps(fx.builderId, fx.reviewerId);
+      const routine = await fx.create(steps);
+      // Every blocker write starts with one delete of the issue's blocker rows: count those statements.
+      await db.execute(sql`create table routine_steps_test_relation_writes (id serial primary key)`);
+      await db.execute(sql`
+        create function routine_steps_test_count_relation_write() returns trigger language plpgsql as $$
+        begin insert into routine_steps_test_relation_writes default values; return null; end $$
+      `);
+      await db.execute(sql`
+        create trigger routine_steps_test_count_relation_write after delete on issue_relations
+        for each statement execute function routine_steps_test_count_relation_write()
+      `);
+      try {
+        const run = await fx.svc.runRoutine(routine.id, { source: "manual" });
+
+        const writes = await db.execute(sql`select count(*)::int as count from routine_steps_test_relation_writes`);
+        expect(writes[0]?.count).toBe(steps.length + 1);
+        expect(await blockersOf(run.linkedIssueId!)).toHaveLength(steps.length);
+      } finally {
+        await db.execute(sql`drop trigger routine_steps_test_count_relation_write on issue_relations`);
+        await db.execute(sql`drop function routine_steps_test_count_relation_write()`);
+        await db.execute(sql`drop table routine_steps_test_relation_writes`);
+      }
+    });
+
     it("wakes only the steps that start the run, never the root", async () => {
       const fx = await seed();
       const routine = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));
@@ -704,6 +731,19 @@ describeEmbeddedPostgres("routine steps", () => {
       expect(second.linkedIssueId).not.toBe(first.linkedIssueId);
     });
 
+    it("does not treat an open task from before the routine had steps as active once steps are added", async () => {
+      const fx = await seed();
+      const plain = await fx.svc.runRoutine(fx.routine.id, { source: "manual" });
+      await fx.svc.update(fx.routine.id, { steps: releaseSteps(fx.builderId, fx.reviewerId) }, {});
+
+      expect((await fx.svc.list(fx.companyId)).find((item) => item.id === fx.routine.id)?.activeIssue).toBeNull();
+      expect((await fx.svc.getDetail(fx.routine.id))?.activeIssue).toBeNull();
+      const stepped = await fx.svc.runRoutine(fx.routine.id, { source: "manual" });
+
+      expect(stepped.status).toBe("issue_created");
+      expect(stepped.linkedIssueId).not.toBe(plain.linkedIssueId);
+    });
+
     it("stores no steps in its revision snapshot and an empty list on the row", async () => {
       const fx = await seed();
       const [row] = await db.select().from(routines).where(eq(routines.id, fx.routine.id));
@@ -883,6 +923,31 @@ describeEmbeddedPostgres("routine steps", () => {
         executionWorkspacePreference: "reuse_existing",
       });
       expect(updated!.executionWorkspaceSettings).toMatchObject({ mode: "isolated_workspace" });
+    });
+
+    it("does not hand a step the workspace of another run's step blocking it by hand", async () => {
+      const fx = await seed({ concurrencyPolicy: "always_enqueue" });
+      const routine = await fx.create(releaseSteps(fx.builderId, fx.reviewerId));
+      const first = await fx.svc.runRoutine(routine.id, { source: "manual" });
+      const second = await fx.svc.runRoutine(routine.id, { source: "manual" });
+      const stepIssues = await stepIssuesOf(routine.id);
+      const issueOf = (runId: string, key: string) =>
+        stepIssues.find((issue) => issue.originRunId === runId && issue.title === `Step ${key}`)!;
+      const workspaceId = await seedWorkspace(fx.companyId, fx.projectId);
+      await db
+        .update(issues)
+        .set({ executionWorkspaceId: workspaceId, status: "done" })
+        .where(eq(issues.id, issueOf(first.id, "implement").id));
+      await db.insert(issueRelations).values({
+        companyId: fx.companyId,
+        issueId: issueOf(first.id, "implement").id,
+        relatedIssueId: issueOf(second.id, "review").id,
+        type: "blocks",
+      });
+
+      expect(await inherit(fx.companyId, issueOf(second.id, "review").id)).toBe(false);
+      const [review] = await db.select().from(issues).where(eq(issues.id, issueOf(second.id, "review").id));
+      expect(review!.executionWorkspaceId).toBeNull();
     });
 
     it("changes nothing for a step without a predecessor workspace, one that has a workspace, or a plain issue", async () => {
