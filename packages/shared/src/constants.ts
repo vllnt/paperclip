@@ -356,6 +356,8 @@ export const ONBOARDING_FIRST_TASK_ORIGIN_KIND = "onboarding_first_task";
 export const ISSUE_ORIGIN_KINDS = [
   "manual",
   "routine_execution",
+  // A child issue created for one step of a routine run; never the routine's live-run slot.
+  "routine_step",
   "stale_active_run_evaluation",
   "harness_liveness_escalation",
   // Historical origin only; automatic productivity reviews have been retired.
