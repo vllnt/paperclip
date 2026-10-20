@@ -57,6 +57,7 @@ import type {
   RoutineRevision,
   RoutineRevisionSnapshotV1,
   RoutineRunSummary,
+  RoutineStep,
   RoutineStepsRunPayload,
   RoutineTrigger,
   RoutineTriggerSecretMaterial,
@@ -78,6 +79,7 @@ import {
   normalizeAgentUrlKey,
   isRoutineStepRunStalled,
   pluginOperationIssueOriginKind,
+  ROUTINE_STEPS_RUN_PAYLOAD_KEY,
   readRoutineStepsRunPayload,
   routineStepTemplateTexts,
   routineGateAppliesToSource,
@@ -141,6 +143,7 @@ import type { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 /** Newest open roots of a routine with steps that are checked for a run that can still move. */
 const OPEN_STEP_ROOTS_CHECKED = 25;
+const APPEND_MODE_STEPS_MESSAGE = "Steps are not supported with append issue mode";
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
@@ -2002,7 +2005,7 @@ export function routineService(
     routine: typeof routines.$inferSelect,
     config: { eventSourceId: string; eventGrouping?: EventGrouping | null },
     variables: RoutineVariable[] = routine.variables ?? [],
-    options: { allowArchivedSource?: boolean } = {},
+    options: { allowArchivedSource?: boolean; steps?: RoutineStep[] } = {},
   ) {
     const source = await db
       .select({ companyId: eventSources.companyId, archived: eventSources.archived })
@@ -2017,6 +2020,7 @@ export function routineService(
     assertEventCompatibleVariables(variables);
     const issueMode = config.eventGrouping?.issueMode;
     if (issueMode && typeof issueMode === "object") {
+      if ((options.steps ?? routine.steps ?? []).length > 0) throw unprocessable(APPEND_MODE_STEPS_MESSAGE);
       if (!routine.assigneeAgentId) throw unprocessable("appendToIssueId requires the routine to have a default agent");
       const target = await db
         .select({ companyId: issues.companyId, assigneeAgentId: issues.assigneeAgentId })
@@ -3255,7 +3259,10 @@ export function routineService(
       if (patch.goalId) await assertGoal(existing.companyId, patch.goalId);
       if (patch.parentIssueId) await assertParentIssue(existing.companyId, patch.parentIssueId);
       assertRoutineVariableDefinitions(nextVariables);
-      if (patch.steps !== undefined || patch.assigneeAgentId !== undefined) {
+      const stepsChanged = patch.steps !== undefined && !isDeepStrictEqual(patch.steps, existing.steps);
+      const defaultAgentChanged =
+        patch.assigneeAgentId !== undefined && patch.assigneeAgentId !== existing.assigneeAgentId;
+      if (stepsChanged || defaultAgentChanged) {
         await assertRoutineStepReferences(db, existing.companyId, nextSteps, nextAssigneeAgentId);
       }
       if (patch.steps?.length && (await getManagedRoutineBinding(existing))) {
@@ -3283,9 +3290,14 @@ export function routineService(
       if (enabledScheduleTriggers) {
         assertScheduleCompatibleVariables(nextVariables);
       }
-      if (patch.variables !== undefined || patch.title !== undefined || patch.description !== undefined) {
+      if (
+        patch.variables !== undefined ||
+        patch.title !== undefined ||
+        patch.description !== undefined ||
+        patch.steps !== undefined
+      ) {
         const enabledEventTriggers = await db
-          .select({ id: routineTriggers.id })
+          .select({ eventGrouping: routineTriggers.eventGrouping })
           .from(routineTriggers)
           .where(
             and(
@@ -3294,10 +3306,15 @@ export function routineService(
               eq(routineTriggers.enabled, true),
               eq(routineTriggers.archived, false),
             ),
-          )
-          .limit(1)
-          .then((rows) => rows.length > 0);
-        if (enabledEventTriggers) assertEventCompatibleVariables(nextVariables);
+          );
+        if (enabledEventTriggers.length > 0) assertEventCompatibleVariables(nextVariables);
+        if (
+          stepsChanged &&
+          nextSteps.length > 0 &&
+          enabledEventTriggers.some((trigger) => typeof trigger.eventGrouping?.issueMode === "object")
+        ) {
+          throw unprocessable(APPEND_MODE_STEPS_MESSAGE);
+        }
       }
       const responsibleUserId = await resolveRoutineResponsibleUserId(
         db,
@@ -3791,7 +3808,7 @@ export function routineService(
           existingRoutine,
           { eventSourceId: triggerSnapshot.eventSourceId, eventGrouping: triggerSnapshot.eventGrouping },
           routineSnapshot.variables,
-          { allowArchivedSource: true },
+          { allowArchivedSource: true, steps: routineSnapshot.steps ?? [] },
         );
       }
 
@@ -4413,6 +4430,7 @@ export function routineService(
       const issue = await db
         .select({
           id: issues.id,
+          companyId: issues.companyId,
           status: issues.status,
           originKind: issues.originKind,
           originRunId: issues.originRunId,
@@ -4429,7 +4447,7 @@ export function routineService(
           triggerPayload: routineRuns.triggerPayload,
         })
         .from(routineRuns)
-        .where(eq(routineRuns.id, issue.originRunId))
+        .where(and(eq(routineRuns.id, issue.originRunId), eq(routineRuns.companyId, issue.companyId)))
         .then((rows) => rows[0] ?? null);
       if (!run) return null;
       if (issue.status === "done") {
@@ -4455,12 +4473,13 @@ export function routineService(
             : {}),
         });
       }
-      if (issue.status === "blocked" && readRoutineStepsRunPayload(run.triggerPayload)) {
+      if (issue.status === "blocked" && run.triggerPayload && ROUTINE_STEPS_RUN_PAYLOAD_KEY in run.triggerPayload) {
         const openStep = await db
           .select({ id: issues.id })
           .from(issues)
           .where(
             and(
+              eq(issues.companyId, issue.companyId),
               eq(issues.parentId, issue.id),
               eq(issues.originKind, "routine_step"),
               inArray(issues.status, OPEN_ISSUE_STATUSES),
@@ -4469,6 +4488,8 @@ export function routineService(
           .limit(1)
           .then((rows) => rows[0] ?? null);
         if (openStep) return null;
+        const readiness = await issueSvc.getDependencyReadiness(issue.id);
+        if (readiness.allBlockersDone) return null;
       }
       if (issue.status === "blocked" || issue.status === "cancelled") {
         const failureReason = executionIssueTransientFailureReason(issue.status);

@@ -454,11 +454,26 @@ describeEmbeddedPostgres("routine steps", () => {
       expect(stored!.status).toBe("issue_created");
     });
 
-    it("still marks a run failed when a root without open steps is blocked", async () => {
+    it("does not mark a run failed when every step is done and the root only waits to be woken", async () => {
       const fx = await seed();
       const routine = await fx.create([step("only", [], { assigneeAgentId: fx.builderId })]);
       const run = await fx.svc.runRoutine(routine.id, { source: "manual" });
       await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.originKind, "routine_step"));
+
+      await fx.svc.syncRunStatusForIssue(run.linkedIssueId!);
+
+      const [stored] = await db.select().from(routineRuns).where(eq(routineRuns.id, run.id));
+      expect(stored!.status).toBe("issue_created");
+    });
+
+    it("still marks a run failed when a step was cancelled and the root is blocked with nothing left to run", async () => {
+      const fx = await seed();
+      const routine = await fx.create([step("only", [], { assigneeAgentId: fx.builderId })]);
+      const run = await fx.svc.runRoutine(routine.id, { source: "manual" });
+      await db
+        .update(issues)
+        .set({ status: "cancelled", cancelledAt: new Date() })
+        .where(eq(issues.originKind, "routine_step"));
 
       await fx.svc.syncRunStatusForIssue(run.linkedIssueId!);
 
@@ -629,6 +644,26 @@ describeEmbeddedPostgres("routine steps", () => {
 
       const restored = await fx.svc.restoreRevision(fx.routine.id, revisionWithSteps, {});
       expect(restored.routine.steps).toHaveLength(5);
+    });
+
+    it("accepts an unrelated edit that sends the stored steps back after a step agent was terminated", async () => {
+      const fx = await seed();
+      const doomedId = await fx.newAgent("Doomed");
+      const steps = [step("a", [], { assigneeAgentId: doomedId }), step("b", ["a"])];
+      await fx.svc.update(fx.routine.id, { steps }, {});
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, doomedId));
+
+      const renamed = await fx.svc.update(
+        fx.routine.id,
+        { title: "Renamed", steps: structuredClone(steps), assigneeAgentId: fx.leadId },
+        {},
+      );
+
+      expect(renamed?.title).toBe("Renamed");
+      await expect(fx.svc.update(fx.routine.id, { steps: [...steps, step("c", ["b"])] }, {})).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining('Step "a"'),
+      });
     });
 
     it("re-checks steps when the default agent is removed", async () => {
@@ -871,30 +906,80 @@ describeEmbeddedPostgres("routine steps", () => {
       expect(fx.wakeups).toHaveLength(0);
     });
 
-    it("adds no steps when events are appended to an existing issue", async () => {
+    describe("append issue mode", () => {
+      async function setupAppendTarget() {
+        const fx = await seedEventFixture(db);
+        const leadId = await fx.createAgent("Lead");
+        const routine = await fx.createRoutine({ assigneeAgentId: leadId });
+        const { source } = await fx.createSource();
+        const target = await fx.issueSvc.create(fx.companyId, {
+          projectId: fx.projectId,
+          title: "ongoing",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: leadId,
+        } as never);
+        return { fx, routine, source, target };
+      }
+
+      it("rejects an append-mode trigger on a routine that has steps", async () => {
+        const { fx, routine, source, target } = await setupAppendTarget();
+        await fx.routinesSvc.update(routine.id, { steps: [step("triage"), step("fix", ["triage"])] }, {});
+
+        await expect(
+          fx.subscribe(routine.id, source.id, { grouping: { issueMode: { appendToIssueId: target.id } } }),
+        ).rejects.toMatchObject({ status: 422, message: "Steps are not supported with append issue mode" });
+      });
+
+      it("rejects steps on a routine that has an append-mode trigger", async () => {
+        const { fx, routine, source, target } = await setupAppendTarget();
+        await fx.subscribe(routine.id, source.id, { grouping: { issueMode: { appendToIssueId: target.id } } });
+
+        await expect(fx.routinesSvc.update(routine.id, { steps: [step("triage")] }, {})).rejects.toMatchObject({
+          status: 422,
+          message: "Steps are not supported with append issue mode",
+        });
+        await expect(fx.routinesSvc.update(routine.id, { title: "Renamed" }, {})).resolves.toMatchObject({
+          title: "Renamed",
+        });
+      });
+
+      it("keeps appending to the target for a routine without steps", async () => {
+        const fx = await seedEventFixture(db);
+        const leadId = await fx.createAgent("Lead");
+        const routine = await fx.createRoutine({ assigneeAgentId: leadId });
+        const { source, secret } = await fx.createSource();
+        const target = await fx.issueSvc.create(fx.companyId, {
+          projectId: fx.projectId,
+          title: "ongoing",
+          status: "todo",
+          priority: "medium",
+          assigneeAgentId: leadId,
+        } as never);
+        await fx.subscribe(routine.id, source.id, {
+          grouping: { issueMode: { appendToIssueId: target.id }, repeatCommentCooldownSec: 600 },
+        });
+
+        const outcome = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e1" })));
+
+        expect(outcome).toMatchObject({ status: "grouped", issueId: target.id });
+        expect(await fx.issuesFor(routine.id)).toHaveLength(0);
+      });
+    });
+
+    it("re-checks event-trigger variables when only the steps add a placeholder without a default", async () => {
       const fx = await seedEventFixture(db);
       const leadId = await fx.createAgent("Lead");
       const routine = await fx.createRoutine({ assigneeAgentId: leadId });
-      await fx.routinesSvc.update(routine.id, { steps: [step("triage"), step("fix", ["triage"])] }, {});
-      const { source, secret } = await fx.createSource();
-      const target = await fx.issueSvc.create(fx.companyId, {
-        projectId: fx.projectId,
-        title: "ongoing",
-        status: "todo",
-        priority: "medium",
-        assigneeAgentId: leadId,
-      } as never);
-      await fx.subscribe(routine.id, source.id, {
-        grouping: { issueMode: { appendToIssueId: target.id }, repeatCommentCooldownSec: 600 },
+      const { source } = await fx.createSource();
+      await fx.subscribe(routine.id, source.id);
+
+      await expect(
+        fx.routinesSvc.update(routine.id, { steps: [{ ...step("triage"), title: "Triage {{target}}" }] }, {}),
+      ).rejects.toMatchObject({
+        status: 422,
+        message: expect.stringContaining("Event triggers require defaults for required routine variables"),
       });
-
-      const outcome = outcomeOf(await fx.send(source, secret, wireEvent({ eventId: "e1" })));
-
-      expect(outcome).toMatchObject({ status: "grouped", issueId: target.id });
-      expect(await stepIssuesOf(routine.id)).toHaveLength(0);
-      expect(await fx.issuesFor(routine.id)).toHaveLength(0);
-      const [appended] = await db.select().from(issues).where(eq(issues.id, target.id));
-      expect(appended!.status).toBe("todo");
     });
 
     it("opens a fresh group with its own steps once the first group's root is closed", async () => {
