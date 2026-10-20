@@ -646,7 +646,12 @@ A wait without `--pull-request` behaves exactly as before: it always wakes the a
   - fewer than 100 requests remain in the rate limit
   - the response is incomplete, paginated, or larger than 2 MiB (`MAX_GITHUB_RESPONSE_BYTES`)
   - the check takes longer than 5 seconds (`PULL_REQUEST_GATE_BUDGET_MS`)
-- **Backoff.** After a rate limit or a timeout, Paperclip stops calling GitHub for that company for a short time and the company's agents wake as before. One scheduler tick spends at most 20 seconds on these checks. When that budget runs out, the tick's remaining due monitors wake without a check.
+- **Backoff.** After GitHub rate limits, refuses or does not answer a check, Paperclip stops calling GitHub for a while, and the agents wake as before in the meantime. A missing credential or an incomplete or oversize response starts no backoff. The memory is per server process. How long and for what depends on the failure:
+  - a rate limit (a 429, a 403 with no requests left or with `retry-after`, or fewer than 100 requests left): the whole company, for the time `retry-after` or `x-ratelimit-reset` asks, at most 1 hour (5 minutes when GitHub names no time)
+  - a timeout: the whole company, 5 minutes
+  - a 401, which means the company's credential is not accepted: the whole company, 15 minutes
+  - any other refusal or failure (a 403 without a rate limit, a 404, a 5xx, a redirect, a network error): that repository only, 15 minutes, so a repository the credential cannot see does not switch the check off for the company's other pull requests
+- **Tick bound.** A scheduler tick stops starting new checks 20 seconds after it begins dispatching its due monitors (`PULL_REQUEST_GATE_TICK_BUDGET_MS`), and the tick's remaining due monitors wake without a check. A check that already started is not cut short and runs to its own 5-second budget, so one tick spends at most about 25 seconds waiting on GitHub, plus its database reads.
 
 The task's waiting banner and composer countdown also display automatic retries
 while their run is `scheduled_retry`. Once a retry is `queued` or `running`, its

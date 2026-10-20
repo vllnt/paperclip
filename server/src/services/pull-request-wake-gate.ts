@@ -30,13 +30,25 @@ export const PULL_REQUEST_FINGERPRINT_CONTEXT_KEY = "pullRequestFingerprint";
 export const PULL_REQUEST_UNCHANGED_MAX_QUIET_MS = 4 * 60 * 60_000;
 /** Hard budget for one gate evaluation: credential plus every GitHub request. */
 export const PULL_REQUEST_GATE_BUDGET_MS = 5_000;
+/**
+ * Budget for starting gates in one scheduler tick. It stops new gates from
+ * starting, it does not interrupt one in flight: a gate that starts just before
+ * it runs out can still spend its own PULL_REQUEST_GATE_BUDGET_MS, so a tick
+ * spends at most about the sum of both on GitHub, plus its database reads.
+ */
+export const PULL_REQUEST_GATE_TICK_BUDGET_MS = 20_000;
 /** A larger GitHub answer means "wake": the gate never buffers an unbounded body. */
 export const MAX_GITHUB_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 const FINGERPRINT_VERSION = 1;
 /** Below this many remaining GitHub requests, leave the quota to the agents. */
 const RATE_LIMIT_FLOOR = 100;
+/** Backoff after a timeout, or a rate limit that names no wait. */
 const BACKOFF_FALLBACK_MS = 5 * 60_000;
+/** Backoff after GitHub refused or could not serve the request (401, 403, 404, a 5xx, a redirect, a network error). */
+const BACKOFF_FAILURE_MS = 15 * 60_000;
+/** No header from GitHub can hold the gate off for longer than this. */
+const BACKOFF_MAX_MS = 60 * 60_000;
 const BACKOFF_MAX_ENTRIES = 1_000;
 const PAGE_SIZE = 100;
 const FAILING_CHECK_CONCLUSIONS = new Set([
@@ -110,6 +122,8 @@ export type PullRequestWakeGateDeps = {
     pullRequest: PullRequestWaitTarget;
   }) => Promise<string | null>;
   budgetMs?: number;
+  /** Budget for starting gates in one scheduler tick; see PULL_REQUEST_GATE_TICK_BUDGET_MS. */
+  tickBudgetMs?: number;
 };
 
 export type PullRequestWakeGateDecision =
@@ -126,10 +140,20 @@ export type PullRequestWakeGateDecision =
       fingerprint: IssuePullRequestFingerprint | null;
     };
 
+const TIMEOUT_BACKOFF = { scope: "company", ms: BACKOFF_FALLBACK_MS } as const;
+
+/**
+ * What a failure says about when to try GitHub again. `company`: the credential
+ * or the quota is shared by the company's every pull request. `repo`: only this
+ * repository is affected, so the company's other pull requests keep being gated.
+ */
+type GateBackoff = { scope: "company" | "repo"; ms: number };
+
 class FingerprintUnavailable extends Error {
   constructor(
     readonly reason: PullRequestFingerprintFailure,
     message: string,
+    readonly backoff?: GateBackoff,
   ) {
     super(message);
   }
@@ -154,27 +178,41 @@ export function readPullRequestWaitTarget(
 }
 
 /**
- * companyId -> epoch ms until which the gate does not call GitHub for that
- * company, after a rate limit or a timeout. One slow or limited company then
- * costs at most one budget per backoff, not one per due monitor.
+ * Key -> epoch ms until which the gate does not call GitHub, after a rate
+ * limit, a timeout or a refusal. The key is a company id (the whole company
+ * waits) or a company id plus repository (only that repository waits). One slow,
+ * limited or misconfigured company or repository then costs at most one budget
+ * per backoff, not one per due monitor.
  */
 const githubBackoffUntil = new Map<string, number>();
 
-function backOff(companyId: string, untilMs: number) {
-  githubBackoffUntil.delete(companyId);
+function backoffKey(companyId: string, pullRequest: PullRequestWaitTarget, scope: GateBackoff["scope"]) {
+  return scope === "company" ? companyId : `${companyId}/${pullRequest.owner}/${pullRequest.repo}`.toLowerCase();
+}
+
+function isBackedOff(companyId: string, pullRequest: PullRequestWaitTarget, nowMs: number) {
+  return (
+    (githubBackoffUntil.get(backoffKey(companyId, pullRequest, "company")) ?? 0) > nowMs ||
+    (githubBackoffUntil.get(backoffKey(companyId, pullRequest, "repo")) ?? 0) > nowMs
+  );
+}
+
+function backOff(key: string, untilMs: number) {
+  githubBackoffUntil.delete(key);
   while (githubBackoffUntil.size >= BACKOFF_MAX_ENTRIES) {
     const oldest = githubBackoffUntil.keys().next().value;
     if (oldest === undefined) break;
     githubBackoffUntil.delete(oldest);
   }
-  githubBackoffUntil.set(companyId, untilMs);
+  githubBackoffUntil.set(key, untilMs);
 }
 
+/** How long GitHub's headers ask us to wait, never more than BACKOFF_MAX_MS. */
 function rateLimitRetryMs(headers: Headers, nowMs: number) {
   const retryAfter = headers.get("retry-after");
-  if (retryAfter && /^[0-9]+$/.test(retryAfter)) return Number(retryAfter) * 1000;
+  if (retryAfter && /^[0-9]+$/.test(retryAfter)) return Math.min(BACKOFF_MAX_MS, Number(retryAfter) * 1000);
   const reset = headers.get("x-ratelimit-reset");
-  if (reset && /^[0-9]+$/.test(reset)) return Math.max(1000, Number(reset) * 1000 - nowMs);
+  if (reset && /^[0-9]+$/.test(reset)) return Math.min(BACKOFF_MAX_MS, Math.max(1000, Number(reset) * 1000 - nowMs));
   return BACKOFF_FALLBACK_MS;
 }
 
@@ -242,7 +280,6 @@ async function readPullRequestEntry(input: {
   token: string;
   fetchImpl: typeof fetch;
   signal: AbortSignal;
-  onRateLimit: (headers: Headers) => void;
 }): Promise<PullRequestFingerprintEntry> {
   const { pullRequest, token, fetchImpl, signal } = input;
   const base = `https://api.github.com/repos/${encodeURIComponent(pullRequest.owner)}/${encodeURIComponent(pullRequest.repo)}`;
@@ -260,10 +297,12 @@ async function readPullRequestEntry(input: {
         signal,
       });
     } catch (error) {
-      if (signal.aborted) throw new FingerprintUnavailable("github_timeout", "GitHub did not answer in time");
+      if (signal.aborted) throw new FingerprintUnavailable("github_timeout", "GitHub did not answer in time", TIMEOUT_BACKOFF);
+      // `redirect: "error"` also lands here: a moved or renamed repository is refused, not followed.
       throw new FingerprintUnavailable(
         "github_request_failed",
         error instanceof Error ? error.message : "GitHub request failed",
+        { scope: "repo", ms: BACKOFF_FAILURE_MS },
       );
     }
     const remaining = response.headers.get("x-ratelimit-remaining");
@@ -272,15 +311,24 @@ async function readPullRequestEntry(input: {
       response.status === 429 ||
       (response.status === 403 && (remaining === "0" || response.headers.has("retry-after")))
     ) {
-      input.onRateLimit(response.headers);
-      throw new FingerprintUnavailable("github_rate_limited", `GitHub answered ${response.status} (rate limited)`);
+      throw new FingerprintUnavailable("github_rate_limited", `GitHub answered ${response.status} (rate limited)`, {
+        scope: "company",
+        ms: rateLimitRetryMs(response.headers, Date.now()),
+      });
     }
     if (!response.ok) {
-      throw new FingerprintUnavailable("github_request_failed", `GitHub answered ${response.status} for ${path}`);
+      // A 401 means the company's credential is not accepted, which holds for all of its
+      // repositories. A 403 (no access), a 404 (no such repository) or a 5xx is this repository's.
+      throw new FingerprintUnavailable("github_request_failed", `GitHub answered ${response.status} for ${path}`, {
+        scope: response.status === 401 ? "company" : "repo",
+        ms: BACKOFF_FAILURE_MS,
+      });
     }
     if (remaining && /^[0-9]+$/.test(remaining) && Number(remaining) < RATE_LIMIT_FLOOR) {
-      input.onRateLimit(response.headers);
-      throw new FingerprintUnavailable("github_rate_limit_low", `GitHub rate limit is low (${remaining} left)`);
+      throw new FingerprintUnavailable("github_rate_limit_low", `GitHub rate limit is low (${remaining} left)`, {
+        scope: "company",
+        ms: rateLimitRetryMs(response.headers, Date.now()),
+      });
     }
     const hasNextPage = /<[^>]*>;\s*rel="next"/.test(response.headers.get("link") ?? "");
     return { body: await readCappedJson(response), hasNextPage };
@@ -389,8 +437,8 @@ export async function computeIssuePullRequestFingerprint(
   | { ok: false; reason: PullRequestFingerprintFailure; detail: string }
 > {
   const fail = (reason: PullRequestFingerprintFailure, detail: string) => ({ ok: false as const, reason, detail });
-  if ((githubBackoffUntil.get(input.companyId) ?? 0) > Date.now()) {
-    return fail("github_backoff", "GitHub was rate limited or slow for this company recently");
+  if (isBackedOff(input.companyId, input.pullRequest, Date.now())) {
+    return fail("github_backoff", "GitHub was rate limited, slow or refused this company or repository recently");
   }
 
   const fetchImpl = deps.fetch ?? fetch;
@@ -401,7 +449,13 @@ export async function computeIssuePullRequestFingerprint(
   const budget = new Promise<never>((_, reject) => {
     budgetTimer = setTimeout(() => {
       controller.abort();
-      reject(new FingerprintUnavailable("github_timeout", `The pull request check took longer than ${budgetMs} ms`));
+      reject(
+        new FingerprintUnavailable(
+          "github_timeout",
+          `The pull request check took longer than ${budgetMs} ms`,
+          TIMEOUT_BACKOFF,
+        ),
+      );
     }, budgetMs);
   });
   const read = async () => {
@@ -420,7 +474,6 @@ export async function computeIssuePullRequestFingerprint(
       token,
       fetchImpl,
       signal: controller.signal,
-      onRateLimit: (headers) => backOff(input.companyId, Date.now() + rateLimitRetryMs(headers, Date.now())),
     });
   };
   try {
@@ -436,7 +489,9 @@ export async function computeIssuePullRequestFingerprint(
     };
   } catch (error) {
     if (error instanceof FingerprintUnavailable) {
-      if (error.reason === "github_timeout") backOff(input.companyId, Date.now() + BACKOFF_FALLBACK_MS);
+      if (error.backoff) {
+        backOff(backoffKey(input.companyId, input.pullRequest, error.backoff.scope), Date.now() + error.backoff.ms);
+      }
       return fail(error.reason, error.message);
     }
     return fail("github_request_failed", error instanceof Error ? error.message : "Unknown error");

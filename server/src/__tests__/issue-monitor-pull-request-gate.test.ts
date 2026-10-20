@@ -254,6 +254,7 @@ describeEmbeddedPostgres("issue monitor: unchanged pull request gate", () => {
       });
     }
     github.calls.length = 0;
+    github.requests.length = 0;
     return { companyId, agentId, issueId, github, gateDeps, nextCheckAt, finishedAt, baselineRunId };
   }
 
@@ -272,9 +273,12 @@ describeEmbeddedPostgres("issue monitor: unchanged pull request gate", () => {
     const issue = await readIssue(issueId);
     // A normal trigger consumes the one-shot monitor; the agent re-arms it.
     expect(issue.monitorNextCheckAt).toBeNull();
+    // Only the monitor's own run: once that run ends, recovery can queue a follow-up
+    // run that inherits the monitor's `source` but has its own wake reason.
     const runs = await db.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.agentId, agentId),
       sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue.monitor'`,
+      sql`${heartbeatRuns.contextSnapshot} ->> 'wakeReason' = 'issue_monitor_due'`,
     ));
     expect(runs).toHaveLength(1);
     return runs[0]!;
@@ -466,6 +470,45 @@ describeEmbeddedPostgres("issue monitor: unchanged pull request gate", () => {
     expect(elapsedMs).toBeLessThan(300 + 2_500);
   });
 
+  // The tick's gate budget stops new gates from starting. A gate already running
+  // is not cut short, so a tick can overrun it by one gate's own budget.
+  it("stops starting gates once the tick's gate budget is spent, and wakes the remaining monitors without one", async () => {
+    // The tick budget sits between one and two gate budgets. The second gate must start
+    // before it runs out: that edge has (tickBudgetMs - gateBudgetMs) of slack for the
+    // database work between gates. The third gate must find it spent: database work only
+    // adds time, so that edge holds on a slow host too (2 * gateBudgetMs >= tickBudgetMs).
+    const gateBudgetMs = 600;
+    const tickBudgetMs = 1_100;
+    const fixtures = [await seed(), await seed(), await seed()];
+    const gated: string[] = [];
+    const heartbeat = heartbeatService(db, {
+      pullRequestWakeGate: {
+        // GitHub never answers; only the gate's own budget ends a read.
+        fetch: ((_url: string, init?: RequestInit) =>
+          new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+          })) as unknown as typeof fetch,
+        resolveToken: async ({ companyId }) => {
+          gated.push(companyId);
+          return "test-token";
+        },
+        budgetMs: gateBudgetMs,
+        tickBudgetMs,
+      },
+    });
+
+    const startedAt = performance.now();
+    await heartbeat.tickTimers(new Date());
+    const elapsedMs = performance.now() - startedAt;
+
+    // Monitors run oldest first: the first gate ends at one gate budget (inside the tick
+    // budget), so the second starts and runs its whole budget, past the tick budget;
+    // the third finds it spent.
+    expect(gated).toEqual([fixtures[0]!.companyId, fixtures[1]!.companyId]);
+    expect(elapsedMs).toBeGreaterThan(tickBudgetMs);
+    for (const fixture of fixtures) await expectWoke(fixture.agentId, fixture.issueId);
+  });
+
   it.each([
     ["429 with retry-after", 429, { "retry-after": "60" }],
     ["403 with retry-after (secondary rate limit)", 403, { "retry-after": "60" }],
@@ -490,6 +533,137 @@ describeEmbeddedPostgres("issue monitor: unchanged pull request gate", () => {
     expect(callsAfterFirst).toBeGreaterThan(0);
     expect(second).toMatchObject({ ok: false, reason: "github_backoff" });
     expect(calls).toBe(callsAfterFirst);
+  });
+
+  // A refusal repeats on every tick unless the gate remembers it. A 401 is the
+  // company's credential, so it holds for every repository; the rest are about
+  // one repository, so the company's other pull requests are still gated.
+  const OTHER_REPOSITORY_TARGET = { owner: "acme", repo: "other", number: 9 };
+  it.each([
+    ["401 (the credential is not accepted)", 401, "company"],
+    ["403 without a rate limit (no access)", 403, "repo"],
+    ["404 (no such repository or no access)", 404, "repo"],
+    ["502 (GitHub is failing)", 502, "repo"],
+  ])("backs off after GitHub answers %s", async (_label, status, scope) => {
+    const fixture = await seed({ baseline: "none" });
+    let calls = 0;
+    const deps = {
+      ...fixture.gateDeps,
+      fetch: (async () => {
+        calls += 1;
+        return new Response("{}", { status });
+      }) as typeof fetch,
+    };
+    const input = { companyId: fixture.companyId, issueId: fixture.issueId, agentId: fixture.agentId, pullRequest: PULL_REQUEST_TARGET };
+
+    const first = await computeIssuePullRequestFingerprint(db, input, deps);
+    const callsAfterFirst = calls;
+    const sameRepository = await computeIssuePullRequestFingerprint(db, input, deps);
+    const callsAfterSame = calls;
+    const otherRepository = await computeIssuePullRequestFingerprint(
+      db,
+      { ...input, pullRequest: OTHER_REPOSITORY_TARGET },
+      deps,
+    );
+
+    expect(first).toMatchObject({ ok: false, reason: "github_request_failed" });
+    expect(callsAfterFirst).toBeGreaterThan(0);
+    expect(sameRepository).toMatchObject({ ok: false, reason: "github_backoff" });
+    expect(callsAfterSame).toBe(callsAfterFirst);
+    if (scope === "company") {
+      expect(otherRepository).toMatchObject({ ok: false, reason: "github_backoff" });
+      expect(calls).toBe(callsAfterFirst);
+    } else {
+      expect(otherRepository).toMatchObject({ ok: false, reason: "github_request_failed" });
+      expect(calls).toBeGreaterThan(callsAfterFirst);
+    }
+  });
+
+  it("backs off for the repository after GitHub redirects the request (the gate never follows one)", async () => {
+    const fixture = await seed({ baseline: "none" });
+    let calls = 0;
+    const deps = {
+      ...fixture.gateDeps,
+      // What fetch does with `redirect: "error"` when GitHub answers a 301.
+      fetch: (async () => {
+        calls += 1;
+        throw new TypeError("fetch failed", { cause: new Error("unexpected redirect") });
+      }) as typeof fetch,
+    };
+    const input = { companyId: fixture.companyId, issueId: fixture.issueId, agentId: fixture.agentId, pullRequest: PULL_REQUEST_TARGET };
+
+    const first = await computeIssuePullRequestFingerprint(db, input, deps);
+    const callsAfterFirst = calls;
+    const second = await computeIssuePullRequestFingerprint(db, input, deps);
+
+    expect(first).toMatchObject({ ok: false, reason: "github_request_failed" });
+    expect(callsAfterFirst).toBeGreaterThan(0);
+    expect(second).toMatchObject({ ok: false, reason: "github_backoff" });
+    expect(calls).toBe(callsAfterFirst);
+  });
+
+  // How long each failure holds the gate off. A fake clock steps to one second
+  // before the hold ends (still backed off) and one second after it (GitHub is asked
+  // again). Each header-driven wait is exact because the start is on a whole second.
+  const SECOND = 1_000;
+  const answers = (status: number, headers: Record<string, string> = {}) =>
+    (async () => new Response("{}", { status, headers })) as typeof fetch;
+  it.each([
+    ["a timeout", "github_timeout", 5 * MINUTE, () =>
+      ((_url: string, init?: RequestInit) =>
+        new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        })) as unknown as typeof fetch],
+    ["a rate limit that names no wait", "github_rate_limited", 5 * MINUTE, () => answers(429)],
+    ["a low rate limit that names no reset", "github_rate_limit_low", 5 * MINUTE, () =>
+      answers(200, { "x-ratelimit-remaining": "5" })],
+    ["a retry-after of 90 seconds", "github_rate_limited", 90 * SECOND, () => answers(429, { "retry-after": "90" })],
+    ["an x-ratelimit-reset 2 minutes ahead", "github_rate_limited", 2 * MINUTE, (startMs: number) =>
+      answers(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(startMs / SECOND + 120) })],
+    // GitHub can ask for a day; the gate asks again after an hour.
+    ["a retry-after of one day", "github_rate_limited", 60 * MINUTE, () => answers(429, { "retry-after": "86400" })],
+    ["an x-ratelimit-reset one day ahead", "github_rate_limited", 60 * MINUTE, (startMs: number) =>
+      answers(403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(startMs / SECOND + 86_400) })],
+    ["a 401", "github_request_failed", 15 * MINUTE, () => answers(401)],
+    ["a 404", "github_request_failed", 15 * MINUTE, () => answers(404)],
+    ["a network error", "github_request_failed", 15 * MINUTE, () =>
+      (async () => {
+        throw new TypeError("fetch failed");
+      }) as typeof fetch],
+  ])("holds the gate off for the time the failure calls for: %s", async (_label, reason, holdMs, fetchAt) => {
+    const fixture = await seed({ baseline: "none" });
+    const startMs = Math.floor(Date.now() / SECOND) * SECOND;
+    const answer = fetchAt(startMs);
+    let calls = 0;
+    const deps = {
+      ...fixture.gateDeps,
+      fetch: ((...args: Parameters<typeof fetch>) => {
+        calls += 1;
+        return answer(...args);
+      }) as typeof fetch,
+      ...(reason === "github_timeout" ? { budgetMs: 200 } : {}),
+    };
+    const input = { companyId: fixture.companyId, issueId: fixture.issueId, agentId: fixture.agentId, pullRequest: PULL_REQUEST_TARGET };
+    const clock = vi.spyOn(Date, "now");
+    try {
+      clock.mockReturnValue(startMs);
+      const first = await computeIssuePullRequestFingerprint(db, input, deps);
+      const callsAfterFirst = calls;
+      clock.mockReturnValue(startMs + holdMs - SECOND);
+      const justBefore = await computeIssuePullRequestFingerprint(db, input, deps);
+      const callsBefore = calls;
+      clock.mockReturnValue(startMs + holdMs + SECOND);
+      const justAfter = await computeIssuePullRequestFingerprint(db, input, deps);
+
+      expect(first).toMatchObject({ ok: false, reason });
+      expect(callsAfterFirst).toBeGreaterThan(0);
+      expect(justBefore).toMatchObject({ ok: false, reason: "github_backoff" });
+      expect(callsBefore).toBe(callsAfterFirst);
+      expect(justAfter).toMatchObject({ ok: false, reason });
+      expect(calls).toBeGreaterThan(callsBefore);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   // A wait without a pull request target behaves exactly as before: the gate
@@ -559,6 +733,49 @@ describeEmbeddedPostgres("issue monitor: unchanged pull request gate", () => {
     }
   });
 
+  // The company token goes to GitHub's API host and nowhere else, and nothing
+  // Paperclip stores holds it. The fake GitHub records what the caller sent.
+  it("sends every request only to api.github.com, with the company token, and refuses redirects", async () => {
+    const fixture = await seed();
+    const heartbeat = heartbeatService(db, { pullRequestWakeGate: fixture.gateDeps });
+
+    await heartbeat.tickTimers(new Date());
+
+    expect(fixture.github.requests).toHaveLength(4);
+    for (const request of fixture.github.requests) {
+      expect(request.origin).toBe("https://api.github.com");
+      expect(request.path).toMatch(/^\/repos\/acme\/app\//);
+      expect(request.redirect).toBe("error");
+      expect(request.authorization).toBe("Bearer test-token");
+      expect(request.hasSignal).toBe(true);
+    }
+  });
+
+  it.each([
+    ["an unchanged pull request (skipped)", (_state: Fixture["github"]["state"]) => undefined],
+    ["a changed pull request (woken)", (state: Fixture["github"]["state"]) => {
+      state.headSha = "2222222222222222222222222222222222222222";
+    }],
+  ])("keeps the GitHub token out of receipts, run context, events and activity for %s", async (_label, change) => {
+    const fixture = await seed();
+    change(fixture.github.state);
+    const heartbeat = heartbeatService(db, { pullRequestWakeGate: fixture.gateDeps });
+
+    await heartbeat.tickTimers(new Date());
+    await heartbeat.drainActiveRunExecutions();
+
+    // The gate did read GitHub with the token, so the check below is not vacuous.
+    expect(fixture.github.requests.map((request) => request.authorization)).toContain("Bearer test-token");
+    const stored = JSON.stringify({
+      wakeRequests: await db.select().from(agentWakeupRequests),
+      runs: await db.select().from(heartbeatRuns),
+      runEvents: await db.select().from(heartbeatRunEvents),
+      activity: await db.select().from(activityLog),
+      issues: await db.select().from(issues),
+    });
+    expect(stored).not.toContain("test-token");
+  });
+
   it.each([
     ["there is no earlier run to compare with", { baseline: "none" as const }],
     ["the last run failed", { baseline: "failed" as const }],
@@ -609,18 +826,49 @@ describeEmbeddedPostgres("issue monitor: unchanged pull request gate", () => {
     expect(rows.map((row) => row.reason)).toEqual([PULL_REQUEST_UNCHANGED_SKIP_REASON]);
   });
 
-  it("does not re-arm over an issue edit made while the pull request was being read", async () => {
+  // The re-arm after a skip re-reads the issue under a lock and re-arms only the
+  // monitor this dispatch claimed. Each case changes exactly one thing that
+  // check compares, while the gate reads GitHub, so deleting any one comparison
+  // fails exactly that case: the edit must win and the attempt must not count.
+  it.each([
+    ["the next check time (a new wait is armed)", true, async (fixture: Fixture, edited: Date) => {
+      await db.update(issues).set({ monitorNextCheckAt: edited }).where(eq(issues.id, fixture.issueId));
+    }],
+    ["the dispatch lease", false, async (fixture: Fixture) => {
+      await db
+        .update(issues)
+        .set({ monitorWakeRequestedAt: new Date(Date.now() + MINUTE) })
+        .where(eq(issues.id, fixture.issueId));
+    }],
+    ["the status", false, async (fixture: Fixture) => {
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+    }],
+    ["the assignee agent", false, async (fixture: Fixture) => {
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: otherAgentId,
+        companyId: fixture.companyId,
+        name: "Other Bot",
+        role: "engineer",
+        status: "active",
+        adapterType: "process",
+        adapterConfig: { command: process.execPath, args: ["-e", ""], cwd: process.cwd() },
+        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } },
+        permissions: {},
+      });
+      await db.update(issues).set({ assigneeAgentId: otherAgentId }).where(eq(issues.id, fixture.issueId));
+    }],
+    ["the assignee person", false, async (fixture: Fixture) => {
+      await db.update(issues).set({ assigneeUserId: "board-user" }).where(eq(issues.id, fixture.issueId));
+    }],
+  ])("does not re-arm over a change to %s made while the pull request was being read", async (_label, keepsEditedCheckTime, edit) => {
     const fixture = await seed();
     const editedNextCheckAt = new Date(Date.now() + 90 * MINUTE);
     const heartbeat = heartbeatService(db, {
       pullRequestWakeGate: {
         ...fixture.gateDeps,
-        // The agent (or a person) arms a new wait while the gate reads GitHub.
         resolveToken: async () => {
-          await db
-            .update(issues)
-            .set({ monitorNextCheckAt: editedNextCheckAt, monitorWakeRequestedAt: null })
-            .where(eq(issues.id, fixture.issueId));
+          await edit(fixture, editedNextCheckAt);
           return "test-token";
         },
       },
@@ -629,8 +877,11 @@ describeEmbeddedPostgres("issue monitor: unchanged pull request gate", () => {
     await heartbeat.tickTimers(new Date());
 
     const issue = await readIssue(fixture.issueId);
-    expect(issue.monitorNextCheckAt?.toISOString()).toBe(editedNextCheckAt.toISOString());
     expect(issue.monitorAttemptCount).toBe(1);
+    expect(issue.monitorLastTriggeredAt).toBeNull();
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe(
+      (keepsEditedCheckTime ? editedNextCheckAt : fixture.nextCheckAt).toISOString(),
+    );
     const rows = await wakeRows(fixture.agentId);
     expect(rows.map((row) => row.reason)).toEqual([PULL_REQUEST_UNCHANGED_SKIP_REASON]);
   });

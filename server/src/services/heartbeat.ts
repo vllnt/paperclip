@@ -522,6 +522,7 @@ import {
 } from "./issue-execution-policy.js";
 import {
   PULL_REQUEST_FINGERPRINT_CONTEXT_KEY,
+  PULL_REQUEST_GATE_TICK_BUDGET_MS,
   PULL_REQUEST_UNCHANGED_SKIP_REASON,
   evaluatePullRequestWakeGate,
   readPullRequestWaitTarget,
@@ -812,8 +813,6 @@ const EXPECTED_PULL_REQUEST_GATE_MISSES = new Set([
   "github_credentials_unavailable",
   "github_backoff",
 ]);
-/** Scheduled monitor dispatches in one tick may spend this long in the pull-request gate. */
-const ISSUE_MONITOR_TICK_GATE_BUDGET_MS = 20_000;
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const ACCEPTED_PLAN_CONVERSION_SKILL_KEY =
@@ -12864,9 +12863,12 @@ export function heartbeatService(
 
     let triggered = 0;
     let skipped = 0;
-    // Bound the GitHub reads one tick may make: past this, the remaining due
-    // monitors wake without the unchanged-pull-request check.
-    const pullRequestGateDeadline = Date.now() + ISSUE_MONITOR_TICK_GATE_BUDGET_MS;
+    // Bound the GitHub reads one tick may make: once the deadline passes, the
+    // remaining due monitors wake without the unchanged-pull-request check. A gate
+    // already running is not cut short, so a tick can overrun the deadline by one
+    // gate's own budget (PULL_REQUEST_GATE_BUDGET_MS).
+    const pullRequestGateDeadline =
+      Date.now() + (options.pullRequestWakeGate?.tickBudgetMs ?? PULL_REQUEST_GATE_TICK_BUDGET_MS);
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {

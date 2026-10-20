@@ -23,6 +23,16 @@ export type FakePullRequestState = {
   hang?: boolean;
 };
 
+/** What the caller sent, as the gate's security guards need to see it. */
+export type FakeGitHubRequest = {
+  origin: string;
+  /** Path and query. */
+  path: string;
+  redirect: RequestRedirect | undefined;
+  authorization: string | null;
+  hasSignal: boolean;
+};
+
 export function defaultFakePullRequestState(): FakePullRequestState {
   return {
     headSha: "1111111111111111111111111111111111111111",
@@ -43,6 +53,7 @@ export function defaultFakePullRequestState(): FakePullRequestState {
 export function createFakeGitHubPullRequestApi(input: { owner: string; repo: string; number: number }) {
   const state: FakePullRequestState = defaultFakePullRequestState();
   const calls: string[] = [];
+  const requests: FakeGitHubRequest[] = [];
   const base = `/repos/${input.owner}/${input.repo}`;
   const json = (body: unknown, status = 200, extraHeaders: Record<string, string> = {}) =>
     new Response(JSON.stringify(body), {
@@ -52,6 +63,13 @@ export function createFakeGitHubPullRequestApi(input: { owner: string; repo: str
   const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const parsed = new URL(typeof url === "string" ? url : url instanceof URL ? url.href : url.url);
     calls.push(`${parsed.pathname}${parsed.search}`);
+    requests.push({
+      origin: parsed.origin,
+      path: `${parsed.pathname}${parsed.search}`,
+      redirect: init?.redirect,
+      authorization: new Headers(init?.headers).get("authorization"),
+      hasSignal: Boolean(init?.signal),
+    });
     if (state.hang) {
       return new Promise<Response>((_, reject) => {
         init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
@@ -90,5 +108,5 @@ export function createFakeGitHubPullRequestApi(input: { owner: string; repo: str
     }
     return json({ message: "Not Found" }, 404);
   }) as typeof globalThis.fetch;
-  return { state, calls, fetch };
+  return { state, calls, requests, fetch };
 }
