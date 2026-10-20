@@ -444,8 +444,14 @@ async function runVitest(args, label, testShard = null) {
       env: invocationEnv("vitest", env),
       stdio: "inherit",
     });
-    child.once("error", reject);
+    let spawnFailed = false;
+    child.once("error", (error) => {
+      spawnFailed = true;
+      reject(error);
+    });
     child.once("close", (code, signal) => {
+      // After a spawn error, close reports a negative errno, not a Vitest result.
+      if (spawnFailed) return;
       if (code !== 0) {
         // Keep going: one red invocation must not hide the ones after it. The
         // summary at the end of the run lists every failure and sets the exit code.

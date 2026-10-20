@@ -100,3 +100,20 @@ test("the summary adds no line the unit-test report step would count as a failin
   assert.equal(result.status, 1);
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /^ *FAIL /m);
 });
+
+test("a Vitest process that cannot start fails the run with exit 1 and no summary", { skip }, () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "run-vitest-nopnpm-"));
+  try {
+    // An empty PATH directory: `pnpm` cannot be found, so spawn emits "error".
+    const result = spawnSync(process.execPath, [script, ...lane], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env: { ...process.env, PATH: dir },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /ENOENT/);
+    assert.doesNotMatch(result.stderr, /invocations failed/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
