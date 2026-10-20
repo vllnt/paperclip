@@ -79,9 +79,14 @@ import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
-import { assertAgentProtectedChangeGranted } from "./agent-protected-change-guard.js";
+import {
+  assertAgentProtectedChangeGranted,
+  type AgentProtectedChangeSurface,
+} from "./agent-protected-change-guard.js";
+import { collectAgentPermissionChanges } from "./agent-self-config-authz.js";
 import { currentPluginHostCallAgent } from "./plugin-host-call-actor.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
+import { forbidden } from "../errors.js";
 import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 import {
   normalizeProviderFamily,
@@ -717,15 +722,18 @@ export function buildHostServices(
   const agents = agentService(db);
 
   /**
-   * Pausing or resuming an agent is board-only on the routes, and resuming one
-   * needs `agents:configure` for an agent caller. A plugin call started by an
-   * agent keeps that rule: the agent behind the call needs `agents:configure`
-   * for the target, so a plugin cannot resume a budget-paused agent (including
-   * the caller) for it. Board, user, and system calls keep their access.
+   * A plugin call started by an agent keeps the rules the routes apply to that
+   * agent: the agent behind the call needs `agents:configure` for the target to
+   * change its protected fields. Pausing or resuming an agent is board-only on
+   * the routes, so a plugin cannot resume a budget-paused agent (including the
+   * caller) for it; an agent's permissions, which hold its authorization policy,
+   * follow the same rule. Board, user, and system calls keep their access.
    */
-  async function assertAgentCallerMayChangeStatus(
+  async function assertAgentCallerMayChangeProtectedFields(
     agent: { id: string; companyId: string },
-    change: "pause" | "resume",
+    fields: string[],
+    surface: Extract<AgentProtectedChangeSurface, `plugin_${string}`>,
+    details: Record<string, unknown> = {},
   ) {
     const caller = currentPluginHostCallAgent();
     if (!caller) return;
@@ -746,10 +754,38 @@ export function buildHostServices(
         });
       },
       target: agent,
-      fields: ["status"],
-      surface: "plugin_status_change",
-      details: { sourcePluginKey: pluginKey, change },
+      fields,
+      surface,
+      details: { sourcePluginKey: pluginKey, ...details },
     });
+  }
+
+  /**
+   * Refuses a plugin call an agent started and records the refusal. For changes
+   * the routes keep to the board, and for changes that have no per-agent grant to
+   * check the agent against: board, user, and system calls keep their access.
+   * Call it before any lookup, so the answer does not reveal what exists.
+   */
+  async function assertNoAgentBehindCall(input: {
+    companyId: string;
+    action: string;
+    entityType: string;
+    entityId: string;
+  }) {
+    const caller = currentPluginHostCallAgent();
+    if (!caller) return;
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: caller.agentId,
+      agentId: caller.agentId,
+      runId: caller.runId,
+      action: input.action,
+      entityType: input.entityType,
+      entityId: input.entityId,
+      details: { sourcePluginKey: pluginKey, reason: "board_only" },
+    });
+    throw forbidden("Board access required");
   }
 
   const managedAgents = pluginManagedAgentService(db, {
@@ -1138,6 +1174,12 @@ export function buildHostServices(
       entityId: input.entityId,
       details: pluginActivityDetails(input.details, input.actor),
     });
+  };
+
+  /** The agent behind the current plugin call, in the shape `logPluginActivity` takes, so the audit entry names it. */
+  const callerActivityActor = () => {
+    const caller = currentPluginHostCallAgent();
+    return { actorAgentId: caller?.agentId ?? null, actorRunId: caller?.runId ?? null };
   };
 
   const collectIssueSubtreeIds = async (companyId: string, rootIssueId: string) => {
@@ -2945,7 +2987,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
-        await assertAgentCallerMayChangeStatus({ id: params.agentId, companyId }, "pause");
+        await assertAgentCallerMayChangeProtectedFields({ id: params.agentId, companyId }, ["status"], "plugin_status_change", { change: "pause" });
         return (await agents.pause(params.agentId)) as Agent;
       },
       async resume(params) {
@@ -2953,7 +2995,7 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
-        await assertAgentCallerMayChangeStatus({ id: params.agentId, companyId }, "resume");
+        await assertAgentCallerMayChangeProtectedFields({ id: params.agentId, companyId }, ["status"], "plugin_status_change", { change: "resume" });
         return (await agents.resume(params.agentId)) as Agent;
       },
       async invoke(params) {
@@ -3196,6 +3238,20 @@ export function buildHostServices(
       async setGrants(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
+        // Setting grants is board-only on the routes: the member routes
+        // (`PATCH /companies/:companyId/members/:memberId/permissions` and
+        // `/role-and-grants`) refuse every non-board actor in
+        // `assertCanManageCompanyMember`, and the agent routes grant only
+        // `tasks:assign`. So a call an agent started cannot set grants, even an
+        // agent that holds `agents:configure`: that agent could hand out keys it
+        // does not hold. Refuse before any lookup, so the answer does not reveal
+        // who is a member or which agents exist.
+        await assertNoAgentBehindCall({
+          companyId,
+          action: "authorization.grants_update_denied",
+          entityType: "principal_permission_grants",
+          entityId: `${params.principalType}:${params.principalId}`,
+        });
         if (params.principalType !== "agent" && params.principalType !== "user") {
           throw new Error("principalType must be 'agent' or 'user'");
         }
@@ -3254,6 +3310,18 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const policy = params.policy ? sanitizeRecord(params.policy) : null;
+        // An agent's policy follows the `agents:configure` rule below. A project's
+        // and an issue's policy carry the trust boundary of their runs and have no
+        // per-agent grant to check the caller against, so a call an agent started
+        // is refused.
+        if (params.resourceType === "project" || params.resourceType === "issue") {
+          await assertNoAgentBehindCall({
+            companyId,
+            action: "authorization.policy_update_denied",
+            entityType: params.resourceType,
+            entityId: params.resourceId,
+          });
+        }
         if (params.resourceType === "agent") {
           const agent = requireInCompany("Agent", await agents.getById(params.resourceId), companyId);
           const permissions = agent.permissions && typeof agent.permissions === "object"
@@ -3261,6 +3329,11 @@ export function buildHostServices(
             : {};
           if (policy) permissions.authorizationPolicy = policy;
           else delete permissions.authorizationPolicy;
+          await assertAgentCallerMayChangeProtectedFields(
+            agent,
+            collectAgentPermissionChanges(agent.permissions, permissions),
+            "plugin_policy_update",
+          );
           await db
             .update(agentsTable)
             .set({ permissions, updatedAt: new Date() })
@@ -3298,6 +3371,7 @@ export function buildHostServices(
           entityType: params.resourceType,
           entityId: params.resourceId,
           details: { hasPolicy: Boolean(policy) },
+          actor: callerActivityActor(),
         });
         const updated = await readAuthorizationPolicy(companyId, params.resourceType, params.resourceId);
         if (!updated) throw new Error("Policy resource not found");

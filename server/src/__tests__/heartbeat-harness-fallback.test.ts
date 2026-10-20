@@ -58,6 +58,8 @@ type Outcome =
   | { kind: "capacity" }
   | { kind: "auth" }
   | { kind: "task_failure" }
+  // A short errorMessage that classifiers read, and a longer errorDetail that only the stored run error shows.
+  | { kind: "failure_with_detail"; errorMessage: string; errorDetail: string; transient?: boolean }
   | { kind: "usage_limit_after_comment" }
   | { kind: "proxy_cooldown_as_transient"; withResetBody?: boolean }
   // What grok_local returns for the CLI's real error events (adapter fixtures error-model-cooldown / error-not-signed-in).
@@ -144,6 +146,15 @@ describeEmbeddedPostgres("agent harness fallback", () => {
           exitCode: 1, signal: null, timedOut: false, provider, model,
           errorMessage: "Tests failed: 3 assertions",
           errorCode: "adapter_failed",
+        };
+      }
+      if (outcome.kind === "failure_with_detail") {
+        return {
+          exitCode: 1, signal: null, timedOut: false, provider, model,
+          errorMessage: outcome.errorMessage, errorDetail: outcome.errorDetail,
+          ...(outcome.transient
+            ? { errorCode: "claude_transient_upstream", errorFamily: "transient_upstream" as const }
+            : { errorCode: "adapter_failed" }),
         };
       }
       if (outcome.kind === "proxy_cooldown_as_transient") {
@@ -686,6 +697,38 @@ describeEmbeddedPostgres("agent harness fallback", () => {
     const fallbackRun = await runPending(companyId, "harness_fallback");
     expect(fallbackRun).toMatchObject({ status: "succeeded", executedAdapterType: "codex_local", fallbackReason: "provider_capacity" });
     expect(invocations.map((call) => call.adapterType)).toEqual(["claude_local", "claude_local", "claude_local", "codex_local"]);
+  });
+
+  it("classifies a failure by its short error message, not by a limit word in its stored error detail", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const errorDetail = "Tests failed: 3 assertions\nLast lines of stderr:\nYou've hit your usage limit.";
+    scripts.claude_local = [{ kind: "failure_with_detail", errorMessage: "Tests failed: 3 assertions", errorDetail }];
+
+    await assign(agentId, issueId);
+
+    const [run] = await runs(companyId);
+    expect(run).toMatchObject({ status: "failed", errorCode: "adapter_failed", error: errorDetail });
+    expect(run!.resultJson).toMatchObject({ errorSummary: "Tests failed: 3 assertions" });
+    expect(run!.resultJson).not.toHaveProperty("errorFamily");
+    expect(await pending(companyId, "harness_fallback")).toBeNull();
+    expect(await db.select().from(agentHarnessCooldowns).where(eq(agentHarnessCooldowns.agentId, agentId))).toEqual([]);
+  });
+
+  it("does not fall back on a capacity word that only the stored error detail of a transient failure shows", async () => {
+    const { companyId, agentId, issueId } = await seed();
+    const failure = {
+      kind: "failure_with_detail" as const, transient: true,
+      errorMessage: "API Error: 500 Internal server error",
+      errorDetail: "API Error: 500 Internal server error\nLast lines of stderr:\nAPI Error: 529 overloaded_error",
+    };
+    scripts.claude_local = [failure, failure, failure];
+    await assign(agentId, issueId);
+    expect((await runPending(companyId, "transient_failure"))?.status).toBe("failed");
+    expect((await runPending(companyId, "transient_failure"))?.status).toBe("failed");
+
+    expect(await pending(companyId, "harness_fallback")).toBeNull();
+    expect(await db.select().from(agentHarnessCooldowns).where(eq(agentHarnessCooldowns.agentId, agentId))).toEqual([]);
+    expect(invocations.map((call) => call.adapterType)).toEqual(["claude_local", "claude_local", "claude_local"]);
   });
 
   it("counts the failed primary and its fallback re-dispatch as one run toward maxDailyRuns", async () => {

@@ -258,6 +258,19 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  /** A plugin API route call as `routes/plugins.ts` builds it: the route's company, and the actor it authenticated. */
+  const apiRequest = (probe: Record<string, unknown>, actor: Record<string, unknown>) => ({
+    routeKey: "probe",
+    method: "POST",
+    path: "/probe",
+    params: probe,
+    query: {},
+    body: null,
+    actor,
+    companyId: "company-a",
+    headers: {},
+  });
+
   it.each([
     {
       label: "an agent performAction",
@@ -279,6 +292,20 @@ describe("plugin-worker-manager stderr failure context", () => {
         actorContext: { type: "user", userId: "user-1", agentId: null, runId: null, companyId: "company-a" },
         renderEnvironment: null,
       }),
+      expected: null,
+    },
+    {
+      label: "an agent handleApiRequest",
+      method: "handleApiRequest",
+      params: (probe: Record<string, unknown>) =>
+        apiRequest(probe, { actorType: "agent", actorId: "agent-1", agentId: "agent-1", userId: null, runId: "run-1" }),
+      expected: { agentId: "agent-1", runId: "run-1", companyId: "company-a" },
+    },
+    {
+      label: "a board user handleApiRequest",
+      method: "handleApiRequest",
+      params: (probe: Record<string, unknown>) =>
+        apiRequest(probe, { actorType: "user", actorId: "user-1", agentId: null, userId: "user-1", runId: null }),
       expected: null,
     },
   ])("exposes the agent behind $label to worker-to-host handlers", async ({ method, params, expected }) => {

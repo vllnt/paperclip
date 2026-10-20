@@ -67,6 +67,7 @@ const additionalSerializedServerTests = new Set([
   "server/src/__tests__/routines-e2e.test.ts",
 ]);
 let invocationIndex = 0;
+const failedInvocations = [];
 const serializedModeName = "serialized";
 const generalModeName = "general";
 const allModeName = "all";
@@ -355,8 +356,26 @@ function runVitest(args, label, testShard = null) {
     process.exit(1);
   }
   if (result.status !== 0) {
-    process.exit(result.status ?? 1);
+    // Keep going: one red invocation must not hide the ones after it. The
+    // summary at the end of the run lists every failure and sets the exit code.
+    failedInvocations.push({
+      label,
+      exitCode: result.status ?? 1,
+      outcome: result.signal ? `signal ${result.signal}` : `exit ${result.status}`,
+    });
   }
+}
+
+function reportFailedInvocations() {
+  if (failedInvocations.length === 0) {
+    return;
+  }
+  console.error(`\n[test:run] ${failedInvocations.length} of ${invocationIndex} Vitest invocations failed:`);
+  for (const { label, outcome } of failedInvocations) {
+    console.error(`[test:run]   ${label} (${outcome})`);
+  }
+  // The first failure sets the exit code, as the old exit-on-first-failure did.
+  process.exitCode = failedInvocations[0].exitCode;
 }
 
 function runGeneralSuites(routeTests) {
@@ -564,3 +583,5 @@ if (options.mode === generalModeName || options.mode === allModeName) {
 if (options.mode === serializedModeName || options.mode === allModeName) {
   runSerializedSuites(routeTests, options.shardIndex ?? 0, options.shardCount ?? 1);
 }
+
+reportFailedInvocations();

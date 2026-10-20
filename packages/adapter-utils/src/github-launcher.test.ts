@@ -1180,6 +1180,23 @@ process.exit(result.status === null ? 1 : result.status);
       expect(child!.args).not.toContain("origin");
     }, 60_000);
 
+    // A host whose container DNS works only over TCP sets RES_OPTIONS=use-vc: a sealed push that loses it cannot resolve the remote.
+    it("keeps the resolver settings of the host for the push, and drops every other variable that is not on the list", async () => {
+      const r = await githubLike();
+      await r.write("app.ts", "z\n");
+      r.git("commit", "-a", "-m", "more app");
+      const shim = await childShim(r);
+      const ran = await exec(path.join(r.bin, "git"), ["push", "origin", "feature/x"], { cwd: r.repo, env: { ...r.env, RES_OPTIONS: "use-vc", LOCALDOMAIN: "corp.example", HOSTALIASES: "/etc/host.aliases", HTTPS_PROXY: "http://proxy.invalid:3128", GIT_CURL_VERBOSE: "1", UNLISTED_SETTING: "x" } })
+        .then(() => 0, (error: any) => error.code as number);
+      expect(ran).toBe(0);
+      const [child] = await shim.children();
+      expect(child!.env.GH_TOKEN).toBe("t");
+      expect(child!.env.RES_OPTIONS).toBe("use-vc");
+      expect(child!.env.LOCALDOMAIN).toBe("corp.example");
+      expect(child!.env.HOSTALIASES).toBe("/etc/host.aliases");
+      for (const key of ["HTTPS_PROXY", "GIT_CURL_VERBOSE", "UNLISTED_SETTING"]) expect(child!.env, key).not.toHaveProperty(key);
+    }, 60_000);
+
     // Review r5: the push child's own private config is the agent's UID's to write too.
     it("sends the push to the captured URL, with the captured refs, even when the child's private config is rewritten as it starts", async () => {
       const r = await githubLike();
@@ -1578,6 +1595,23 @@ process.exit(result.status === null ? 1 : result.status);
         // Where "origin" is comes from the launcher's own environment config (the URL the broker was told), not from a file.
         const keys = Object.entries(child!.env!).filter(([key]) => key.startsWith("GIT_CONFIG_KEY_")).map(([key, value]) => [value, child!.env![key.replace("KEY", "VALUE")]]);
         expect(keys).toContainEqual(["remote.origin.url", r.bare]);
+      }, 60_000);
+
+      it("keeps the resolver settings of the host for the fetch and the ls-remote, and drops every other variable that is not on the list", async () => {
+        const r = await allowed();
+        await someoneElse(r);
+        const shim = await readShim(r);
+        const result = await exec(path.join(r.bin, "git"), ["fetch", "origin"], { cwd: r.repo, env: { ...r.env, RES_OPTIONS: "use-vc", LOCALDOMAIN: "corp.example", HOSTALIASES: "/etc/host.aliases", HTTPS_PROXY: "http://proxy.invalid:3128", GIT_CURL_VERBOSE: "1", UNLISTED_SETTING: "x" } })
+          .then(() => 0, (error: any) => error.code as number);
+        expect(result).toBe(0);
+        const credentialed = (await shim.calls()).filter(call => NETWORK.includes(call.sub) && call.env?.GH_TOKEN === TOKEN);
+        expect(credentialed.length).toBeGreaterThan(0);
+        for (const call of credentialed) {
+          expect(call.env!.RES_OPTIONS, call.sub).toBe("use-vc");
+          expect(call.env!.LOCALDOMAIN, call.sub).toBe("corp.example");
+          expect(call.env!.HOSTALIASES, call.sub).toBe("/etc/host.aliases");
+          for (const key of ["HTTPS_PROXY", "GIT_CURL_VERBOSE", "UNLISTED_SETTING"]) expect(call.env, `${call.sub} ${key}`).not.toHaveProperty(key);
+        }
       }, 60_000);
 
       it("passes the credential to no git process of the launcher except the command that needs it", async () => {
