@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, companies, companyMemberships, createDb, issues, projects, routineRuns } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET, readRoutineStepsRunPayload, type RoutineStep } from "@paperclipai/shared";
@@ -718,30 +718,31 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
   });
 
   describe("an event and a manual run on one task", () => {
-    it("produce exactly one tree, whichever gets the task first", async () => {
+    async function setup() {
       const fx = await seedEventFixture(db);
       const leadId = await fx.createAgent("Lead");
       const builderId = await fx.createAgent("Builder");
       const reviewerId = await fx.createAgent("Reviewer");
       const { source } = await fx.sources.ensureInternal(fx.companyId, { userId: "board-user" });
-      const routine = await fx.routinesSvc.create(
-        fx.companyId,
-        {
-          projectId: fx.projectId,
-          goalId: null,
-          parentIssueId: null,
-          title: "Release check",
-          description: "Lead brief",
-          assigneeAgentId: leadId,
-          priority: "medium",
-          status: "active",
-          concurrencyPolicy: "coalesce_if_active",
-          catchUpPolicy: "skip_missed",
-          steps: [step("build", [], { assigneeAgentId: builderId }), step("review", ["build"], { assigneeAgentId: reviewerId })],
-        } as never,
-        {},
-      );
-      await fx.subscribe(routine.id, source.id, { grouping: { issueMode: "event_issue" } });
+      const createRoutine = (title: string) =>
+        fx.routinesSvc.create(
+          fx.companyId,
+          {
+            projectId: fx.projectId,
+            goalId: null,
+            parentIssueId: null,
+            title,
+            description: "Lead brief",
+            assigneeAgentId: leadId,
+            priority: "medium",
+            status: "active",
+            concurrencyPolicy: "coalesce_if_active",
+            catchUpPolicy: "skip_missed",
+            steps: [step("build", [], { assigneeAgentId: builderId }), step("review", ["build"], { assigneeAgentId: reviewerId })],
+          } as never,
+          {},
+        );
+      const listen = (routineId: string) => fx.subscribe(routineId, source.id, { grouping: { issueMode: "event_issue" } });
       const task = await fx.issueSvc.create(fx.companyId, {
         title: "Fix login",
         status: "todo",
@@ -750,22 +751,45 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
         assigneeAgentId: leadId,
         createdByUserId: "board-user",
       });
+      const race = (manualRoutineId: string) =>
+        Promise.allSettled([
+          fx.sources.publishInternal(fx.companyId, { issueId: task.id }),
+          fx.routinesSvc.runRoutine(manualRoutineId, { source: "manual", targetIssueId: task.id }, { userId: "board-user" }),
+        ]);
+      const children = () =>
+        db.select().from(issues).where(and(eq(issues.companyId, fx.companyId), eq(issues.parentId, task.id)));
+      const runsOf = (routineIds: string[]) => db.select().from(routineRuns).where(inArray(routineRuns.routineId, routineIds));
+      return { createRoutine, listen, race, children, runsOf };
+    }
 
-      const [published, manual] = await Promise.allSettled([
-        fx.sources.publishInternal(fx.companyId, { issueId: task.id }),
-        fx.routinesSvc.runRoutine(routine.id, { source: "manual", targetIssueId: task.id }, { userId: "board-user" }),
-      ]);
+    type Setup = Awaited<ReturnType<typeof setup>>;
 
-      const eventStarted = published.status === "fulfilled" && published.value.stepsAttached;
-      const manualStarted = manual.status === "fulfilled";
-      expect(eventStarted).not.toBe(manualStarted);
-      const children = await db
-        .select()
-        .from(issues)
-        .where(and(eq(issues.companyId, fx.companyId), eq(issues.parentId, task.id)));
-      expect(children).toHaveLength(2);
-      const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+    /** Exactly one start built the tree; the other was refused, and the task's assignee stays asleep either way. */
+    async function expectOneTree(t: Setup, [published, manual]: Awaited<ReturnType<Setup["race"]>>, routineIds: string[]) {
+      expect(published.status === "fulfilled" && published.value.stepsAttached).toBe(true);
+      if (manual.status === "rejected") expect(manual.reason).toMatchObject({ status: 409 });
+      expect(await t.children()).toHaveLength(2);
+      const runs = await t.runsOf(routineIds);
       expect(runs.filter((run) => run.status === "issue_created")).toHaveLength(1);
+      const eventRun = runs.find((run) => run.source === "event");
+      expect(manual.status === "fulfilled" ? eventRun?.status === "failed" : eventRun?.status === "issue_created").toBe(true);
+    }
+
+    it("produce exactly one tree, whichever gets the task first", async () => {
+      const t = await setup();
+      const routine = await t.createRoutine("Release check");
+      await t.listen(routine.id);
+
+      await expectOneTree(t, await t.race(routine.id), [routine.id]);
+    });
+
+    it("produce exactly one tree when they belong to two routines, so only the task lock decides", async () => {
+      const t = await setup();
+      const listening = await t.createRoutine("Release check");
+      const manual = await t.createRoutine("Hand check");
+      await t.listen(listening.id);
+
+      await expectOneTree(t, await t.race(manual.id), [listening.id, manual.id]);
     });
   });
 });
