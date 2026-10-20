@@ -31,6 +31,7 @@ import {
   // Agent
   AGENT_PALETTE_IDS,
   AGENT_AVATAR_SIZES,
+  PRINCIPAL_TYPES,
   CHARACTER_STATES,
   agentAppearanceSchema,
   createAgentSchema,
@@ -78,6 +79,8 @@ import {
   // Project
   createProjectSchema,
   updateProjectSchema,
+  setProjectAccessModeSchema,
+  grantProjectAccessSchema,
   createProjectWorkspaceSchema,
   updateProjectWorkspaceSchema,
   // Company
@@ -1430,6 +1433,9 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/chats/{agentRef}",
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
+  "PUT /api/projects/{id}/access/mode",
+  "POST /api/projects/{id}/access/principals",
+  "DELETE /api/projects/{id}/access/principals/{principalType}/{principalId}",
   "DELETE /api/issues/{id}/documents/{key}",
   "GET /api/companies/{companyId}/decisions",
   "GET /api/cloud/stacks",
@@ -4937,6 +4943,65 @@ registry.registerPath({
   summary: "Get a project",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/projects/{id}/access",
+  tags: ["projects"],
+  summary: "List who can access a project",
+  description:
+    "Returns the project's access mode, the server enforcement level (`off` or `shadow`), and every user and agent that can reach the project with each reason: company mode, explicit access-list entry, company owner/admin, or lead agent. Requires project read access.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/projects/{id}/access/mode",
+  tags: ["projects"],
+  summary: "Set a project's access mode",
+  description:
+    "`company` keeps the project open to every company member and agent. `restricted` limits it to company owners/admins, the lead agent, an issue's current assignee, and the access list. Company owner/admin board users only; agents cannot change project access.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(setProjectAccessModeSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/projects/{id}/access/principals",
+  tags: ["projects"],
+  summary: "Add a user or agent to a project's access list",
+  description:
+    "Users must be active company members and agents must belong to the company and not be terminated. Returns 201 when added and 200 when already listed. Company owner/admin board users only.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(grantProjectAccessSchema),
+  },
+  responses: {
+    200: r.ok(),
+    201: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/projects/{id}/access/principals/{principalType}/{principalId}",
+  tags: ["projects"],
+  summary: "Remove a user or agent from a project's access list",
+  description: "Company owner/admin board users only.",
+  request: {
+    params: z.object({ id: z.string(), principalType: z.enum(PRINCIPAL_TYPES), principalId: z.string() }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({

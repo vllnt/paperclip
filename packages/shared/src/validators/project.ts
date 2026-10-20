@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { PROJECT_STATUSES, PROJECT_ICON_NAMES } from "../constants.js";
+import { PRINCIPAL_TYPES, PROJECT_ACCESS_MODES, PROJECT_STATUSES, PROJECT_ICON_NAMES } from "../constants.js";
 import { envConfigSchema } from "./secret.js";
 import { trustAuthorizationPolicySchema } from "./trust-policy.js";
 import { objectWithoutDefaults } from "./partial.js";
@@ -131,5 +131,18 @@ export const updateProjectSchema = objectWithoutDefaults(
 ).partial();
 
 export type UpdateProject = z.infer<typeof updateProjectSchema>;
+
+export const setProjectAccessModeSchema = z.object({
+  accessMode: z.enum(PROJECT_ACCESS_MODES),
+}).strict();
+
+export type SetProjectAccessMode = z.infer<typeof setProjectAccessModeSchema>;
+
+export const grantProjectAccessSchema = z.object({
+  principalType: z.enum(PRINCIPAL_TYPES),
+  principalId: z.string().trim().min(1).max(255),
+}).strict();
+
+export type GrantProjectAccess = z.infer<typeof grantProjectAccessSchema>;
 
 export type ProjectExecutionWorkspacePolicy = z.infer<typeof projectExecutionWorkspacePolicySchema>;

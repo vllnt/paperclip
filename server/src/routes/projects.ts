@@ -12,23 +12,28 @@ import { toolAccessService } from "../services/tool-access.js";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import {
+  PRINCIPAL_TYPES,
   createProjectSchema,
   createProjectWorkspaceSchema,
+  grantProjectAccessSchema,
   findWorkspaceCommandDefinition,
   isUuidLike,
   matchWorkspaceRuntimeServiceToCommand,
+  setProjectAccessModeSchema,
   updateProjectSchema,
   updateProjectWorkspaceSchema,
   workspaceRuntimeControlTargetSchema,
 } from "@paperclipai/shared";
+import type { GrantProjectAccess } from "@paperclipai/shared";
 import type { WorkspaceRuntimeDesiredState, WorkspaceRuntimeServiceStateMap } from "@paperclipai/shared";
 import { trackProjectCreated } from "@paperclipai/shared/telemetry";
 import { validate } from "../middleware/validate.js";
 import { accessService, projectService, logActivity, workspaceOperationService } from "../services/index.js";
-import { conflict, forbidden, unprocessable } from "../errors.js";
+import { projectAccessService } from "../services/project-access.js";
+import { badRequest, conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertCompanyAdmin, getAccessibleResource, getActorInfo } from "./authz.js";
 import {
   buildWorkspaceRuntimeDesiredStatePatch,
   listConfiguredRuntimeServiceEntries,
@@ -54,6 +59,7 @@ const SHARED_WORKSPACE_STOP_AND_RESTART_ACTIONS = new Set(["stop", "restart"]);
 export function projectRoutes(db: Db, options: { pluginWorkerManager?: Pick<PluginWorkerManager, "call"> } = {}) {
   const router = Router();
   const svc = projectService(db);
+  const projectAccess = projectAccessService(db);
 
   async function repositoryViewer(req: Request) {
     if (req.actor.type === "board") return { userId: req.actor.userId ?? null, localTrusted: req.actor.source === "local_implicit" };
@@ -233,6 +239,66 @@ export function projectRoutes(db: Db, options: { pluginWorkerManager?: Pick<Plug
     if (!project) return;
     if (!(await assertProjectReadAllowed(req, res, project))) return;
     res.json(project);
+  });
+
+  router.get("/projects/:id/access", async (req, res) => {
+    const project = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Project not found");
+    if (!project) return;
+    if (!(await assertProjectReadAllowed(req, res, project))) return;
+    res.json(await projectAccess.summary(project));
+  });
+
+  router.put("/projects/:id/access/mode", validate(setProjectAccessModeSchema), async (req, res) => {
+    const project = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Project not found");
+    if (!project) return;
+    assertCompanyAdmin(req, project.companyId);
+    const { changed } = await projectAccess.setMode(project, req.body.accessMode);
+    if (changed) {
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: project.companyId, actorType: actor.actorType, actorId: actor.actorId,
+        action: "project_access.mode_changed", entityType: "project", entityId: project.id,
+        details: { from: project.accessMode, to: req.body.accessMode },
+      });
+    }
+    res.json(await projectAccess.summary({ ...project, accessMode: req.body.accessMode }));
+  });
+
+  router.post("/projects/:id/access/principals", validate(grantProjectAccessSchema), async (req, res) => {
+    const project = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Project not found");
+    if (!project) return;
+    assertCompanyAdmin(req, project.companyId);
+    const { principalType, principalId }: GrantProjectAccess = req.body;
+    const actor = getActorInfo(req);
+    const { created } = await projectAccess.grant(project, { principalType, principalId }, req.actor.userId ?? null);
+    if (created) {
+      await logActivity(db, {
+        companyId: project.companyId, actorType: actor.actorType, actorId: actor.actorId,
+        action: "project_access.granted", entityType: "project", entityId: project.id,
+        details: { principalType, principalId },
+      });
+    }
+    res.status(created ? 201 : 200).json(await projectAccess.summary(project));
+  });
+
+  router.delete("/projects/:id/access/principals/:principalType/:principalId", async (req, res) => {
+    const principalType = PRINCIPAL_TYPES.find((type) => type === req.params.principalType);
+    if (!principalType) {
+      throw badRequest(`principalType must be one of: ${PRINCIPAL_TYPES.join(", ")}`);
+    }
+    const project = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Project not found");
+    if (!project) return;
+    assertCompanyAdmin(req, project.companyId);
+    const principalId = req.params.principalId as string;
+    const { removed } = await projectAccess.revoke(project, principalType, principalId);
+    if (!removed) throw notFound("Project access entry not found");
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: project.companyId, actorType: actor.actorType, actorId: actor.actorId,
+      action: "project_access.revoked", entityType: "project", entityId: project.id,
+      details: { principalType, principalId },
+    });
+    res.json(await projectAccess.summary(project));
   });
 
   router.get("/projects/:id/external-object-summary", async (req, res) => {

@@ -27,6 +27,7 @@ export { agentTaskSessions, agentSessionGoalActions } from "./agent_task_session
 export { agentWakeupRequests } from "./agent_wakeup_requests.js";
 export { projects } from "./projects.js";
 export { projectMemberships } from "./project_memberships.js";
+export { projectPrincipalAccess } from "./project_principal_access.js";
 export { documentMemberships } from "./document_memberships.js";
 export { projectWorkspaces } from "./project_workspaces.js";
 export { executionWorkspaces } from "./execution_workspaces.js";

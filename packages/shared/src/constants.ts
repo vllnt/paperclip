@@ -591,6 +591,26 @@ export const PROJECT_STATUSES = [
 ] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 
+/**
+ * Who may reach a project. `company` keeps the default V1 behaviour (every
+ * company member and agent). `restricted` limits it to company owners/admins,
+ * the project lead agent, an issue's current assignee, and principals on the
+ * project access list.
+ */
+export const PROJECT_ACCESS_MODES = ["company", "restricted"] as const;
+export type ProjectAccessMode = (typeof PROJECT_ACCESS_MODES)[number];
+
+/** Why a principal can reach a project, as reported by the effective-access view. */
+export const PROJECT_ACCESS_SOURCES = ["company_mode", "explicit", "company_admin", "lead_agent"] as const;
+export type ProjectAccessSource = (typeof PROJECT_ACCESS_SOURCES)[number];
+
+/**
+ * Server enforcement level for project access (`PAPERCLIP_PROJECT_ACCESS_MODE`).
+ * `off` evaluates nothing; `shadow` logs decisions it would deny but allows them.
+ */
+export const PROJECT_ACCESS_ENFORCEMENT_LEVELS = ["off", "shadow"] as const;
+export type ProjectAccessEnforcementLevel = (typeof PROJECT_ACCESS_ENFORCEMENT_LEVELS)[number];
+
 export const ENVIRONMENT_DRIVERS = ["local", "ssh", "sandbox", "plugin"] as const;
 export type EnvironmentDriver = (typeof ENVIRONMENT_DRIVERS)[number];
 

@@ -399,6 +399,10 @@ export {
 export {
   createProjectSchema,
   updateProjectSchema,
+  setProjectAccessModeSchema,
+  grantProjectAccessSchema,
+  type SetProjectAccessMode,
+  type GrantProjectAccess,
   createProjectWorkspaceSchema,
   updateProjectWorkspaceSchema,
   projectExecutionWorkspacePolicySchema,

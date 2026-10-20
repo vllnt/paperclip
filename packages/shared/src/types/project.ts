@@ -1,4 +1,12 @@
-import type { BudgetWindowKind, PauseReason, ProjectStatus } from "../constants.js";
+import type {
+  BudgetWindowKind,
+  PauseReason,
+  PrincipalType,
+  ProjectAccessEnforcementLevel,
+  ProjectAccessMode,
+  ProjectAccessSource,
+  ProjectStatus,
+} from "../constants.js";
 import type {
   ProjectExecutionWorkspacePolicy,
   ProjectWorkspaceRuntimeConfig,
@@ -94,6 +102,7 @@ export interface Project {
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
   executionWorkspacePolicy: ProjectExecutionWorkspacePolicy | null;
+  accessMode: ProjectAccessMode;
   codebase: ProjectCodebase;
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
@@ -132,4 +141,22 @@ export interface ProjectRepositoryOptions {
   warnings?: string[];
   /** Optional company-relative connection settings page supplied by a plugin. */
   setupPath?: string;
+}
+
+/** One user or agent that can reach a project, with every reason it can. */
+export interface ProjectAccessPrincipal {
+  principalType: PrincipalType;
+  principalId: string;
+  name: string;
+  sources: ProjectAccessSource[];
+  /** Set when the principal is on the explicit access list. */
+  grantedAt: Date | null;
+}
+
+/** Effective access to a project: its mode and every principal that can reach it. */
+export interface ProjectAccessSummary {
+  projectId: string;
+  accessMode: ProjectAccessMode;
+  enforcement: ProjectAccessEnforcementLevel;
+  principals: ProjectAccessPrincipal[];
 }

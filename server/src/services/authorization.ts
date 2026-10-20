@@ -38,6 +38,7 @@ import {
 } from "./trust-preset-resolver.js";
 import { logger } from "../middleware/logger.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
+import { projectAccessEnforcementLevel, projectAccessService } from "./project-access.js";
 import { grantsForHumanRole, normalizeHumanRole } from "./company-member-roles.js";
 
 export type AuthorizationActor =
@@ -257,6 +258,8 @@ type ProjectAuthorizationRow = {
   id: string;
   companyId: string;
   executionWorkspacePolicy: unknown;
+  leadAgentId: string | null;
+  accessMode: string;
 };
 type IssueAuthorizationRow = {
   id: string;
@@ -563,6 +566,7 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 export function authorizationService(db: Db | DbTransaction) {
+  const projectAccess = projectAccessService(db);
   async function isInstanceAdmin(userId: string | null | undefined): Promise<boolean> {
     if (!userId) return false;
     if (
@@ -776,6 +780,8 @@ export function authorizationService(db: Db | DbTransaction) {
         id: projects.id,
         companyId: projects.companyId,
         executionWorkspacePolicy: projects.executionWorkspacePolicy,
+        leadAgentId: projects.leadAgentId,
+        accessMode: projects.accessMode,
       })
       .from(projects)
       .where(eq(projects.id, projectId))
@@ -2463,7 +2469,43 @@ export function authorizationService(db: Db | DbTransaction) {
     scope?: Record<string, unknown> | null;
   }): Promise<AuthorizationDecision> {
     const agentDecision = await decideBase(input);
-    return applyResponsibleUserIntersection(input, agentDecision);
+    const decision = await applyResponsibleUserIntersection(input, agentDecision);
+    await observeProjectAccess(input, decision);
+    return decision;
+  }
+
+  /**
+   * Project access gate, evaluated after every other rule so it can only narrow
+   * an allow. In `shadow` mode it logs what it would deny and changes nothing;
+   * in `off` mode (the default) it does no work at all.
+   */
+  async function observeProjectAccess(
+    input: { actor: AuthorizationActor; action: AuthorizationAction; resource: AuthorizationResource },
+    decision: AuthorizationDecision,
+  ): Promise<void> {
+    if (!decision.allowed || projectAccessEnforcementLevel() === "off") return;
+    const { resource } = input;
+    if (resource.type !== "project" && resource.type !== "issue") return;
+
+    const issue = resource.type === "issue" && resource.issueId ? await loadIssue(resource.issueId) : null;
+    const projectId = resource.type === "project" ? resource.projectId : issue?.projectId ?? resource.projectId;
+    if (!projectId) return;
+    const project = await loadProject(projectId);
+    if (!project || project.companyId !== resource.companyId || project.accessMode !== "restricted") return;
+
+    const reachable = await projectAccess.actorCanReachRestrictedProject({ actor: input.actor, project, issue });
+    if (reachable) return;
+    logger.warn({
+      projectAccessMode: "shadow",
+      action: input.action,
+      resourceType: resource.type,
+      companyId: resource.companyId,
+      projectId,
+      issueId: issue?.id ?? null,
+      actorType: input.actor.type,
+      actorUserId: input.actor.userId ?? null,
+      actorAgentId: input.actor.agentId ?? null,
+    }, "project access would deny");
   }
 
   return {

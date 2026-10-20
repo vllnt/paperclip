@@ -1,6 +1,12 @@
 import { Command } from "commander";
-import type { Project } from "@paperclipai/shared";
-import { createProjectSchema, updateProjectSchema } from "@paperclipai/shared";
+import type { Project, ProjectAccessSummary } from "@paperclipai/shared";
+import {
+  PROJECT_ACCESS_MODES,
+  createProjectSchema,
+  grantProjectAccessSchema,
+  setProjectAccessModeSchema,
+  updateProjectSchema,
+} from "@paperclipai/shared";
 import {
   addCommonClientOptions,
   apiPath,
@@ -205,6 +211,140 @@ export function registerProjectCommands(program: Command): void {
       }),
     { includeCompany: false },
   );
+
+  registerProjectAccessCommands(project);
+}
+
+interface ProjectAccessPrincipalOptions extends BaseClientOptions {
+  user?: string;
+  agent?: string;
+}
+
+function registerProjectAccessCommands(project: Command): void {
+  const access = project
+    .command("access")
+    .description("Project access: who can reach a project, and the restricted-mode access list");
+
+  function projectQuery(companyId: string | undefined) {
+    return companyId ? `?${new URLSearchParams({ companyId }).toString()}` : "";
+  }
+
+  function printSummary(summary: ProjectAccessSummary, json: boolean) {
+    if (json) {
+      printOutput(summary, { json: true });
+      return;
+    }
+    console.log(formatInlineRecord({
+      projectId: summary.projectId,
+      accessMode: summary.accessMode,
+      enforcement: summary.enforcement,
+    }));
+    for (const principal of summary.principals) {
+      console.log(formatInlineRecord({
+        type: principal.principalType,
+        id: principal.principalId,
+        name: principal.name,
+        sources: principal.sources.join(","),
+      }));
+    }
+  }
+
+  addCommonClientOptions(
+    access
+      .command("list")
+      .description("List every user and agent that can reach a project, and why")
+      .argument("<project>", "Project ID or shortname")
+      .option("-C, --company-id <id>", "Company ID for shortname lookup")
+      .action(async (projectRef: string, opts: BaseClientOptions & { companyId?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const summary = await ctx.api.get<ProjectAccessSummary>(
+            `${apiPath`/api/projects/${projectRef}/access`}${projectQuery(ctx.companyId)}`,
+          );
+          if (summary) printSummary(summary, ctx.json);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    access
+      .command("mode")
+      .description("Set the project access mode (company owners/admins only)")
+      .argument("<project>", "Project ID or shortname")
+      .argument("<mode>", `Access mode: ${PROJECT_ACCESS_MODES.join(" | ")}`)
+      .option("-C, --company-id <id>", "Company ID for shortname lookup")
+      .action(async (projectRef: string, mode: string, opts: BaseClientOptions & { companyId?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const payload = setProjectAccessModeSchema.parse({ accessMode: mode });
+          const summary = await ctx.api.put<ProjectAccessSummary>(
+            `${apiPath`/api/projects/${projectRef}/access/mode`}${projectQuery(ctx.companyId)}`,
+            payload,
+          );
+          if (summary) printSummary(summary, ctx.json);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    access
+      .command("grant")
+      .description("Add a user or an agent to the project access list (company owners/admins only)")
+      .argument("<project>", "Project ID or shortname")
+      .option("--user <userId>", "User ID to add")
+      .option("--agent <agentId>", "Agent ID to add")
+      .option("-C, --company-id <id>", "Company ID for shortname lookup")
+      .action(async (projectRef: string, opts: ProjectAccessPrincipalOptions & { companyId?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const payload = grantProjectAccessSchema.parse(principalFromOptions(opts));
+          const summary = await ctx.api.post<ProjectAccessSummary>(
+            `${apiPath`/api/projects/${projectRef}/access/principals`}${projectQuery(ctx.companyId)}`,
+            payload,
+          );
+          if (summary) printSummary(summary, ctx.json);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    access
+      .command("revoke")
+      .description("Remove a user or an agent from the project access list (company owners/admins only)")
+      .argument("<project>", "Project ID or shortname")
+      .option("--user <userId>", "User ID to remove")
+      .option("--agent <agentId>", "Agent ID to remove")
+      .option("-C, --company-id <id>", "Company ID for shortname lookup")
+      .action(async (projectRef: string, opts: ProjectAccessPrincipalOptions & { companyId?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const { principalType, principalId } = principalFromOptions(opts);
+          const summary = await ctx.api.delete<ProjectAccessSummary>(
+            `${apiPath`/api/projects/${projectRef}/access/principals/${principalType}/${principalId}`}${projectQuery(ctx.companyId)}`,
+          );
+          if (summary) printSummary(summary, ctx.json);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+}
+
+function principalFromOptions(opts: ProjectAccessPrincipalOptions): { principalType: "user" | "agent"; principalId: string } {
+  if (opts.user && opts.agent) throw new Error("Pass either --user or --agent, not both.");
+  if (opts.user) return { principalType: "user", principalId: opts.user };
+  if (opts.agent) return { principalType: "agent", principalId: opts.agent };
+  throw new Error("Pass --user <userId> or --agent <agentId>.");
 }
 
 function parseCsv(value: string | undefined): string[] | undefined {
