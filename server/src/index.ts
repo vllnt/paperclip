@@ -1571,7 +1571,8 @@ async function startServerWithDatabaseTeardown(
 
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
-            const result = await heartbeat.reapOrphanedRuns();
+            // Startup: a run owned by another boot id has a dead owner.
+            const result = await heartbeat.reapOrphanedRuns({ reapDeadBootRuns: true });
             logger.info(
               { reaped: result.reaped, runIds: result.runIds },
               "startup reap of orphaned heartbeat runs complete",

@@ -314,6 +314,22 @@ warnings and errors remain visible.
 
 Recovery lifecycle events retain the original structured failure code, retry attempt, next retry time, and predecessor/successor identifiers. Durable status delivery uses an idempotency marker; delivery grants no provider authority. Failed publication is retried without repeating provider work. These records are not first-party Telemetry.
 
+A server restart can cut a legacy run short. The shutdown drain, or the startup
+reap of a run that another server boot owned, then queues a retry with the
+reason `planned_restart_resume`. That retry is due at once and carries
+`resumeFromRunId`, so it resumes the session of the interrupted run. It spends
+no failure retry, and a run whose failure budget is spent gets none. At most
+three such retries follow each other; then the ordinary bounded retry applies.
+The server queues it only when stored lease evidence shows that the remote
+processes of the run stopped. If it cannot show this, the interrupted run
+records a lifecycle event with the payload `{ "reason": "remote_stop_unproven" }`
+and this message, and the ordinary bounded retry applies:
+
+`Restart resume skipped: the remote processes of this run are not proven stopped; the ordinary bounded retry applies`
+
+At startup the reap does not wait for the lease of a run owned by another boot
+to expire, because the server runs one process per database.
+
 If execution-continuation setup finds that a task no longer exists, is closed,
 or its owner changed, the existing cancellation settlement records
 `continuation_task_ownership_changed`. The run and wake request become cancelled
