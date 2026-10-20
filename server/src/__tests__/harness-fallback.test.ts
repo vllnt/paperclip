@@ -292,4 +292,12 @@ describe("checkRunHarnessCompatibility", () => {
     expect(check({ provider: "codex", model: "gpt-5.6-sol" })).toEqual({ ok: true });
     expect(check({ provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5" })).toEqual({ ok: true });
   });
+
+  it.each(["cursor", "grok", "pi"])("leaves an ACPX %s agent on the runner's default Claude model alone", (acpxAgent) => {
+    expect(checkRunHarnessCompatibility({
+      adapterType: "paperclip_runner",
+      config: { provider: "acpx", acpxAgent, model: "claude-opus-5-5" },
+      fallback: false,
+    })).toEqual({ ok: true });
+  });
 });
