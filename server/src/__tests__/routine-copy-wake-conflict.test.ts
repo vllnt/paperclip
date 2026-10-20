@@ -19,6 +19,7 @@ import {
   agents,
   companies,
   companySkills,
+  costEvents,
   createDb,
   environmentLeases,
   heartbeatRunEvents,
@@ -97,6 +98,7 @@ describeEmbeddedPostgres("a wake of an older routine copy while a newer copy hol
     await db.delete(workspaceRuntimeServices);
     await db.delete(routineRuns);
     await db.delete(issues);
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);

@@ -6,8 +6,11 @@ import {
   agentRuntimeState,
   agentWakeupRequests,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   companySkills,
+  costEvents,
   createDb,
   environmentLeases,
   environments,
@@ -113,6 +116,7 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
         await db.delete(issues);
         await db.delete(heartbeatRunEvents);
         await db.delete(activityLog);
+        await db.delete(costEvents);
         await db.delete(heartbeatRuns);
         await db.delete(agentWakeupRequests);
         await db.delete(agentRuntimeState);
@@ -120,6 +124,7 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
         await db.delete(environments);
         await db.delete(executionWorkspaces);
         await db.delete(companySkills);
+        await db.delete(companyMemberships);
         await db.delete(companies);
         break;
       } catch (error) {
@@ -144,6 +149,15 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+    });
+    // Agents act within their responsible user's access, so that user must
+    // exist and be an active member for a later run to reuse the task's workspace.
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible user", email: "responsible-user@example.test",
+      createdAt: new Date(), updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
     });
     for (const [id, name] of [[agentId, "Coder"], [otherAgentId, "Other"]] as const) {
       await db.insert(agents).values({
