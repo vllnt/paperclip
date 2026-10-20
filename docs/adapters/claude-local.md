@@ -17,6 +17,58 @@ and run log retain only the generic failure message, recovery labels, and reset
 timestamp. Context, turn, rate, and configured budget limits are not treated as
 subscription quota exhaustion merely because ACP labels them `limit`.
 
+## Failure messages
+
+When a CLI run fails, the run's stored error message says how the Claude
+process ended. It reads only structural facts, never the wording of one
+message. One fact goes on each line, and the first line carries the cause,
+because single-line views such as the Inbox show only that line:
+
+- `Timed out after <n>s`, when Paperclip stopped the process at its timeout.
+- The result error, when Claude's stream-json output reported one (cut to 2048
+  characters). When the output does not parse, the parse failure takes this
+  place, also after a clean exit.
+- The exit line: the exit code, the signal, and the transport error code when
+  one applies, then the last non-empty stderr line (cut to 200 characters), for
+  example `Claude exited with code 1: Error: 401 Unauthorized`.
+- When stderr holds more than that line, `Last lines of stderr:` and the end of
+  stderr: at most the last 20 lines and 2048 characters, without blank lines.
+  The tail always starts at the start of a line. A line that alone is longer
+  than 2048 characters loses its end. A leading `…` marks that earlier lines
+  were left out.
+
+A failed run that exited with a non-zero code or a signal always gets this
+text, also when Claude's result event reported success.
+
+The adapter returns this text as `errorDetail`. Its short `errorMessage` stays
+as before, and failure classification (error codes, quota cooldowns, recovery)
+keeps reading the short message. The run keeps it in `resultJson.errorSummary`.
+Prompts that quote a run error, and the "Failure summary" row of a stranded-run
+notice, get the short one-line message (prompts cap it at 500 characters). The
+run page and the Inbox show the full stored error.
+
+The helper redacts before it cuts the tail, and it bounds the text it redacts.
+It masks secret-shaped text (API keys, bearer tokens, `key=value` secrets, JSON
+secret fields, URL passwords, PEM blocks) and the header forms
+`x-api-key: <value>`, `x-auth-key=<value>` and `Authorization: Basic <value>`.
+It masks the whole value of a `Cookie` or `Set-Cookie` header, up to the end of
+its line. Stderr can hold megabytes, and the redaction rules are slow on a long
+unbroken run of letters, digits, `-` and `_`. So the helper redacts only the end
+of stderr: the last whole lines that fit in 8 KiB (an over-long last line keeps
+its start), and the first 8 KiB of the result error. No cut separates the name of
+a secret from its value, because the text starts at the start of a line. A PEM
+block that starts before that end is left out through its END marker.
+
+The server redacts the stored error message of every adapter again, before it
+stores it, with the same header rules from
+`@paperclipai/adapter-utils/command-redaction`. It first masks the values of the
+run's registered env and secret bindings (a value of 4 or more characters, so an
+exit code is never masked), then applies its own text redaction. It cuts the
+stored error at 8 KB, after the redaction, and the cut keeps the first line. The
+run still keeps the full stderr excerpt and log. The shared helper is
+`describeProcessExit` in `@paperclipai/adapter-utils/process-exit-cause`, so
+other local adapters can use the same message.
+
 ## Prerequisites
 
 - Claude Code CLI installed (`claude` command available)

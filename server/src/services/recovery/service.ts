@@ -99,7 +99,7 @@ import {
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
+import { isExternalChatPresentationContext, readRunErrorSummary } from "../heartbeat-run-summary.js";
 import {
   CHAT_CONTROL_RECOVERY_STOP_CODE,
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
@@ -402,11 +402,11 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   if (readRecoveryRunErrorFamily(latestRun) === "provider_quota") return true;
   if (latestRun?.errorCode !== "adapter_failed") return false;
   return /(?:usage|rate|quota) limit|you(?:'|’)ve hit your (?:\w+ )?limit|quota (?:exceeded|reset)|try again after/i.test(
-    latestRun.error ?? "",
+    readRunErrorSummary(latestRun) ?? "",
   );
 }
 
-function resolveStrandedRecoveryCause(
+export function resolveStrandedRecoveryCause(
   latestRun: LatestIssueRun,
   explicitCause?: StrandedRecoveryCause,
 ): StrandedRecoveryCause {
@@ -662,7 +662,7 @@ export function classifyAdapterFailureForRecovery(
   const resultJson = parseObject(latestRun.resultJson);
   const error = [
     latestRun.errorCode ?? "",
-    latestRun.error ?? "",
+    readRunErrorSummary(latestRun) ?? "",
     JSON.stringify(resultJson),
   ].join("\n");
   if (
@@ -4338,6 +4338,11 @@ export function recoveryService(
           input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
+    // The short summary keeps the notice's "Failure summary" row to one line.
+    // The run page and the Inbox still show the full stored error.
+    const sourceRunErrorSummary = input.latestRun
+      ? readRunErrorSummary(input.latestRun)
+      : null;
     const escalationNotice = buildStrandedRecoveryEscalationNotice({
       seed: input.notice,
       fallbackBody: input.comment,
@@ -4353,8 +4358,8 @@ export function recoveryService(
             agentId: input.latestRun.agentId,
             status: input.latestRun.status,
             errorCode: input.latestRun.errorCode,
-            errorSummary: input.latestRun.error
-              ? redactSensitiveText(input.latestRun.error)
+            errorSummary: sourceRunErrorSummary
+              ? redactSensitiveText(sourceRunErrorSummary)
               : null,
           }
         : null,

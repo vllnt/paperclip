@@ -37,7 +37,7 @@ import {
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
-import { hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, truncateAtGrapheme, type ExecutionBlocker } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
@@ -398,7 +398,7 @@ import {
   emitAgentTaskRunById,
 } from "./agent-task-run-telemetry.js";
 import { reportRunFailure } from "./run-failure-report.js";
-import { collectRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
+import { collectRunFailureSecretValues, redactRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
@@ -417,6 +417,7 @@ import {
   isExternalChatPresentationContext,
   mergeHeartbeatRunResultJson,
   readCompletedAssistantMessageCandidate,
+  readRunErrorSummary,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
   summarizeRunErrorForModel,
@@ -761,6 +762,14 @@ import {
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
+// A registered env value shorter than this is a flag or a number such as `1`,
+// not a credential. Masking it everywhere would rewrite the exit code in the
+// stored run error ("exited with code 1").
+const MIN_RUN_ERROR_SECRET_VALUE_CHARS = 4;
+// The most characters of an error that a run stores. The error text lands in the run row, the
+// wakeup, the agent's error reason and the live events, so an adapter's detail never grows them
+// without bound. The cut ends the text and keeps its first line, which carries the cause.
+const MAX_RUN_ERROR_CHARS = 8 * 1024;
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -1346,7 +1355,7 @@ export function parseSandboxProviderPluginNotReadyFailureMessage(
   };
 }
 
-function isRetryableInteractionContinuationInfrastructureFailure(
+export function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<
     typeof heartbeatRuns.$inferSelect,
     "error" | "errorCode" | "resultJson"
@@ -1363,11 +1372,12 @@ function isRetryableInteractionContinuationInfrastructureFailure(
     return false;
 
   const resultJson = parseObject(run.resultJson);
+  const error = readRunErrorSummary(run);
   return (
-    isSpawnLikeFailureMessage(run.error) ||
+    isSpawnLikeFailureMessage(error) ||
     isSpawnLikeFailureMessage(resultJson.errorMessage) ||
     isSpawnLikeFailureMessage(resultJson.message) ||
-    isSandboxProviderWorkerUnavailableFailureMessage(run.error) ||
+    isSandboxProviderWorkerUnavailableFailureMessage(error) ||
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.errorMessage) ||
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.message)
   );
@@ -3875,6 +3885,7 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
           and length(${heartbeatRuns.resultJson} ->> 'acpPendingToolCount') < 16
           then ${heartbeatRuns.resultJson} -> 'acpPendingToolCount' end,
         'errorFamily', left(${heartbeatRuns.resultJson} ->> 'errorFamily', 32),
+        'errorSummary', left(${heartbeatRuns.resultJson} ->> 'errorSummary', ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}),
         'finalResponseRecorded', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'finalResponseRecorded') = 'boolean'
           then ${heartbeatRuns.resultJson} -> 'finalResponseRecorded' end,
         'executionBeforeRestore', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'executionBeforeRestore') = 'object'
@@ -18663,7 +18674,7 @@ export function heartbeatService(
       status: run.status,
       errorCode: run.errorCode,
       errorFamily: readHeartbeatRunErrorFamily(run),
-      errorMessage: run.error,
+      errorMessage: readRunErrorSummary(run),
       retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       usefulWork,
     });
@@ -28136,16 +28147,46 @@ export function heartbeatService(
           usageBasis: adapterResult.usageBasis ?? null,
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
-        const runErrorMessage =
+        // Only the stored copies are redacted. The outcome, the error code and
+        // the quota reclassification above already read the adapter's raw result.
+        // The run's registered env and secret values go first, because an opaque
+        // value has no shape for the text rule to recognize. Every reader of the
+        // stored error (Inbox, live and plugin events, wakeup error, agent error
+        // reason) then sees the redacted text.
+        const failureSecretValues = readFailureReportSecrets().filter(
+          (value) => value.length >= MIN_RUN_ERROR_SECRET_VALUE_CHARS,
+        );
+        // The cut comes after the redaction: a cut before it could leave half of a secret that
+        // no rule recognizes.
+        const redactRunError = (text: string) =>
+          truncateAtGrapheme(
+            redactSensitiveText(
+              redactCurrentUserText(
+                redactRunFailureSecretValues(text, failureSecretValues),
+                currentUserRedactionOptions,
+              ),
+            ),
+            MAX_RUN_ERROR_CHARS,
+          );
+        // Classifiers read the adapter's short errorMessage. A failed run stores
+        // the adapter's fuller errorDetail when it has one, and keeps the short
+        // message in resultJson.errorSummary for classifiers that read it back.
+        const runErrorSummary =
           outcome === "cancelled"
-            ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
+            ? redactRunError(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
             : outcome === "succeeded"
               ? null
-              : redactCurrentUserText(
+              : redactRunError(
                   adapterResult.errorMessage ??
                     (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                  currentUserRedactionOptions,
                 );
+        const adapterErrorDetail =
+          outcome === "failed" || outcome === "timed_out"
+            ? readNonEmptyString(adapterResult.errorDetail)
+            : null;
+        const runErrorMessage = adapterErrorDetail
+          ? redactRunError(adapterErrorDetail)
+          : runErrorSummary;
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
         const runErrorCode =
@@ -28276,17 +28317,18 @@ export function heartbeatService(
                   ? {
                       backgroundTaskStopped: true,
                       backgroundTaskStopWarning: adapterResult.errorMessage
-                        ? redactCurrentUserText(adapterResult.errorMessage, currentUserRedactionOptions)
+                        ? redactRunError(adapterResult.errorMessage)
                         : null,
                     }
                   : {}),
+                ...(adapterErrorDetail ? { errorSummary: runErrorSummary } : {}),
                 configFreshness: configFreshnessResultMetadata,
               },
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
             }),
             errorCode: runErrorCode,
-            errorMessage: runErrorMessage,
+            errorMessage: runErrorSummary,
           }),
           adapterResult.summary ?? null,
           ), runErrorCode, runErrorMessage),
