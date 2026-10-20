@@ -21,13 +21,15 @@ import {
   accessService,
   agentService,
   documentAnnotationService,
+  issueService,
   logActivity,
   projectService,
   routineService,
 } from "../services/index.js";
 import { agentTrustService } from "../services/agent-trust.js";
+import { routineStepWarnings } from "../services/routine-steps.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { badRequest, forbidden, unauthorized, unsupportedMediaType } from "../errors.js";
+import { badRequest, forbidden, notFound, unauthorized, unsupportedMediaType } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -41,6 +43,7 @@ export function routineRoutes(
   });
   const documentAnnotationsSvc = documentAnnotationService(db);
   const access = accessService(db);
+  const issues = issueService(db);
   const agentTrust = agentTrustService(db, { agents: agentService(db), projects: projectService(db) });
   const routineDocumentKey = "description";
 
@@ -194,6 +197,50 @@ export function routineRoutes(
     return routine;
   }
 
+  /** The steps whose agent cannot take work now; saving or running a routine still succeeds. */
+  function stepWarningsOf(routine: {
+    companyId: string;
+    steps?: RoutineStep[] | null;
+    assigneeAgentId: string | null;
+  }) {
+    return routineStepWarnings(db, routine.companyId, routine.steps ?? [], routine.assigneeAgentId);
+  }
+
+  /**
+   * A run that starts steps on an existing task changes that task (it gains subtasks and blockers, and
+   * an agent-owned one becomes blocked), so the caller needs the right the issue routes ask before they
+   * create a subtask: the access decision for `issue:mutate`. Board users hold it through their
+   * company membership, which the routine check already covered.
+   * @throws HttpError 404 when the task is not in the routine's company, 403 when an agent may not change it.
+   */
+  async function assertCanStartStepsOnTask(req: Request, companyId: string, taskId: string) {
+    const task = await issues.getById(taskId);
+    if (!task || task.companyId !== companyId) throw notFound("Task not found");
+    if (req.actor.type !== "agent") return;
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: task.companyId,
+        issueId: task.id,
+        projectId: task.projectId,
+        parentIssueId: task.parentId,
+        assigneeAgentId: task.assigneeAgentId,
+        assigneeUserId: task.assigneeUserId,
+        status: task.status,
+      },
+      scope: {
+        issueId: task.id,
+        projectId: task.projectId,
+        parentIssueId: task.parentId,
+        assigneeAgentId: task.assigneeAgentId,
+        assigneeUserId: task.assigneeUserId,
+      },
+    });
+    if (!decision.allowed) throw forbidden("This agent may not change the task", { issueId: task.id });
+  }
+
   async function logRoutineRevisionCreated(req: Request, input: {
     companyId: string;
     routineId: string;
@@ -266,7 +313,7 @@ export function routineRoutes(
       changeSummary: "Created routine",
       triggerCount: 0,
     });
-    res.status(201).json(created);
+    res.status(201).json({ ...created, warnings: await stepWarningsOf(created) });
   });
 
   router.get("/routines/:id", async (req, res) => {
@@ -505,7 +552,7 @@ export function routineRoutes(
         triggerCount: null,
       });
     }
-    res.json(updated);
+    res.json(updated ? { ...updated, warnings: await stepWarningsOf(updated) } : updated);
   });
 
   router.post("/routines/:id/revisions/:revisionId/restore", async (req, res) => {
@@ -724,6 +771,8 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    const targetIssueId: string | null = req.body.targetIssueId ?? null;
+    if (targetIssueId) await assertCanStartStepsOnTask(req, routine.companyId, targetIssueId);
     const run = await svc.runRoutine(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
@@ -739,9 +788,19 @@ export function routineRoutes(
       action: "routine.run_triggered",
       entityType: "routine_run",
       entityId: run.id,
-      details: { routineId: routine.id, source: run.source, status: run.status },
+      details: {
+        routineId: routine.id,
+        source: run.source,
+        status: run.status,
+        ...(targetIssueId ? { targetIssueId } : {}),
+      },
     });
-    res.status(202).json(run);
+    const warnings = await stepWarningsOf({
+      companyId: routine.companyId,
+      steps: routine.steps,
+      assigneeAgentId: req.body.assigneeAgentId ?? routine.assigneeAgentId,
+    });
+    res.status(202).json({ ...run, warnings });
   });
 
   // Runs the gate once and reports what a real run would do with the result. It creates no run,

@@ -1,6 +1,14 @@
 import { and, asc, eq, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, executionWorkspaces, issueRelations, issues, labels, routineRuns } from "@paperclipai/db";
+import {
+  agents,
+  executionWorkspaces,
+  heartbeatRuns,
+  issueRelations,
+  issues,
+  labels,
+  routineRuns,
+} from "@paperclipai/db";
 import {
   OPEN_ISSUE_STATUSES,
   ROUTINE_STEPS_RUN_PAYLOAD_KEY,
@@ -9,20 +17,34 @@ import {
   routineStartingSteps,
   routineStepPredecessorKeys,
   type RoutineStep,
+  type RoutineStepWarning,
   type RoutineStepsRunPayload,
 } from "@paperclipai/shared";
-import { HttpError, unprocessable } from "../errors.js";
+import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { evaluateAgentInvokability } from "./agent-invokability.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { issueExecutionWorkspaceModeForPersistedWorkspace } from "./execution-workspace-policy.js";
 import { isClosedExecutionWorkspaceStatus } from "./execution-workspaces.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
-import type { DbTransaction, issueService } from "./issues.js";
+import { MAX_CHILD_ISSUES_CREATED_BY_HELPER, type DbTransaction, type issueService } from "./issues.js";
 
 /** Actor id on the activity rows a run writes for its step issues; the activity gate ignores it. */
 export const ROUTINE_STEP_ACTOR_ID = "routine-steps";
+
+/** Heartbeat run statuses in which a run still owns, or is about to own, the task it works on. */
+export const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
+
+/**
+ * Statuses of a task that steps can be attached to. A task in any other status is being worked on or
+ * is finished; blocking it would clear a live checkout or reopen finished work.
+ */
+const ATTACHABLE_TASK_STATUSES: readonly string[] = ["backlog", "todo", "blocked"];
+
+/** Origins whose tasks belong to a routine run or a conversation and never take steps from outside. */
+const UNATTACHABLE_TASK_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step", "chat_channel"];
 
 type IssueService = ReturnType<typeof issueService>;
 type StepIssue = Awaited<ReturnType<IssueService["createChild"]>>["issue"];
@@ -112,6 +134,42 @@ export async function assertRoutineStepReferences(
 }
 
 /**
+ * Names the steps whose agent cannot take work right now (paused, waiting for approval, terminated,
+ * missing, or under a manager whose chain is broken). It refuses nothing: the board is told on save and
+ * on run, and the step starts once the agent is back. The rule is the one the assignment wake applies;
+ * all agents of the company are read once.
+ * @param defaultAssigneeAgentId The agent a step without `assigneeAgentId` runs as.
+ * @returns one warning per affected step, in written order; empty when every agent can start.
+ */
+export async function routineStepWarnings(
+  db: Db,
+  companyId: string,
+  steps: RoutineStep[],
+  defaultAssigneeAgentId: string | null,
+): Promise<RoutineStepWarning[]> {
+  if (!steps.some((step) => step.assigneeAgentId ?? defaultAssigneeAgentId)) return [];
+  const companyAgents = await db
+    .select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+      reportsTo: agents.reportsTo,
+      status: agents.status,
+    })
+    .from(agents)
+    .where(eq(agents.companyId, companyId));
+  const agentsById = new Map(companyAgents.map((agent) => [agent.id, agent]));
+  return steps.flatMap((step): RoutineStepWarning[] => {
+    const agentId = step.assigneeAgentId ?? defaultAssigneeAgentId;
+    if (!agentId) return [];
+    const invokability = evaluateAgentInvokability(agentsById.get(agentId), companyAgents);
+    return invokability.invokable
+      ? []
+      : [{ code: "step_agent_unavailable", stepKey: step.key, agentId, reason: invokability.reason }];
+  });
+}
+
+/**
  * Whether a routine run's root still has a step that has not finished. A blocked step counts: it is
  * waiting for its predecessors, not done. Callers hold the root back while this is true.
  * @param executor The connection to read on; pass the open transaction to see its own writes.
@@ -160,8 +218,11 @@ export interface CreateRoutineRunIssuesInput<TRoot extends RoutineRunRoot> {
   steps: RoutineStep[];
   /** Agent for steps without `assigneeAgentId`. */
   defaultAssigneeAgentId: string | null;
-  /** Values for `{{variable}}` placeholders in step text. */
-  variables: Record<string, unknown>;
+  /**
+   * Values for `{{variable}}` placeholders in step text. A function receives the root once it exists,
+   * for values that come from it.
+   */
+  variables: Record<string, unknown> | ((root: TRoot) => Record<string, unknown>);
 }
 
 export interface AttachedRoutineSteps {
@@ -193,10 +254,11 @@ function interpolateText(text: string, variables: Record<string, unknown>): stri
 export async function createRoutineRunIssues<TRoot extends RoutineRunRoot>(
   input: CreateRoutineRunIssuesInput<TRoot>,
 ): Promise<{ root: TRoot; attached: AttachedRoutineSteps }> {
-  const { tx, issueSvc, createRoot, run, routine, steps, defaultAssigneeAgentId, variables } = input;
+  const { tx, issueSvc, createRoot, run, routine, steps, defaultAssigneeAgentId } = input;
   return tx.transaction(async (savepoint) => {
     const savepointDb = savepoint as unknown as Db;
     const root = await createRoot(savepoint);
+    const variables = typeof input.variables === "function" ? input.variables(root) : input.variables;
     const stepIssueIds: Record<string, string> = {};
     const startingIssues: StepIssue[] = [];
     const activityPublications: ActivityPublication[] = [];
@@ -278,6 +340,153 @@ export async function createRoutineRunIssues<TRoot extends RoutineRunRoot>(
 
     return { root, attached: { stepIssueIds, startingIssues, activityPublications } };
   });
+}
+
+/** A task as the attach function reads it under lock. */
+export type RoutineStepTargetIssue = typeof issues.$inferSelect;
+
+export interface AttachRoutineStepsToIssueInput {
+  /** The dispatch transaction; the lock, the guards and the steps are one savepoint of it. */
+  tx: Db;
+  issueSvc: Pick<IssueService, "createChild">;
+  companyId: string;
+  /** The existing task the steps go under. */
+  issueId: string;
+  /** The routine run that owns the steps. */
+  run: { id: string };
+  routine: { id: string; priority: string };
+  steps: RoutineStep[];
+  /** Agent for steps without `assigneeAgentId`. */
+  defaultAssigneeAgentId: string | null;
+  /** Values for `{{variable}}` placeholders; `issue.title` and `issue.identifier` come from the task. */
+  variables: Record<string, unknown>;
+  /**
+   * Runs once the guards pass and before anything is created; throw to refuse the task. It reads on
+   * `executor`, the savepoint the attach runs in.
+   */
+  assertCanStart?: (issue: RoutineStepTargetIssue, executor: Db) => Promise<void>;
+}
+
+/** Whether a heartbeat run that has not finished is working on the task. */
+async function hasLiveHeartbeatRun(executor: Db, companyId: string, issueId: string): Promise<boolean> {
+  const rows = await executor
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, companyId),
+        inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
+}
+
+/**
+ * Attaches the steps of a routine to a task that already exists, instead of to a new root: the task
+ * waits for every step, as the root of a routine run does.
+ *
+ * The task row is locked first, so two attaches on one task (an event and a manual run, say) take
+ * turns and the second sees the first one's steps. Under that lock a task is refused when it is
+ * hidden or in another company (404), belongs to a routine run or a conversation (422), is not in
+ * backlog, todo or blocked (409), has a run in progress (409), already has routine steps in
+ * progress (409), or would end up with more subtasks than a helper may create (422). A task an agent
+ * owns is then set to `blocked`, so that agent does not start on it while the steps run; a task no
+ * agent owns keeps its status and only gains the blocker edges. Everything is one savepoint of `tx`:
+ * if a step fails, the steps are gone, the status is back and the task itself is untouched. It never
+ * wakes anyone; the caller wakes `attached.startingIssues` once its own transaction commits.
+ * @throws HttpError for a refused task, or the one {@link createRoutineRunIssues} names.
+ */
+export async function attachRoutineStepsToIssue(
+  input: AttachRoutineStepsToIssueInput,
+): Promise<{ root: RoutineStepTargetIssue; attached: AttachedRoutineSteps }> {
+  const { tx, companyId, issueId, run, routine, steps, assertCanStart } = input;
+  const rootPublications: ActivityPublication[] = [];
+  const created = await createRoutineRunIssues({
+    tx,
+    issueSvc: input.issueSvc,
+    run,
+    routine,
+    steps,
+    defaultAssigneeAgentId: input.defaultAssigneeAgentId,
+    variables: (root: RoutineStepTargetIssue) => ({
+      ...input.variables,
+      "issue.title": root.title,
+      "issue.identifier": root.identifier ?? "",
+    }),
+    createRoot: async (savepoint) => {
+      const savepointDb = savepoint as unknown as Db;
+      const locked = await savepoint
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!locked || locked.hiddenAt) throw notFound("Task not found");
+      if (
+        (locked.originKind && UNATTACHABLE_TASK_ORIGIN_KINDS.includes(locked.originKind)) ||
+        locked.conversationAgentId
+      ) {
+        throw unprocessable("Routine steps cannot be attached to a routine run or a conversation");
+      }
+      if (!ATTACHABLE_TASK_STATUSES.includes(locked.status)) {
+        throw conflict(
+          `Routine steps can only be attached to a task in ${ATTACHABLE_TASK_STATUSES.join(", ")}; this task is ${locked.status}`,
+          { status: locked.status },
+        );
+      }
+      if (
+        locked.checkoutRunId ||
+        locked.executionRunId ||
+        (await hasLiveHeartbeatRun(savepointDb, companyId, locked.id))
+      ) {
+        throw conflict("The task has a run in progress; attach the steps once it has finished");
+      }
+      if (await hasOpenRoutineSteps(savepointDb, companyId, locked.id)) {
+        throw conflict("The task already has routine steps in progress");
+      }
+      const [{ childCount }] = await savepoint
+        .select({ childCount: sql<number>`count(*)::int` })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.parentId, locked.id)));
+      if (childCount + steps.length > MAX_CHILD_ISSUES_CREATED_BY_HELPER) {
+        throw unprocessable(
+          `The task has ${childCount} subtasks; adding ${steps.length} steps would pass the limit of ${MAX_CHILD_ISSUES_CREATED_BY_HELPER}`,
+          { childCount, stepCount: steps.length, limit: MAX_CHILD_ISSUES_CREATED_BY_HELPER },
+        );
+      }
+      await assertCanStart?.(locked, savepointDb);
+
+      if (!locked.assigneeAgentId || locked.status === "blocked") return locked;
+      const [blocked] = await savepoint
+        .update(issues)
+        .set({ status: "blocked", updatedAt: new Date() })
+        .where(eq(issues.id, locked.id))
+        .returning();
+      await logActivity(
+        savepointDb,
+        {
+          companyId,
+          actorType: "system",
+          actorId: ROUTINE_STEP_ACTOR_ID,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: locked.id,
+          details: {
+            status: "blocked",
+            _previous: { status: locked.status },
+            routineId: routine.id,
+            routineRunId: run.id,
+          },
+        },
+        rootPublications,
+      );
+      return blocked ?? locked;
+    },
+  });
+  created.attached.activityPublications.unshift(...rootPublications);
+  return created;
 }
 
 /**

@@ -68,6 +68,7 @@ import type {
   UpdateRoutineTrigger,
 } from "@paperclipai/shared";
 import {
+  PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
   ROUTINE_GATE_SKIP_REASON,
   ROUTINE_GATE_TRIGGER_INACTIVE_REASON,
   ROUTINE_GATE_UNAVAILABLE_REASON,
@@ -113,8 +114,10 @@ import {
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
 import {
+  LIVE_HEARTBEAT_RUN_STATUSES,
   ROUTINE_STEP_ACTOR_ID,
   assertRoutineStepReferences,
+  attachRoutineStepsToIssue,
   createRoutineRunIssues,
   hasOpenRoutineSteps,
   routineStartingStepAgentIds,
@@ -166,7 +169,15 @@ function rootHasCancelledStep() {
   );
 }
 const APPEND_MODE_STEPS_MESSAGE = "Steps are not supported with append issue mode";
-const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
+const EVENT_ISSUE_SOURCE_MESSAGE =
+  'issueMode "event_issue" is only valid on the built-in Paperclip event source';
+const EVENT_ISSUE_STEPS_MESSAGE =
+  'issueMode "event_issue" attaches the routine\'s steps to the created task, so the routine needs at least one step';
+const EVENT_ISSUE_GATE_MESSAGE =
+  'A gate script that applies to event triggers cannot be combined with issueMode "event_issue": the steps start while the task is created';
+const INTERNAL_SOURCE_ISSUE_MODE_MESSAGE =
+  'Triggers on the built-in Paperclip event source must use issueMode "event_issue"';
+const INTERNAL_SOURCE_FALLBACK_MESSAGE = "Triggers on the built-in Paperclip event source cannot be fallbacks";
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
@@ -425,6 +436,7 @@ function nextResultText(status: string, issueId?: string | null) {
   if (status === "skipped_gate") return "Skipped by the gate script";
   if (status === "skipped_gate_unchanged") return "Skipped because the gate output did not change";
   if (status === "skipped_gate_unavailable") return "Skipped because the gate script could not run";
+  if (status === "skipped_new_issue_budget") return "Skipped because the event source's new-issue budget is spent";
   if (status === "gating") return "Waiting for the gate script";
   if (status === "completed") return "Execution issue completed";
   if (status === "failed") return "Execution failed";
@@ -2072,12 +2084,16 @@ export function routineService(
    */
   async function assertEventTriggerAllowed(
     routine: typeof routines.$inferSelect,
-    config: { eventSourceId: string; eventGrouping?: EventGrouping | null },
+    config: { eventSourceId: string; eventGrouping?: EventGrouping | null; fallback?: boolean },
     variables: RoutineVariable[] = routine.variables ?? [],
-    options: { allowArchivedSource?: boolean; steps?: RoutineStep[] } = {},
+    options: { allowArchivedSource?: boolean; steps?: RoutineStep[]; gate?: RoutineGate | null } = {},
   ) {
     const source = await db
-      .select({ companyId: eventSources.companyId, archived: eventSources.archived })
+      .select({
+        companyId: eventSources.companyId,
+        archived: eventSources.archived,
+        normalizer: eventSources.normalizer,
+      })
       .from(eventSources)
       .where(eq(eventSources.id, config.eventSourceId))
       .then((rows) => rows[0] ?? null);
@@ -2088,6 +2104,16 @@ export function routineService(
     }
     assertEventCompatibleVariables(variables);
     const issueMode = config.eventGrouping?.issueMode;
+    const internalSource = source.normalizer === PAPERCLIP_INTERNAL_EVENT_NORMALIZER;
+    if (issueMode === "event_issue") {
+      if (!internalSource) throw unprocessable(EVENT_ISSUE_SOURCE_MESSAGE);
+      if ((options.steps ?? routine.steps ?? []).length === 0) throw unprocessable(EVENT_ISSUE_STEPS_MESSAGE);
+      const gate = options.gate === undefined ? routine.gate : options.gate;
+      if (routineGateAppliesToSource(gate, "event")) throw unprocessable(EVENT_ISSUE_GATE_MESSAGE);
+    } else if (internalSource) {
+      throw unprocessable(INTERNAL_SOURCE_ISSUE_MODE_MESSAGE);
+    }
+    if (internalSource && config.fallback) throw unprocessable(INTERNAL_SOURCE_FALLBACK_MESSAGE);
     if (issueMode && typeof issueMode === "object") {
       if ((options.steps ?? routine.steps ?? []).length > 0) throw unprocessable(APPEND_MODE_STEPS_MESSAGE);
       if (!routine.assigneeAgentId) throw unprocessable("appendToIssueId requires the routine to have a default agent");
@@ -2155,6 +2181,8 @@ export function routineService(
     resolveResponsibleUserId: async (executor, routine) =>
       (await resolveLatestRevisionResponsibleUserId(executor, routine)) ?? routine.responsibleUserId ?? null,
     gateApplies: (routine) => routineGateAppliesToSource(routine.gate, "event"),
+    assertStepsCanStart: (routine, task, executor) =>
+      assertStartingStepAgentsAdmitted(executor, routine, routine.assigneeAgentId, task.projectId),
     onGating: (runId) => kickGate(runId),
   });
 
@@ -2894,6 +2922,136 @@ export function routineService(
   }
 
   /**
+   * Refuses, before an existing task is touched, when the agent of a step that would start now could
+   * not be woken (see {@link assertWakeAdmitsAssignee}). Reads on `executor`, the attach savepoint.
+   * @param defaultAgentId The agent a step without `assigneeAgentId` runs as.
+   */
+  async function assertStartingStepAgentsAdmitted(
+    executor: Db,
+    routine: { companyId: string; steps: RoutineStep[] | null },
+    defaultAgentId: string | null,
+    projectId: string | null,
+  ) {
+    for (const agentId of routineStartingStepAgentIds(routine.steps ?? [], defaultAgentId)) {
+      await assertWakeAdmitsAssignee(executor, routine.companyId, agentId, projectId);
+    }
+  }
+
+  /**
+   * A manual or API run that puts the routine's steps under a task that already exists instead of
+   * opening a new run task. It shares {@link attachRoutineStepsToIssue}, and so its guards, with the
+   * event path. A task that is refused (404, 409 or 422) fails the call and leaves no run behind: the
+   * transaction rolls back with the run row and the steps. The concurrency policy, the unchanged-run
+   * skip and gates do not apply: the caller named the task, and the task row lock lets two starts on
+   * it take turns, so the second finds the first one's steps and is refused.
+   * @param input.idempotencyKey A caller's key: a repeat returns the run it made instead of attaching again.
+   */
+  async function runRoutineOnIssue(input: {
+    routine: typeof routines.$inferSelect;
+    targetIssueId: string;
+    source: "manual" | "api";
+    payload?: Record<string, unknown> | null;
+    variables?: Record<string, unknown> | null;
+    assigneeAgentId?: string | null;
+    idempotencyKey?: string | null;
+    actor?: Actor;
+  }) {
+    const { routine } = input;
+    const steps = routine.steps ?? [];
+    if (steps.length === 0) throw unprocessable("The routine has no steps to start on a task");
+    if (await getManagedRoutineBinding(routine)) {
+      throw unprocessable("Steps cannot be started on a task by a plugin-managed routine");
+    }
+    const defaultAssigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
+    const resolvedVariables = resolveRoutineVariableValues(routine.variables ?? [], input);
+    const allVariables = { ...getBuiltinRoutineVariableValues(), ...resolvedVariables };
+    const triggerPayload = {
+      ...(mergeRoutineRunPayload(input.payload, resolvedVariables) ?? {}),
+      targetIssueId: input.targetIssueId,
+    };
+    /** Filled inside the transaction and acted on only after it commits. */
+    const stepsToStart: AttachedRoutineSteps[] = [];
+    let reusedExistingRun = false;
+    const run = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await tx.execute(
+        sql`select id from ${routines} where ${routines.id} = ${routine.id} and ${routines.companyId} = ${routine.companyId} for update`,
+      );
+      if (input.idempotencyKey) {
+        const existing = await txDb
+          .select()
+          .from(routineRuns)
+          .where(
+            and(
+              eq(routineRuns.companyId, routine.companyId),
+              eq(routineRuns.routineId, routine.id),
+              eq(routineRuns.source, input.source),
+              eq(routineRuns.idempotencyKey, input.idempotencyKey),
+              isNull(routineRuns.triggerId),
+            ),
+          )
+          .orderBy(desc(routineRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) {
+          reusedExistingRun = true;
+          return existing;
+        }
+      }
+
+      const triggeredAt = new Date();
+      const responsibleUserId =
+        input.actor?.userId ??
+        (await resolveLatestRevisionResponsibleUserId(txDb, routine)) ??
+        routine.responsibleUserId ??
+        null;
+      const createdRun = await txDb
+        .insert(routineRuns)
+        .values({
+          companyId: routine.companyId,
+          routineId: routine.id,
+          triggerId: null,
+          source: input.source,
+          status: "received",
+          triggeredAt,
+          idempotencyKey: input.idempotencyKey ?? null,
+          triggerPayload,
+          routineRevisionId: routine.latestRevisionId,
+          responsibleUserId,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      if (!createdRun) throw new Error("The routine run was not recorded");
+      const { root, attached } = await attachRoutineStepsToIssue({
+        tx: txDb,
+        issueSvc,
+        companyId: routine.companyId,
+        issueId: input.targetIssueId,
+        run: createdRun,
+        routine,
+        steps,
+        defaultAssigneeAgentId,
+        variables: allVariables,
+        assertCanStart: (task, executor) =>
+          assertStartingStepAgentsAdmitted(executor, routine, defaultAssigneeAgentId, task.projectId),
+      });
+      stepsToStart.push(attached);
+      const updated = await finalizeRun(createdRun.id, { status: "issue_created", linkedIssueId: root.id }, txDb);
+      await updateRoutineTouchedState(
+        { routineId: routine.id, triggerId: null, triggeredAt, status: "issue_created", issueId: root.id },
+        txDb,
+      );
+      return updated ?? createdRun;
+    });
+
+    for (const attached of stepsToStart) {
+      await startAttachedRoutineSteps(attached, { heartbeat, contextSource: "routine.dispatch" });
+    }
+    await recordDispatchOutcome(routine, run, reusedExistingRun, false);
+    return withoutGateInternals(run);
+  }
+
+  /**
    * The audit row and the telemetry event for a dispatch. A run parked as `gating` records
    * neither: it is logged once, when the gate worker commits it, so every run has one audit row.
    */
@@ -3367,7 +3525,8 @@ export function routineService(
         patch.variables !== undefined ||
         patch.title !== undefined ||
         patch.description !== undefined ||
-        patch.steps !== undefined
+        patch.steps !== undefined ||
+        patch.gate !== undefined
       ) {
         const enabledEventTriggers = await db
           .select({ eventGrouping: routineTriggers.eventGrouping })
@@ -3387,6 +3546,13 @@ export function routineService(
           enabledEventTriggers.some((trigger) => typeof trigger.eventGrouping?.issueMode === "object")
         ) {
           throw unprocessable(APPEND_MODE_STEPS_MESSAGE);
+        }
+        if (
+          (patch.steps !== undefined || patch.gate !== undefined) &&
+          enabledEventTriggers.some((trigger) => trigger.eventGrouping?.issueMode === "event_issue")
+        ) {
+          if (nextSteps.length === 0) throw unprocessable(EVENT_ISSUE_STEPS_MESSAGE);
+          if (routineGateAppliesToSource(nextGate, "event")) throw unprocessable(EVENT_ISSUE_GATE_MESSAGE);
         }
       }
       const responsibleUserId = await resolveRoutineResponsibleUserId(
@@ -3604,7 +3770,11 @@ export function routineService(
       }
 
       if (input.kind === "event") {
-        await assertEventTriggerAllowed(routine, { eventSourceId: input.eventSourceId, eventGrouping: input.eventGrouping });
+        await assertEventTriggerAllowed(routine, {
+          eventSourceId: input.eventSourceId,
+          eventGrouping: input.eventGrouping,
+          fallback: input.fallback,
+        });
       }
 
       const { trigger, revision } = await db.transaction(async (tx) => {
@@ -3674,10 +3844,18 @@ export function routineService(
         const nextEventSourceId = patch.eventSourceId ?? existing.eventSourceId;
         const nextEventGrouping = patch.eventGrouping === undefined ? existing.eventGrouping : patch.eventGrouping;
         const enabling = patch.enabled === true && !existing.enabled;
-        if (nextEventSourceId && (enabling || patch.eventSourceId !== undefined || patch.eventGrouping !== undefined)) {
+        const nextFallback = patch.fallback ?? existing.fallback;
+        if (
+          nextEventSourceId
+          && (enabling || patch.eventSourceId !== undefined || patch.eventGrouping !== undefined || patch.fallback === true)
+        ) {
           const routine = await getRoutineById(existing.routineId);
           if (!routine) throw notFound("Routine not found");
-          await assertEventTriggerAllowed(routine, { eventSourceId: nextEventSourceId, eventGrouping: nextEventGrouping });
+          await assertEventTriggerAllowed(routine, {
+            eventSourceId: nextEventSourceId,
+            eventGrouping: nextEventGrouping,
+            fallback: nextFallback,
+          });
         }
       }
 
@@ -3896,9 +4074,13 @@ export function routineService(
         if (!triggerSnapshot.eventSourceId) throw unprocessable("Event trigger snapshot has no event source");
         await assertEventTriggerAllowed(
           existingRoutine,
-          { eventSourceId: triggerSnapshot.eventSourceId, eventGrouping: triggerSnapshot.eventGrouping },
+          {
+            eventSourceId: triggerSnapshot.eventSourceId,
+            eventGrouping: triggerSnapshot.eventGrouping,
+            fallback: triggerSnapshot.fallback,
+          },
           routineSnapshot.variables,
-          { allowArchivedSource: true, steps: routineSnapshot.steps ?? [] },
+          { allowArchivedSource: true, steps: routineSnapshot.steps ?? [], gate: routineSnapshot.gate ?? null },
         );
       }
 
@@ -4062,6 +4244,19 @@ export function routineService(
       const trigger = input.triggerId ? await getTriggerById(input.triggerId) : null;
       if (trigger && trigger.routineId !== routine.id) throw forbidden("Trigger does not belong to routine");
       if (trigger && !trigger.enabled) throw conflict("Routine trigger is not active");
+      if (input.targetIssueId) {
+        if (input.triggerId) throw unprocessable("A run on a task cannot name a trigger");
+        return runRoutineOnIssue({
+          routine,
+          targetIssueId: input.targetIssueId,
+          source: input.source,
+          payload: input.payload as Record<string, unknown> | null | undefined,
+          variables: input.variables as Record<string, unknown> | null | undefined,
+          assigneeAgentId: input.assigneeAgentId ?? null,
+          idempotencyKey: input.idempotencyKey,
+          actor,
+        });
+      }
       return dispatchRoutineRun({
         routine,
         trigger,

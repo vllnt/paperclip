@@ -276,6 +276,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { retainBacklogHumanAssignment } from "../services/human-directed-work.js";
+import type { EventSourceService } from "../services/event-sources/service.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
@@ -3578,6 +3579,8 @@ export function issueRoutes(
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
+    /** Publishes `issue.created` for a new task, so a routine can attach its steps before the assignee wakes. */
+    eventSources?: Pick<EventSourceService, "publishInternal">;
     taskWatchdogEnqueueWakeup?: TaskWatchdogServiceDeps["enqueueWakeup"] | null;
     recoveryActionEnqueueWakeup?: (
       agentId: string,
@@ -3634,6 +3637,40 @@ export function issueRoutes(
       sourceRun?.companyId === comment.companyId &&
       sourceRun.agentId === assigneeAgentId
     );
+  };
+  /**
+   * Publishes the `issue.created` event of a task the caller just created and waits for the routines
+   * that listen to it, so the caller knows whether a routine attached its steps. Then the assignee must
+   * stay asleep: the steps' own agents are woken instead, and the task is `blocked` until they finish.
+   * It never throws, and costs one query when no event trigger listens.
+   * @returns the task as the response should show it (its status and blockers changed when steps were attached).
+   */
+  const publishCreatedTask = async <
+    T extends {
+      id: string;
+      companyId: string;
+      status: string;
+      updatedAt: Date;
+      blockedBy: unknown;
+      blocks: unknown;
+    },
+  >(
+    issue: T,
+  ): Promise<{ issue: T; stepsAttached: boolean }> => {
+    if (!opts.eventSources) return { issue, stepsAttached: false };
+    const { stepsAttached } = await opts.eventSources.publishInternal(issue.companyId, { issueId: issue.id });
+    if (!stepsAttached) return { issue, stepsAttached };
+    try {
+      const [fresh, relations] = await Promise.all([svc.getById(issue.id), svc.getRelationSummaries(issue.id)]);
+      if (!fresh) return { issue, stepsAttached };
+      return {
+        issue: { ...issue, status: fresh.status, updatedAt: fresh.updatedAt, blockedBy: relations.blockedBy, blocks: relations.blocks },
+        stepsAttached,
+      };
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "failed to re-read a task after routine steps were attached");
+      return { issue, stepsAttached };
+    }
   };
   const enqueueStalledReviewDecisionWakeup =
     opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
@@ -12345,18 +12382,23 @@ export function issueRoutes(
       // Do not auto-wake the onboarding first task. Nothing should run and no
       // token should be spent until the user types: the greeting is posted above
       // (deterministic, no LLM) and the user's first comment wakes the assignee
-      // through the normal comment path. Every other create path keeps its wake.
+      // through the normal comment path. Every other create path keeps its wake, unless a routine
+      // attached its steps to the task: then the steps' agents are woken and the task waits for them.
       if (!isOnboardingFirstTask) {
-        void queueIssueAssignmentWakeup({
-          heartbeat,
-          assignmentEvent: true,
-          issue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "issue.create",
-          requestedByActorType: actor.actorType,
-          requestedByActorId: actor.actorId,
-        });
+        const published = await publishCreatedTask(issue);
+        issue = published.issue;
+        if (!published.stepsAttached) {
+          void queueIssueAssignmentWakeup({
+            heartbeat,
+            assignmentEvent: true,
+            issue,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "issue.create",
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+          });
+        }
       }
       await queueTaskWatchdogEvaluation(issue, actor.runId);
 
@@ -12609,26 +12651,31 @@ export function issueRoutes(
         actorInfo: actor,
         assigneeAgentId: issue.assigneeAgentId,
       });
+      let createdChild = issue;
       if (!serializationContext || !currentSerializedChild) {
-        void queueIssueAssignmentWakeup({
-          heartbeat,
-          assignmentEvent: true,
-          issue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "issue.child_create",
-          requestedByActorType: actor.actorType,
-          requestedByActorId: actor.actorId,
-        });
+        const published = await publishCreatedTask(createdChild);
+        createdChild = published.issue;
+        if (!published.stepsAttached) {
+          void queueIssueAssignmentWakeup({
+            heartbeat,
+            assignmentEvent: true,
+            issue: createdChild,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "issue.child_create",
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+          });
+        }
       }
       await blockWatchdogParentOnCurrentChild({
         actor,
         watchdogParentIssueId: serializationContext?.watchdogParentIssueId,
-        currentChildIssueId: currentSerializedChild?.id ?? issue.id,
+        currentChildIssueId: currentSerializedChild?.id ?? createdChild.id,
       });
-      await queueTaskWatchdogEvaluation(issue, actor.runId);
+      await queueTaskWatchdogEvaluation(createdChild, actor.runId);
 
-      res.status(201).json(issue);
+      res.status(201).json(createdChild);
     },
   );
 

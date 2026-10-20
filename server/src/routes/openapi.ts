@@ -114,6 +114,10 @@ import {
   rotateEventSourceSecretSchema,
   listEventDeliveriesQuerySchema,
   genericV1EventSchema,
+  EVENT_SOURCE_NORMALIZERS,
+  EVENT_SOURCE_SIGNING_MODES,
+  PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
+  ROUTINE_STEP_WARNING_CODES,
   // Folders
   createFolderSchema,
   ensureMySkillFolderSchema,
@@ -1422,6 +1426,7 @@ const AGENT_ONLY_OPERATIONS = new Set(
 
 const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/event-sources",
+  "POST /api/companies/{companyId}/event-sources/paperclip",
   "PATCH /api/event-sources/{id}",
   "DELETE /api/event-sources/{id}",
   "POST /api/event-sources/{id}/rotate-secret",
@@ -1735,6 +1740,7 @@ const CREATED_OPERATIONS = new Set([
 ]);
 
 const ACCEPTED_OPERATIONS = new Set([
+  "POST /api/routines/{id}/run",
   "POST /api/companies/{companyId}/email/send",
   "POST /api/companies/import",
   "POST /api/health/dev-server/restart",
@@ -5024,6 +5030,31 @@ registry.registerPath({
 
 // ─── Routines ────────────────────────────────────────────────────────────────
 
+const routineStepWarningRef = registry.register(
+  "RoutineStepWarning",
+  z.object({
+    code: z.enum(ROUTINE_STEP_WARNING_CODES),
+    stepKey: z.string(),
+    agentId: z.string().guid(),
+    reason: z.string(),
+  }),
+);
+
+/** A success response that is the stored record plus the non-blocking `warnings` of the save or run. */
+const okWithStepWarnings = () => ({
+  description: "Success",
+  content: {
+    "application/json": {
+      schema: {
+        type: "object",
+        required: ["warnings"],
+        properties: { warnings: { type: "array", items: routineStepWarningRef } },
+        additionalProperties: true,
+      },
+    },
+  },
+});
+
 registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/routines",
@@ -5038,12 +5069,15 @@ registry.registerPath({
   path: "/api/companies/{companyId}/routines",
   tags: ["routines"],
   summary: "Create a routine",
+  description:
+    "The response carries `warnings`: one entry per step whose agent cannot take work now (for example paused). " +
+    "A warning never blocks the save.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(createRoutineSchema),
   },
   responses: {
-    200: r.ok(),
+    200: okWithStepWarnings(),
     400: r.badRequest,
     401: r.unauthorized,
     404: r.notFound,
@@ -5066,12 +5100,15 @@ registry.registerPath({
   path: "/api/routines/{id}",
   tags: ["routines"],
   summary: "Update a routine",
+  description:
+    "The response carries `warnings`: one entry per step whose agent cannot take work now (for example paused). " +
+    "A warning never blocks the save.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateRoutineSchema),
   },
   responses: {
-    200: r.ok(),
+    200: okWithStepWarnings(),
     400: r.badRequest,
     401: r.unauthorized,
     404: r.notFound,
@@ -5094,14 +5131,21 @@ registry.registerPath({
   path: "/api/routines/{id}/run",
   tags: ["routines"],
   summary: "Manually run a routine",
+  description:
+    "Answers 202 with the run. With `targetIssueId` the routine's steps start on that existing task instead of a new " +
+    "root task: 404 when the task is missing or belongs to another company, 403 when an agent may not change the task, " +
+    "409 when the task is not in backlog, todo or blocked, has a live run or still has open routine steps, or a starting " +
+    "step's agent cannot be woken, and 422 when the routine has no steps or the request also names a trigger. " +
+    "The response carries `warnings` for steps whose agent cannot start work now.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(runRoutineSchema),
   },
   responses: {
-    200: r.ok(),
+    200: okWithStepWarnings(),
     400: r.badRequest,
     401: r.unauthorized,
+    403: r.forbidden,
     404: r.notFound,
     409: r.conflict,
     422: r.unprocessable,
@@ -5234,6 +5278,27 @@ registry.registerPath({
   },
 });
 
+/** `ingressUrl` is null for the built-in Paperclip source, which has no ingress and no secret. */
+const eventSourceRef = registry.register(
+  "EventSource",
+  z.object({
+    id: z.string().guid(),
+    companyId: z.string().guid(),
+    name: z.string(),
+    enabled: z.boolean(),
+    archived: z.boolean(),
+    publicId: z.string(),
+    ingressUrl: z.string().nullable(),
+    signingMode: z.enum(EVENT_SOURCE_SIGNING_MODES),
+    normalizer: z.enum([...EVENT_SOURCE_NORMALIZERS, PAPERCLIP_INTERNAL_EVENT_NORMALIZER]),
+  }),
+);
+
+const okEventSource = () => ({
+  description: "Success",
+  content: { "application/json": { schema: eventSourceRef } },
+});
+
 registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/event-sources",
@@ -5243,7 +5308,28 @@ registry.registerPath({
     params: z.object({ companyId: z.string() }),
     query: z.object({ includeArchived: z.enum(["true", "false", "1", "0"]).optional() }),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: {
+    200: { description: "Success", content: { "application/json": { schema: { type: "array", items: eventSourceRef } } } },
+    401: r.unauthorized,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/event-sources/paperclip",
+  tags: ["event-sources"],
+  summary: "Get the built-in Paperclip event source of a company, creating it on first use",
+  description:
+    "The source has the `paperclip_v1` normalizer, no secret and no ingress URL (`ingressUrl` is null): Paperclip " +
+    "publishes task events into it. Subscribe a routine event trigger to it with `grouping.issueMode: \"event_issue\"` " +
+    "to start the routine's steps on each new task. `event_issue` is valid only on this source and only for a routine " +
+    "with steps. Calling the endpoint again returns the same source.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: {
+    200: okEventSource(),
+    401: r.unauthorized,
+    404: r.notFound,
+  },
 });
 
 registry.registerPath({
@@ -5265,7 +5351,7 @@ registry.registerPath({
   tags: ["event-sources"],
   summary: "Get an event source",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  responses: { 200: okEventSource(), 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({
@@ -5277,7 +5363,7 @@ registry.registerPath({
     params: z.object({ id: z.string() }),
     body: jsonBody(updateEventSourceSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
+  responses: { 200: okEventSource(), 400: r.badRequest, 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({
