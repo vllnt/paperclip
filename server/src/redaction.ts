@@ -360,14 +360,15 @@ const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   "gi",
 );
 // An HTTP-header-style secret with an unquoted value, as a CLI prints it to
-// stderr: `x-api-key: <value>`, `Cookie: <value>`, `Authorization: token <value>`.
-// The name must start a word and end in a secret word; it is narrower than the
-// field-name pattern, so plain-text labels such as `Login URL:` stay visible.
-// An optional auth scheme word is redacted with the value, so `token <value>`
-// never keeps the value visible.
-const HEADER_SECRET_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|token|secrets?|password|passwd|credentials?|cookie|authorization|private[-_]?key|jwt)`;
+// stderr: `x-api-key: <value>`, `x-auth-key=<value>`, `Cookie: <value>`,
+// `Authorization: token <value>`. The name must start a word and either be an
+// `x-…-key` header or end in a secret word; it is narrower than the field-name
+// pattern, so plain-text labels such as `Login URL:` stay visible. An optional
+// auth scheme word is redacted with the value, so `token <value>` never keeps
+// the value visible.
+const HEADER_SECRET_NAME_PATTERN = String.raw`(?:x-[A-Za-z0-9-]+-key|[A-Za-z0-9_-]*(?:api[-_]?key|token|secrets?|password|passwd|credentials?|cookie|authorization|private[-_]?key|jwt))`;
 const HEADER_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:^|[\s{,;(])${HEADER_SECRET_NAME_PATTERN}[ \t]*:[ \t]*)` +
+  String.raw`((?:^|[\s{,;(])${HEADER_SECRET_NAME_PATTERN}[ \t]*[:=][ \t]*)` +
     String.raw`(?!["'\\]|\*\*\*REDACTED\*\*\*)(?:(?:basic|bearer|digest|token)[ \t]+)?[^\s"'` +
     "`" +
     String.raw`,;}\])]+`,

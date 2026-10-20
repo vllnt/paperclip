@@ -429,33 +429,42 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
     expect(await stopActivity(issueId)).toBeUndefined();
   });
 
-  it("redacts secrets from the stored error message of a failed run", async () => {
+  it("stores a failed run's error detail and stderr with secrets redacted, and classifies by the short message", async () => {
     const { agentId, issueId } = await seed();
     // Built at runtime so the source holds no secret-shaped literal.
     const secret = ["fixture", "Stored", "Value", "0123"].join("");
-    mockAdapterExecute.mockImplementation(agentTurn(issueId, () => ({
-      exitCode: 1,
-      signal: null,
-      timedOut: false,
-      errorMessage: [
-        "Agent exited with code 1: request failed",
-        `Authorization: Basic ${secret}1`,
-        `x-api-key: ${secret}2`,
-        `options: { apiKey: '${secret}3', retries: 2 }`,
-        "Usage limit reached. Resets at 4pm (UTC).",
-      ].join("\n"),
-      errorCode: "adapter_failed",
-      provider: "test",
-      model: "test-model",
-    })));
+    const stderr = [
+      `Authorization: Basic ${secret}1`,
+      `x-api-key: ${secret}2`,
+      `options: { apiKey: '${secret}3', retries: 2 }`,
+      `x-auth-key=${secret}4`,
+      "Usage limit reached. Resets at 4pm (UTC).",
+    ].join("\n");
+    mockAdapterExecute.mockImplementation(async (ctx) => {
+      await (ctx as AdapterContext & { onLog: (stream: "stderr", chunk: string) => Promise<void> }).onLog("stderr", `${stderr}\n`);
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Agent exited with code 1: x-api-key: ${secret}5`,
+        errorDetail: `Agent exited with code 1: request failed\nLast lines of stderr:\n${stderr}`,
+        errorCode: "adapter_failed",
+        provider: "test",
+        model: "test-model",
+      };
+    });
 
     const run = await runOnce(agentId, issueId);
 
     expect(run.status).toBe("failed");
-    expect(run.error).toContain("Agent exited with code 1: request failed");
-    expect(run.error).toContain("***REDACTED***");
-    for (const n of [1, 2, 3]) expect(run.error).not.toContain(`${secret}${n}`);
-    // Redaction keeps the text that recovery and quota classification read.
+    // The quota sentence is only in the detail, so the server's quota safety net leaves the code alone.
+    expect(run.errorCode).toBe("adapter_failed");
+    expect(run.error).toMatch(/^Agent exited with code 1: request failed\nLast lines of stderr:\n/);
+    expect(run.resultJson).toMatchObject({ errorSummary: "Agent exited with code 1: x-api-key: ***REDACTED***" });
+    const stored = [run.error, JSON.stringify(run.resultJson), run.stderrExcerpt].join("\n");
+    for (const n of [1, 2, 3, 4, 5]) expect(stored).not.toContain(`${secret}${n}`);
+    expect(run.stderrExcerpt).toContain("x-auth-key=***REDACTED***");
+    // Redaction keeps the text that people and classifiers read.
     expect(run.error).toContain("Usage limit reached. Resets at 4pm (UTC).");
   });
 });

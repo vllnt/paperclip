@@ -114,7 +114,8 @@ interface AdapterExecutionResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
-  errorMessage?: string | null;
+  errorMessage?: string | null;  // short message; failure classifiers read it
+  errorDetail?: string | null;   // fuller text the failed run stores instead, e.g. describeProcessExit()
   usage?: { inputTokens: number; outputTokens: number };
   sessionParams?: Record<string, unknown> | null;  // persist across heartbeats
   sessionDisplayId?: string | null;

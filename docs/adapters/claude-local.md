@@ -19,10 +19,10 @@ subscription quota exhaustion merely because ACP labels them `limit`.
 
 ## Failure messages
 
-When a CLI run fails, the run's error message says how the Claude process
-ended. It reads only structural facts, never the wording of one message. One
-fact goes on each line, and the first line carries the cause, because
-single-line views such as the Inbox show only that line:
+When a CLI run fails, the run's stored error message says how the Claude
+process ended. It reads only structural facts, never the wording of one
+message. One fact goes on each line, and the first line carries the cause,
+because single-line views such as the Inbox show only that line:
 
 - `Timed out after <n>s`, when Paperclip stopped the process at its timeout.
 - The result error, when Claude's stream-json output reported one.
@@ -32,6 +32,11 @@ single-line views such as the Inbox show only that line:
 - When stderr holds more than that line, `Last lines of stderr:` and the end of
   stderr: at most the last 20 lines and 2048 characters, without blank lines. A
   leading `…` marks a cut tail.
+
+The adapter returns this text as `errorDetail`. Its short `errorMessage` stays
+as before, and failure classification (error codes, quota cooldowns, recovery)
+keeps reading the short message. The run keeps it in `resultJson.errorSummary`.
+Prompts that quote a run error get it as one line of at most 500 characters.
 
 Secret-shaped text (API keys, bearer tokens, `key=value` secrets, URL
 passwords, PEM blocks) is redacted before any cut. The server redacts the

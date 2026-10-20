@@ -529,12 +529,16 @@ describe("redaction", () => {
       `Authorization: token ${secret}3`,
       `Set-Cookie: session=${secret}4; Path=/`,
       `headers: { password: ${secret}5, retries: 3 }`,
+      `x-auth-key: ${secret}6`,
+      `X-Custom-Key=${secret}7`,
+      `cookie=${secret}8`,
     ].join("\n");
 
     const result = redactSensitiveText(input);
 
-    for (const n of [1, 2, 3, 4, 5]) expect(result).not.toContain(`${secret}${n}`);
+    for (const n of [1, 2, 3, 4, 5, 6, 7, 8]) expect(result).not.toContain(`${secret}${n}`);
     expect(result).toContain(`x-api-key: ${REDACTED_EVENT_VALUE}`);
+    expect(result).toContain(`X-Custom-Key=${REDACTED_EVENT_VALUE}`);
     expect(result).toContain(`Authorization: ${REDACTED_EVENT_VALUE}`);
     expect(result).toContain("Path=/");
     expect(result).toContain("retries: 3");
@@ -549,6 +553,7 @@ describe("redaction", () => {
       "Usage limit reached. Resets at 4pm (UTC). Retry-After: 120",
       "Error: spawn agent-cli ENOENT",
       "Missing API key: no credentials configured",
+      "max_tokens=4096 hotkey: ctrl",
     ].join("\n");
 
     expect(redactSensitiveText(input)).toBe(input);

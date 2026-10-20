@@ -99,7 +99,7 @@ import {
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
+import { isExternalChatPresentationContext, readRunErrorSummary } from "../heartbeat-run-summary.js";
 import {
   CHAT_CONTROL_RECOVERY_STOP_CODE,
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
@@ -402,7 +402,7 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   if (readRecoveryRunErrorFamily(latestRun) === "provider_quota") return true;
   if (latestRun?.errorCode !== "adapter_failed") return false;
   return /(?:usage|rate|quota) limit|you(?:'|’)ve hit your (?:\w+ )?limit|quota (?:exceeded|reset)|try again after/i.test(
-    latestRun.error ?? "",
+    readRunErrorSummary(latestRun) ?? "",
   );
 }
 
@@ -662,7 +662,7 @@ export function classifyAdapterFailureForRecovery(
   const resultJson = parseObject(latestRun.resultJson);
   const error = [
     latestRun.errorCode ?? "",
-    latestRun.error ?? "",
+    readRunErrorSummary(latestRun) ?? "",
     JSON.stringify(resultJson),
   ].join("\n");
   if (

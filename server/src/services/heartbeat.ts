@@ -417,6 +417,7 @@ import {
   isExternalChatPresentationContext,
   mergeHeartbeatRunResultJson,
   readCompletedAssistantMessageCandidate,
+  readRunErrorSummary,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
   summarizeRunErrorForModel,
@@ -1362,11 +1363,12 @@ function isRetryableInteractionContinuationInfrastructureFailure(
     return false;
 
   const resultJson = parseObject(run.resultJson);
+  const error = readRunErrorSummary(run);
   return (
-    isSpawnLikeFailureMessage(run.error) ||
+    isSpawnLikeFailureMessage(error) ||
     isSpawnLikeFailureMessage(resultJson.errorMessage) ||
     isSpawnLikeFailureMessage(resultJson.message) ||
-    isSandboxProviderWorkerUnavailableFailureMessage(run.error) ||
+    isSandboxProviderWorkerUnavailableFailureMessage(error) ||
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.errorMessage) ||
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.message)
   );
@@ -3873,6 +3875,7 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
           and length(${heartbeatRuns.resultJson} ->> 'acpPendingToolCount') < 16
           then ${heartbeatRuns.resultJson} -> 'acpPendingToolCount' end,
         'errorFamily', left(${heartbeatRuns.resultJson} ->> 'errorFamily', 32),
+        'errorSummary', left(${heartbeatRuns.resultJson} ->> 'errorSummary', ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}),
         'finalResponseRecorded', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'finalResponseRecorded') = 'boolean'
           then ${heartbeatRuns.resultJson} -> 'finalResponseRecorded' end,
         'executionBeforeRestore', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'executionBeforeRestore') = 'object'
@@ -18633,7 +18636,7 @@ export function heartbeatService(
       status: run.status,
       errorCode: run.errorCode,
       errorFamily: readHeartbeatRunErrorFamily(run),
-      errorMessage: run.error,
+      errorMessage: readRunErrorSummary(run),
       retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       usefulWork,
     });
@@ -28148,18 +28151,29 @@ export function heartbeatService(
           usageBasis: adapterResult.usageBasis ?? null,
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
-        // Only the stored copy is redacted. The outcome, the error code and the
-        // quota reclassification above already read the adapter's raw result.
-        const runErrorMessage =
+        // Only the stored copies are redacted. The outcome, the error code and
+        // the quota reclassification above already read the adapter's raw result.
+        const redactRunError = (text: string) =>
+          redactSensitiveText(redactCurrentUserText(text, currentUserRedactionOptions));
+        // Classifiers read the adapter's short errorMessage. A failed run stores
+        // the adapter's fuller errorDetail when it has one, and keeps the short
+        // message in resultJson.errorSummary for classifiers that read it back.
+        const runErrorSummary =
           outcome === "cancelled"
-            ? redactSensitiveText(redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions))
+            ? redactRunError(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
             : outcome === "succeeded"
               ? null
-              : redactSensitiveText(redactCurrentUserText(
+              : redactRunError(
                   adapterResult.errorMessage ??
                     (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                  currentUserRedactionOptions,
-                ));
+                );
+        const adapterErrorDetail =
+          outcome === "failed" || outcome === "timed_out"
+            ? readNonEmptyString(adapterResult.errorDetail)
+            : null;
+        const runErrorMessage = adapterErrorDetail
+          ? redactRunError(adapterErrorDetail)
+          : runErrorSummary;
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
         const runErrorCode =
@@ -28290,17 +28304,18 @@ export function heartbeatService(
                   ? {
                       backgroundTaskStopped: true,
                       backgroundTaskStopWarning: adapterResult.errorMessage
-                        ? redactSensitiveText(redactCurrentUserText(adapterResult.errorMessage, currentUserRedactionOptions))
+                        ? redactRunError(adapterResult.errorMessage)
                         : null,
                     }
                   : {}),
+                ...(adapterErrorDetail ? { errorSummary: runErrorSummary } : {}),
                 configFreshness: configFreshnessResultMetadata,
               },
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
             }),
             errorCode: runErrorCode,
-            errorMessage: runErrorMessage,
+            errorMessage: runErrorSummary,
           }),
           adapterResult.summary ?? null,
           ), runErrorCode, runErrorMessage),
