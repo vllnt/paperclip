@@ -196,6 +196,41 @@ Caveats:
 - Resuming needs an adapter with a session codec: the claude, codex, cursor, gemini, grok, hermes, kimi, opencode and pi adapters. Others start fresh each wake.
 - A separate review step cannot send work back to an earlier step. Use separate steps for one-shot reviews, or for several reviews in parallel (for example one security lens and one performance lens, joined by a later step).
 
+### Start the steps on a task
+
+A run normally opens its own task. A routine with steps can instead put its steps under a task that already exists or that someone is creating, so the work is planned on the task they care about. Two ways start it:
+
+- **Manual run on an existing task:** `POST /api/routines/{routineId}/run` with `targetIssueId` (see [Manual Run](#manual-run)).
+- **Event trigger on new tasks:** an `event` trigger on the company's built-in Paperclip event source with `eventGrouping.issueMode: "event_issue"` (see [Start steps on a created task](event-sources.md#start-steps-on-a-created-task)).
+
+Both use the same rules. The task is locked, then checked, and then the steps are created under it as sub-tasks with the same blockers, order and wakes as any run:
+
+| Answer | When |
+|--------|------|
+| `404` | The task is not in the routine's company, or is hidden |
+| `409` | The task is not in `backlog`, `todo` or `blocked`; it has a checkout, an execution lock or a queued or running heartbeat run; or it already has open routine steps |
+| `422` | The routine has no steps; the task is a routine run, a routine step or a conversation; or its sub-tasks plus the steps would pass 25 |
+
+What happens to the task:
+
+- **Owned by an agent:** it becomes `blocked`, so that agent does not start on it while the steps run. The existing blockers-resolved wake returns it to the agent after the last step.
+- **Owned by a person, or by nobody:** its status does not change. It only gains the blocker edges, so it shows what it waits for.
+- **A step fails to create:** the steps created for this run are removed and the status goes back. The task itself is never deleted.
+
+Two starts on one task (an event and a manual run, say) take turns on the task's row lock, so the task ends up with one tree of steps. The manual run's idempotency key is `issue:{issueId}` for the routine: a second run on a task whose first run is still open is refused.
+
+In the text of a step on such a run, `{{issue.title}}` and `{{issue.identifier}}` are the task's title and identifier. On any other run they are left as written.
+
+### Step warnings
+
+Routine create and update (`POST /api/companies/{companyId}/routines`, `PATCH /api/routines/{routineId}`) and the manual run response carry a `warnings` array. It is always present and is empty when nothing needs attention:
+
+```
+{ "warnings": [{ "code": "step_agent_unavailable", "stepKey": "build", "agentId": "{agentId}", "reason": "paused" }] }
+```
+
+`reason` is why the agent cannot take work now, for example `paused`, `pending_approval`, `error`, `terminated` or `not_invokable`. A warning never blocks the save or the run; it tells you a step may not start until the agent is available again. The CLI prints each warning to stderr as `warning: step "{stepKey}": agent {agentId} is {reason}` and keeps the response on stdout.
+
 ## Add Trigger
 
 ```
@@ -294,6 +329,17 @@ Fires a run immediately, bypassing the schedule. Concurrency policy still applie
 
 `triggerId` is optional. When supplied, the server validates the trigger belongs to this routine (`403`) and is enabled (`409`), then records the run against that trigger and updates its `lastFiredAt`. Omit it for a generic manual run with no trigger attribution.
 
+### Run on an existing task
+
+```
+POST /api/routines/{routineId}/run
+{ "targetIssueId": "{issueId}" }
+```
+
+For a routine with steps, `targetIssueId` (a UUID) attaches the steps to that task instead of opening a new one. The answer is `202` with the run (`linkedIssueId` is the task) and `warnings` (see [Step warnings](#step-warnings)). The answers `404`, `409` and `422` and what happens to the task are in [Start the steps on a task](#start-the-steps-on-a-task). A routine without steps is `422`. You need the routine permissions and the right to update the task; the activity entry records `targetIssueId`.
+
+CLI: `paperclipai routine run {routineId} --target-issue {uuid-or-identifier}`. An identifier such as `PC-12` is looked up with the issue API first.
+
 ## Fire Public Trigger
 
 ```
@@ -372,6 +418,8 @@ GET /api/routines/{routineId}/event-groups?open=true&limit=50
 ```
 
 Lists the alert groups of the routine, newest activity first: the group's issue, `repeatCount`, `lastSeverity` and `lastState`. `open` defaults to `true`; `limit` is 1-200. Event runs appear in run history with `source` `event` and the statuses `issue_created`, `grouped` (comment on the open issue) and `recovered`.
+
+A trigger with `eventGrouping.issueMode: "event_issue"` has no event groups. Its event is a task being created, and the routine's steps start on that task (see [Start the steps on a task](#start-the-steps-on-a-task)). It is allowed only on the built-in Paperclip event source, with `fallback: false`, for a routine that has steps; otherwise the save is `422`. A routine gate script that applies to event triggers cannot be combined with it (`422` at both the trigger save and the gate save).
 
 ## List Runs
 
