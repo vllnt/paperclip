@@ -10,6 +10,7 @@ Test code for `doc/plans/2026-10-10-backend-effect.md` (sections 4 and 8). Nothi
 | `faults.mjs census` | The per-route statement census: the statements one healthy request of each read route sends, at two or more data sizes, to show which routes are N+1 shaped. |
 | `lib/server.mjs` | Starts a checkout's server from source as a child process against a given database, in a temporary home with a minimal environment, and waits until `/api/health` reports `ok`. |
 | `lib/stats.mjs` | Quantiles, the distribution-free interval of the median of paired differences, the pass, fail or inconclusive rule of section 8, and the pairs a row needs. |
+| `harness.test.mjs` | Self-tests of the statistics and of the proxy's four modes against a stand-in database, with no Postgres: `node --test tests/perf/backend/harness.test.mjs` (under a second). |
 
 ## Before a run
 
