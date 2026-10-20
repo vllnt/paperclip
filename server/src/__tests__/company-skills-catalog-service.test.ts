@@ -367,7 +367,7 @@ describeEmbeddedPostgres("companySkillService.installFromCatalog", () => {
     await expect(fs.readFile(path.join(result!.skill.sourceLocator!, "SKILL.md"), "utf8")).resolves.toContain("# Review");
   });
 
-  it("files packaged catalog skills of two categories, imported together, under one folder per category", async () => {
+  it("files packaged catalog skills of two categories, imported together, under one folder per category, and a skill outside any category in none", async () => {
     const companyId = await createCompany();
     const packaged = (category: string, slug: string) => {
       const key = `paperclipai/bundled/${category}/${slug}`;
@@ -396,11 +396,14 @@ describeEmbeddedPostgres("companySkillService.installFromCatalog", () => {
 
     const results = await svc.importPackageFiles(companyId, {
       ...packaged("software-development", "review"),
+      "skills/notes/SKILL.md": "---\nname: notes\nslug: notes\n---\n\n# Notes\n",
       ...packaged("research", "survey"),
       ...packaged("software-development", "refactor"),
     });
 
-    expect(results.map((result) => result.action)).toEqual(["created", "created", "created"]);
+    expect(results.map((result) => result.action)).toEqual(["created", "created", "created", "created"]);
+    const notes = results.find((result) => result.skill.slug === "notes");
+    expect(notes?.skill.folderId).toBeNull();
     const folderOf = new Map((await db
       .select({ key: companySkills.key, folderId: folders.id, name: folders.name, systemKey: folders.systemKey })
       .from(companySkills)
