@@ -22,6 +22,11 @@
  * --trials [10], --predicates [default,wide], --steady ms [10000], --tail ms
  * [5000], --stall ms [3000] (0 skips the slow-failure case), --query
  * ["select pg_sleep(0.003)"].
+ *
+ *   F4, route level: the server of each arm's checkout behind the proxy,
+ *   under the dashboard load, through a flap and a blackout (`f4`, see README).
+ *
+ *   The per-route statement census (`census`, see README).
  */
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -53,10 +58,11 @@ function errorCode(error) {
 }
 
 /**
- * postgres.js 3.4.9 fetches the array types on every new connection and does
- * not handle a failure of that fetch, so a backend that dies while a
- * connection starts raises an unhandled rejection. The server exits on one;
- * the harness counts them instead, per trial, so both arms are measured.
+ * Before #301, the repository patch of postgres.js 3.4.9 did not handle a
+ * failed array-type fetch on a new connection, so a backend that died while a
+ * connection started raised an unhandled rejection. The server exits on one;
+ * the harness counts them instead, per trial, so a checkout from before #301
+ * can still be measured. With #301 the count should be 0.
  */
 const unhandled = { count: 0, codes: {} };
 process.on("unhandledRejection", (reason) => {
