@@ -85,7 +85,7 @@ Read [references/lane-templates.md](references/lane-templates.md) for the rules 
 | A parent kept `in_review` with a no-op monitor | Each re-arm brings one timer wake with nothing new; the lead pays for a run per check | Parent `blocked` on its children; only the implementer waits on an external check |
 | Assigned `todo` mirrors | An issue that only mirrors outside state is dispatched as an assignment and runs with nothing to do | Record the outside state as a work product or comment on the owning issue, or park the mirror in `backlog` |
 | Deep trees | Context and diagnostics spread over many levels; owners are unclear | Keep to 3 levels, 4 at most |
-| Per-agent run caps hit by liveness redispatch | The recovery pass dispatches every assigned `todo` issue that never ran. The runs queue behind `maxConcurrentRuns` and count against `maxDailyRuns`; at the daily cap, new wakes are skipped and real lane work waits [`server/src/services/recovery/service.ts` `reconcileStrandedAssignedIssues`, `server/src/services/heartbeat.ts` `getHeartbeatDailyCapBlock`, `doc/SPEC-implementation.md` § 11.6] | Keep few assigned `todo` issues per agent; park future work in `backlog`; watch `capReached` in `paperclipai run stats` |
+| Per-agent run caps hit by liveness redispatch | The recovery pass dispatches every assigned `todo` issue that never ran. The runs queue behind `maxConcurrentRuns` and count against `maxDailyRuns`. At the daily cap, new wakes are skipped, and recovery holds the rest until the UTC day resets (one `heartbeat.daily_cap_dispatch_held` activity entry): real lane work waits [`server/src/services/recovery/service.ts` `reconcileStrandedAssignedIssues`, `server/src/services/heartbeat.ts` `getHeartbeatDailyCapBlock`, `doc/SPEC-implementation.md` § 11.6] | Keep few assigned `todo` issues per agent; park future work in `backlog`; watch `capReached` in `paperclipai run stats` |
 
 ## Checklist
 
@@ -115,4 +115,9 @@ Read these numbers before you change a lane and again after a day of real runs. 
 
 ## What a lane does not depend on
 
-A lane design does not depend on session reuse across routine ticks, a no-change check before a monitor wake, cap-aware liveness dispatch, or priority ordering of queued runs. If an instance has them, a good lane gets cheaper; its shape stays the same.
+A lane design does not depend on session reuse across routine ticks or a no-change check before a monitor wake. If an instance has them, a good lane gets cheaper; its shape stays the same.
+
+Two scheduler rules help a lane but do not replace its shape [`doc/SPEC-implementation.md` § 11.6]:
+
+- An agent's queued runs start by issue priority, raised as they wait, and runs of issues with unresolved blockers go last. Set each lane issue's priority on purpose.
+- At the daily cap, recovery holds never-run assigned work until the UTC day resets. The work still waits; the fix is fewer assigned `todo` issues.
