@@ -80,6 +80,7 @@ import {
   normalizeAgentUrlKey,
   isRoutineStepRunStalled,
   pluginOperationIssueOriginKind,
+  OPEN_ISSUE_STATUSES,
   ROUTINE_STEPS_RUN_PAYLOAD_KEY,
   readRoutineStepsRunPayload,
   routineStepTemplateTexts,
@@ -142,7 +143,6 @@ import {
 import { createGateWorker, type GateProcessContext, type GateWorkerHandlers } from "./routine-gates/worker.js";
 import type { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 
-const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 /** Newest open roots of a routine with steps that are checked for a run that can still move. */
 const OPEN_STEP_ROOTS_CHECKED = 25;
 

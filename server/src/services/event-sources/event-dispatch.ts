@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { issues, routineEventGroups, routineRuns, routines, routineTriggers } from "@paperclipai/db";
 import {
   DEFAULT_EVENT_GROUPING,
+  OPEN_ISSUE_STATUSES,
   ROUTINE_GATE_SKIP_REASON,
   ROUTINE_GATE_TRIGGER_INACTIVE_REASON,
   eventGroupingSchema,
@@ -51,7 +52,6 @@ type RoutineRunRow = typeof routineRuns.$inferSelect;
 type GroupRow = typeof routineEventGroups.$inferSelect;
 
 /** Statuses of an issue that still absorbs repeats. Mirrors the open set of `issues_open_routine_execution_uq`. */
-const OPEN_GROUP_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const OUTCOME_ERROR_MAX_LENGTH = 500;
 
 export type EventFailureClass = "permanent" | "transient";
@@ -216,7 +216,7 @@ async function findOpenGroup(
         eq(routineEventGroups.routineId, routine.id),
         eq(routineEventGroups.fingerprint, fingerprint),
         isNull(issues.hiddenAt),
-        inArray(issues.status, OPEN_GROUP_ISSUE_STATUSES),
+        inArray(issues.status, OPEN_ISSUE_STATUSES),
         onlyIssueId ? eq(routineEventGroups.issueId, onlyIssueId) : undefined,
       ),
     )
@@ -245,7 +245,7 @@ async function loadAppendTarget(
         eq(issues.companyId, routine.companyId),
         eq(issues.assigneeAgentId, routine.assigneeAgentId),
         isNull(issues.hiddenAt),
-        inArray(issues.status, OPEN_GROUP_ISSUE_STATUSES),
+        inArray(issues.status, OPEN_ISSUE_STATUSES),
       ),
     )
     .limit(1);
@@ -264,7 +264,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
   }
 
   function isOpenIssue(row: { status: string; hiddenAt: Date | null } | null): boolean {
-    return !!row && row.hiddenAt === null && OPEN_GROUP_ISSUE_STATUSES.includes(row.status);
+    return !!row && row.hiddenAt === null && (OPEN_ISSUE_STATUSES as readonly string[]).includes(row.status);
   }
 
   /**

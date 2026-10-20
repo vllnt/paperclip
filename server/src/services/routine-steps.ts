@@ -2,6 +2,7 @@ import { and, asc, eq, inArray, isNull, ne, notInArray, sql } from "drizzle-orm"
 import type { Db } from "@paperclipai/db";
 import { agents, executionWorkspaces, issueRelations, issues, labels, routineRuns } from "@paperclipai/db";
 import {
+  OPEN_ISSUE_STATUSES,
   ROUTINE_STEPS_RUN_PAYLOAD_KEY,
   interpolateRoutineTemplate,
   orderRoutineStepsTopologically,
@@ -110,8 +111,6 @@ export async function assertRoutineStepReferences(
   }
 }
 
-const OPEN_STEP_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
-
 /**
  * Whether a routine run's root still has a step that has not finished. A blocked step counts: it is
  * waiting for its predecessors, not done. Callers hold the root back while this is true.
@@ -126,7 +125,7 @@ export async function hasOpenRoutineSteps(executor: Db, companyId: string, rootI
         eq(issues.companyId, companyId),
         eq(issues.parentId, rootIssueId),
         eq(issues.originKind, "routine_step"),
-        inArray(issues.status, OPEN_STEP_STATUSES),
+        inArray(issues.status, OPEN_ISSUE_STATUSES),
       ),
     )
     .limit(1);

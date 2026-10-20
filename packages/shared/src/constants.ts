@@ -197,6 +197,9 @@ export const ISSUE_STATUSES = [
 ] as const;
 export type IssueStatus = (typeof ISSUE_STATUSES)[number];
 
+/** Statuses of an issue that is not finished: its work can still move (everything but done and cancelled). */
+export const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const satisfies readonly IssueStatus[];
+
 export const INBOX_MINE_ISSUE_STATUSES = [
   "backlog",
   "todo",
