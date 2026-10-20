@@ -86,6 +86,7 @@ import {
 import { collectAgentPermissionChanges } from "./agent-self-config-authz.js";
 import { currentPluginHostCallAgent } from "./plugin-host-call-actor.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
+import { forbidden } from "../errors.js";
 import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 import {
   normalizeProviderFamily,
@@ -699,6 +700,24 @@ export function recordWorkerProviderSpan(
     ...(status ? { status } : {}),
     ...(times ? { startTimeMs: times.startTimeMs, endTimeMs: times.endTimeMs } : {}),
   });
+}
+
+/**
+ * The grants `next` would add, remove, or rescope for a principal that holds
+ * `stored`, as `grants.<permissionKey>` paths for the protected-change guard.
+ */
+function changedGrantFields(
+  stored: Array<{ permissionKey: string; scope: unknown }>,
+  next: Array<{ permissionKey: string; scope: unknown }>,
+): string[] {
+  const describe = (grants: Array<{ permissionKey: string; scope: unknown }>) =>
+    new Map(grants.map((grant) => [`${grant.permissionKey}:${JSON.stringify(grant.scope ?? null)}`, grant.permissionKey]));
+  const before = describe(stored);
+  const after = describe(next);
+  const changed = new Set<string>();
+  for (const [key, permissionKey] of before) if (!after.has(key)) changed.add(permissionKey);
+  for (const [key, permissionKey] of after) if (!before.has(key)) changed.add(permissionKey);
+  return [...changed].sort().map((permissionKey) => `grants.${permissionKey}`);
 }
 
 export function buildHostServices(
@@ -3206,20 +3225,30 @@ export function buildHostServices(
         if (params.principalType !== "agent" && params.principalType !== "user") {
           throw new Error("principalType must be 'agent' or 'user'");
         }
+        const nextGrants = params.grants.map((grant) => ({
+          permissionKey: grant.permissionKey as PermissionKey,
+          scope: grant.scope ? sanitizeRecord(grant.scope) : null,
+        }));
         if (params.principalType === "agent") {
-          requireInCompany("Agent", await agents.getById(params.principalId), companyId);
+          const target = requireInCompany("Agent", await agents.getById(params.principalId), companyId);
+          const stored = await access.listPrincipalGrants(companyId, "agent", params.principalId);
+          await assertAgentCallerMayChangeProtectedFields(
+            target,
+            changedGrantFields(stored, nextGrants),
+            "plugin_grants_update",
+          );
         } else {
           const membership = await access.getMembership(companyId, params.principalType as PrincipalType, params.principalId);
           if (!membership) throw new Error("Principal is not a member of this company");
+          // Member grant routes (`PATCH /companies/:companyId/members/:memberId/permissions`
+          // and `/role-and-grants`) refuse every non-board actor in `assertCanManageCompanyMember`.
+          if (currentPluginHostCallAgent()) throw forbidden("Board access required");
         }
         await access.setPrincipalGrants(
           companyId,
           params.principalType as PrincipalType,
           params.principalId,
-          params.grants.map((grant) => ({
-            permissionKey: grant.permissionKey as PermissionKey,
-            scope: grant.scope ? sanitizeRecord(grant.scope) : null,
-          })),
+          nextGrants,
           params.grantedByUserId ?? null,
         );
         await logPluginActivity({

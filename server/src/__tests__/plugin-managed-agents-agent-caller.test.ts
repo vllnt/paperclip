@@ -502,4 +502,104 @@ describeEmbeddedPostgres("plugin managed-agent reset by an agent caller", () => 
       expect((await readAgent(managedAgentId)).permissions).not.toHaveProperty("authorizationPolicy");
     }
   });
+
+  async function grantKeys(companyId: string, principalId: string) {
+    const rows = await db
+      .select()
+      .from(principalPermissionGrants)
+      .where(and(eq(principalPermissionGrants.companyId, companyId), eq(principalPermissionGrants.principalId, principalId)));
+    return rows.map((row) => row.permissionKey).sort();
+  }
+
+  function setGrants(
+    services: Awaited<ReturnType<typeof seed>>["services"],
+    companyId: string,
+    principalType: "agent" | "user",
+    principalId: string,
+  ) {
+    return services.authorization.setGrants({
+      companyId,
+      principalType,
+      principalId,
+      grants: [{ permissionKey: "agents:configure" }],
+    });
+  }
+
+  it.each([
+    { label: "another agent", target: "managed" as const },
+    { label: "itself", target: "peer" as const },
+  ])("refuses a grant update for $label started by an agent without agents:configure, and logs it", async ({ target }) => {
+    const { companyId, services, managedAgentId, peerId } = await seed();
+    const targetId = target === "peer" ? peerId : managedAgentId;
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+        setGrants(services, companyId, "agent", targetId)),
+    ).rejects.toMatchObject({
+      status: 403,
+      details: { code: "agent_self_protected_config_change", fields: ["grants.agents:configure"] },
+    });
+
+    expect(await grantKeys(companyId, targetId)).toEqual([]);
+    expect((await deniedActivity(targetId))[0]).toMatchObject({
+      actorId: peerId,
+      details: { surface: "plugin_grants_update", sourcePluginKey: MANIFEST.id },
+    });
+  });
+
+  it("refuses a grant update for a user member started by an agent", async () => {
+    const { companyId, services, peerId } = await seed();
+    const userId = `user-${randomUUID()}`;
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "operator",
+    });
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+        setGrants(services, companyId, "user", userId)),
+    ).rejects.toMatchObject({ status: 403 });
+
+    expect(await grantKeys(companyId, userId)).toEqual([]);
+  });
+
+  it("still sets grants for a call that no agent started, and for an agent holding company-wide agents:configure on another agent", async () => {
+    const { companyId, services, managedAgentId, peerId } = await seed();
+    const userId = `user-${randomUUID()}`;
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "operator",
+    });
+
+    await setGrants(services, companyId, "user", userId);
+    await setGrants(services, companyId, "agent", managedAgentId);
+    expect(await grantKeys(companyId, userId)).toEqual(["agents:configure"]);
+    expect(await grantKeys(companyId, managedAgentId)).toEqual(["agents:configure"]);
+    await services.authorization.setGrants({ companyId, principalType: "agent", principalId: managedAgentId, grants: [] });
+
+    await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "agent", principalId: peerId, permissionKey: "agents:configure", scope: null, grantedByUserId: null,
+    });
+    await runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+      setGrants(services, companyId, "agent", managedAgentId));
+    expect(await grantKeys(companyId, managedAgentId)).toEqual(["agents:configure"]);
+    expect(await deniedActivity(managedAgentId)).toHaveLength(0);
+  });
+
+  it("refuses an agent with only a company-wide agents:configure grant adding a grant to itself", async () => {
+    const { companyId, services, peerId } = await seed();
+    await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "agent", principalId: peerId, permissionKey: "agents:configure", scope: null, grantedByUserId: null,
+    });
+
+    await expect(
+      runWithPluginHostCallAgent({ agentId: peerId, runId: null, companyId }, () =>
+        services.authorization.setGrants({
+          companyId,
+          principalType: "agent",
+          principalId: peerId,
+          grants: [{ permissionKey: "agents:configure" }, { permissionKey: "users:manage_permissions" }],
+        })),
+    ).rejects.toMatchObject({ status: 403, details: { fields: ["grants.users:manage_permissions"] } });
+
+    expect(await grantKeys(companyId, peerId)).toEqual(["agents:configure"]);
+  });
 });

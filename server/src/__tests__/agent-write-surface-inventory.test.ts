@@ -61,7 +61,7 @@ const SURFACES: Record<string, Surface> = {
   "services/onboarding-seed.ts": { kind: "board-only", how: "the onboarding-seed route calls assertBoard" },
   "services/plugin-host-services.ts": {
     kind: "guarded",
-    how: "managed reconcile and reset, pause, resume, and agent authorization policy updates check the agent behind the plugin call",
+    how: "managed reconcile and reset, pause, resume, agent authorization policy updates, and grant updates check the agent behind the plugin call",
     tests: ["plugin-managed-agents-agent-caller.test.ts", "plugin-worker-manager.test.ts"],
   },
   "services/plugin-managed-agents.ts": {

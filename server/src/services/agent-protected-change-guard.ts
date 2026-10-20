@@ -14,6 +14,7 @@ export type AgentProtectedChangeSurface =
   | "plugin_managed_create"
   | "plugin_status_change"
   | "plugin_policy_update"
+  | "plugin_grants_update"
   | "built_in_reset"
   | "join_approval"
   | "company_import"
