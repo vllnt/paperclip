@@ -1935,7 +1935,7 @@ type IssueUserContextInput = {
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
 /** Conversation containers cannot acquire new child edges, even with the experiment disabled. */
-async function assertExecutionTaskParent(db: Db, companyId: string, parentId?: string | null) {
+async function assertExecutionTaskParent(db: DbReader, companyId: string, parentId?: string | null) {
   if (!parentId) return;
   const [parent] = await db.select({ conversationAgentId: issues.conversationAgentId })
     .from(issues).where(and(eq(issues.id, parentId), eq(issues.companyId, companyId)));
@@ -7224,8 +7224,12 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableUser(companyId: string, userId: string) {
-    const membership = await db
+  async function assertAssignableUser(
+    companyId: string,
+    userId: string,
+    dbOrTx: DbReader = db,
+  ) {
+    const membership = await dbOrTx
       .select({ id: companyMemberships.id })
       .from(companyMemberships)
       .where(
@@ -9366,7 +9370,7 @@ export function issueService(db: Db) {
       data: IssueChildCreateInput,
       dbOrTx: Db | DbTransaction = db,
     ) => {
-      const executor = dbOrTx as unknown as Db;
+      const executor: DbReader = dbOrTx;
       const parent = await executor
         .select()
         .from(issues)
@@ -9915,7 +9919,7 @@ export function issueService(db: Db) {
       const deduplicateByTitle = allowDuplicate === false && !titleNeedsGeneration;
       issueData.title = resolvedTitle;
       const isolatedWorkspacesEnabled = (
-        await instanceSettings.getExperimental()
+        await instanceSettings.getExperimental({ db: dbOrTx })
       ).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -9926,12 +9930,12 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(db, companyId, data.assigneeAgentId, {
+        await assertAssignableAgent(dbOrTx, companyId, data.assigneeAgentId, {
           kind: "work",
         });
       }
       if (data.assigneeUserId) {
-        await assertAssignableUser(companyId, data.assigneeUserId);
+        await assertAssignableUser(companyId, data.assigneeUserId, dbOrTx);
       }
       if (
         data.status === "in_progress" &&
@@ -9942,7 +9946,7 @@ export function issueService(db: Db) {
       }
       const created: { event: IssueCreatedEvent | null } = { event: null };
       const persist = async (tx: DbTransaction) => {
-        await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
+        await assertExecutionTaskParent(tx, companyId, issueData.parentId);
         if (issueData.conversationAgentId && issueData.conversationUserId) {
           const identity = `conversation:${companyId}:${issueData.conversationAgentId}:${issueData.conversationUserId}`;
           await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${identity}, 0))`);

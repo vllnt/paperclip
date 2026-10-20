@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -18,6 +18,7 @@ import {
 import { readRoutineStepsRunPayload, type EventGrouping, type RoutineStep } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedEventFixture, wireEvent } from "./helpers/event-source-fixture.js";
+import { issueService } from "../services/issues.ts";
 import { inheritRoutineStepWorkspace } from "../services/routine-steps.ts";
 import { routineService } from "../services/routines.ts";
 
@@ -32,6 +33,18 @@ if (!embeddedPostgresSupport.supported) {
 
 function step(key: string, after: string[] = [], extra: Partial<RoutineStep> = {}): RoutineStep {
   return { key, title: `Step ${key}`, after, ...extra };
+}
+
+async function within<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} did not finish within ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 describeEmbeddedPostgres("routine steps", () => {
@@ -77,13 +90,19 @@ describeEmbeddedPostgres("routine steps", () => {
     return { companyId, projectId, newAgent };
   }
 
-  async function seed(options: { steps?: RoutineStep[]; concurrencyPolicy?: "coalesce_if_active" | "skip_if_active" | "always_enqueue" } = {}) {
+  async function seed(
+    options: {
+      steps?: RoutineStep[];
+      concurrencyPolicy?: "coalesce_if_active" | "skip_if_active" | "always_enqueue";
+      serviceDb?: ReturnType<typeof createDb>;
+    } = {},
+  ) {
     const company = await seedCompany();
     const leadId = await company.newAgent("Lead");
     const builderId = await company.newAgent("Builder");
     const reviewerId = await company.newAgent("Reviewer");
     const wakeups: Array<{ agentId: string; issueId: string | null; reason: string | null | undefined }> = [];
-    const svc = routineService(db, {
+    const svc = routineService(options.serviceDb ?? db, {
       heartbeat: {
         wakeup: async (agentId, opts) => {
           const issueId =
@@ -348,6 +367,59 @@ describeEmbeddedPostgres("routine steps", () => {
       const [stored] = await db.select().from(routineRuns).where(eq(routineRuns.id, run.id));
       expect(stored!.status).toBe("failed");
     });
+  });
+
+  describe("connection pool", () => {
+    it("finishes a 25-step dispatch while concurrent creates queue on the issue counter", async () => {
+      const poolDb = createDb(tempDb!.connectionString, { maxConnections: 3 });
+      try {
+        const fx = await seed({ serviceDb: poolDb });
+        const chain = Array.from({ length: 25 }, (_, index) =>
+          step(`s${index}`, index === 0 ? [] : [`s${index - 1}`]),
+        );
+        const routine = await fx.create(chain);
+        const issueSvc = issueService(poolDb);
+
+        const counterLockHeld = async () =>
+          (
+            await db.execute(sql`
+              select 1 from pg_locks l join pg_class c on c.oid = l.relation
+              where c.relname = 'companies' and l.mode = 'RowExclusiveLock' and l.granted
+              limit 1
+            `)
+          ).length > 0;
+
+        const startedAt = performance.now();
+        const elapsed = () => Math.round(performance.now() - startedAt);
+        const dispatch = fx.svc.runRoutine(routine.id, { source: "manual" }).then((value) => ({ value, ms: elapsed() }));
+        let lockSeenMs = -1;
+        while (lockSeenMs < 0 && elapsed() < 10_000) {
+          if (await counterLockHeld()) lockSeenMs = elapsed();
+          else await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+        expect(lockSeenMs).toBeGreaterThanOrEqual(0);
+
+        const others = [0, 1, 2].map((index) =>
+          issueSvc
+            .create(fx.companyId, { title: `Other ${index}`, status: "todo", assigneeAgentId: fx.leadId })
+            .then(() => elapsed()),
+        );
+        const [dispatched, ...finishedAt] = await within(
+          Promise.all([dispatch, ...others]),
+          45_000,
+          "a 25-step dispatch with three concurrent creates on a 3-connection pool",
+        );
+
+        console.info(
+          `issue counter lock seen at ${lockSeenMs}ms, dispatch done at ${dispatched.ms}ms, concurrent creates done at ${finishedAt.join("ms, ")}ms`,
+        );
+        expect(dispatched.value.status).toBe("issue_created");
+        expect(await stepIssuesOf(routine.id)).toHaveLength(25);
+        expect(Math.min(...finishedAt)).toBeGreaterThanOrEqual(lockSeenMs);
+      } finally {
+        await poolDb.$client.end({ timeout: 0 }).catch(() => undefined);
+      }
+    }, 60_000);
   });
 
   describe("a routine without steps", () => {
