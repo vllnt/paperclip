@@ -5840,13 +5840,15 @@ export function buildExplicitResumeSessionOverride(input: {
   resumeRunSessionParams?: Record<string, unknown> | null;
   taskSession: ResumeSessionRow | null;
   sessionCodec: AdapterSessionCodec;
+  /** Only a session the selected run created or saved, never the one it started from. */
+  ownSessionOnly?: boolean;
 }) {
   const resumeRunSessionIdAfter = truncateDisplayId(
     input.resumeRunSessionIdAfter,
   );
-  const resumeRunSessionIdBefore = truncateDisplayId(
-    input.resumeRunSessionIdBefore,
-  );
+  const resumeRunSessionIdBefore = input.ownSessionOnly
+    ? null
+    : truncateDisplayId(input.resumeRunSessionIdBefore);
   const desiredDisplayId = requiresCanonicalSessionIds(input.adapterType)
     ? isCanonicalSessionIdForAdapter(input.adapterType, resumeRunSessionIdAfter)
       ? resumeRunSessionIdAfter
@@ -13106,6 +13108,7 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     payload: Record<string, unknown> | null,
     taskKey: string | null,
+    opts: { ownSessionOnly?: boolean } = {},
   ) {
     const resumeFromRunId = readNonEmptyString(payload?.resumeFromRunId);
     if (!resumeFromRunId) return null;
@@ -13155,6 +13158,7 @@ export function heartbeatService(
         : null,
       taskSession: resumeTaskSession,
       sessionCodec,
+      ownSessionOnly: opts.ownSessionOnly,
     });
     if (!sessionOverride) return null;
 
@@ -17049,10 +17053,14 @@ export function heartbeatService(
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     // A retry row skips enqueueWakeup, so a resume writes the session override
-    // that enqueueWakeup would have: the interrupted run's own session.
+    // that enqueueWakeup would have: the interrupted run's own session. A run
+    // that asked for a fresh session resumes only a session it created; without
+    // one, its retry starts fresh as the run would have.
     const isRestartResume = retryReason === PLANNED_RESTART_RESUME_RETRY_REASON;
     const restartResumeSession = isRestartResume
-      ? await resolveExplicitResumeSessionOverride(agent, { resumeFromRunId: run.id }, taskKey)
+      ? await resolveExplicitResumeSessionOverride(agent, { resumeFromRunId: run.id }, taskKey, {
+          ownSessionOnly: contextSnapshot.forceFreshSession === true,
+        })
       : null;
     const sessionBefore =
       restartResumeSession?.sessionDisplayId ??
@@ -17098,14 +17106,15 @@ export function heartbeatService(
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }
           : {}),
         ...(isRestartResume
+          ? { failureRetriesBeforePlannedRestart: executionFailureRetryCount(run) }
+          : {}),
+        ...(restartResumeSession
           ? {
-              failureRetriesBeforePlannedRestart: executionFailureRetryCount(run),
               // The copied context may hold the previous run's session choice.
-              // An undefined value is dropped when the context is stored.
               forceFreshSession: false,
-              resumeFromRunId: restartResumeSession?.resumeFromRunId,
-              resumeSessionDisplayId: restartResumeSession?.sessionDisplayId,
-              resumeSessionParams: restartResumeSession?.sessionParams,
+              resumeFromRunId: restartResumeSession.resumeFromRunId,
+              resumeSessionDisplayId: restartResumeSession.sessionDisplayId,
+              resumeSessionParams: restartResumeSession.sessionParams,
             }
           : {}),
         ...(shouldQuarantineWorkspaceForRetry
@@ -21212,13 +21221,13 @@ export function heartbeatService(
   }
 
   /**
-   * `reapDeadBootRuns` is for startup only. The server runs one process per
-   * database, so a legacy run owned by another boot id belongs to a
-   * process that is gone, and its lease cannot be live. Such a run is reaped
-   * at once, without waiting for its lease to expire, and resumes when the
-   * remote processes are proven stopped.
+   * A legacy run of another boot id whose controller lease expired lost its
+   * server to a restart or a crash. It resumes on the same session when its
+   * remote processes are proven stopped. A live lease always wins, even across
+   * boots: during an overlapping deploy the old server still owns its runs and
+   * drains them itself.
    */
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; reapDeadBootRuns?: boolean }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
     // Recovery never launches a provider or infers stopped ownership from
@@ -21547,12 +21556,11 @@ export function heartbeatService(
       }
       if (resumedRunIds.has(run.id)) continue;
       if (locallyTracked) continue;
-      const deadBootRun =
-        opts?.reapDeadBootRuns === true &&
+      if (await hasLiveLegacyController(db, run)) continue;
+      const restartInterrupted =
         run.runtimeMode === "legacy" &&
         !!run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId;
-      if (!deadBootRun && (await hasLiveLegacyController(db, run))) continue;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -21628,7 +21636,7 @@ export function heartbeatService(
         ((tracksLegacyLocalChild &&
           (!!run.processPid || !!run.processGroupId)) ||
           monitorDispatchLostWithoutFutureWake);
-      if (!(await revokeExpiredLegacyController(db, run, { ownerGone: deadBootRun }))) continue;
+      if (!(await revokeExpiredLegacyController(db, run))) continue;
       const baseMessage = buildProcessLossMessage(run);
       const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
 
@@ -21686,13 +21694,13 @@ export function heartbeatService(
           // The old server is gone, but its remote command may not be. Resume
           // the session only when the stored evidence shows the stop.
           const resumeAfterRestart =
-            deadBootRun &&
+            restartInterrupted &&
             (await remoteRunProcessesProvenStopped(
               db,
               finalizedRun.companyId,
               finalizedRun.id,
             ));
-          if (deadBootRun && !resumeAfterRestart) {
+          if (restartInterrupted && !resumeAfterRestart) {
             await appendRunEvent(finalizedRun, RESTART_RESUME_SKIPPED_EVENT);
           }
           retriedRun = await enqueueProcessLossRetry(

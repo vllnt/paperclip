@@ -114,6 +114,8 @@ describeEmbeddedPostgres("heartbeat restart resume", () => {
       processPid?: number | null;
       controllerBootId?: string;
       leaseValidForMs?: number;
+      sessionIdBefore?: string | null;
+      sessionIdAfter?: string | null;
     } = {},
   ) {
     const { companyId, agentId } = agent;
@@ -145,8 +147,8 @@ describeEmbeddedPostgres("heartbeat restart resume", () => {
       wakeupRequestId,
       contextSnapshot: { issueId, wakeReason: "issue_assigned", ...(input.contextSnapshot ?? {}) },
       processPid: input.processPid ?? null,
-      sessionIdBefore: "session-before",
-      sessionIdAfter: "session-after",
+      sessionIdBefore: input.sessionIdBefore === undefined ? "session-before" : input.sessionIdBefore,
+      sessionIdAfter: input.sessionIdAfter === undefined ? "session-after" : input.sessionIdAfter,
       scheduledRetryAttempt: input.scheduledRetryAttempt ?? 0,
       scheduledRetryReason: input.scheduledRetryReason ?? null,
       ...(input.controllerBootId
@@ -262,6 +264,23 @@ describeEmbeddedPostgres("heartbeat restart resume", () => {
       expect(shouldResetTaskSessionForWake(retry.contextSnapshot)).toBe(false);
       // The one failure retry already spent stays at one: the restart is free.
       expect(failureRetries(retry)).toBe(1);
+    });
+
+    it("keeps a fresh-session choice when the run never named a session of its own", async () => {
+      const seeded = await seedRunningRun(await seedAgent(), {
+        contextSnapshot: { forceFreshSession: true },
+        // Cut short before the CLI named its session: only the discarded one is known.
+        sessionIdBefore: "stale-session",
+        sessionIdAfter: null,
+      });
+
+      await heartbeatService(db).drainRunningRunsForShutdown("SIGTERM", new Date());
+
+      const retry = await successorOf(seeded.runId);
+      expect(retry).toMatchObject({ scheduledRetryReason: RESUME });
+      expect(retry.contextSnapshot).toMatchObject({ forceFreshSession: true });
+      expect(retry.contextSnapshot).not.toHaveProperty("resumeFromRunId");
+      expect(retry.contextSnapshot).not.toHaveProperty("resumeSessionDisplayId");
     });
 
     it("leaves the full ordinary retry budget to a real failure after the resume", async () => {
@@ -380,8 +399,15 @@ describeEmbeddedPostgres("heartbeat restart resume", () => {
     });
   });
 
-  describe("startup reap of runs owned by another boot", () => {
-    it("reaps a run of another boot at once, but only when asked to, and queues a resume", async () => {
+  describe("reap of runs owned by another boot", () => {
+    async function expireLease(runId: string) {
+      await db
+        .update(heartbeatRuns)
+        .set({ controllerLeaseExpiresAt: new Date(Date.now() - 1_000) })
+        .where(eq(heartbeatRuns.id, runId));
+    }
+
+    it("leaves a run of another boot alone while its lease is live, and resumes it once the lease expired", async () => {
       const seeded = await seedRunningRun(await seedAgent(), {
         processPid: DEAD_PID,
         controllerBootId: randomUUID(),
@@ -389,11 +415,12 @@ describeEmbeddedPostgres("heartbeat restart resume", () => {
       });
       const heartbeat = heartbeatService(db);
 
-      // Without the startup flag the live lease still protects the run.
+      // An overlapping deploy: the other server is still up and renews its lease.
       expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
       expect((await heartbeat.getRun(seeded.runId))?.status).toBe("running");
 
-      const result = await heartbeat.reapOrphanedRuns({ reapDeadBootRuns: true });
+      await expireLease(seeded.runId);
+      const result = await heartbeat.reapOrphanedRuns();
 
       expect(result).toEqual({ reaped: 1, runIds: [seeded.runId] });
       expect(await heartbeat.getRun(seeded.runId)).toMatchObject({ status: "failed", errorCode: "process_lost" });
@@ -412,15 +439,28 @@ describeEmbeddedPostgres("heartbeat restart resume", () => {
       expect(failureRetries(retry)).toBe(0);
     });
 
-    it("does not reap a run that this boot owns", async () => {
+    it("resumes from the periodic reap too", async () => {
+      const seeded = await seedRunningRun(await seedAgent(), {
+        processPid: DEAD_PID,
+        controllerBootId: randomUUID(),
+        leaseValidForMs: -1_000,
+      });
+
+      const result = await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 30_000 });
+
+      expect(result).toEqual({ reaped: 1, runIds: [seeded.runId] });
+      expect(await successorOf(seeded.runId)).toMatchObject({ scheduledRetryReason: RESUME });
+    });
+
+    it("gives a lost run of this boot the ordinary retry, not a resume", async () => {
       const seeded = await seedRunningRun(await seedAgent(), {
         processPid: DEAD_PID,
         controllerBootId: legacyControllerBootId,
+        leaseValidForMs: -1_000,
       });
-      const heartbeat = heartbeatService(db);
 
-      expect(await heartbeat.reapOrphanedRuns({ reapDeadBootRuns: true })).toEqual({ reaped: 0, runIds: [] });
-      expect((await heartbeat.getRun(seeded.runId))?.status).toBe("running");
+      expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [seeded.runId] });
+      expect(await successorOf(seeded.runId)).toMatchObject({ scheduledRetryReason: TRANSIENT });
     });
 
     it("leaves a run running while its local child process is still alive", async () => {
@@ -430,10 +470,11 @@ describeEmbeddedPostgres("heartbeat restart resume", () => {
       const seeded = await seedRunningRun(await seedAgent(), {
         processPid: child.pid ?? null,
         controllerBootId: randomUUID(),
+        leaseValidForMs: -1_000,
       });
       const heartbeat = heartbeatService(db);
 
-      expect(await heartbeat.reapOrphanedRuns({ reapDeadBootRuns: true })).toEqual({ reaped: 0, runIds: [] });
+      expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
       expect((await heartbeat.getRun(seeded.runId))?.status).toBe("running");
     });
 
@@ -441,11 +482,12 @@ describeEmbeddedPostgres("heartbeat restart resume", () => {
       const seeded = await seedRunningRun(await seedAgent(), {
         processPid: DEAD_PID,
         controllerBootId: randomUUID(),
+        leaseValidForMs: -1_000,
       });
       await seedSshLease(seeded);
       const heartbeat = heartbeatService(db);
 
-      const result = await heartbeat.reapOrphanedRuns({ reapDeadBootRuns: true });
+      const result = await heartbeat.reapOrphanedRuns();
 
       expect(result.reaped).toBe(1);
       expect(await successorOf(seeded.runId)).toMatchObject({
