@@ -10,6 +10,8 @@ import { getLastProjectId } from "../lib/recent-projects";
 import { NewProjectForm } from "./NewProjectDialog";
 
 vi.mock("../api/projects", () => ({ projectsApi: { create: vi.fn() } }));
+// The fork's form navigates to a repository connection; this test renders it outside a router.
+vi.mock("@/lib/router", () => ({ useNavigate: () => vi.fn() }));
 vi.mock("./ProjectRepositoryInput", () => ({
   ProjectRepositoryInput: () => null,
   repositoryOptionsKey: (companyId: string) => ["repositories", companyId],
