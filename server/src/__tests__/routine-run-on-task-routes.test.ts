@@ -486,6 +486,36 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
       expect(await s.runsOf(routine.id)).toEqual([]);
     });
 
+    it("cannot set up an event_issue trigger, even on its own routine", async () => {
+      const fx = await seedEventFixture(db);
+      const leadId = await fx.createAgent("Lead");
+      const { source } = await fx.sources.ensureInternal(fx.companyId, { userId: "board-user" });
+      const routine = await fx.routinesSvc.create(
+        fx.companyId,
+        {
+          projectId: fx.projectId,
+          goalId: null,
+          parentIssueId: null,
+          title: "Release check",
+          description: "Lead brief",
+          assigneeAgentId: leadId,
+          priority: "medium",
+          status: "active",
+          concurrencyPolicy: "coalesce_if_active",
+          catchUpPolicy: "skip_missed",
+          steps: [step("build")],
+        } as never,
+        {},
+      );
+      const body = { kind: "event", eventSourceId: source.id, eventGrouping: { issueMode: "event_issue" } };
+
+      const asAgent = await request(appFor(agentActor(fx.companyId, leadId))).post(`/api/routines/${routine.id}/triggers`).send(body);
+      const asBoard = await request(appFor(boardActor(fx.companyId))).post(`/api/routines/${routine.id}/triggers`).send(body);
+
+      expect(asAgent.status).toBe(403);
+      expect(asBoard.status).toBe(201);
+    });
+
     it("cannot run a routine assigned to another agent", async () => {
       const s = await seed();
       const routine = await s.createRoutine();

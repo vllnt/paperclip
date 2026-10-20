@@ -178,6 +178,8 @@ const EVENT_ISSUE_GATE_MESSAGE =
 const INTERNAL_SOURCE_ISSUE_MODE_MESSAGE =
   'Triggers on the built-in Paperclip event source must use issueMode "event_issue"';
 const INTERNAL_SOURCE_FALLBACK_MESSAGE = "Triggers on the built-in Paperclip event source cannot be fallbacks";
+const EVENT_ISSUE_BOARD_ONLY_MESSAGE =
+  'Only board users can create, enable, restore or change an issueMode "event_issue" trigger: it starts the routine\'s steps on every matching task of the company';
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
@@ -2234,6 +2236,15 @@ export function routineService(
     if (!actor.userId) throw forbidden("Only board users can change a routine gate");
   }
 
+  /**
+   * An `event_issue` trigger starts the routine's steps on every matching task of the company, including
+   * tasks of other agents and of people. Creating, enabling, restoring or changing one is a board decision;
+   * an agent may still disable, archive or relabel it.
+   */
+  function assertCanWriteEventIssueTrigger(actor: Actor) {
+    if (actor.agentId) throw forbidden(EVENT_ISSUE_BOARD_ONLY_MESSAGE);
+  }
+
   /** Finalizes a parked run only while it is still `gating`, so a late caller never overwrites a settled run. */
   async function finalizeGatingRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>) {
     return db
@@ -3773,6 +3784,7 @@ export function routineService(
       }
 
       if (input.kind === "event") {
+        if (input.eventGrouping?.issueMode === "event_issue") assertCanWriteEventIssueTrigger(actor);
         await assertEventTriggerAllowed(routine, {
           eventSourceId: input.eventSourceId,
           eventGrouping: input.eventGrouping,
@@ -3848,6 +3860,10 @@ export function routineService(
         const nextEventGrouping = patch.eventGrouping === undefined ? existing.eventGrouping : patch.eventGrouping;
         const enabling = patch.enabled === true && !existing.enabled;
         const nextFallback = patch.fallback ?? existing.fallback;
+        const eventIssue = existing.eventGrouping?.issueMode === "event_issue"
+          || nextEventGrouping?.issueMode === "event_issue";
+        const unarchiving = patch.archived === false && existing.archived === true;
+        if (eventIssue && (enabling || unarchiving || touchesEventFields)) assertCanWriteEventIssueTrigger(actor);
         if (
           nextEventSourceId
           && (enabling || patch.eventSourceId !== undefined || patch.eventGrouping !== undefined || patch.fallback === true)
@@ -4070,6 +4086,34 @@ export function routineService(
         assertCanChangeGate(actor);
         if (routineSnapshot.gate) {
           await assertGateConfig(existingRoutine.companyId, routineSnapshot.assigneeAgentId, routineSnapshot.gate);
+        }
+      }
+      const restoredEventIssueTriggers = snapshot.triggers.filter(
+        (trigger) => trigger.kind === "event" && trigger.enabled && trigger.eventGrouping?.issueMode === "event_issue",
+      );
+      if (actor.agentId && restoredEventIssueTriggers.length > 0) {
+        const liveTriggers = await db
+          .select()
+          .from(routineTriggers)
+          .where(
+            and(
+              eq(routineTriggers.companyId, existingRoutine.companyId),
+              eq(routineTriggers.routineId, existingRoutine.id),
+              inArray(routineTriggers.id, restoredEventIssueTriggers.map((trigger) => trigger.id)),
+            ),
+          );
+        const liveById = new Map(liveTriggers.map((trigger) => [trigger.id, trigger]));
+        for (const restored of restoredEventIssueTriggers) {
+          const live = liveById.get(restored.id);
+          const unchanged = live !== undefined
+            && live.kind === "event"
+            && live.enabled
+            && !live.archived
+            && live.eventSourceId === (restored.eventSourceId ?? null)
+            && live.fallback === (restored.fallback ?? false)
+            && isDeepStrictEqual(live.eventMatch ?? null, restored.eventMatch ?? null)
+            && isDeepStrictEqual(live.eventGrouping ?? null, restored.eventGrouping ?? null);
+          if (!unchanged) assertCanWriteEventIssueTrigger(actor);
         }
       }
       for (const triggerSnapshot of snapshot.triggers) {

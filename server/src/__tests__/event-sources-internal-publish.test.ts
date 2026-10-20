@@ -462,6 +462,62 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
       expect(unchanged!.steps).toHaveLength(2);
     });
 
+    it("is refused for an agent, even on its own routine", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+
+      await expect(
+        s.fx.routinesSvc.createTrigger(
+          routine.id,
+          { kind: "event", label: null, eventSourceId: s.source.id, eventMatch: null, eventGrouping: EVENT_ISSUE, fallback: false } as never,
+          { agentId: s.leadId },
+        ),
+      ).rejects.toMatchObject({ status: 403, message: expect.stringContaining("board") });
+      expect(await db.select().from(routineTriggers).where(eq(routineTriggers.routineId, routine.id))).toEqual([]);
+    });
+
+    it("cannot be widened, switched on or brought back by an agent, which may still switch it off or rename it", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const trigger = await s.listen(routine, { grouping: EVENT_ISSUE, match: { labels: { created_by: "user" } } });
+      const agent = { agentId: s.leadId };
+      const svc = s.fx.routinesSvc;
+
+      await expect(svc.updateTrigger(trigger.id, { eventMatch: null } as never, agent)).rejects.toMatchObject({ status: 403 });
+      await expect(svc.updateTrigger(trigger.id, { eventGrouping: EVENT_ISSUE } as never, agent)).rejects.toMatchObject({
+        status: 403,
+      });
+      await svc.updateTrigger(trigger.id, { label: "Release check on new tasks" } as never, agent);
+      await svc.updateTrigger(trigger.id, { enabled: false } as never, agent);
+      await expect(svc.updateTrigger(trigger.id, { enabled: true } as never, agent)).rejects.toMatchObject({ status: 403 });
+      await svc.updateTrigger(trigger.id, { archived: true } as never, agent);
+      await expect(svc.updateTrigger(trigger.id, { archived: false } as never, agent)).rejects.toMatchObject({ status: 403 });
+
+      const [after] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+      expect(after).toMatchObject({ label: "Release check on new tasks", enabled: false, archived: true });
+      expect(after?.eventMatch).toEqual({ labels: { created_by: "user" } });
+    });
+
+    it("cannot be brought back by an agent from an older revision, unless it is unchanged", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const svc = s.fx.routinesSvc;
+      const board = { userId: "board-user" };
+      const agent = { agentId: s.leadId };
+      const trigger = await s.listen(routine, { grouping: EVENT_ISSUE, match: { labels: { created_by: "user" } } });
+      const [withTrigger] = await svc.listRevisions(routine.id);
+      await svc.updateTrigger(trigger.id, { enabled: false } as never, board);
+
+      await expect(svc.restoreRevision(routine.id, withTrigger!.id, agent)).rejects.toMatchObject({ status: 403 });
+      const [stillOff] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+      expect(stillOff?.enabled).toBe(false);
+
+      await svc.restoreRevision(routine.id, withTrigger!.id, board);
+      await svc.update(routine.id, { title: "Release check, renamed" } as never, board);
+      const restored = await svc.restoreRevision(routine.id, withTrigger!.id, agent);
+      expect(restored.routine.title).toBe("Release check");
+    });
+
     it("lets a routine with a disabled trigger lose its steps", async () => {
       const s = await seed();
       const routine = await s.createRoutine();
