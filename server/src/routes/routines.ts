@@ -9,6 +9,7 @@ import {
   parseListRoutinesQuery,
   rotateRoutineTriggerSecretSchema,
   routineStepSchema,
+  routineStepStatsQuerySchema,
   runRoutineSchema,
   updateDocumentAnnotationThreadSchema,
   updateRoutineSchema,
@@ -26,6 +27,7 @@ import {
   routineService,
 } from "../services/index.js";
 import { agentTrustService } from "../services/agent-trust.js";
+import { getRoutineStepStats } from "../services/routine-step-stats.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, unauthorized, unsupportedMediaType } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -550,6 +552,20 @@ export function routineRoutes(
     const limit = Number(req.query.limit ?? 50);
     const result = await svc.listRuns(routine.id, Number.isFinite(limit) ? limit : 50);
     res.json(result);
+  });
+
+  router.get("/routines/:id/step-stats", async (req, res) => {
+    const query = routineStepStatsQuerySchema.parse(req.query);
+    const routine = await getAccessibleResource(req, res, svc.get(req.params.id as string), "Routine not found");
+    if (!routine) return;
+    res.json(
+      await getRoutineStepStats(db, {
+        companyId: routine.companyId,
+        routineId: routine.id,
+        runs: query.runs,
+        currentSteps: routine.steps ?? [],
+      }),
+    );
   });
 
   router.post("/routines/:id/triggers", validate(createRoutineTriggerSchema), async (req, res) => {

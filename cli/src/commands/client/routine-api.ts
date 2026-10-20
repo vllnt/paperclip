@@ -23,6 +23,10 @@ interface RoutineWriteOptions extends JsonOptions {
   stepsFile?: string;
 }
 
+interface StepStatsOptions extends BaseClientOptions {
+  runs?: string;
+}
+
 interface RoutineListOptions extends CompanyOptions {
   q?: string;
   agentId?: string;
@@ -103,6 +107,22 @@ export function registerRoutineApiCommands(program: Command): void {
           const ctx = resolveCommandContext(opts);
           const query = opts.limit ? `?${new URLSearchParams({ limit: opts.limit }).toString()}` : "";
           printOutput(await ctx.api.get(`${apiPath`/api/routines/${routineId}/runs`}${query}`), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+  addCommonClientOptions(
+    routine
+      .command("step-stats")
+      .description("Read-only stats per step of a routine over its latest runs")
+      .argument("<routineId>", "Routine ID")
+      .option("--runs <n>", "How many of the latest routine runs to read (default 50, max 100)")
+      .action(async (routineId: string, opts: StepStatsOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const query = opts.runs ? `?${new URLSearchParams({ runs: opts.runs }).toString()}` : "";
+          printOutput(await ctx.api.get(`${apiPath`/api/routines/${routineId}/step-stats`}${query}`), { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }

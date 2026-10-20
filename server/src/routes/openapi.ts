@@ -107,6 +107,8 @@ import {
   updateRoutineTriggerSchema,
   rotateRoutineTriggerSecretSchema,
   runRoutineSchema,
+  routineStepStatsQuerySchema,
+  routineStepStatsSchema,
   // Event sources
   createEventSourceSchema,
   updateEventSourceSchema,
@@ -5086,6 +5088,26 @@ registry.registerPath({
   summary: "List runs for a routine",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/routines/{id}/step-stats",
+  tags: ["routines"],
+  summary: "Read-only stats per step of a routine over its latest runs",
+  description:
+    "Per routine and per step key: runs, how step issues ended (done, cancelled including skipped, open), " +
+    "median duration, agent runs, tokens, cost, review rounds and the changes-requested rate. Derived from " +
+    "existing rows (the step issue ids each run recorded, the step issues, run usage records and review " +
+    "decisions); it writes nothing. `runs` sets how many of the latest routine runs are read (default 50, max 100).",
+  request: { params: z.object({ id: z.string() }), query: routineStepStatsQuerySchema },
+  responses: {
+    200: r.ok(routineStepStatsSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 registry.registerPath({
