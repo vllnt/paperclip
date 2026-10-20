@@ -1,5 +1,8 @@
 import type {
+  GrantProjectAccess,
   Project,
+  ProjectAccessMode,
+  ProjectAccessSummary,
   ProjectRepositoryOptions,
   ProjectWorkspace,
   WorkspaceOperation,
@@ -28,6 +31,20 @@ export const projectsApi = {
     return api.get<Project[]>("/companies/" + encodeURIComponent(companyId) + "/projects" + (query ? "?" + query : ""));
   },
   get: (id: string, companyId?: string) => api.get<Project>(projectPath(id, companyId)),
+  getAccess: (id: string, companyId?: string) =>
+    api.get<ProjectAccessSummary>(projectPath(id, companyId, "/access")),
+  setAccessMode: (id: string, accessMode: ProjectAccessMode, companyId?: string) =>
+    api.put<ProjectAccessSummary>(projectPath(id, companyId, "/access/mode"), { accessMode }),
+  grantAccess: (id: string, principal: GrantProjectAccess, companyId?: string) =>
+    api.post<ProjectAccessSummary>(projectPath(id, companyId, "/access/principals"), principal),
+  revokeAccess: (id: string, principal: GrantProjectAccess, companyId?: string) =>
+    api.delete<ProjectAccessSummary>(
+      projectPath(
+        id,
+        companyId,
+        `/access/principals/${encodeURIComponent(principal.principalType)}/${encodeURIComponent(principal.principalId)}`,
+      ),
+    ),
   create: (companyId: string, data: Record<string, unknown>) =>
     api.post<Project>(`/companies/${companyId}/projects`, data),
   update: (id: string, data: Record<string, unknown>, companyId?: string) =>

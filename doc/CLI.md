@@ -517,6 +517,16 @@ npx paperclipai project create --company-id <company-id> --name "Ops" --env-json
 npx paperclipai project update <project-id> --execution-workspace-policy-json '{"enabled":true,"defaultMode":"shared_workspace"}'
 ```
 
+Project access (see `doc/SPEC-implementation.md` §9.12). Changing the mode or the list requires a company owner/admin:
+
+```sh
+npx paperclipai project access list <project-id-or-shortname>
+npx paperclipai project access mode <project-id-or-shortname> restricted
+npx paperclipai project access grant <project-id-or-shortname> --agent <agent-id>
+npx paperclipai project access grant <project-id-or-shortname> --user <user-id>
+npx paperclipai project access revoke <project-id-or-shortname> --agent <agent-id>
+```
+
 ## Goal Commands
 
 ```sh

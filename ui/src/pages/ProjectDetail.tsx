@@ -24,6 +24,7 @@ import { BudgetPolicyCard } from "../components/BudgetPolicyCard";
 import { IssuesList } from "../components/IssuesList";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { PageTabBar } from "../components/PageTabBar";
+import { ProjectAccessSection } from "../components/ProjectAccessSection";
 import { ProjectWorkspacesContent } from "../components/ProjectWorkspacesContent";
 import { SummarySlotCard } from "../components/SummarySlotCard";
 import { MembershipAction } from "../components/MembershipAction";
@@ -906,6 +907,7 @@ export function ProjectDetail() {
             getFieldSaveState={(field) => fieldSaveStates[field] ?? "idle"}
             onArchive={(archived) => archiveProject.mutate(archived)}
             archivePending={archiveProject.isPending}
+            access={<ProjectAccessSection projectId={project.id} companyId={project.companyId} />}
           />
         </div>
       )}

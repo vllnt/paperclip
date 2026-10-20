@@ -1471,6 +1471,7 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/projects/:projectId`           | Project details    |
 | POST   | `/api/companies/:companyId/projects` | Create project (`repositoryIds`/`repositoryUrls` arrays or inline `workspace`; optional `idempotencyKey`) |
 | PATCH  | `/api/projects/:projectId`           | Update project     |
+| GET    | `/api/projects/:projectId/access`    | Who can reach the project and why (read-only; only company owners/admins change access) |
 | GET    | `/api/projects/:projectId/workspaces` | List project workspaces |
 | POST   | `/api/projects/:projectId/workspaces` | Create project workspace |
 | PATCH  | `/api/projects/:projectId/workspaces/:workspaceId` | Update project workspace |

@@ -18,6 +18,18 @@ export function canInviteCompanyMembers(
   companyId: string | null | undefined,
   boardAccess: CurrentBoardAccess | undefined,
 ): boolean {
+  return isCompanyAdmin(companyId, boardAccess);
+}
+
+/**
+ * Whether the board is a company owner or admin (or the local operator / an
+ * instance admin), mirroring the server's `assertCompanyAdmin`. Resolves to
+ * false while the snapshot is unknown; the server stays authoritative.
+ */
+export function isCompanyAdmin(
+  companyId: string | null | undefined,
+  boardAccess: CurrentBoardAccess | undefined,
+): boolean {
   if (!boardAccess) return false;
   if (boardAccess.source === "local_implicit" || boardAccess.isInstanceAdmin) return true;
   if (!companyId) return false;
@@ -43,4 +55,15 @@ export function useCanInviteCompanyMembers(enabled = true): boolean {
     staleTime: 30_000,
   });
   return enabled && canInviteCompanyMembers(company?.selectedCompanyId, boardAccess.data);
+}
+
+/** Whether the signed-in board is an owner or admin of the selected company. */
+export function useIsCompanyAdmin(companyId: string | null | undefined): boolean {
+  const boardAccess = useQuery({
+    queryKey: queryKeys.access.currentBoardAccess,
+    queryFn: () => accessApi.getCurrentBoardAccess(),
+    retry: false,
+    staleTime: 30_000,
+  });
+  return isCompanyAdmin(companyId, boardAccess.data);
 }

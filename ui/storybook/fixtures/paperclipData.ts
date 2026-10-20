@@ -669,6 +669,7 @@ function createProject(overrides: Partial<Project> = {}): Project {
     env: null,
     pauseReason: null,
     pausedAt: null,
+    accessMode: "company",
     executionWorkspacePolicy: {
       enabled: true,
       defaultMode: "isolated_workspace",

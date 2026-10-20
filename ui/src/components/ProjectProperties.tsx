@@ -26,6 +26,8 @@ import { Badge } from "@/components/ui/badge";
 interface ProjectPropertiesProps {
   project: Project;
   repositories?: ReactNode;
+  /** Access section, rendered above the danger zone. */
+  access?: ReactNode;
   onUpdate?: (data: Record<string, unknown>) => void;
   onFieldUpdate?: (field: ProjectConfigFieldKey, data: Record<string, unknown>) => void;
   getFieldSaveState?: (field: ProjectConfigFieldKey) => ProjectFieldSaveState;
@@ -205,7 +207,7 @@ function ArchiveDangerZone({
   );
 }
 
-export function ProjectProperties({ project, repositories, onUpdate, onFieldUpdate, getFieldSaveState, onArchive, archivePending }: ProjectPropertiesProps) {
+export function ProjectProperties({ project, repositories, access, onUpdate, onFieldUpdate, getFieldSaveState, onArchive, archivePending }: ProjectPropertiesProps) {
   const { visible: workspaceIsolationControlsVisible } = useWorkspaceIsolationControls();
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
@@ -998,6 +1000,12 @@ export function ProjectProperties({ project, repositories, onUpdate, onFieldUpda
 
       </div>
 
+      {access ? (
+        <>
+          <Separator className="my-4" />
+          {access}
+        </>
+      ) : null}
       {onArchive && (
         <>
           <Separator className="my-4" />

@@ -77,6 +77,7 @@ function makeProject(overrides: Partial<Project>): Project {
     env: null,
     pauseReason: null,
     pausedAt: null,
+    accessMode: "company",
     executionWorkspacePolicy: null,
     codebase: {
       workspaceId: null,

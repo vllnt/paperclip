@@ -613,7 +613,7 @@ conversation lifecycles, and protection against replaying superseded requests.
 | Set subordinate budget | yes | yes (manager subtree only) |
 | Manage responsible user's inbox state | yes | yes (default-open policy) |
 | Manage another user's inbox state | yes | saved target-user opt-in or scoped `inbox:manage` grant |
-| Set work-object visibility (issue/project) | no | no (pro gate) |
+| Set work-object visibility (issue/project) | no | no (pro gate); project access mode and list: company owner/admin only, see §9.12 |
 
 Agent resume is the only grant-gated exception in the lifecycle-route group. An
 agent actor calling `POST /agents/:agentId/resume` must pass the protected
@@ -700,7 +700,7 @@ The approved term set is:
 
 - A **private marker** on an agent profile (where represented) does **not** make company-visible work private.
 - Company-visible work objects (issues, comments, work products, costs, activity, project/task state) remain visible to the board and in-company agents by default.
-- Project/issue-level privacy, scoped assignment-only object visibility, and organization-wide custom ACLs are deferred to Pro/Enterprise controls.
+- Project/issue-level privacy, scoped assignment-only object visibility, and organization-wide custom ACLs are deferred to Pro/Enterprise controls. The exception is the core project access list in §9.12, which is being rolled out behind a server flag and does not yet deny anything.
 
 ## 9.6 V1 vs Pro/Enterprise Controls (recommended target split)
 
@@ -711,7 +711,7 @@ The approved term set is:
 | Profile visibility | Full profile visibility for coordination and audit | Optional profile redaction / selective sharing for external surfaces |
 | Config visibility | Board full read with redacted secret fields; agent config read/write constrained by own agent identity | Scoped config visibility controls and central policy enforcement |
 | Assignment/invocation | Assignment creates execution authority; board can reassign or force release | Delegation policies and scoped invokers with deny-listed tool classes |
-| Work-object visibility | All issues and projects in-company are visible to board and agents | Project/issue ACLs and reviewer-only channels |
+| Work-object visibility | All issues and projects in-company are visible to board and agents (core project access list in rollout, §9.12) | Issue ACLs and reviewer-only channels |
 | Tool/secret policy | Secret refs, log redaction, and adapter-level command/webhook restrictions | Tool allowlists with centralized policy evaluation |
 | Company skills | Open to authenticated company agents; core enforces invariants and any stored restriction policy | Paperclip EE policy editor, protected-skill controls, presets, simulation, and policy audit UX |
 | Inbox management | Responsible agent may archive/unarchive its responsible user's Mine items under a default-open user policy; explicit cross-user access requires saved target-user opt-in or `inbox:manage`; all mutations are audited | Policy administration UX, organization presets, simulations, bulk controls, and richer audit/reporting surfaces |
@@ -1049,6 +1049,24 @@ Ownership split:
 - **Core / Free:** permission key and scoped-grant enforcement; responsible-user resolution; default-open, disabled, and allowlist policy modes; archive/unarchive APIs; per-user archive persistence; resurfacing behavior; activity audit records; and stable denial codes.
 - **Paperclip EE / Enterprise:** centralized policy administration beyond the per-user controls, organization-wide presets, policy simulation, bulk inbox operations, advanced compliance reporting, and richer administrative audit UX. EE may extend policy management surfaces but must not weaken core company boundaries, user policy restrictions, scoped grants, or audit requirements.
 
+## 9.12 Project Access List (rollout in progress)
+
+One access model covers users and agents. Both are principals (`principal_type` `user` or `agent`), as in `company_memberships` and `principal_permission_grants`.
+
+- `projects.access_mode` is `company` (the default and today's behaviour: every active member and every non-terminated company agent can reach the project) or `restricted`.
+- `project_principal_access` lists the users and agents allowed into a restricted project. A row grants presence only. What the principal may do there still comes from its company role, grants and every other rule in this section, so project access can only narrow access, never widen it.
+- Implicit access to a restricted project, which is never stored: the local operator, instance admins (not cloud tenants), company owners/admins, the project lead agent, and the current assignee of the issue being acted on (that issue only).
+- Only company owner/admin board users may change the mode or the list. Agents never can, whatever grants they hold.
+- Mutations write `project_access.mode_changed`, `project_access.granted` and `project_access.revoked` activity entries.
+- `GET /projects/:projectId/access` returns every principal that can reach the project with each reason (`company_mode`, `explicit`, `company_admin`, `lead_agent`). Any principal with `project:read` may read it.
+- Low-trust boundaries, task-bridge key scopes, `tasks:assign_scope` project scopes and tool-access `projectIds` selectors are separate controls. All of them must allow an action; none of them widens project access.
+
+Server enforcement is controlled by `PAPERCLIP_PROJECT_ACCESS_MODE`:
+
+- `off` (default): the gate does no work.
+- `shadow`: `authorization.decide` evaluates the gate after every other rule, for `project` resources and `issue` resources with a project. When it would deny, it logs `project access would deny` and still allows the action.
+- Enforcement lands later, together with list filtering (issue lists, search, activity, costs, inbox, agent context) and runtime dispatch, so a partially enforced boundary is never shipped. Until then the UI labels restricted mode "Not enforced yet".
+
 ## 10. API Contract (REST)
 
 All endpoints are under `/api` and return JSON.
@@ -1177,6 +1195,10 @@ assignee/run ownership checks, and the `issue.released` activity event still app
 - `POST /companies/:companyId/projects`
 - `GET /projects/:projectId`
 - `PATCH /projects/:projectId`
+- `GET /projects/:projectId/access`
+- `PUT /projects/:projectId/access/mode` (company owner/admin)
+- `POST /projects/:projectId/access/principals` (company owner/admin)
+- `DELETE /projects/:projectId/access/principals/:principalType/:principalId` (company owner/admin)
 
 ## 10.6 Current-user Resource Memberships
 
