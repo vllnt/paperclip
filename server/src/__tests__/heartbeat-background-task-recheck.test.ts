@@ -492,6 +492,86 @@ describeEmbeddedPostgres("heartbeat background task re-check", () => {
     expect(run.resultJson).toMatchObject({ errorSummary: first });
   });
 
+  it("redacts a very long adapter error in bounded time", async () => {
+    const { agentId, issueId } = await seed();
+    // The text rule's run time grows with the square of this input: minutes when it reads all of it.
+    const long = `Agent exited with code 1: ${"a-b-".repeat(64 * 1024)}.`;
+    mockAdapterExecute.mockImplementation(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: long,
+      errorDetail: long,
+      errorCode: "adapter_failed",
+      provider: "test",
+      model: "test-model",
+    }));
+
+    const startedAt = performance.now();
+    const run = await runOnce(agentId, issueId);
+
+    expect(performance.now() - startedAt).toBeLessThan(5_000);
+    expect(run.status).toBe("failed");
+    expect(run.error!.length).toBeLessThanOrEqual(8 * 1024);
+    expect(run.error!.startsWith("Agent exited with code 1: a-b-")).toBe(true);
+    expect(run.error!.endsWith("…")).toBe(true);
+  });
+
+  it("redacts a secret that ends at the stored bound of a long error", async () => {
+    const { agentId, issueId } = await seed();
+    const secret = ["fixture", "Edge", "Value", "0123"].join("");
+    const first = "Agent exited with code 1: request failed";
+    const filler = "x".repeat(8 * 1024 - first.length - "\nx-api-key: ".length - secret.length);
+    const detail = `${first}\n${filler}\nx-api-key: ${secret}\n${"y".repeat(64 * 1024)}`;
+    mockAdapterExecute.mockImplementation(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: first,
+      errorDetail: detail,
+      errorCode: "adapter_failed",
+      provider: "test",
+      model: "test-model",
+    }));
+
+    const run = await runOnce(agentId, issueId);
+
+    expect(run.error!.startsWith(`${first}\n`)).toBe(true);
+    expect(run.error).not.toContain(secret.slice(0, 7));
+  });
+
+  it("keeps a secret that the redaction window cuts out of the stored error, even after an earlier secret shrinks", async () => {
+    const { agentId, issueId } = await seed();
+    const secret = ["fixture", "Window", "Value", "0123"].join("");
+    const first = "Agent exited with code 1: request failed";
+    // A long bearer token shrinks to one marker, so the text after it moves forward by about 6 KiB.
+    const token = "t".repeat(6 * 1024);
+    const head = `${first}\nAuthorization: Bearer ${token}\n`;
+    // The JSON value starts 7 characters before the end of the redaction window, so the window
+    // holds an unclosed `"password":"fixture` that no text rule matches.
+    const window = 12 * 1024;
+    const opener = `{"password":"`;
+    const filler = "z".repeat(window - head.length - opener.length - 7);
+    const detail = `${head}${filler}${opener}${secret}"}\n${"y".repeat(64 * 1024)}`;
+    mockAdapterExecute.mockImplementation(async () => ({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: first,
+      errorDetail: detail,
+      errorCode: "adapter_failed",
+      provider: "test",
+      model: "test-model",
+    }));
+
+    const run = await runOnce(agentId, issueId);
+
+    expect(run.error!.startsWith(`${first}\nAuthorization: ***REDACTED***`)).toBe(true);
+    expect(run.error).not.toContain(token.slice(0, 32));
+    expect(run.error).not.toContain(secret.slice(0, 7));
+    expect(run.error!.endsWith("…")).toBe(true);
+  });
+
   it("redacts the run's registered env values from every stored copy of the error, even a value with no secret shape", async () => {
     // An opaque value has no recognizable shape, so only the registered-value rule can mask it.
     const opaque = ["plain", "words", "only", "7loaded"].join("-");

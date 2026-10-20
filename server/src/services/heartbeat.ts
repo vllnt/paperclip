@@ -770,6 +770,35 @@ const MIN_RUN_ERROR_SECRET_VALUE_CHARS = 4;
 // wakeup, the agent's error reason and the live events, so an adapter's detail never grows them
 // without bound. The cut ends the text and keeps its first line, which carries the cause.
 const MAX_RUN_ERROR_CHARS = 8 * 1024;
+// The text rule's run time grows with the square of its input, and an adapter error can hold
+// megabytes of stderr. So the text rule reads only the stored bound plus this margin. A secret
+// that the margin cut splits sits at the end of the redacted window, so the margin is dropped
+// again before the stored cut: earlier secrets that redaction shortens cannot pull it in.
+// The margin is longer than a secret value that a text rule matches.
+const RUN_ERROR_REDACTION_MARGIN_CHARS = 4 * 1024;
+
+function sliceAtCodePoint(text: string, end: number): string {
+  const lastCode = end > 0 ? text.charCodeAt(end - 1) : 0;
+  return text.slice(0, lastCode >= 0xd800 && lastCode <= 0xdbff ? end - 1 : Math.max(end, 0));
+}
+
+function redactStoredRunError(
+  text: string,
+  failureSecretValues: readonly string[],
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+): string {
+  // The registered values and the current user are exact matches, linear in the text, so they
+  // read all of it: a value of any length is masked before a cut can split it.
+  const exact = redactCurrentUserText(
+    redactRunFailureSecretValues(text, failureSecretValues),
+    currentUserRedactionOptions,
+  );
+  const window = MAX_RUN_ERROR_CHARS + RUN_ERROR_REDACTION_MARGIN_CHARS;
+  if (exact.length <= window) return truncateAtGrapheme(redactSensitiveText(exact), MAX_RUN_ERROR_CHARS);
+  const redacted = redactSensitiveText(sliceAtCodePoint(exact, window));
+  const kept = sliceAtCodePoint(redacted, redacted.length - RUN_ERROR_REDACTION_MARGIN_CHARS);
+  return truncateAtGrapheme(`${kept}…`, MAX_RUN_ERROR_CHARS);
+}
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -28156,18 +28185,8 @@ export function heartbeatService(
         const failureSecretValues = readFailureReportSecrets().filter(
           (value) => value.length >= MIN_RUN_ERROR_SECRET_VALUE_CHARS,
         );
-        // The cut comes after the redaction: a cut before it could leave half of a secret that
-        // no rule recognizes.
         const redactRunError = (text: string) =>
-          truncateAtGrapheme(
-            redactSensitiveText(
-              redactCurrentUserText(
-                redactRunFailureSecretValues(text, failureSecretValues),
-                currentUserRedactionOptions,
-              ),
-            ),
-            MAX_RUN_ERROR_CHARS,
-          );
+          redactStoredRunError(text, failureSecretValues, currentUserRedactionOptions);
         // Classifiers read the adapter's short errorMessage. A failed run stores
         // the adapter's fuller errorDetail when it has one, and keeps the short
         // message in resultJson.errorSummary for classifiers that read it back.
