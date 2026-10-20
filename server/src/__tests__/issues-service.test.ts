@@ -2087,6 +2087,49 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(advancedIssueIds).toContain(legacyContentMachineOperationIssueId);
   });
 
+  it("leaves the roots and the steps of routine runs out of a list that excludes routine executions", async () => {
+    const companyId = randomUUID();
+    const routineId = randomUUID();
+    const manualId = randomUUID();
+    const rootId = randomUUID();
+    const stepId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: manualId, companyId, title: "Manual", status: "todo", priority: "medium" },
+      {
+        id: rootId,
+        companyId,
+        title: "Routine root",
+        status: "todo",
+        priority: "medium",
+        originKind: "routine_execution",
+        originId: routineId,
+      },
+      {
+        id: stepId,
+        companyId,
+        parentId: rootId,
+        title: "Routine step",
+        status: "todo",
+        priority: "medium",
+        originKind: "routine_step",
+        originId: routineId,
+      },
+    ]);
+
+    const ids = async (filters?: Parameters<typeof svc.list>[1]) =>
+      (await svc.list(companyId, filters)).map((issue) => issue.id).sort();
+
+    expect(await ids()).toEqual([manualId, rootId, stepId].sort());
+    expect(await ids({ excludeRoutineExecutions: true })).toEqual([manualId]);
+    expect(await ids({ excludeRoutineExecutions: true, originKind: "routine_step" })).toEqual([stepId]);
+  });
+
   it("excludes plugin operation issues from unread inbox counts", async () => {
     const companyId = randomUUID();
     const userId = "board-user";

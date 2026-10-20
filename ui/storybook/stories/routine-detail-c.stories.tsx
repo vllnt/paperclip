@@ -255,6 +255,7 @@ function makeContext(
     activityGatePolicy: "always",
     activityGateScope: "company",
     variables: routineDetail.variables,
+    steps: routineDetail.steps ?? [],
     env: routineDetail.env ?? null,
     automationWakeSettings: {},
     runContextPolicy: null,
@@ -325,6 +326,7 @@ function makeContext(
 
 const SECTION_TITLES: Record<RoutineSectionKey, string> = {
   overview: "Overview",
+  steps: "Steps",
   triggers: "Triggers",
   variables: "Variables",
   secrets: "Secrets",
