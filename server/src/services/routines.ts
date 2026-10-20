@@ -68,6 +68,7 @@ import type {
   UpdateRoutineTrigger,
 } from "@paperclipai/shared";
 import {
+  PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
   ROUTINE_GATE_SKIP_REASON,
   ROUTINE_GATE_TRIGGER_INACTIVE_REASON,
   ROUTINE_GATE_UNAVAILABLE_REASON,
@@ -167,6 +168,15 @@ function rootHasCancelledStep() {
   );
 }
 const APPEND_MODE_STEPS_MESSAGE = "Steps are not supported with append issue mode";
+const EVENT_ISSUE_SOURCE_MESSAGE =
+  'issueMode "event_issue" is only valid on the built-in Paperclip event source';
+const EVENT_ISSUE_STEPS_MESSAGE =
+  'issueMode "event_issue" attaches the routine\'s steps to the created task, so the routine needs at least one step';
+const EVENT_ISSUE_GATE_MESSAGE =
+  'A gate script that applies to event triggers cannot be combined with issueMode "event_issue": the steps start while the task is created';
+const INTERNAL_SOURCE_ISSUE_MODE_MESSAGE =
+  'Triggers on the built-in Paperclip event source must use issueMode "event_issue"';
+const INTERNAL_SOURCE_FALLBACK_MESSAGE = "Triggers on the built-in Paperclip event source cannot be fallbacks";
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
@@ -425,6 +435,7 @@ function nextResultText(status: string, issueId?: string | null) {
   if (status === "skipped_gate") return "Skipped by the gate script";
   if (status === "skipped_gate_unchanged") return "Skipped because the gate output did not change";
   if (status === "skipped_gate_unavailable") return "Skipped because the gate script could not run";
+  if (status === "skipped_new_issue_budget") return "Skipped because the event source's new-issue budget is spent";
   if (status === "gating") return "Waiting for the gate script";
   if (status === "completed") return "Execution issue completed";
   if (status === "failed") return "Execution failed";
@@ -2068,12 +2079,16 @@ export function routineService(
    */
   async function assertEventTriggerAllowed(
     routine: typeof routines.$inferSelect,
-    config: { eventSourceId: string; eventGrouping?: EventGrouping | null },
+    config: { eventSourceId: string; eventGrouping?: EventGrouping | null; fallback?: boolean },
     variables: RoutineVariable[] = routine.variables ?? [],
-    options: { allowArchivedSource?: boolean; steps?: RoutineStep[] } = {},
+    options: { allowArchivedSource?: boolean; steps?: RoutineStep[]; gate?: RoutineGate | null } = {},
   ) {
     const source = await db
-      .select({ companyId: eventSources.companyId, archived: eventSources.archived })
+      .select({
+        companyId: eventSources.companyId,
+        archived: eventSources.archived,
+        normalizer: eventSources.normalizer,
+      })
       .from(eventSources)
       .where(eq(eventSources.id, config.eventSourceId))
       .then((rows) => rows[0] ?? null);
@@ -2084,6 +2099,16 @@ export function routineService(
     }
     assertEventCompatibleVariables(variables);
     const issueMode = config.eventGrouping?.issueMode;
+    const internalSource = source.normalizer === PAPERCLIP_INTERNAL_EVENT_NORMALIZER;
+    if (issueMode === "event_issue") {
+      if (!internalSource) throw unprocessable(EVENT_ISSUE_SOURCE_MESSAGE);
+      if ((options.steps ?? routine.steps ?? []).length === 0) throw unprocessable(EVENT_ISSUE_STEPS_MESSAGE);
+      const gate = options.gate === undefined ? routine.gate : options.gate;
+      if (routineGateAppliesToSource(gate, "event")) throw unprocessable(EVENT_ISSUE_GATE_MESSAGE);
+    } else if (internalSource) {
+      throw unprocessable(INTERNAL_SOURCE_ISSUE_MODE_MESSAGE);
+    }
+    if (internalSource && config.fallback) throw unprocessable(INTERNAL_SOURCE_FALLBACK_MESSAGE);
     if (issueMode && typeof issueMode === "object") {
       if ((options.steps ?? routine.steps ?? []).length > 0) throw unprocessable(APPEND_MODE_STEPS_MESSAGE);
       if (!routine.assigneeAgentId) throw unprocessable("appendToIssueId requires the routine to have a default agent");
@@ -2151,6 +2176,11 @@ export function routineService(
     resolveResponsibleUserId: async (executor, routine) =>
       (await resolveLatestRevisionResponsibleUserId(executor, routine)) ?? routine.responsibleUserId ?? null,
     gateApplies: (routine) => routineGateAppliesToSource(routine.gate, "event"),
+    assertStepsCanStart: async (routine, task, executor) => {
+      for (const agentId of routineStartingStepAgentIds(routine.steps ?? [], routine.assigneeAgentId)) {
+        await assertWakeAdmitsAssignee(executor, routine.companyId, agentId, task.projectId);
+      }
+    },
     onGating: (runId) => kickGate(runId),
   });
 
@@ -3359,7 +3389,8 @@ export function routineService(
         patch.variables !== undefined ||
         patch.title !== undefined ||
         patch.description !== undefined ||
-        patch.steps !== undefined
+        patch.steps !== undefined ||
+        patch.gate !== undefined
       ) {
         const enabledEventTriggers = await db
           .select({ eventGrouping: routineTriggers.eventGrouping })
@@ -3379,6 +3410,13 @@ export function routineService(
           enabledEventTriggers.some((trigger) => typeof trigger.eventGrouping?.issueMode === "object")
         ) {
           throw unprocessable(APPEND_MODE_STEPS_MESSAGE);
+        }
+        if (
+          (patch.steps !== undefined || patch.gate !== undefined) &&
+          enabledEventTriggers.some((trigger) => trigger.eventGrouping?.issueMode === "event_issue")
+        ) {
+          if (nextSteps.length === 0) throw unprocessable(EVENT_ISSUE_STEPS_MESSAGE);
+          if (routineGateAppliesToSource(nextGate, "event")) throw unprocessable(EVENT_ISSUE_GATE_MESSAGE);
         }
       }
       const responsibleUserId = await resolveRoutineResponsibleUserId(
@@ -3596,7 +3634,11 @@ export function routineService(
       }
 
       if (input.kind === "event") {
-        await assertEventTriggerAllowed(routine, { eventSourceId: input.eventSourceId, eventGrouping: input.eventGrouping });
+        await assertEventTriggerAllowed(routine, {
+          eventSourceId: input.eventSourceId,
+          eventGrouping: input.eventGrouping,
+          fallback: input.fallback,
+        });
       }
 
       const { trigger, revision } = await db.transaction(async (tx) => {
@@ -3666,10 +3708,18 @@ export function routineService(
         const nextEventSourceId = patch.eventSourceId ?? existing.eventSourceId;
         const nextEventGrouping = patch.eventGrouping === undefined ? existing.eventGrouping : patch.eventGrouping;
         const enabling = patch.enabled === true && !existing.enabled;
-        if (nextEventSourceId && (enabling || patch.eventSourceId !== undefined || patch.eventGrouping !== undefined)) {
+        const nextFallback = patch.fallback ?? existing.fallback;
+        if (
+          nextEventSourceId
+          && (enabling || patch.eventSourceId !== undefined || patch.eventGrouping !== undefined || patch.fallback === true)
+        ) {
           const routine = await getRoutineById(existing.routineId);
           if (!routine) throw notFound("Routine not found");
-          await assertEventTriggerAllowed(routine, { eventSourceId: nextEventSourceId, eventGrouping: nextEventGrouping });
+          await assertEventTriggerAllowed(routine, {
+            eventSourceId: nextEventSourceId,
+            eventGrouping: nextEventGrouping,
+            fallback: nextFallback,
+          });
         }
       }
 
@@ -3888,9 +3938,13 @@ export function routineService(
         if (!triggerSnapshot.eventSourceId) throw unprocessable("Event trigger snapshot has no event source");
         await assertEventTriggerAllowed(
           existingRoutine,
-          { eventSourceId: triggerSnapshot.eventSourceId, eventGrouping: triggerSnapshot.eventGrouping },
+          {
+            eventSourceId: triggerSnapshot.eventSourceId,
+            eventGrouping: triggerSnapshot.eventGrouping,
+            fallback: triggerSnapshot.fallback,
+          },
           routineSnapshot.variables,
-          { allowArchivedSource: true, steps: routineSnapshot.steps ?? [] },
+          { allowArchivedSource: true, steps: routineSnapshot.steps ?? [], gate: routineSnapshot.gate ?? null },
         );
       }
 

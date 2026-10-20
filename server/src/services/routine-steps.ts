@@ -322,8 +322,11 @@ export interface AttachRoutineStepsToIssueInput {
   defaultAssigneeAgentId: string | null;
   /** Values for `{{variable}}` placeholders; `issue.title` and `issue.identifier` come from the task. */
   variables: Record<string, unknown>;
-  /** Runs once the guards pass and before anything is created; throw to refuse the task. */
-  assertCanStart?: (issue: RoutineStepTargetIssue) => Promise<void>;
+  /**
+   * Runs once the guards pass and before anything is created; throw to refuse the task. It reads on
+   * `executor`, the savepoint the attach runs in.
+   */
+  assertCanStart?: (issue: RoutineStepTargetIssue, executor: Db) => Promise<void>;
 }
 
 /** Whether a heartbeat run that has not finished is working on the task. */
@@ -415,7 +418,7 @@ export async function attachRoutineStepsToIssue(
           { childCount, stepCount: steps.length, limit: MAX_CHILD_ISSUES_CREATED_BY_HELPER },
         );
       }
-      await assertCanStart?.(locked);
+      await assertCanStart?.(locked, savepointDb);
 
       if (!locked.assigneeAgentId || locked.status === "blocked") return locked;
       const [blocked] = await savepoint
