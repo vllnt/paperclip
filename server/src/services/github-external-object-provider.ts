@@ -1,8 +1,11 @@
-import type { Db } from "@paperclipai/db";
+import { and, desc, eq, isNotNull, not } from "drizzle-orm";
+import { documents, externalObjectMentions, issueComments, issues, type Db } from "@paperclipai/db";
 import type { ExternalObjectCanonicalUrl } from "@paperclipai/shared";
 import { DEFAULT_GITHUB_TOKEN_SECRET_NAMES } from "./git-credentials.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { resolveGitHubIssueReadToken } from "./github-read-credentials.js";
 import { secretService } from "./secrets.js";
+import { isLowTrustQuarantinedSql } from "./source-trust.js";
 import type {
   ExternalObjectDetection,
   ExternalObjectDetector,
@@ -13,9 +16,18 @@ import type {
 
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
+/**
+ * The object a token is for: its id (null for a reference that is not stored, such as a merge
+ * check), and the `owner/name` of its repository.
+ */
+export interface GitHubTokenContext {
+  objectId: string | null;
+  repository: string;
+}
+
 export interface GitHubExternalObjectProviderOptions {
   fetch?: FetchLike;
-  tokenProvider?: (companyId: string) => Promise<string | null> | string | null;
+  tokenProvider?: (companyId: string, context: GitHubTokenContext) => Promise<string | null> | string | null;
   secretNames?: readonly string[];
   /** Transient matching input; leave off for stored external-object snapshots. */
   includePullRequestBody?: boolean;
@@ -341,7 +353,7 @@ async function safeJson(response: Response) {
   }
 }
 
-async function defaultTokenProvider(db: Db, companyId: string, secretNames: readonly string[]) {
+async function companySecretToken(db: Db, companyId: string, secretNames: readonly string[]) {
   const secrets = secretService(db);
   for (const secretName of secretNames) {
     const secret = await secrets.getByName(companyId, secretName);
@@ -353,6 +365,85 @@ async function defaultTokenProvider(db: Db, companyId: string, secretNames: read
   return null;
 }
 
+/** How many of an object's issues to try, newest first, before the object waits for its next refresh. */
+const MAX_IDENTITY_ISSUES = 3;
+
+/**
+ * The agents that hold the issues which mention the object, newest issue first: a refresh reads
+ * GitHub with the authority a run of one of them on that issue has.
+ *
+ * A mention in a low-trust quarantined comment or document does not count. Its text is not trusted
+ * to steer a higher-trust action, and choosing whose personal grant reads a repository is one. The
+ * issue's own trust is checked later, by resolveGitHubIssueReadToken, and covers its title and
+ * description.
+ *
+ * @returns `holders`: the agents of the trusted mentions. `onlyQuarantined`: no trusted mention, but
+ *   a quarantined one exists, so the object has no reader at all.
+ */
+async function mentioningIssueAgents(db: Db, companyId: string, objectId: string) {
+  const mentions = () => db
+    .selectDistinct({ issueId: issues.id, agentId: issues.assigneeAgentId, updatedAt: issues.updatedAt })
+    .from(externalObjectMentions)
+    .innerJoin(issues, and(eq(issues.id, externalObjectMentions.sourceIssueId), eq(issues.companyId, externalObjectMentions.companyId)))
+    .leftJoin(issueComments, and(
+      eq(externalObjectMentions.sourceKind, "comment"),
+      eq(issueComments.id, externalObjectMentions.sourceRecordId),
+      eq(issueComments.companyId, externalObjectMentions.companyId),
+    ))
+    .leftJoin(documents, and(
+      eq(externalObjectMentions.sourceKind, "document"),
+      eq(documents.id, externalObjectMentions.sourceRecordId),
+      eq(documents.companyId, externalObjectMentions.companyId),
+    ));
+  const ofObject = and(
+    eq(externalObjectMentions.companyId, companyId),
+    eq(externalObjectMentions.objectId, objectId),
+    isNotNull(issues.assigneeAgentId),
+  );
+  const rows = await mentions()
+    .where(and(
+      ofObject,
+      not(isLowTrustQuarantinedSql(issueComments.sourceTrust)),
+      not(isLowTrustQuarantinedSql(documents.sourceTrust)),
+    ))
+    .orderBy(desc(issues.updatedAt))
+    .limit(MAX_IDENTITY_ISSUES);
+  const holders = rows.flatMap((row) => (row.agentId ? [{ issueId: row.issueId, agentId: row.agentId }] : []));
+  if (holders.length > 0) return { holders, onlyQuarantined: false };
+  const [anyMention] = await mentions().where(ofObject).limit(1);
+  return { holders, onlyQuarantined: anyMention !== undefined };
+}
+
+/**
+ * The credential a run on an issue that mentions the object would read the repository with (see
+ * resolveGitHubIssueReadToken). An object that no assigned issue mentions has no such run: a company
+ * secret then, as before. An object that only quarantined text mentions has no token: low-trust
+ * text does not pick a credential, and it does not fall back to the company secret either. Throws
+ * when every issue's managed identity is unusable and none has a token.
+ */
+async function defaultTokenProvider(
+  db: Db,
+  companyId: string,
+  secretNames: readonly string[],
+  context: GitHubTokenContext,
+) {
+  const { holders, onlyQuarantined } = context.objectId
+    ? await mentioningIssueAgents(db, companyId, context.objectId)
+    : { holders: [], onlyQuarantined: false };
+  if (holders.length === 0) return onlyQuarantined ? null : companySecretToken(db, companyId, secretNames);
+  let failure: unknown = null;
+  for (const holder of holders) {
+    try {
+      const token = await resolveGitHubIssueReadToken(db, { companyId, ...holder, repository: context.repository });
+      if (token) return token;
+    } catch (error) {
+      failure = error;
+    }
+  }
+  if (failure) throw failure;
+  return null;
+}
+
 export function createGitHubExternalObjectProvider(
   db: Db,
   opts: GitHubExternalObjectProviderOptions = {},
@@ -361,7 +452,7 @@ export function createGitHubExternalObjectProvider(
   const secretNames = opts.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
   const tokenProvider = Object.prototype.hasOwnProperty.call(opts, "tokenProvider") && opts.tokenProvider !== undefined
     ? opts.tokenProvider
-    : ((companyId: string) => defaultTokenProvider(db, companyId, secretNames));
+    : ((companyId: string, context: GitHubTokenContext) => defaultTokenProvider(db, companyId, secretNames, context));
 
   const detector: ExternalObjectDetector = {
     key: "github",
@@ -402,7 +493,12 @@ export function createGitHubExternalObjectProvider(
 
         let token: string | null = null;
         try {
-          token = typeof tokenProvider === "function" ? await tokenProvider(companyId) : tokenProvider;
+          token = typeof tokenProvider === "function"
+            ? await tokenProvider(companyId, {
+                objectId: typeof object.id === "string" ? object.id : null,
+                repository: `${identity.owner}/${identity.repo}`,
+              })
+            : tokenProvider;
         } catch {
           return {
             ok: false,

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { parseIssueWaitPullRequestUrl } from "@paperclipai/shared";
-import { createGitRemoteAuthProvider } from "./git-credentials.js";
+import { resolveGitHubIssueReadToken } from "./github-read-credentials.js";
 
 /**
  * Pre-wake gate for a wait that explicitly targets one GitHub pull request
@@ -264,22 +264,21 @@ async function readCappedJson(response: Response): Promise<unknown> {
 }
 
 /**
- * Company-scoped sources only: the managed GitHub connection, then a company
- * secret. The server-environment token is not this company's credential.
+ * The credential a run of this agent on this issue would read the repository with
+ * (see resolveGitHubIssueReadToken): the managed GitHub identity the issue continues
+ * under, else a company secret. The server-environment token is not this company's
+ * credential.
  */
-async function defaultResolveToken(
+function defaultResolveToken(
   db: Db,
   input: { companyId: string; issueId: string; agentId: string; pullRequest: PullRequestWaitTarget },
 ) {
-  const provider = createGitRemoteAuthProvider(
-    db,
-    input.companyId,
-    { issueId: input.issueId, agentId: input.agentId },
-    { env: {} },
-  );
-  const invocation = await provider(`https://github.com/${input.pullRequest.owner}/${input.pullRequest.repo}.git`);
-  const token = invocation?.env.GH_TOKEN?.trim();
-  return token ? token : null;
+  return resolveGitHubIssueReadToken(db, {
+    companyId: input.companyId,
+    agentId: input.agentId,
+    issueId: input.issueId,
+    repository: `${input.pullRequest.owner}/${input.pullRequest.repo}`,
+  });
 }
 
 async function readPullRequestEntry(input: {
