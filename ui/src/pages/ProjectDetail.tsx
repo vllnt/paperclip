@@ -913,8 +913,12 @@ export function ProjectDetail() {
                   goalRefs={project.goals}
                   onGoalIdsChange={project.archivedAt ? undefined : async (goalIds) => {
                     await updateProjectField("goals", { goalIds });
-                    // The next link or unlink must start from the saved goals, so wait until the page shows them.
-                    await queryClient.refetchQueries({ queryKey: queryKeys.projects.detail(routeProjectRef) });
+                    // The next link or unlink must start from the saved goals, so wait until the page shows them,
+                    // and report a failed reload instead of offering changes from the old goals.
+                    await queryClient.refetchQueries(
+                      { queryKey: queryKeys.projects.detail(routeProjectRef), type: "active" },
+                      { throwOnError: true },
+                    );
                   }}
                 />
                 <ProjectRoutinesSection

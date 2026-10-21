@@ -114,7 +114,10 @@ export function GoalDetail() {
   });
   const openTasks = openTasksQuery.data ?? [];
   const goalRoutines = (goalRoutinesQuery.data ?? []).filter((routine) => routine.status !== "archived");
-  const linkedWorkError = openTasksQuery.error ?? goalRoutinesQuery.error;
+  // A failed background refresh keeps the work already shown; an error replaces a tab only when it has no data.
+  const openTasksError = openTasksQuery.data ? null : openTasksQuery.error;
+  const goalRoutinesError = goalRoutinesQuery.data ? null : goalRoutinesQuery.error;
+  const linkedWorkError = openTasksError ?? goalRoutinesError;
   const linkedWorkLoading = openTasksQuery.isLoading || goalRoutinesQuery.isLoading;
 
   const { data: agents } = useQuery({
@@ -288,8 +291,8 @@ export function GoalDetail() {
         </TabsContent>
 
         <TabsContent value="tasks" className="mt-4">
-          {openTasksQuery.error ? (
-            <p role="alert" className="text-sm text-destructive">Failed to load the goal's open tasks: {openTasksQuery.error.message}</p>
+          {openTasksError ? (
+            <p role="alert" className="text-sm text-destructive">Failed to load the goal's open tasks: {openTasksError.message}</p>
           ) : openTasksQuery.isLoading ? (
             <p className="text-sm text-muted-foreground">Loading open tasks...</p>
           ) : openTasks.length === 0 ? (
@@ -317,8 +320,8 @@ export function GoalDetail() {
               Routine
             </Button>
           </div>
-          {goalRoutinesQuery.error ? (
-            <p role="alert" className="text-sm text-destructive">Failed to load the goal's routines: {goalRoutinesQuery.error.message}</p>
+          {goalRoutinesError ? (
+            <p role="alert" className="text-sm text-destructive">Failed to load the goal's routines: {goalRoutinesError.message}</p>
           ) : goalRoutinesQuery.isLoading ? (
             <p className="text-sm text-muted-foreground">Loading routines...</p>
           ) : goalRoutines.length === 0 ? (
