@@ -304,7 +304,8 @@ npx paperclipai run stats --since 7d --agent-id <agent-id> --json
 ```
 
 `runsToday` counts what `runtimeConfig.heartbeat.maxDailyRuns` counts: runs started in the current UTC day that
-are not queued or waiting to retry, less the provider quota failures that the cap forgives (see
+are not queued or waiting to retry, with a run and its harness fallback re-dispatch or restart resume counted once,
+less the provider quota failures that the cap forgives (see
 `providerQuotaRetry.maxDailyUncountedRuns`).
 
 ## Plugin Actions
