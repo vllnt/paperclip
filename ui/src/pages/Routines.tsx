@@ -16,6 +16,7 @@ import { useToastActions } from "../context/ToastContext";
 import { buildMarkdownMentionOptions } from "../lib/company-members";
 import { cn } from "../lib/utils";
 import { queryKeys } from "../lib/queryKeys";
+import { agentNameMap, stepWarningsToast } from "../lib/routine-step-warnings";
 import { groupBy } from "../lib/groupBy";
 import { createIssueDetailLocationState } from "../lib/issueDetailBreadcrumb";
 import { collectLiveIssueIds } from "../lib/liveIssueIds";
@@ -57,6 +58,7 @@ import {
 import { auditSectionHref } from "./audit/audit-navigation";
 import { routineDetailHref } from "../components/RoutineContextualSidebar";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
+import { useNewRoutineLink } from "../hooks/useNewRoutineLink";
 import { useStreamlinedUiEnabled } from "../hooks/useStreamlinedUiEnabled";
 import type { RoutineListItem, RoutineVariable } from "@paperclipai/shared";
 import type { FolderListItem } from "@paperclipai/shared";
@@ -615,8 +617,10 @@ export function Routines({ fixedAssigneeAgentId, embedded = false, excludeRoutin
     onMutate: ({ id }) => {
       setRunningRoutineId(id);
     },
-    onSuccess: async (_, { id }) => {
+    onSuccess: async (run, { id }) => {
       setRunDialogRoutine(null);
+      const warningToast = stepWarningsToast(run.warnings, agentNameMap(agents));
+      if (warningToast) pushToast(warningToast);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.list(selectedCompanyId!) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(id) }),
@@ -782,6 +786,11 @@ export function Routines({ fixedAssigneeAgentId, embedded = false, excludeRoutin
     }));
     setComposerOpen(true);
   }
+
+  useNewRoutineLink((projectId) => {
+    if (projectId) setDraft((current) => ({ ...current, projectId }));
+    openCreateRoutine();
+  }, !embedded);
 
   async function moveSelectedRoutines(folderId: string | null) {
     const ids = selectedRoutineIds;

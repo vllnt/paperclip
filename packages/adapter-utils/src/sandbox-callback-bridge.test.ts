@@ -325,6 +325,42 @@ describe("sandbox callback bridge", () => {
     expect(forwarded).toEqual(["GET /api/openapi.json"]);
   });
 
+  it("serves exact GET health over the queue and denies health mutations and lookalikes", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-health-"));
+    cleanupDirs.push(rootDir);
+    const queueDir = path.join(rootDir, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const health = { status: "ok", commit: "0123456789abcdef0123456789abcdef01234567" };
+    const forwarded: string[] = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(), queueDir,
+      handleRequest: async (request) => {
+        forwarded.push(`${request.method} ${request.path}`);
+        return { status: 200, body: JSON.stringify(health) };
+      },
+    });
+    cleanupFns.push(() => worker.stop());
+    const requests = [
+      { method: "GET", path: "/api/health" },
+      { method: "POST", path: "/api/health" },
+      { method: "POST", path: "/api/health/dev-server/restart" },
+      { method: "GET", path: "/api/health/extra" },
+      { method: "GET", path: "/api/healthz" },
+    ];
+    for (const [index, request] of requests.entries()) {
+      await writeFile(path.join(directories.requestsDir, `health-${index}.json`), JSON.stringify({
+        id: `health-${index}`, ...request, query: "", headers: {}, body: "", createdAt: new Date().toISOString(),
+      }));
+    }
+    await worker.stop({ drainTimeoutMs: 5_000 });
+    for (const [index] of requests.entries()) {
+      const response = JSON.parse(await readFile(path.join(directories.responsesDir, `health-${index}.json`), "utf8"));
+      expect(response.status).toBe(index === 0 ? 200 : 403);
+      if (index === 0) expect(JSON.parse(response.body)).toEqual(health);
+    }
+    expect(forwarded).toEqual(["GET /api/health"]);
+  });
+
   it("denies non-allowlisted requests by default", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-default-policy-"));
     cleanupDirs.push(rootDir);

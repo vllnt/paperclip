@@ -15,7 +15,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { createFakeGitHubPullRequestApi } from "./helpers/fake-github-pull-request.js";
 import { attentionService } from "../services/attention.js";
 import { listSupersededExhaustedRunIds } from "../services/attention-exhausted-runs.js";
-import { heartbeatService } from "../services/heartbeat.js";
+import { claimRoutineTaskSession, heartbeatService } from "../services/heartbeat.js";
 import { evaluatePullRequestWakeGate } from "../services/pull-request-wake-gate.js";
 
 /**
@@ -30,7 +30,10 @@ import { evaluatePullRequestWakeGate } from "../services/pull-request-wake-gate.
  * - Hot query 2: the attention feed's "did a newer run supersede this
  *   exhausted run" check (attentionService.list). An exhausted run stays in the
  *   feed until something supersedes it, so the check also runs for old runs.
- * - Hot query 3: the pull request wake gate's "agent's latest run on the issue"
+ * - Hot query 3: the routine session claim's "does another running run of this
+ *   agent hold the routine session" check (claimRoutineTaskSession), sent on
+ *   every routine-execution run.
+ * - Hot query 4: the pull request wake gate's "agent's latest run on the issue"
  *   lookup (evaluatePullRequestWakeGate), on an issue whose runs are all old.
  *
  * The test seeds a table large enough that the default plan has to choose,
@@ -57,12 +60,17 @@ const AGENTS = 26;
 const QUERY_1_BUFFER_BOUND = 100;
 const QUERY_2_BUFFER_BOUND = 1_000;
 /**
- * Hot query 3 reads the hot issue's 600 index entries and heap rows, then one
+ * Query 3 reads one agent's runs through its index (about 230 here, about 235
+ * buffers) and the claim key of only its running runs' contexts.
+ */
+const CLAIM_BUFFER_BOUND = 400;
+/**
+ * Hot query 4 reads the hot issue's 600 index entries and heap rows, then one
  * context. Walking the company's newest runs instead reads the contexts above
  * them: over a thousand buffers here.
  */
 const HOT_ISSUE_RUNS = 600;
-const QUERY_3_BUFFER_BOUND = 400;
+const QUERY_4_BUFFER_BOUND = 400;
 /**
  * Runs without an issue of one agent, all older than its exhausted run. A check that
  * ranges over created_at reads about 2 buffers. One that compares every older run's time
@@ -220,7 +228,7 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
       fingerprint: `plans:${sourceIssueId}`, evidence: { latestRunId: null }, nextAction: "Recover",
       wakePolicy: { type: "bounded_recovery_owner", ownerAgentId: agentIds[0], attempt: 1, maxAttempts: 5 }, attemptCount: 1, maxAttempts: 5,
     });
-    // A hot issue for hot query 3: one agent's 600 runs on one issue, each with an ~8 kB
+    // A hot issue for hot query 4: one agent's 600 runs on one issue, each with an ~8 kB
     // incompressible context, all older than the bulk seed (but after OLD). A plan that walks the
     // company's newest runs instead of the issue index passes (and detoasts) every run above them.
     await db.$client.unsafe(`
@@ -282,7 +290,7 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
     for (const statement of hot) await expectNewerRunCheckPlans(statement);
   });
 
-  it("hot query 3 (pull request wake gate's baseline run) uses the issue index on an issue whose runs are all old", async () => {
+  it("hot query 4 (pull request wake gate's baseline run) uses the issue index on an issue whose runs are all old", async () => {
     const recorder = recordingDb(db);
     const github = createFakeGitHubPullRequestApi({ owner: "acme", repo: "app", number: 7 });
     const decision = await evaluatePullRequestWakeGate(
@@ -299,7 +307,7 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
       expect(plan.generic, `${label}: plan kind`).toBe(genericPlan);
       expect(plan.seqScans, `${label}: sequential scan of heartbeat_runs`).toEqual([]);
       expect(plan.usesIssueIndex, `${label}: does not use ${ISSUE_OR_TASK_INDEX}`).toBe(true);
-      expect(plan.buffers, `${label}: shared buffers`).toBeLessThan(QUERY_3_BUFFER_BOUND);
+      expect(plan.buffers, `${label}: shared buffers`).toBeLessThan(QUERY_4_BUFFER_BOUND);
     }
   });
 
@@ -347,6 +355,22 @@ describeEmbeddedPostgres("heartbeat_runs hot query plans", () => {
       expect(plan.buffers, `${label}: shared buffers`).toBeLessThan(bufferBound);
     }
   }
+
+  it("hot query 3 (routine session claim) reads only the agent's running runs, in custom and generic plans", async () => {
+    const recorder = recordingDb(db);
+    // A run id that is not in the table: the claim's write then changes no seeded row.
+    await claimRoutineTaskSession(recorder.db, { companyId, agentId: agentIds[0]!, runId: randomUUID(), key: "routine:plans" });
+    const hot = recorder.statements.filter(({ query }) => /^\s*select/i.test(query) && query.includes("\"heartbeat_runs\".\"context_snapshot\" ->>"));
+    expect(hot, "claimRoutineTaskSession no longer sends the running-claim lookup; update this guard").toHaveLength(1);
+    expect(selectList(hot[0]!.query), "the claim lookup must not select (detoast) context_snapshot").not.toContain("context_snapshot");
+    for (const genericPlan of [false, true]) {
+      const plan = await explain(hot[0]!, genericPlan);
+      const label = `${genericPlan ? "generic" : "custom"} plan (${plan.shape})`;
+      expect(plan.generic, `${label}: plan kind`).toBe(genericPlan);
+      expect(plan.seqScans, `${label}: sequential scan of heartbeat_runs`).toEqual([]);
+      expect(plan.buffers, `${label}: shared buffers`).toBeLessThan(CLAIM_BUFFER_BOUND);
+    }
+  });
 
   it("keeps context_snapshot and result_json out of the hot statements' select lists", async () => {
     const recorder = recordingDb(db);

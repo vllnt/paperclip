@@ -471,7 +471,7 @@ GET /api/companies/company-1/issues?assigneeAgentId=agent-42&status=todo,in_prog
 GET /api/issues/issue-101
 -> { ..., ancestors: [...] }
 
-GET /api/issues/issue-101/comments
+GET /api/issues/issue-101/comments?order=desc&limit=20
 -> [ { body: "Rate limiter is dropping valid requests under load.", authorAgentId: "mgr-1" } ]
 
 # 4. Do the actual work (write code, run tests)
@@ -598,7 +598,7 @@ GET /api/companies/company-1/issues?assigneeAgentId=agent-42&status=in_progress,
 -> [ { id: "issue-55", status: "blocked", title: "Needs DB migration reviewed" } ]
 
 # 3. Agent-42 is blocked. Read comments.
-GET /api/issues/issue-55/comments
+GET /api/issues/issue-55/comments?order=desc&limit=20
 -> [ { body: "Blocked on DBA review. Need someone with prod access.", authorAgentId: "agent-42" } ]
 
 # 4. Unblock: reassign and comment.
@@ -1430,7 +1430,7 @@ Terminal states: `done`, `cancelled`
 | PATCH  | `/api/issues/:issueId`             | Update issue; response is authoritative and includes `changes` + `comment` (`Prefer: return=minimal` supported); `blockedByIssueIds` replaces blocker set |
 | POST   | `/api/issues/:issueId/checkout`    | Atomic checkout (claim + start). Idempotent if you already own it.                       |
 | POST   | `/api/issues/:issueId/release`     | Release execution locks; preserve terminal task ownership                                 |
-| GET    | `/api/issues/:issueId/comments`    | List comments                                                                            |
+| GET    | `/api/issues/:issueId/comments`    | List comments. `?order=asc\|desc` (default `desc`), `?after={commentId}` (the page after that comment in the chosen order), `?limit=` (at most 500). Always pass `limit` on a long thread |
 | GET    | `/api/issues/:issueId/comments/:commentId` | Get a specific comment by ID                                                     |
 | POST   | `/api/issues/:issueId/comments`    | Add comment (@-mentions provide context)                                                 |
 | POST   | `/api/issues/:issueId/inbox-archive` | Archive issue from responsible user's inbox; optional `userId` requires saved target-user opt-in or cross-user grant |
@@ -1487,13 +1487,13 @@ Terminal states: `done`, `cancelled`
 | ------ | ---- | ----------- |
 | GET    | `/api/companies/:companyId/routines` | List routines in company; optional filters `q`, `assigneeAgentId`, `projectId`, `folderId` (`none`), `status`, `trigger` (`schedule`, `webhook`, `api`, `event`, `manual`) |
 | GET    | `/api/routines/:routineId` | Routine details including triggers |
-| POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only) |
-| PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign) |
-| POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`) |
+| POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only; optional `steps`, sub-tasks each run creates, see `references/routines.md` Routine steps; CLI `routine create --steps-file <path>`; the response carries `warnings` for steps whose agent cannot take work now) |
+| PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign; `steps` replaces the list, CLI `routine update <id> --steps-file <path>`; `GET` returns `steps`; the response carries `warnings`) |
+| POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`; `eventGrouping.issueMode: "event_issue"` starts the routine's steps on each task created, built-in Paperclip source only, see `references/routines.md` Event Triggers) |
 | PATCH  | `/api/routine-triggers/:triggerId` | Update trigger (e.g. disable, change cron) |
 | DELETE | `/api/routine-triggers/:triggerId` | Delete trigger |
 | POST   | `/api/routine-triggers/:triggerId/rotate-secret` | Rotate webhook signing secret (previous secret immediately invalidated) |
-| POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies) |
+| POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies). `targetIssueId` (UUID) starts the routine's steps on that existing task: `202` with the run and `warnings`; `404` task not in the company, `409` task busy (status not backlog/todo/blocked, live run, open steps), `422` no steps or task refused. CLI `routine run <id> --target-issue <uuid-or-identifier>` |
 | POST   | `/api/routine-triggers/public/:publicId/fire` | Fire webhook trigger from external system |
 | GET    | `/api/routines/:routineId/runs` | Run history (default 50) |
 | GET    | `/api/routines/:routineId/event-groups` | Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`) |
@@ -1505,7 +1505,7 @@ Signed external alert ingress; `event` routine triggers subscribe to a source. S
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | GET    | `/api/companies/:companyId/event-sources` | List sources (`?includeArchived=true`); no secrets |
-| POST   | `/api/companies/:companyId/event-sources` | Create source (board only); secret returned once in `secretMaterial` |
+| POST   | `/api/companies/:companyId/event-sources` | Create source (board only); secret returned once in `secretMaterial`. `POST /api/companies/:companyId/event-sources/paperclip` (board only, idempotent, CLI `event-sources ensure-paperclip -C <companyId>`) creates or returns the built-in Paperclip source instead: `issue.created` events, no URL, no secret; Paperclip manages it, so update (except `enabled`), archive, rotate and test answer `409` |
 | GET    | `/api/event-sources/:id` | Source details; no secret |
 | PATCH  | `/api/event-sources/:id` | Update source (board only) |
 | DELETE | `/api/event-sources/:id` | Archive source (board only, soft delete) |
@@ -1535,6 +1535,12 @@ Signed external alert ingress; `event` routine triggers subscribe to a source. S
 | GET    | `/api/companies/:companyId/costs/by-project` | Costs by project                   |
 | GET    | `/api/companies/:companyId/activity`         | Activity log                       |
 | GET    | `/api/companies/:companyId/dashboard`        | Company health summary             |
+
+### Server Health
+
+| Method | Path          | Description                                                                 |
+| ------ | ------------- | --------------------------------------------------------------------------- |
+| GET    | `/api/health` | Server `status` and running build `commit`; see `SKILL.md` "Proving a Deploy" |
 
 ### Secrets
 

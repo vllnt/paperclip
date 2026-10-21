@@ -1,4 +1,11 @@
-import { RUN_CONTEXT_DEFAULTS, resolveCompanyEnvironmentDefault, resolveTransientRetryPolicy, type ResolvedTransientRetryPolicy } from "@paperclipai/shared";
+import {
+  ROUTINE_RUN_ISSUE_ORIGIN_KINDS,
+  RUN_CONTEXT_DEFAULTS,
+  isRoutineRunIssueOriginKind,
+  resolveCompanyEnvironmentDefault,
+  resolveTransientRetryPolicy,
+  type ResolvedTransientRetryPolicy,
+} from "@paperclipai/shared";
 import { issueIdEqualsText } from "./issue-id-match.js";
 import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
@@ -38,6 +45,7 @@ import {
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure, truncateAtGrapheme, type ExecutionBlocker } from "@paperclipai/shared";
+import { CONTEXT_WINDOW_EXCEEDED_ERROR_CODE, isContextWindowExceededMessage } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
@@ -93,7 +101,14 @@ import {
   clearAdapterSteering,
   setAdapterSteeringHandle,
 } from "./adapter-steering.js";
-import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
+import {
+  executionFailureRetryCount,
+  executionRetryAttemptCount,
+  accountingForScheduledRetry,
+  PLANNED_RESTART_RESUME_MAX_ATTEMPTS,
+  PLANNED_RESTART_RESUME_RETRY_REASON,
+  PLANNED_RESTART_RESUME_WAKE_REASON,
+} from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
@@ -509,6 +524,7 @@ import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
 import { isRetryableMonitorWakeBlock, monitorWakeRetryDelayMs } from "./issue-monitor-wake-block.js";
 import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { inheritRoutineStepWorkspace } from "./routine-steps.js";
 import { orderQueuedRunsForClaim, selectAgentQueuedRuns } from "./queued-run-claim-order.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
@@ -728,7 +744,7 @@ import {
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
-import { remoteProcessStopRunEvent } from "./ssh-run-process-stop.js";
+import { remoteProcessStopRunEvent, remoteRunProcessesProvenStopped } from "./ssh-run-process-stop.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
   clearHeartbeatRunRuntimeStatus,
@@ -995,6 +1011,15 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
+// Recorded on a restart-interrupted run whose remote stop has no stored proof.
+const RESTART_RESUME_SKIPPED_EVENT = {
+  eventType: "lifecycle",
+  stream: "system",
+  level: "warn",
+  message:
+    "Restart resume skipped: the remote processes of this run are not proven stopped; the ordinary bounded retry applies",
+  payload: { reason: "remote_stop_unproven" },
+} as const;
 function isTransientWorkspaceGitScanCode(code: string | null | undefined): boolean {
   return code === WORKSPACE_GIT_SCAN_ERROR_CODES.timeout || code === WORKSPACE_GIT_SCAN_ERROR_CODES.saturated;
 }
@@ -1031,6 +1056,8 @@ type DeferredWakeHeldReason =
 // bounded transient budget instead of ending as a plain `adapter_failed`.
 const WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE = "workspace_restore_lock_timeout";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
+const CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE =
+  "Not retried automatically: the prompt is larger than the model's context window, so the same run would fail the same way. Start a fresh session or shorten what the run replays, then wake the agent again.";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON =
@@ -1294,6 +1321,11 @@ function readHeartbeatRunErrorFamily(
 ) {
   if (run.errorCode === "provider_quota") {
     return "provider_quota";
+  }
+  // A context overflow fails the same way every time, whatever family the
+  // adapter guessed from its output.
+  if (run.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) {
+    return null;
   }
   if (
     run.errorCode === "codex_transient_upstream" ||
@@ -5851,13 +5883,15 @@ export function buildExplicitResumeSessionOverride(input: {
   resumeRunSessionParams?: Record<string, unknown> | null;
   taskSession: ResumeSessionRow | null;
   sessionCodec: AdapterSessionCodec;
+  /** Only a session the selected run created or saved, never the one it started from. */
+  ownSessionOnly?: boolean;
 }) {
   const resumeRunSessionIdAfter = truncateDisplayId(
     input.resumeRunSessionIdAfter,
   );
-  const resumeRunSessionIdBefore = truncateDisplayId(
-    input.resumeRunSessionIdBefore,
-  );
+  const resumeRunSessionIdBefore = input.ownSessionOnly
+    ? null
+    : truncateDisplayId(input.resumeRunSessionIdBefore);
   const desiredDisplayId = requiresCanonicalSessionIds(input.adapterType)
     ? isCanonicalSessionIdForAdapter(input.adapterType, resumeRunSessionIdAfter)
       ? resumeRunSessionIdAfter
@@ -6159,14 +6193,99 @@ export function deriveTaskKeyWithHeartbeatFallback(
   return null;
 }
 
+/**
+ * Each tick of a routine creates a new issue, so an issue-keyed session never
+ * outlives one tick. Keying the session by routine instead lets the next tick
+ * resume it. The agent_task_sessions row is already scoped by company, agent
+ * and adapter type, so a different assignee or harness gets its own session.
+ */
+const ROUTINE_TASK_SESSION_KEY_PREFIX = "routine:";
+/** Run-context key naming the routine session a running run holds. */
+export const ROUTINE_TASK_SESSION_CLAIM_KEY = "paperclipRoutineTaskSessionKey";
+/**
+ * Run-context key naming the run that took the claim. Retry and continuation
+ * runs copy their source run's context; a copied claim names another run and
+ * so does not count.
+ */
+export const ROUTINE_TASK_SESSION_CLAIM_RUN_KEY = "paperclipRoutineTaskSessionRunId";
+
+export function routineTaskSessionKey(input: {
+  adapterType: string;
+  issueTaskKey: string | null;
+  issue: {
+    id: string;
+    originKind: string | null;
+    originId: string | null;
+  } | null;
+  conversation: boolean;
+  /** The agent's session compaction is on and has a limit. */
+  sessionRotates: boolean;
+}): string | null {
+  const { issue } = input;
+  if (!issue || input.conversation) return null;
+  // A shared routine session grows with every tick, so only a session that
+  // rotates is shared. Adapter-managed defaults (all limits 0) keep one per issue.
+  if (!input.sessionRotates) return null;
+  if (issue.originKind !== "routine_execution" || !issue.originId) return null;
+  // An explicit non-issue task key on the wake keeps its own session.
+  if (input.issueTaskKey !== issue.id) return null;
+  // The native runtime resumes and tracks goals per issue.
+  if (input.adapterType === "paperclip_runner") return null;
+  return `${ROUTINE_TASK_SESSION_KEY_PREFIX}${issue.originId}`;
+}
+
+/**
+ * Takes the routine session for one running run. Another running run of the
+ * same agent holding it means overlapping ticks; the caller then keeps the
+ * per-issue key, so the two runs never share a session. The claim lives in the
+ * run's context and names the run, so it lapses when the run stops running
+ * (finished, failed, cancelled or reaped) and a copy in another run's context
+ * does not count. Reads only the claim keys of the agent's running runs.
+ */
+export async function claimRoutineTaskSession(
+  db: Db,
+  input: { companyId: string; agentId: string; runId: string; key: string },
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`routine-task-session:${input.companyId}:${input.agentId}:${input.key}`}, 0))`,
+    );
+    const holder = await tx
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          eq(heartbeatRuns.status, "running"),
+          ne(heartbeatRuns.id, input.runId),
+          sql`${heartbeatRuns.contextSnapshot} ->> ${ROUTINE_TASK_SESSION_CLAIM_KEY} = ${input.key}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> ${ROUTINE_TASK_SESSION_CLAIM_RUN_KEY} = ${heartbeatRuns.id}::text`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (holder) return false;
+    await tx
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || jsonb_build_object(${ROUTINE_TASK_SESSION_CLAIM_KEY}::text, ${input.key}::text, ${ROUTINE_TASK_SESSION_CLAIM_RUN_KEY}::text, ${input.runId}::text)`,
+      })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return true;
+  });
+}
+
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
+  options: { routineTaskSession?: boolean } = {},
 ) {
   if (contextSnapshot?.forceFreshSession === true) return true;
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (
-    wakeReason === "issue_assigned" ||
+    // Every routine tick is a new assignment; its session spans the ticks.
+    (wakeReason === "issue_assigned" && options.routineTaskSession !== true) ||
     wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON ||
     wakeReason === "execution_approval_requested" ||
     // PF-4: unscoped timer wakes are exploratory ("any new work?") and should
@@ -6262,12 +6381,14 @@ export function filterZombieCoalesceTarget<
 
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
+  options: { routineTaskSession?: boolean } = {},
 ) {
   if (contextSnapshot?.forceFreshSession === true)
     return "forceFreshSession was requested";
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
+  if (wakeReason === "issue_assigned" && options.routineTaskSession !== true)
+    return "wake reason is issue_assigned";
   if (wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON) {
     return `wake reason is ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON}`;
   }
@@ -7837,6 +7958,13 @@ export function mergeCoalescedContextSnapshot(
   // admitted proof, but must never accept a new marker from an incoming wake.
   delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
   delete merged[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY];
+  // The routine-session claim names the target run and only
+  // claimRoutineTaskSession mints it. Keep the target's claim; an incoming
+  // wake context may carry another run's copy of it, which must not replace it.
+  for (const key of [ROUTINE_TASK_SESSION_CLAIM_KEY, ROUTINE_TASK_SESSION_CLAIM_RUN_KEY]) {
+    if (existing[key] === undefined) delete merged[key];
+    else merged[key] = existing[key];
+  }
   const mergedAttachmentOmissions = mergeExternalAttachmentOmissions(
     existing,
     incoming,
@@ -13228,6 +13356,7 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     payload: Record<string, unknown> | null,
     taskKey: string | null,
+    opts: { ownSessionOnly?: boolean } = {},
   ) {
     const resumeFromRunId = readNonEmptyString(payload?.resumeFromRunId);
     if (!resumeFromRunId) return null;
@@ -13277,6 +13406,7 @@ export function heartbeatService(
         : null,
       taskSession: resumeTaskSession,
       sessionCodec,
+      ownSessionOnly: opts.ownSessionOnly,
     });
     if (!sessionOverride) return null;
 
@@ -13618,6 +13748,12 @@ export function heartbeatService(
     sessionDisplayId: string | null;
     lastRunId: string | null;
     lastError: string | null;
+    /**
+     * When set, an existing row is written only while its lastRunId is one of
+     * these. Any other value means a later run saved the row, and this write
+     * would put an older session back.
+     */
+    onlyIfLastRunIdIn?: ReadonlyArray<string | null>;
   }) {
     return db.transaction(async (tx) => {
       // A task key that is not an issue id locks nothing, as `id::text = taskKey` matched nothing.
@@ -13630,6 +13766,8 @@ export function heartbeatService(
       }
     const existing = await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey))).then((rows) => rows[0] ?? null);
     if (existing) {
+      const guard = input.onlyIfLastRunIdIn;
+      if (guard && !guard.includes(existing.lastRunId)) return null;
       return tx
         .update(agentTaskSessions)
         .set({
@@ -13639,7 +13777,15 @@ export function heartbeatService(
           lastError: input.lastError,
           updatedAt: new Date(),
         })
-        .where(eq(agentTaskSessions.id, existing.id))
+        .where(and(
+          eq(agentTaskSessions.id, existing.id),
+          // Under READ COMMITTED this re-checks the row a concurrent save just changed.
+          ...(guard
+            ? [existing.lastRunId === null
+                ? isNull(agentTaskSessions.lastRunId)
+                : eq(agentTaskSessions.lastRunId, existing.lastRunId)]
+            : []),
+        ))
         .returning()
         .then((rows) => rows[0] ?? null);
     }
@@ -13669,12 +13815,26 @@ export function heartbeatService(
       adapterType?: string | null;
       expectedRunId?: string;
       includeIssueAliases?: boolean;
+      /**
+       * When set, a row is cleared only while its lastRunId is one of these.
+       * Any other value means a later run saved the row after this one began.
+       */
+      onlyIfLastRunIdIn?: ReadonlyArray<string | null>;
     },
   ) {
     const conditions = [
       eq(agentTaskSessions.companyId, companyId),
       eq(agentTaskSessions.agentId, agentId),
     ];
+    if (opts?.onlyIfLastRunIdIn) {
+      const runIds = opts.onlyIfLastRunIdIn.filter((id): id is string => id !== null);
+      conditions.push(
+        or(
+          runIds.length > 0 ? inArray(agentTaskSessions.lastRunId, runIds) : sql`false`,
+          opts.onlyIfLastRunIdIn.includes(null) ? isNull(agentTaskSessions.lastRunId) : sql`false`,
+        )!,
+      );
+    }
     if (opts?.taskKey) {
       const exactTaskKey = eq(agentTaskSessions.taskKey, opts.taskKey);
       if (opts.includeIssueAliases) {
@@ -13685,6 +13845,7 @@ export function heartbeatService(
         // identifier used by some saved sessions. Resolve only from the current
         // same-company issue row, in this DELETE's snapshot; arbitrary custom
         // keys retain exact-match behavior and run/model context grants no alias.
+        // A routine-execution issue's session is its routine's session.
         conditions.push(
           or(
             exactTaskKey,
@@ -13693,7 +13854,9 @@ export function heartbeatService(
               where ${issues.companyId} = ${companyId}
                 and ${selectedIssue}
                 and (${agentTaskSessions.taskKey} = ${issues.id}::text
-                  or ${agentTaskSessions.taskKey} = ${issues.identifier})
+                  or ${agentTaskSessions.taskKey} = ${issues.identifier}
+                  or (${issues.originKind} = 'routine_execution'
+                    and ${agentTaskSessions.taskKey} = ${ROUTINE_TASK_SESSION_KEY_PREFIX}::text || ${issues.originId}))
             )`,
           )!,
         );
@@ -15412,10 +15575,19 @@ export function heartbeatService(
     return { outcome: "retry_exhausted" as const, queuedRun: null };
   }
 
+  /**
+   * `resumeAfterRestart` is for a run that a server restart cut short and whose
+   * remote processes are proven stopped (`remoteRunProcessesProvenStopped`).
+   * Its retry is due now, resumes the same session and spends no failure retry.
+   * After three such resumes in a row, the ordinary bounded retry applies.
+   * A spent failure budget stays spent: such a run gets no resume, so a restart
+   * never opens new attempts for an incident that is already escalating.
+   */
   async function enqueueProcessLossRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     now: Date,
+    opts: { resumeAfterRestart?: boolean } = {},
   ) {
     // Completion deliveries own their durable bounded retry and reply identity.
     // A second process-loss retry would compete for the same outbox input.
@@ -15426,6 +15598,22 @@ export function heartbeatService(
     // transient retries; process loss must not open a second retry budget.
     if (run.runtimeMode === "native" || await legacyExecutionNeedsReconciliationWithEvidence(db, run))
       return null;
+    if (
+      opts.resumeAfterRestart &&
+      executionRetryAttemptCount(run, BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON) <
+        BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS
+    ) {
+      const resumed = await scheduleBoundedRetryForRun(run, agent, {
+        now,
+        retryReason: PLANNED_RESTART_RESUME_RETRY_REASON,
+        wakeReason: PLANNED_RESTART_RESUME_WAKE_REASON,
+        maxAttempts: PLANNED_RESTART_RESUME_MAX_ATTEMPTS,
+        delayMs: 0,
+      });
+      if (resumed.outcome === "scheduled") return resumed.run;
+      // Only a used-up resume lane falls back. Any other refusal also binds the ordinary retry.
+      if (resumed.outcome !== "retry_exhausted") return null;
+    }
     const scheduled = await scheduleBoundedRetryForRun(run, agent, { now });
     return scheduled.outcome === "scheduled" ? scheduled.run : null;
   }
@@ -16338,7 +16526,15 @@ export function heartbeatService(
       failureReason: interrupted.error ?? undefined,
     });
 
-    const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+    // The drain already stopped the local child. The resume needs proof that the
+    // remote side is stopped too: two processes must never share one session.
+    const resumeAfterRestart = await remoteRunProcessesProvenStopped(
+      db,
+      interrupted.companyId,
+      interrupted.id,
+    );
+    if (!resumeAfterRestart) await appendRunEvent(interrupted, RESTART_RESUME_SKIPPED_EVENT);
+    const retry = await enqueueProcessLossRetry(interrupted, agent, now, { resumeAfterRestart });
     if (!retry) {
       await releaseIssueExecutionAndPromote(interrupted);
     }
@@ -16851,7 +17047,7 @@ export function heartbeatService(
             and(
               eq(issues.id, input.issueId),
               eq(issues.companyId, input.companyId),
-              eq(issues.originKind, "routine_execution"),
+              inArray(issues.originKind, [...ROUTINE_RUN_ISSUE_ORIGIN_KINDS]),
             ),
           )
           .then((rows) => rows[0]?.policy ?? null)
@@ -16900,6 +17096,24 @@ export function heartbeatService(
     return nextSlot.getTime() > input.dueAt.getTime() ? nextSlot : input.dueAt;
   }
 
+  /** Says in the run log why a context overflow gets no automatic retry. */
+  async function recordContextWindowExceededNotRetried(run: typeof heartbeatRuns.$inferSelect) {
+    if (run.errorCode !== CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) return;
+    // The event only explains the outcome; a write failure must not skip the
+    // retry and release steps that follow it.
+    try {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE,
+        payload: { errorCode: CONTEXT_WINDOW_EXCEEDED_ERROR_CODE },
+      });
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to record why a context overflow is not retried");
+    }
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -16918,6 +17132,11 @@ export function heartbeatService(
     if (run.errorCode === "provider_tool_definition_invalid") {
       return { outcome: "not_scheduled" as const,
         reason: "Repair the invalid tool definitions before starting a new attempt.",
+        issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
+    if (run.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) {
+      return { outcome: "not_scheduled" as const,
+        reason: CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE,
         issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
     }
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
@@ -17137,7 +17356,19 @@ export function heartbeatService(
       }
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
-    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    // A retry row skips enqueueWakeup, so a resume writes the session override
+    // that enqueueWakeup would have: the interrupted run's own session. A run
+    // that asked for a fresh session resumes only a session it created; without
+    // one, its retry starts fresh as the run would have.
+    const isRestartResume = retryReason === PLANNED_RESTART_RESUME_RETRY_REASON;
+    const restartResumeSession = isRestartResume
+      ? await resolveExplicitResumeSessionOverride(agent, { resumeFromRunId: run.id }, taskKey, {
+          ownSessionOnly: contextSnapshot.forceFreshSession === true,
+        })
+      : null;
+    const sessionBefore =
+      restartResumeSession?.sessionDisplayId ??
+      (await resolveSessionBeforeForWakeup(agent, taskKey));
     const interactionContinuationPayload =
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
         ? {
@@ -17177,6 +17408,18 @@ export function heartbeatService(
           : {}),
         ...(retryReason === AI_CONNECTION_BUSY_RETRY_REASON
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }
+          : {}),
+        ...(isRestartResume
+          ? { failureRetriesBeforePlannedRestart: executionFailureRetryCount(run) }
+          : {}),
+        ...(restartResumeSession
+          ? {
+              // The copied context may hold the previous run's session choice.
+              forceFreshSession: false,
+              resumeFromRunId: restartResumeSession.resumeFromRunId,
+              resumeSessionDisplayId: restartResumeSession.sessionDisplayId,
+              resumeSessionParams: restartResumeSession.sessionParams,
+            }
           : {}),
         ...(shouldQuarantineWorkspaceForRetry
           ? {
@@ -18343,7 +18586,7 @@ export function heartbeatService(
         .where(eq(companies.id, agent.companyId))
         .then((rows) => rows[0]?.settings ?? null),
       routine:
-        issue?.originKind === "routine_execution" && issue.originId
+        isRoutineRunIssueOriginKind(issue?.originKind) && issue?.originId
           ? await dbOrTx
               .select({ settings: routines.automationWakeSettings })
               .from(routines)
@@ -21281,6 +21524,13 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
+  /**
+   * A legacy run of another boot id whose controller lease expired lost its
+   * server to a restart or a crash. It resumes on the same session when its
+   * remote processes are proven stopped. A live lease always wins, even across
+   * boots: during an overlapping deploy the old server still owns its runs and
+   * drains them itself.
+   */
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -21611,6 +21861,10 @@ export function heartbeatService(
       if (resumedRunIds.has(run.id)) continue;
       if (locallyTracked) continue;
       if (await hasLiveLegacyController(db, run)) continue;
+      const restartInterrupted =
+        run.runtimeMode === "legacy" &&
+        !!run.controllerBootId &&
+        run.controllerBootId !== legacyControllerBootId;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -21741,10 +21995,23 @@ export function heartbeatService(
       const retryAgent = await getAgent(run.agentId);
       if (shouldRetry) {
         if (retryAgent) {
+          // The old server is gone, but its remote command may not be. Resume
+          // the session only when the stored evidence shows the stop.
+          const resumeAfterRestart =
+            restartInterrupted &&
+            (await remoteRunProcessesProvenStopped(
+              db,
+              finalizedRun.companyId,
+              finalizedRun.id,
+            ));
+          if (restartInterrupted && !resumeAfterRestart) {
+            await appendRunEvent(finalizedRun, RESTART_RESUME_SKIPPED_EVENT);
+          }
           retriedRun = await enqueueProcessLossRetry(
             finalizedRun,
             retryAgent,
             now,
+            { resumeAfterRestart },
           );
         }
       } else if (retryAgent) {
@@ -23404,12 +23671,19 @@ export function heartbeatService(
           );
         }
       }
-      const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
+      const issueTaskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
       const sessionCodec = getAdapterSessionCodec(agent.adapterType);
       const issueId = readNonEmptyString(context.issueId);
       let issueContext = issueId
         ? await getIssueExecutionContext(agent.companyId, issueId)
         : null;
+      if (issueId && issueContext) {
+        const inherited = await inheritRoutineStepWorkspace(db, agent.companyId, issueContext).catch((error) => {
+          logger.warn({ err: error, issueId }, "failed to inherit the workspace of a routine step's predecessor");
+          return false;
+        });
+        if (inherited) issueContext = await getIssueExecutionContext(agent.companyId, issueId);
+      }
       const issueDependencyReadiness = issueId
         ? await issuesSvc
             .listDependencyReadiness(agent.companyId, [issueId])
@@ -23751,6 +24025,33 @@ export function heartbeatService(
         context.executionPolicy = retainedTrust.executionPolicy;
       }
       const config = parseObject(agent.adapterConfig);
+      const sessionCompactionPolicy = parseSessionCompactionPolicy(agent);
+      const candidateRoutineSessionKey = routineTaskSessionKey({
+        adapterType: agent.adapterType,
+        issueTaskKey,
+        issue: issueContext,
+        conversation: isConversation(issueContext),
+        sessionRotates:
+          sessionCompactionPolicy.enabled && hasSessionCompactionThresholds(sessionCompactionPolicy),
+      });
+      const routineSessionKey =
+        candidateRoutineSessionKey &&
+        (await claimRoutineTaskSession(db, {
+          companyId: agent.companyId,
+          agentId: agent.id,
+          runId: run.id,
+          key: candidateRoutineSessionKey,
+        }))
+          ? candidateRoutineSessionKey
+          : null;
+      if (routineSessionKey) {
+        context[ROUTINE_TASK_SESSION_CLAIM_KEY] = routineSessionKey;
+        context[ROUTINE_TASK_SESSION_CLAIM_RUN_KEY] = run.id;
+      } else {
+        delete context[ROUTINE_TASK_SESSION_CLAIM_KEY];
+        delete context[ROUTINE_TASK_SESSION_CLAIM_RUN_KEY];
+      }
+      const taskKey = routineSessionKey ?? issueTaskKey;
       const taskSession = taskKey
         ? await getTaskSession(
             agent.companyId,
@@ -24677,7 +24978,8 @@ export function heartbeatService(
         const canRefresh = typeof capability === "function" ? capability(runtimeConfig) : capability === true;
         if (!canRefresh) context.forceFreshSession = true;
       }
-      const wakeSessionResetReason = describeSessionResetReason(context);
+      const sessionResetOptions = { routineTaskSession: routineSessionKey !== null };
+      const wakeSessionResetReason = describeSessionResetReason(context, sessionResetOptions);
       const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
         hasTaskSession: taskSession != null,
         configuredModel,
@@ -24694,7 +24996,9 @@ export function heartbeatService(
       const harnessSwitched =
         previousIssueHarness !== null && previousIssueHarness !== agent.adapterType;
       const resetTaskSession =
-        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset || harnessSwitched;
+        shouldResetTaskSessionForWake(context, sessionResetOptions) ||
+        sessionConfigFreshness.reset ||
+        harnessSwitched;
       const sessionResetReason =
         [
           ...sessionConfigFreshness.reasons,
@@ -25986,6 +26290,40 @@ export function heartbeatService(
         sessionDisplayId: previousSessionDisplayId,
         taskKey,
       };
+      // A resumed routine session last worked on an earlier tick's issue. Tell
+      // it plainly that this wake is a new issue and the earlier one is separate.
+      // Built after rotation and credential checks, so only a resume carries it.
+      const routineSessionLastRunId =
+        routineSessionKey &&
+        issueRef &&
+        (runtimeForAdapter.sessionId || runtimeForAdapter.sessionParams)
+          ? (taskSessionForRun?.lastRunId ?? null)
+          : null;
+      if (routineSessionLastRunId && issueRef) {
+        const previousIssue = await db
+          .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+          .from(heartbeatRuns)
+          .innerJoin(
+            issues,
+            and(
+              eq(issues.companyId, heartbeatRuns.companyId),
+              issueIdEqualsText(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`),
+            ),
+          )
+          .where(
+            and(
+              eq(heartbeatRuns.id, routineSessionLastRunId),
+              eq(heartbeatRuns.companyId, agent.companyId),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (previousIssue?.id !== issueRef.id) {
+          context[PAPERCLIP_WAKE_PAYLOAD_KEY] = {
+            ...parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]),
+            routineSession: { previousIssue },
+          };
+        }
+      }
       // A delta is safe only when the selected provider session is exactly the
       // task session whose last dispatch supplied the baseline history.
       if (
@@ -27901,6 +28239,45 @@ export function heartbeatService(
                       },
                     } : {}),
                     onSteeringReady: (handle) => setAdapterSteeringHandle(run.id, handle),
+                    // A run that ends before it returns (for example on a server restart)
+                    // still leaves its session for the retry. The final write below replaces it.
+                    onSessionCheckpoint: async (checkpoint) => {
+                      try {
+                        const next = resolveNextSessionState({
+                          adapterType: agent.adapterType,
+                          codec: sessionCodec,
+                          adapterResult: { exitCode: null, signal: null, timedOut: false, ...checkpoint },
+                          outcome: "succeeded",
+                          previousParams: previousSessionParams,
+                          previousDisplayId: runtimeForAdapter.sessionDisplayId,
+                          previousLegacySessionId: runtimeForAdapter.sessionId,
+                        });
+                        const sessionIdAfter = next.displayId ?? next.legacySessionId;
+                        if (!sessionIdAfter) return;
+                        const [stored] = await db
+                          .update(heartbeatRuns)
+                          .set({ sessionIdAfter, updatedAt: new Date() })
+                          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+                          .returning({ id: heartbeatRuns.id });
+                        if (!stored || !taskKey) return;
+                        await upsertTaskSession({
+                          companyId: agent.companyId,
+                          agentId: agent.id,
+                          adapterType: agent.adapterType,
+                          taskKey,
+                          sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+                            next.params,
+                            configuredModel,
+                            sessionConfigMetadata,
+                          ),
+                          sessionDisplayId: next.displayId,
+                          lastRunId: run.id,
+                          lastError: null,
+                        });
+                      } catch (err) {
+                        logger.warn({ err, runId: run.id }, "failed to store the early session checkpoint");
+                      }
+                    },
                     onCancellationReady: async () => {
                       await registerAdapterExecutionControl(run.id, executionControl);
                       const current = await getRun(run.id);
@@ -28346,16 +28723,22 @@ export function heartbeatService(
           : runErrorSummary;
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
+        // The provider's own refusal of an oversized prompt wins over the code
+        // the adapter guessed, so no retry path sends the same prompt again.
+        const contextWindowExceeded =
+          outcome === "failed" && isContextWindowExceededMessage(adapterResult.errorMessage);
         const runErrorCode =
           outcome === "timed_out"
             ? "timeout"
             : outcome === "cancelled"
               ? (latestRun?.errorCode ?? "cancelled")
-              : outcome === "failed"
-                ? (adapterResult.errorCode ??
-                  recordedResponsibleUserDenialCode ??
-                  "adapter_failed")
-                : null;
+              : contextWindowExceeded
+                ? CONTEXT_WINDOW_EXCEEDED_ERROR_CODE
+                : outcome === "failed"
+                  ? (adapterResult.errorCode ??
+                    recordedResponsibleUserDenialCode ??
+                    "adapter_failed")
+                  : null;
 
         let logSummary: {
           bytes: number | null;
@@ -28773,6 +29156,7 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
+          await recordContextWindowExceededNotRetried(livenessRun);
           const harnessFallbackOutcome = outcome === "failed" && !isMaxTurnExhaustionRun(livenessRun)
             ? await handleProviderQuotaFailure({
                 run: livenessRun,
@@ -28947,6 +29331,9 @@ export function heartbeatService(
           if (taskKey) {
             if (
               adapterResult.clearSession ||
+              // A session that overflowed the context window overflows again on
+              // its next resume; under a routine key that is the next tick.
+              runErrorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE ||
               (!nextSessionState.params && !nextSessionState.displayId)
             ) {
               await clearTaskSessions(agent.companyId, agent.id, {
@@ -29150,6 +29537,9 @@ export function heartbeatService(
           recordedResponsibleUserDenialCode ??
           nativeTerminalFailureCode ??
           (restoreLockTimeoutFailure ? WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE : null) ??
+          (isContextWindowExceededMessage(err instanceof Error ? err.message : null)
+            ? CONTEXT_WINDOW_EXCEEDED_ERROR_CODE
+            : null) ??
           "adapter_failed";
         logger.error({ err, runId }, "heartbeat execution failed");
 
@@ -29267,6 +29657,7 @@ export function heartbeatService(
           ) {
             await finalizeIssueCommentPolicy(livenessRun, agent);
           }
+          await recordContextWindowExceededNotRetried(livenessRun);
           if (livenessRun.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE) {
             // Only this branch tolerates a scheduling error; the other keeps
             // propagating it as it always did.
@@ -29305,7 +29696,16 @@ export function heartbeatService(
             },
           );
 
-          if (
+          if (taskKey && livenessRun.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) {
+            // Resuming an overflowed session fails the same way, so drop it
+            // unless a later run has saved the row since.
+            await clearTaskSessions(agent.companyId, agent.id, {
+              taskKey,
+              adapterType: agent.adapterType,
+              expectedRunId: failedRun.id,
+              onlyIfLastRunIdIn: [taskSession?.lastRunId ?? null, failedRun.id],
+            });
+          } else if (
             taskKey &&
             (goalCheckpointSession.current ||
               previousSessionParams ||
@@ -29329,6 +29729,10 @@ export function heartbeatService(
                 previousSessionDisplayId,
               lastRunId: failedRun.id,
               lastError: message,
+              // This only re-saves the session the run started with. The release
+              // above may have started the next run on the same key, and a save
+              // by that run (or any run since this one began) is newer.
+              onlyIfLastRunIdIn: [taskSession?.lastRunId ?? null, failedRun.id],
             });
           }
         }

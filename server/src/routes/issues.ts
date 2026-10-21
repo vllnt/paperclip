@@ -278,6 +278,7 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { retainBacklogHumanAssignment } from "../services/human-directed-work.js";
+import type { EventSourceService } from "../services/event-sources/service.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
@@ -343,10 +344,10 @@ import {
   resolveActorSourceTrustForIssue,
   sanitizeQuarantinedCommentForHigherTrust,
 } from "../services/source-trust.js";
+import { agentTrustService } from "../services/agent-trust.js";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
   resolveCoreTrustPreset,
-  type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
@@ -3581,6 +3582,8 @@ export function issueRoutes(
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
+    /** Publishes `issue.created` for a new task, so a routine can attach its steps before the assignee wakes. */
+    eventSources?: Pick<EventSourceService, "publishInternal">;
     taskWatchdogEnqueueWakeup?: TaskWatchdogServiceDeps["enqueueWakeup"] | null;
     recoveryActionEnqueueWakeup?: (
       agentId: string,
@@ -3637,6 +3640,55 @@ export function issueRoutes(
       sourceRun?.companyId === comment.companyId &&
       sourceRun.agentId === assigneeAgentId
     );
+  };
+  /**
+   * Publishes the `issue.created` event of a task the caller just created and waits for the routines
+   * that listen to it, so the caller knows whether a routine attached its steps. Then the assignee must
+   * stay asleep: the steps' own agents are woken instead, and the task is `blocked` until they finish.
+   * It never throws, and costs one query when no event trigger listens.
+   * @param creatingRunId the heartbeat run of the request: a task made while working on a routine's task
+   * does not publish.
+   * @returns the task as the response should show it (its status, status version and blockers changed when
+   * steps were attached).
+   */
+  const publishCreatedTask = async <
+    T extends {
+      id: string;
+      companyId: string;
+      status: string;
+      statusVersion: number;
+      updatedAt: Date;
+      blockedBy: unknown;
+      blocks: unknown;
+    },
+  >(
+    issue: T,
+    creatingRunId: string | null,
+  ): Promise<{ issue: T; stepsAttached: boolean }> => {
+    if (!opts.eventSources) return { issue, stepsAttached: false };
+    const { stepsAttached } = await opts.eventSources.publishInternal(issue.companyId, {
+      issueId: issue.id,
+      creatingRunId,
+    });
+    if (!stepsAttached) return { issue, stepsAttached };
+    try {
+      const [fresh, relations] = await Promise.all([svc.getById(issue.id), svc.getRelationSummaries(issue.id)]);
+      if (!fresh) return { issue, stepsAttached };
+      return {
+        issue: {
+          ...issue,
+          status: fresh.status,
+          statusVersion: fresh.statusVersion,
+          updatedAt: fresh.updatedAt,
+          blockedBy: relations.blockedBy,
+          blocks: relations.blocks,
+        },
+        stepsAttached,
+      };
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "failed to re-read a task after routine steps were attached");
+      return { issue, stepsAttached };
+    }
   };
   const enqueueStalledReviewDecisionWakeup =
     opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
@@ -3963,68 +4015,8 @@ export function issueRoutes(
     );
   }
 
-  async function resolveAgentTrustForIssue(
-    input: {
-      agentId: string | null | undefined;
-      runId?: string | null;
-    },
-    companyId: string,
-    issue?: {
-      companyId: string;
-      projectId?: string | null;
-      executionPolicy?: unknown;
-    } | null,
-  ): Promise<TrustPresetResolution | null> {
-    if (!input.agentId) return null;
-    const [agent, run] = await Promise.all([
-      agentsSvc.getById(input.agentId),
-      input.runId
-        ? db
-            .select({
-              companyId: heartbeatRuns.companyId,
-              agentId: heartbeatRuns.agentId,
-              contextSnapshot: heartbeatRuns.contextSnapshot,
-            })
-            .from(heartbeatRuns)
-            .where(
-              and(
-                eq(heartbeatRuns.id, input.runId),
-                eq(heartbeatRuns.companyId, companyId),
-              ),
-            )
-            .then((rows) => rows[0] ?? null)
-        : Promise.resolve(null),
-    ]);
-    if (!agent || agent.companyId !== companyId) return null;
-    const runContext =
-      run?.agentId === agent.id &&
-      run.contextSnapshot &&
-      typeof run.contextSnapshot === "object"
-        ? (run.contextSnapshot as Record<string, unknown>)
-        : null;
-    const runExecutionPolicy =
-      runContext?.executionPolicy &&
-      typeof runContext.executionPolicy === "object"
-        ? (runContext.executionPolicy as Record<string, unknown>)
-        : null;
-    const project = issue?.projectId
-      ? await projectsSvc.getById(issue.projectId)
-      : null;
-    return resolveCoreTrustPreset({
-      companyId,
-      agent,
-      project: project?.companyId === companyId ? project : null,
-      issue: issue
-        ? {
-            companyId: issue.companyId,
-            executionPolicy: issue.executionPolicy,
-          }
-        : null,
-      run: runExecutionPolicy
-        ? { companyId, executionPolicy: runExecutionPolicy }
-        : null,
-    });
-  }
+  const agentTrust = agentTrustService(db, { agents: agentsSvc, projects: projectsSvc });
+  const { resolveAgentTrustForIssue } = agentTrust;
 
   async function actorIsLowTrustReview(
     req: Request,
@@ -4056,25 +4048,13 @@ export function issueRoutes(
     projectId: string | null,
     requestedPolicy: unknown,
   ) {
-    const policy = normalizeIssueExecutionPolicy(requestedPolicy);
-    if (req.actor.type !== "agent") return policy;
-    const trust = await resolveAgentTrustForIssue(
+    if (req.actor.type !== "agent") return normalizeIssueExecutionPolicy(requestedPolicy);
+    return agentTrust.containCreatedExecutionPolicy(
       { agentId: req.actor.agentId, runId: req.actor.runId },
       companyId,
-      { companyId, projectId, executionPolicy: policy },
+      projectId,
+      requestedPolicy,
     );
-    if (trust?.kind === "denied") throw forbidden(trust.detail);
-    if (trust?.kind !== "low_trust_review") return policy;
-    // A new task must retain the creator's effective containment, including
-    // run-only restrictions. Client policy can narrow it, never reset it.
-    return normalizeIssueExecutionPolicy({
-      ...policy,
-      authorizationPolicy: {
-        ...policy?.authorizationPolicy,
-        trustPreset: trust.preset,
-        trustBoundary: trust.boundary,
-      },
-    });
   }
 
   async function directParentReportDisabledForIssue(issue: {
@@ -12420,18 +12400,23 @@ export function issueRoutes(
       // Do not auto-wake the onboarding first task. Nothing should run and no
       // token should be spent until the user types: the greeting is posted above
       // (deterministic, no LLM) and the user's first comment wakes the assignee
-      // through the normal comment path. Every other create path keeps its wake.
+      // through the normal comment path. Every other create path keeps its wake, unless a routine
+      // attached its steps to the task: then the steps' agents are woken and the task waits for them.
       if (!isOnboardingFirstTask) {
-        void queueIssueAssignmentWakeup({
-          heartbeat,
-          assignmentEvent: true,
-          issue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "issue.create",
-          requestedByActorType: actor.actorType,
-          requestedByActorId: actor.actorId,
-        });
+        const published = await publishCreatedTask(issue, actor.runId ?? null);
+        issue = published.issue;
+        if (!published.stepsAttached) {
+          void queueIssueAssignmentWakeup({
+            heartbeat,
+            assignmentEvent: true,
+            issue,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "issue.create",
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+          });
+        }
       }
       await queueTaskWatchdogEvaluation(issue, actor.runId);
 
@@ -12684,26 +12669,31 @@ export function issueRoutes(
         actorInfo: actor,
         assigneeAgentId: issue.assigneeAgentId,
       });
+      let createdChild = issue;
       if (!serializationContext || !currentSerializedChild) {
-        void queueIssueAssignmentWakeup({
-          heartbeat,
-          assignmentEvent: true,
-          issue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "issue.child_create",
-          requestedByActorType: actor.actorType,
-          requestedByActorId: actor.actorId,
-        });
+        const published = await publishCreatedTask(createdChild, actor.runId ?? null);
+        createdChild = published.issue;
+        if (!published.stepsAttached) {
+          void queueIssueAssignmentWakeup({
+            heartbeat,
+            assignmentEvent: true,
+            issue: createdChild,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "issue.child_create",
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+          });
+        }
       }
       await blockWatchdogParentOnCurrentChild({
         actor,
         watchdogParentIssueId: serializationContext?.watchdogParentIssueId,
-        currentChildIssueId: currentSerializedChild?.id ?? issue.id,
+        currentChildIssueId: currentSerializedChild?.id ?? createdChild.id,
       });
-      await queueTaskWatchdogEvaluation(issue, actor.runId);
+      await queueTaskWatchdogEvaluation(createdChild, actor.runId);
 
-      res.status(201).json(issue);
+      res.status(201).json(createdChild);
     },
   );
 

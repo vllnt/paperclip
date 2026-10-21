@@ -138,8 +138,11 @@ export function bumpExecutionWorkspaceLifecycleGeneration(
   };
 }
 
-function isClosedExecutionWorkspaceStatus(status: string | null | undefined): boolean {
-  return status === "archived" || status === "cleanup_failed";
+/** Workspace statuses that mean the workspace can no longer be used. */
+export const CLOSED_EXECUTION_WORKSPACE_STATUSES = ["archived", "cleanup_failed"] as const;
+
+export function isClosedExecutionWorkspaceStatus(status: string | null | undefined): boolean {
+  return CLOSED_EXECUTION_WORKSPACE_STATUSES.some((closed) => closed === status);
 }
 
 // The metadata key that marks a workspace as reopened for a source issue that is
@@ -207,8 +210,9 @@ export function clearMetadataReopenPendingConsumption(
 // releases the lock when the transaction that holds `tx` commits or rolls back.
 // Both the reopen path and the destructive cleanup path acquire the same lock,
 // so they never run against the same workspace at the same time, even on
-// different server processes.
-async function acquireExecutionWorkspaceLifecycleLock(
+// different server processes. A routine step that inherits a workspace takes it
+// too, so it never reuses a workspace that an archive is closing.
+export async function acquireExecutionWorkspaceLifecycleLock(
   tx: DbTransaction,
   workspaceId: string,
 ): Promise<void> {

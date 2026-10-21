@@ -15,6 +15,9 @@ export function buildNativeContinuationPrompt(input: {
   const continuation = wake?.executionContinuation;
   const delta = continuation?.resumeDelta;
   if (!wake || !delta || delta.baseRunId !== input.previousRunId) return null;
+  // New comments outside the history window have no body in the delta; the
+  // full bootstrap prompt lists them with read instructions.
+  if ((delta.olderMessages?.length ?? 0) > 0 || (delta.unlistedMessages ?? 0) > 0) return null;
   const rawWake = input.wakePayload && typeof input.wakePayload === "object"
     ? input.wakePayload as Record<string, unknown> : {};
   // Attachment descriptors are intentionally omitted by the generic normalizer.

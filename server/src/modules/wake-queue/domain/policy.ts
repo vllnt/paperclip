@@ -210,6 +210,8 @@ export type ReleaseRecoveryReviewParticipantFacts = {
   applies: boolean;
   /** True when the finishing run was itself a review-participant-recovery retry. */
   isExecutionReviewParticipantRecoveryRun: boolean;
+  /** True when the finishing run failed in a way another automatic run cannot fix, for example a context overflow. */
+  failureIsNonRetryable?: boolean;
 };
 
 export type ReleaseRecoveryImmediateFacts = {
@@ -391,7 +393,8 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
     const shouldBlock =
       !shared.recoveryAgentInvokable ||
       !shared.recoveryAgentPresent ||
-      reviewParticipant.isExecutionReviewParticipantRecoveryRun;
+      reviewParticipant.isExecutionReviewParticipantRecoveryRun ||
+      reviewParticipant.failureIsNonRetryable === true;
     if (shouldBlock) {
       return { kind: "blocked", notice: "execution_review_participant" };
     }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { setImmediate } from "node:timers/promises";
+import net from "node:net";
+import { setImmediate, setTimeout as sleep } from "node:timers/promises";
 
 const postgres = process.env.DRIVER_FORMAT === "cjs"
   ? createRequire(import.meta.url)("postgres")
@@ -19,6 +20,14 @@ const capture = (query) => Promise.resolve(query).then(
   () => { throw new Error("Expected the closed connection to reject"); },
   (error) => error,
 );
+/** A Postgres ErrorResponse message with severity FATAL. */
+const fatalErrorResponse = (code, message) => {
+  const fields = Buffer.from(`SFATAL\0VFATAL\0C${code}\0M${message}\0\0`, "latin1");
+  const header = Buffer.alloc(5);
+  header.write("E", 0, "latin1");
+  header.writeInt32BE(fields.length + 4, 1);
+  return Buffer.concat([header, fields]);
+};
 const terminate = async (pid) => {
   await control.unsafe("select pg_terminate_backend($1)", [pid]);
   await closed.promise;
@@ -109,6 +118,63 @@ try {
     await task;
     await Promise.all(pending);
     reserved?.release();
+  } else if (mode === "type-fetch-reset" || mode === "type-fetch-fatal") {
+    // Every new connection first fetches the array types. When the socket
+    // dies during that fetch (a reset, or a FATAL such as a terminated backend
+    // followed by a close), the driver must not raise an unhandled rejection,
+    // which ends this process with output on stderr. It must fail the first
+    // query once, not replay it at once in a loop while every start fails,
+    // and must not put a connection into service that skipped its own type
+    // fetch.
+    const target = new URL(process.env.TEST_DATABASE_URL);
+    const connections = [];
+    let faulting = true;
+    let faults = 0;
+    const proxy = net.createServer((client) => {
+      const connection = { sent: "" };
+      connections.push(connection);
+      const upstream = net.connect(Number(target.port), target.hostname);
+      client.on("data", (chunk) => {
+        connection.sent += chunk.toString("latin1");
+        if (faulting && connection.sent.includes("typcategory")) {
+          faults += 1;
+          upstream.destroy();
+          if (mode === "type-fetch-reset") client.resetAndDestroy();
+          else client.end(fatalErrorResponse("57P01", "terminating connection due to administrator command"));
+          return;
+        }
+        upstream.write(chunk);
+      });
+      upstream.on("data", (chunk) => client.write(chunk));
+      client.on("error", () => upstream.destroy());
+      upstream.on("error", () => client.destroy());
+      client.on("close", () => upstream.destroy());
+      upstream.on("close", () => client.destroy());
+    });
+    await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const proxied = new URL(target);
+    proxied.port = String(proxy.address().port);
+    const typed = postgres(proxied.href, { max: 1, backoff: 0, onnotice() {} });
+    try {
+      // The proxy faults every type fetch until the first query settles.
+      const first = await Promise.race([
+        Promise.resolve(typed.unsafe("select 1 as value")).then((rows) => rows[0].value, (error) => error.code),
+        sleep(5_000, "still pending", { ref: false }),
+      ]);
+      faulting = false;
+      assert.equal(first, mode === "type-fetch-reset" ? "ECONNRESET" : "57P01");
+      assert.equal(faults, 1);
+      assert.equal(connections.length, 1);
+      // The next query opens a new connection that fetches its own types first.
+      assert.equal((await typed.unsafe("select 42 as value"))[0].value, 42);
+      assert.equal(connections.length, 2);
+      assert.ok(!connections[0].sent.includes("as value"));
+      const typesAt = connections[1].sent.indexOf("typcategory");
+      assert.ok(typesAt >= 0 && typesAt < connections[1].sent.indexOf("as value"), "query before the type fetch");
+    } finally {
+      await typed.end({ timeout: 1 });
+      await new Promise((resolve) => proxy.close(resolve));
+    }
   } else {
     throw new Error("Unknown recovery case");
   }

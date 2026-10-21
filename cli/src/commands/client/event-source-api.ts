@@ -88,6 +88,25 @@ export function registerEventSourceApiCommands(program: Command): void {
 
   addCommonClientOptions(
     eventSources
+      .command("ensure-paperclip")
+      .description(
+        "Create the company's built-in Paperclip event source, or return it if it exists (safe to repeat). " +
+          "It has no ingest URL or secret; routine triggers on it can start their steps on each created task.",
+      )
+      .option("-C, --company-id <id>", "Company ID")
+      .action(async (opts: CompanyOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          printOutput(await ctx.api.post(apiPath`/api/companies/${ctx.companyId}/event-sources/paperclip`, {}), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    eventSources
       .command("rotate")
       .description("Rotate an event source secret; the previous secret stops working immediately")
       .argument("<sourceId>", "Event source ID")

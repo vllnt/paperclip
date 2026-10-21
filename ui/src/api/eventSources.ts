@@ -1,4 +1,8 @@
-import type { RoutineTrigger } from "@paperclipai/shared";
+import {
+  PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
+  type PaperclipInternalEventNormalizer,
+  type RoutineTrigger,
+} from "@paperclipai/shared";
 import { api } from "./client";
 
 /**
@@ -45,12 +49,16 @@ export interface EventSource {
   enabled: boolean;
   archived: boolean;
   publicId: string;
-  /** Absolute ingress URL: `POST …/api/event-sources/public/{publicId}/events`. */
-  ingressUrl: string;
+  /**
+   * Absolute ingress URL: `POST …/api/event-sources/public/{publicId}/events`.
+   * `null` for the built-in Paperclip source, which has no ingress.
+   */
+  ingressUrl: string | null;
   secretId: string | null;
   signingMode: EventSigningMode;
   replayWindowSec: number;
-  normalizer: EventNormalizer;
+  /** `paperclip_v1` marks the built-in Paperclip source; a user can never pick it. */
+  normalizer: EventNormalizer | PaperclipInternalEventNormalizer;
   normalizerConfig: Record<string, unknown> | null;
   pinnedLabels: Record<string, string>;
   rateLimitPerMinute: number;
@@ -210,7 +218,8 @@ export interface EventGrouping {
   repeatCommentCooldownSec: number;
   rewakeOnSeverityIncrease: boolean;
   onRecovery: EventOnRecovery;
-  issueMode: "group" | { appendToIssueId: string };
+  /** `event_issue` attaches the routine's steps to the created task; only the built-in Paperclip source accepts it. */
+  issueMode: "group" | "event_issue" | { appendToIssueId: string };
 }
 
 export type EventRoutineTrigger = RoutineTrigger & {
@@ -225,6 +234,11 @@ export function isEventTrigger(trigger: RoutineTrigger): trigger is EventRoutine
   return trigger.kind === "event";
 }
 
+/** The built-in Paperclip source: managed by Paperclip, no secret and no ingress URL. */
+export function isPaperclipInternalSource(source: Pick<EventSource, "normalizer"> | null | undefined): boolean {
+  return source?.normalizer === PAPERCLIP_INTERNAL_EVENT_NORMALIZER;
+}
+
 export interface EventSourceDeliveryFilters {
   status?: EventDeliveryStatus | "all";
   limit?: number;
@@ -236,6 +250,9 @@ export const eventSourcesApi = {
     api.get<EventSource[]>(`/companies/${companyId}/event-sources${includeArchived ? "?includeArchived=true" : ""}`),
   create: (companyId: string, data: CreateEventSourceInput) =>
     api.post<EventSourceWithSecret>(`/companies/${companyId}/event-sources`, data),
+  /** Creates the company's built-in Paperclip source on the first call; later calls return it unchanged. */
+  ensurePaperclip: (companyId: string) =>
+    api.post<EventSource>(`/companies/${companyId}/event-sources/paperclip`, {}),
   get: (id: string) => api.get<EventSource>(`/event-sources/${id}`),
   update: (id: string, data: UpdateEventSourceInput) =>
     api.patch<EventSource>(`/event-sources/${id}`, data),

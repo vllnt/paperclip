@@ -35,12 +35,15 @@ import {
 import { RunButton } from "../components/AgentActionButtons";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
+import { routineStepsEqual } from "../lib/routine-steps";
 import { Badge } from "@/components/ui/badge";
 import {
   RoutineSubSidebar,
   RoutineSectionPicker,
 } from "../components/RoutineSubSidebar";
 import { RoutineSaveBar } from "../components/RoutineSaveBar";
+import { RoutineStepWarnings } from "../components/RoutineStepWarnings";
+import { agentNameMap, stepWarningsToast } from "../lib/routine-step-warnings";
 import {
   EDITABLE_SECTIONS,
   ROUTINE_SECTION_KEYS,
@@ -54,6 +57,7 @@ import {
 } from "../components/routine-sections/context";
 import {
   OverviewSection,
+  StepsSection,
   TriggersSection,
   VariablesSection,
   SecretsSection,
@@ -68,6 +72,7 @@ import {
 import type {
   RoutineDetail as RoutineDetailType,
   RoutineEnvConfig,
+  RoutineStepWarning,
   RoutineVariable,
 } from "@paperclipai/shared";
 
@@ -87,6 +92,7 @@ export function buildRoutineProjectOptions(
 
 const SECTION_TITLES: Record<RoutineSectionKey, string> = {
   overview: "Overview",
+  steps: "Steps",
   triggers: "Triggers",
   variables: "Variables",
   secrets: "Secrets",
@@ -174,6 +180,7 @@ export function RoutineDetail() {
   const projectSelectorRef = useRef<HTMLButtonElement | null>(null);
   const [secretMessage, setSecretMessage] = useState<SecretMessage | null>(null);
   const [saveConflict, setSaveConflict] = useState(false);
+  const [stepWarnings, setStepWarnings] = useState<RoutineStepWarning[]>([]);
   const [runVariablesOpen, setRunVariablesOpen] = useState(false);
   const [newTrigger, setNewTrigger] = useState(createDefaultNewTrigger);
   const [editDraft, setEditDraft] = useState<RoutineEditDraft>({
@@ -187,6 +194,7 @@ export function RoutineDetail() {
     activityGatePolicy: "always",
     activityGateScope: "company",
     variables: [],
+    steps: [],
     env: null,
     automationWakeSettings: {},
     runContextPolicy: null,
@@ -284,6 +292,7 @@ export function RoutineDetail() {
             activityGatePolicy: routine.activityGatePolicy,
             activityGateScope: routine.activityGateScope,
             variables: routine.variables,
+            steps: routine.steps ?? [],
             env: routine.env ?? null,
             automationWakeSettings: readAutomationWakeSettings(routine.automationWakeSettings),
             runContextPolicy: routine.runContextPolicy ?? null,
@@ -321,6 +330,9 @@ export function RoutineDetail() {
     }
     if (JSON.stringify(editDraft.variables) !== JSON.stringify(routineDefaults.variables)) {
       result.push({ key: "variables", label: "the variables" });
+    }
+    if (!routineStepsEqual(editDraft.steps, routineDefaults.steps)) {
+      result.push({ key: "steps", label: "the steps" });
     }
     if (JSON.stringify(editDraft.env ?? null) !== JSON.stringify(routineDefaults.env ?? null)) {
       result.push({ key: "env", label: "the secrets" });
@@ -425,6 +437,10 @@ export function RoutineDetail() {
     },
     onSuccess: async (saved) => {
       setSaveConflict(false);
+      const warnings = saved.warnings ?? [];
+      setStepWarnings(warnings);
+      const warningToast = stepWarningsToast(warnings, agentNameMap(agents));
+      if (warningToast) pushToast(warningToast);
       // The saved routine is the new base, and the draft adopts it so unedited wake
       // settings do not stay dirty against a value saved or refetched in the meantime.
       const savedWakeSettings = readAutomationWakeSettings(saved.automationWakeSettings);
@@ -469,8 +485,10 @@ export function RoutineDetail() {
           ? { executionWorkspaceSettings: data.executionWorkspaceSettings }
           : {}),
       }),
-    onSuccess: async () => {
+    onSuccess: async (run) => {
       pushToast({ title: "Routine run started", tone: "success" });
+      const warningToast = stepWarningsToast(run.warnings, agentNameMap(agents));
+      if (warningToast) pushToast(warningToast);
       setRunVariablesOpen(false);
       navigateToSection("runs");
       await Promise.all([
@@ -710,6 +728,7 @@ export function RoutineDetail() {
         activityGatePolicy: response.routine.activityGatePolicy,
         activityGateScope: response.routine.activityGateScope,
         variables: response.routine.variables as RoutineVariable[],
+        steps: response.routine.steps ?? [],
         env: (response.routine.env ?? null) as RoutineEnvConfig | null,
         automationWakeSettings: readAutomationWakeSettings(response.routine.automationWakeSettings),
         runContextPolicy: response.routine.runContextPolicy ?? null,
@@ -931,8 +950,15 @@ export function RoutineDetail() {
               <h2 id="routine-section-title" className="mb-4 text-lg font-semibold">
                 {SECTION_TITLES[section]}
               </h2>
+              <RoutineStepWarnings
+                warnings={stepWarnings}
+                agentNames={agentNameMap(agents)}
+                className="mb-4"
+                onDismiss={() => setStepWarnings([])}
+              />
 
               {section === "overview" && <OverviewSection />}
+              {section === "steps" && <StepsSection />}
               {section === "triggers" && <TriggersSection />}
               {section === "variables" && <VariablesSection />}
               {section === "secrets" && <SecretsSection />}

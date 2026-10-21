@@ -1,13 +1,22 @@
 import type { RequestHandler } from "express";
 import { promisify } from "node:util";
-import { deflate, gzip } from "node:zlib";
+import { brotliCompress, constants as zlibConstants, deflate, gzip } from "node:zlib";
 
 export const API_COMPRESSION_THRESHOLD_BYTES = 1024;
 
+/**
+ * Brotli quality for JSON bodies. Node's default (11) costs many times the CPU
+ * of gzip. At 4, a 2 MB issue list comes out about a quarter smaller than with
+ * gzip's default level and takes less CPU; 5 saves a little more for about
+ * twice the CPU.
+ */
+export const API_BROTLI_QUALITY = 4;
+
+const brotliAsync = promisify(brotliCompress);
 const gzipAsync = promisify(gzip);
 const deflateAsync = promisify(deflate);
 
-type SupportedEncoding = "gzip" | "deflate";
+type SupportedEncoding = "br" | "gzip" | "deflate";
 
 type ApiCompressionOptions = {
   thresholdBytes?: number;
@@ -38,16 +47,31 @@ function parseAcceptEncoding(value: string | string[] | undefined): EncodingPref
 }
 
 function selectEncoding(value: string | string[] | undefined): SupportedEncoding | null {
-  const preferences = parseAcceptEncoding(value).filter((entry) => entry.q > 0);
-  const findQ = (encoding: SupportedEncoding) =>
-    preferences.find((entry) => entry.encoding === encoding)?.q ??
-    preferences.find((entry) => entry.encoding === "*")?.q ??
-    0;
+  const preferences = parseAcceptEncoding(value);
+  // An explicit entry wins over "*", also when it refuses the encoding (q=0).
+  const explicitQ = (encoding: string) => preferences.find((entry) => entry.encoding === encoding)?.q;
+  const wildcardQ = explicitQ("*") ?? 0;
+  // Brotli only when the client names it; "*" alone keeps gzip.
+  const brQ = explicitQ("br") ?? 0;
+  const gzipQ = explicitQ("gzip") ?? wildcardQ;
+  const deflateQ = explicitQ("deflate") ?? wildcardQ;
+  const best = Math.max(brQ, gzipQ, deflateQ);
+  if (best <= 0) return null;
+  if (brQ === best) return "br";
+  return gzipQ === best ? "gzip" : "deflate";
+}
 
-  const gzipQ = findQ("gzip");
-  const deflateQ = findQ("deflate");
-  if (gzipQ <= 0 && deflateQ <= 0) return null;
-  return gzipQ >= deflateQ ? "gzip" : "deflate";
+function compressBody(encoding: SupportedEncoding, body: Buffer): Promise<Buffer> {
+  if (encoding === "br") {
+    return brotliAsync(body, {
+      params: {
+        [zlibConstants.BROTLI_PARAM_MODE]: zlibConstants.BROTLI_MODE_TEXT,
+        [zlibConstants.BROTLI_PARAM_QUALITY]: API_BROTLI_QUALITY,
+        [zlibConstants.BROTLI_PARAM_SIZE_HINT]: body.length,
+      },
+    });
+  }
+  return encoding === "gzip" ? gzipAsync(body) : deflateAsync(body);
 }
 
 function isJsonContentType(value: unknown): boolean {
@@ -207,9 +231,7 @@ export function apiCompression(options: ApiCompressionOptions = {}): RequestHand
 
       void (async () => {
         try {
-          const compressed = selectedEncoding === "gzip"
-            ? await gzipAsync(body)
-            : await deflateAsync(body);
+          const compressed = await compressBody(selectedEncoding, body);
           res.vary("Accept-Encoding");
           res.setHeader("Content-Encoding", selectedEncoding);
           res.setHeader("Content-Length", String(compressed.length));
