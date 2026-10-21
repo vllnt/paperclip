@@ -4179,15 +4179,22 @@ registry.registerPath({
   tags: ["issues"],
   summary: "List issues in a company",
   description:
-    "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract.",
+    "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract. " +
+    "`goalId` returns the issues whose own goal is that goal; issues of its sub-goals are not included. A `goalId` that is not a UUID returns 422.",
   request: {
     params: z.object({ companyId: z.string() }),
-    query: z.object({ view: z.enum(["compact"]).optional() }).passthrough(),
+    query: z
+      .object({
+        view: z.enum(["compact"]).optional(),
+        goalId: z.string().guid().optional().describe("Only issues whose own goal is this goal"),
+      })
+      .passthrough(),
   },
   responses: {
     200: r.ok(),
     304: { description: "Not Modified" },
     401: r.unauthorized,
+    422: r.unprocessable,
   },
 });
 
@@ -5069,7 +5076,7 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/routines",
   tags: ["routines"],
-  summary: "List routines in a company; optional filters q, assigneeAgentId, folderId (or none), projectId, status and trigger combine with AND",
+  summary: "List routines in a company; optional filters q, assigneeAgentId, folderId (or none), projectId, goalId, status and trigger combine with AND",
   request: { params: z.object({ companyId: z.string() }), query: listRoutinesQuerySchema },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
