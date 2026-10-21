@@ -34,6 +34,7 @@ const mockParams = vi.hoisted(() => ({ projectId: "project-1" }));
 const mockSetBreadcrumbs = vi.hoisted(() => vi.fn());
 const mockIssuesList = vi.hoisted(() => vi.fn());
 const mockSummarySlotCard = vi.hoisted(() => vi.fn());
+const mockProjectRoutinesSection = vi.hoisted(() => vi.fn());
 const mockLocation = vi.hoisted(() => ({
   pathname: "/projects/project-1/plugin-operations",
   search: "",
@@ -84,7 +85,15 @@ vi.mock("@/plugins/slots", () => ({
 }));
 vi.mock("@/plugins/launchers", () => ({ PluginLauncherOutlet: () => null }));
 vi.mock("../components/ProjectProperties", () => ({
-  ProjectProperties: () => <div data-testid="project-properties"><input aria-label="Unsaved project field" /></div>,
+  ProjectProperties: ({ routines }: { routines?: ReactNode }) => (
+    <div data-testid="project-properties"><input aria-label="Unsaved project field" />{routines}</div>
+  ),
+}));
+vi.mock("../components/ProjectRoutinesSection", () => ({
+  ProjectRoutinesSection: (props: unknown) => {
+    mockProjectRoutinesSection(props);
+    return <div data-testid="project-routines-section" />;
+  },
 }));
 vi.mock("../components/BudgetPolicyCard", () => ({
   BudgetPolicyCard: () => <div data-testid="budget-policy-card" />,
@@ -274,6 +283,35 @@ describe("ProjectDetail", () => {
       projectId: "project-1",
       originKindPrefix: "plugin:paperclip.missions",
     });
+  });
+
+  it("shows the project's routines on the Configuration tab only", async () => {
+    mockLocation.pathname = "/projects/project-1/configuration";
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ProjectDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector('[data-testid="project-properties"] [data-testid="project-routines-section"]')).not.toBeNull();
+    expect(mockProjectRoutinesSection).toHaveBeenCalledWith({ companyId: "company-1", projectId: "project-1", canCreate: true });
+
+    mockLocation.pathname = "/projects/project-1/budget";
+    await act(() => root!.render(
+      <QueryClientProvider client={queryClient}>
+        <ProjectDetail />
+      </QueryClientProvider>,
+    ));
+    expect(container.querySelector('[data-testid="project-routines-section"]')).toBeNull();
   });
 
   it("keeps Timeline out of the project task-list controls", async () => {
