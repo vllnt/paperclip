@@ -5,7 +5,7 @@ import { boardScope } from "./setup.js";
 import type { PluginWriteRequest } from "./write-identity.js";
 import { nativeGitHubReady } from "./native-github.js";
 import { JOB_BUDGET_MS, HEAD_MARGIN_MS, QUEUE_ATTEMPTS, QUEUE_LIMIT, QUEUE_PER_REPOSITORY, QUEUE_RETRY_MS, QUEUE_SHARE, RUN_BUDGET_MS, SYNC_PAGE_SIZE,
-  TRACKED_PER_RUN, TRACKED_RECHECK_MS, currentSweep, newestUpdate, resumeFrom, validTime, walkUpdated, type RepoCursor, type WalkEnd } from "./sync-window.js";
+  TRACKED_PER_RUN, TRACKED_RECHECK_MS, currentSweep, resumeFrom, validTime, walkUpdated, type RepoCursor, type WalkEnd } from "./sync-window.js";
 import { PLUGIN_ID, type AutomationRule, type ConnectionState, type GitHubIssue, type Repository, type SyncReport, type SyncSettings, type TaskRepository, type TaskRepositories } from "./contracts.js";
 
 const ORIGIN = `plugin:${PLUGIN_ID}:issue` as const;
@@ -368,10 +368,8 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
   async function loadCursor(companyId: string, repositoryId: number): Promise<RepoCursor> {
     const saved = await ctx.state.get(cursorKey(companyId, repositoryId)) as Partial<RepoCursor> | null;
     const startedAt = validTime(saved?.sweep?.startedAt), since = validTime(saved?.sweep?.since);
-    const sweptAt = validTime(saved?.sweptAt);
     // The first full pass is also the first recent-changes walk, so a repository has no `head` until its first pass ends.
-    const head = validTime(saved?.head) ?? (startedAt === undefined && sweptAt !== undefined ? new Date(Date.parse(sweptAt) - HEAD_MARGIN_MS).toISOString() : undefined);
-    return { head, sweptAt, sweep: startedAt === undefined ? undefined : { startedAt, since } };
+    return { head: validTime(saved?.head), sweptAt: validTime(saved?.sweptAt), sweep: startedAt === undefined ? undefined : { startedAt, since } };
   }
   /** Drops the asks for a second look at these issues, except one that a newer ask replaced while the run was working on it. */
   function settle(companyId: string, queued: SyncQueue, ...githubIds: Array<number | string>) {
@@ -431,7 +429,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
         if (!await scope.connected()) return null;
         const result = await github.issues(auth.id, auth.pem, repo, page, "all", { direction: "asc", perPage: SYNC_PAGE_SIZE, ...(since ? { since: resumeFrom(since) } : {}) });
         if (result.nextPage !== null && (result.nextPage <= page || result.nextPage > 10000)) throw new Error("GitHub returned an invalid issue page.");
-        return { items: result.issues, nextPage: result.nextPage, cursor: result.cursor ?? newestUpdate(result.issues) };
+        return { items: result.issues, nextPage: result.nextPage, cursor: result.cursor ?? null };
       },
       async visit(listed) {
         await recover(listed);
