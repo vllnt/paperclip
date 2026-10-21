@@ -6,6 +6,7 @@ import {
   CalendarClock,
   KeyRound,
   LayoutDashboard,
+  ListOrdered,
   Play,
   Repeat,
   Send,
@@ -20,6 +21,7 @@ import { SidebarNavItem } from "./SidebarNavItem";
 
 export const ROUTINE_DETAIL_VIEWS = [
   "overview",
+  "steps",
   "triggers",
   "variables",
   "delivery",
@@ -40,6 +42,7 @@ export type RoutineContextualNavItem = {
 
 export const ROUTINE_CONTEXTUAL_NAV_ITEMS: readonly RoutineContextualNavItem[] = [
   { view: "overview", label: "Overview", icon: LayoutDashboard },
+  { view: "steps", label: "Steps", icon: ListOrdered },
   { view: "triggers", label: "Triggers", icon: CalendarClock },
   { view: "variables", label: "Variables", icon: Braces },
   { view: "delivery", label: "Delivery", icon: Send },

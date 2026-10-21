@@ -52,6 +52,7 @@ Fields:
 | `parentIssueId` | no | Parent issue for created run issues |
 | `priority` | no | `critical`, `high`, `medium` (default), `low` |
 | `status` | no | `active` (default), `paused`, `archived` |
+| `steps` | no | Ordered sub-tasks each run creates under the run's task. See [Routine Steps](#routine-steps). Default `[]` (no steps) |
 | `concurrencyPolicy` | no | Behaviour when a run fires while a previous one is still active |
 | `catchUpPolicy` | no | Behaviour for missed scheduled runs |
 
@@ -97,6 +98,103 @@ POST /api/routines/{routineId}/revisions/{revisionId}/restore
 ```
 
 Restores a historical routine definition by creating a new latest revision copied from the selected revision. Historical revision rows, routine run history, and activity history are preserved. If restoring a deleted webhook trigger requires recreating it, the response can include one-time replacement secret material for that trigger.
+
+## Routine Steps
+
+A routine with `steps` creates its task **and** one sub-task per step each time it runs. Use it for repeatable multi-stage work, for example implement, review, then two checks in parallel, then a release check. A routine without steps (`steps: []`, the default) behaves exactly as before.
+
+```
+PATCH /api/routines/{routineId}
+{
+  "steps": [
+    { "key": "implement", "title": "Implement {{target}}", "description": "Make the change and open a pull request." },
+    { "key": "review", "title": "Review {{target}}", "assigneeAgentId": "{reviewerAgentId}", "after": ["implement"] },
+    { "key": "lint", "title": "Lint", "after": ["review"] },
+    { "key": "types", "title": "Type check", "after": ["review"] },
+    { "key": "ship", "title": "Release check", "after": ["lint", "types"] }
+  ]
+}
+```
+
+A step has these fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `key` | yes | Lowercase slug (letters, digits, `-`, `_`; at most 40), unique in the routine |
+| `title` | yes | Task title, at most 200 characters. `{{variables}}` are filled in at run time |
+| `description` | no | Task instructions in Markdown. `{{variables}}` and `skill://` mentions work |
+| `assigneeAgentId` | no | Agent that runs the step. Defaults to the run's agent: the `assigneeAgentId` of the run request, else the routine's agent. An agent can name only itself in a run of a routine with steps. Validation fails when a step has neither |
+| `after` | no | Keys of the steps this one waits for. Empty (default) means it starts with the run |
+| `priority` | no | Defaults to the routine's priority |
+| `labelIds` | no | Labels of the company |
+| `executionPolicy` | no | Review and approval stages for the step, as on any task |
+| `acceptanceCriteria` | no | Checklist lines. `{{variables}}` work here too |
+
+A `skill://<skillId>` mention in a step description gives the step's agent that company skill for the run. It applies on adapters that sync skills and on `paperclip_runner`; it is ignored on `cursor_cloud`, `openclaw_gateway`, `http` and `process`.
+
+Rules checked when you save: keys are unique, `after` points at other steps, there are no cycles, at most 25 steps, and every agent and label belongs to the company. Variables that appear only in a step are added to the routine's variables, so manual runs ask for them.
+
+**What a run creates.** The run's task and its steps are created together in one savepoint of the dispatch transaction:
+
+1. The run's task, as today, but in status `blocked`. It is not woken at the start.
+2. One child task per step, with origin kind `routine_step` and the root as parent. Steps are created in layers: first the steps with no `after`, then the steps whose predecessors are all created, and so on, each layer in the order the steps were written. A step with no `after` is `todo`; the others are `blocked` by the steps they wait for.
+3. Only the steps with no `after` are woken, after the dispatch commits. Paperclip's existing blocker wakes start the others as their predecessors finish (`issue_blockers_resolved`). A step that waits for several steps starts after all of them are done (a join).
+4. The root's agent is woken once, after the last step finishes, to wrap up the run.
+
+If creating the task or any step fails, none of them is kept and the run is recorded as `failed`. If a later database write of the same dispatch fails, the whole dispatch rolls back: no task and no run row remain, and the caller gets the error (accepted; the next trigger starts again).
+
+The run record keeps `routineSteps: { steps, stepIssueIds }` in its trigger payload, so later edits to the routine never change a run in flight. The `routineSteps` key is reserved: a trigger payload you send with that key loses it. To stop a run, cancel its task with the existing tree control (cancel the task and its sub-tasks): the root and every step are cancelled, and the routine is free for the next run.
+
+**A cancelled step.** A cancelled step never counts as done, so the steps that wait for it stay `blocked` and the run's task stays blocked. Nothing cascades: the blocked steps stay visible so a person can decide. Once every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled*. A stalled run no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run where another branch is still running stays live. When the run's task is next updated, a stalled run is recorded as `failed`. To clean up a stalled run, cancel its task with the tree control.
+
+**Concurrency.** For a routine with steps, an open root of an earlier run counts as live: `skip_if_active` and `coalesce_if_active` act on it until it is done or cancelled, or until the run is stalled (see above). `always_enqueue` is unchanged.
+
+**Workspaces.** Steps are siblings, so a step that has no workspace of its own reuses the execution workspace of the earliest step it waited for in the same project, right before it first runs. A reviewer therefore sees the implementer's checkout.
+
+**Limits.**
+
+- Routine environment variables and secrets apply to the run's task only. Step agents do not inherit them.
+- `after` entries are plain step keys.
+- Steps are not supported with append issue mode (`appendToIssueId`); the API returns `422` with `Steps are not supported with append issue mode`.
+- For an event-triggered routine, the storm breaker counts alert groups, not issues, and each group can create up to 26 issues (the task plus 25 steps). Lower the source's `maxNewIssuesPerHour` if that is too many.
+- Steps are an API, CLI and UI feature of the routine. The routine UI edits key, title, instructions, agent, priority and `after`; `labelIds`, `executionPolicy` and `acceptanceCriteria` are set through the API or CLI. The UI keeps them when you edit a step.
+
+**Permissions.** Writing steps needs the same rights as assigning tasks. A board user needs `tasks:assign`. **An agent can only assign steps to itself**; naming another agent returns `403`. Restoring a revision that holds steps follows the same rules for an agent: the steps must be assigned to the agent, and a low-trust agent can restore only steps that already carry its containment (otherwise `403`; update the steps instead).
+
+CLI:
+
+```
+paperclipai routine create --company-id {companyId} --payload-json '{...}' --steps-file steps.json
+paperclipai routine update {routineId} --steps-file steps.json
+```
+
+`steps.json` holds the JSON array. The flag is refused when the payload also contains `steps`.
+
+### Review loops
+
+To implement, review, fix and re-review, put the review on the step being reviewed as an `executionPolicy` review stage. Do not add a separate review step.
+
+```
+{
+  "key": "implement",
+  "title": "Implement {{target}}",
+  "assigneeAgentId": "{implementerAgentId}",
+  "executionPolicy": {
+    "stages": [{ "type": "review", "participants": [{ "type": "agent", "agentId": "{reviewerAgentId}" }] }],
+    "maxReviewRounds": 3
+  }
+}
+```
+
+The whole loop stays on one task. When the reviewer asks for changes the task goes back to the implementer, then to the reviewer again, until the reviewer approves or `maxReviewRounds` is reached (default 3, at most 50). After that the existing review escalation applies: the task goes to the responsible or creating user when there is one.
+
+Why it is cheaper: an agent's session is stored per agent, adapter and task (`agent_task_sessions`). `execution_review_requested` and `execution_changes_requested` wakes do not reset the session (see `shouldResetTaskSessionForWake` in `server/src/services/heartbeat.ts`), so the reviewer and the implementer each resume their own session between rounds instead of re-reading everything.
+
+Caveats:
+
+- `issue_assigned` and `execution_approval_requested` wakes start a **fresh** session. An approval stage does not resume.
+- Resuming needs an adapter with a session codec: the claude, codex, cursor, gemini, grok, hermes, kimi, opencode and pi adapters. Others start fresh each wake.
+- A separate review step cannot send work back to an earlier step. Use separate steps for one-shot reviews, or for several reviews in parallel (for example one security lens and one performance lens, joined by a later step).
 
 ## Add Trigger
 
@@ -298,6 +396,7 @@ Agents can read all routines in their company but can only create and manage rou
 | Rotate trigger secret | ✅ own only | ✅ |
 | Manual run | ✅ own only | ✅ |
 | Reassign to another agent | ❌ | ✅ |
+| Write `steps` | ✅ own routines, steps assigned to itself | ✅ with `tasks:assign` |
 
 Agents can add `event` triggers to their own routines and read event sources and event groups. Creating, editing, rotating and archiving event sources is board-only.
 

@@ -92,6 +92,18 @@ describe("issue filters", () => {
     expect(filtered.map((issue) => issue.id)).toEqual(["agent-match", "user-match"]);
   });
 
+  it("hides the roots and the steps of routine runs only when routine visibility filtering is enabled", () => {
+    const issues = [
+      makeIssue({ id: "manual", originKind: "manual" }),
+      makeIssue({ id: "root", originKind: "routine_execution" }),
+      makeIssue({ id: "step", originKind: "routine_step" }),
+    ];
+    const hiding = { ...defaultIssueFilterState, hideRoutineExecutions: true };
+
+    expect(applyIssueFilters(issues, hiding, null, true).map((issue) => issue.id)).toEqual(["manual"]);
+    expect(applyIssueFilters(issues, hiding, null, false).map((issue) => issue.id)).toEqual(["manual", "root", "step"]);
+  });
+
   it("counts creator filters as an active filter group", () => {
     expect(countActiveIssueFilters({
       ...defaultIssueFilterState,

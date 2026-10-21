@@ -8,6 +8,9 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 
+/** Reads only, so a caller can pass its pool or an open transaction. */
+type AssignabilityReader = Pick<Db, "select">;
+
 type AgentAssignmentKind = "work" | "routine";
 
 type AssignabilityAgent = AgentEligibilityAgent;
@@ -67,7 +70,7 @@ function conflictDetails(input: {
   };
 }
 
-async function getAgent(db: Db, agentId: string): Promise<AssignabilityAgent | null> {
+async function getAgent(db: AssignabilityReader, agentId: string): Promise<AssignabilityAgent | null> {
   return db
     .select({
       id: agents.id,
@@ -81,7 +84,7 @@ async function getAgent(db: Db, agentId: string): Promise<AssignabilityAgent | n
     .then((rows) => rows[0] ?? null);
 }
 
-async function listCompanyAgents(db: Db, companyId: string): Promise<AssignabilityAgent[]> {
+async function listCompanyAgents(db: AssignabilityReader, companyId: string): Promise<AssignabilityAgent[]> {
   return db
     .select({
       id: agents.id,
@@ -102,7 +105,7 @@ function assignmentReasonFromHealth(health: AgentOrgChainHealth): AgentAssignmen
 }
 
 export async function assertAssignableAgent(
-  db: Db,
+  db: AssignabilityReader,
   companyId: string,
   agentId: string | null | undefined,
   options: { kind?: AgentAssignmentKind } = {},

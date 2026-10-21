@@ -1,4 +1,4 @@
-import { isHeartbeatRunVisibleInMine } from "@paperclipai/shared";
+import { isHeartbeatRunVisibleInMine, isRoutineRunIssueOriginKind } from "@paperclipai/shared";
 import type {
   Approval,
   DashboardSummary,
@@ -423,7 +423,7 @@ export function shouldIncludeRoutineExecutionIssue(
   issue: Pick<Issue, "originKind">,
   hideRoutineExecutions: boolean,
 ): boolean {
-  return !hideRoutineExecutions || issue.originKind !== "routine_execution";
+  return !hideRoutineExecutions || !isRoutineRunIssueOriginKind(issue.originKind);
 }
 
 export function filterInboxIssues(issues: Issue[], hideRoutineExecutions: boolean): Issue[] {
