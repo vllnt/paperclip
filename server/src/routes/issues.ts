@@ -8180,6 +8180,11 @@ export function issueRoutes(
       res.status(400).json({ error: "view must be 'compact' when provided" });
       return;
     }
+    const goalIdFilter = req.query.goalId;
+    if (goalIdFilter !== undefined && (typeof goalIdFilter !== "string" || !isUuidLike(goalIdFilter))) {
+      res.status(422).json({ error: "goalId must be a UUID" });
+      return;
+    }
     if (
       rawLimit !== undefined &&
       (parsedLimit === null ||
@@ -8267,6 +8272,7 @@ export function issueRoutes(
       inboxArchivedByUserId,
       unreadForUserId,
       projectId: req.query.projectId as string | undefined,
+      goalId: goalIdFilter,
       workspaceId: req.query.workspaceId as string | undefined,
       executionWorkspaceId: req.query.executionWorkspaceId as
         string | undefined,
