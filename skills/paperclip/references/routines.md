@@ -395,6 +395,6 @@ POST /api/routines/{routineId}/triggers
 
 Use `first` for a scheduled routine that must not wait behind a long queue, such as an hourly health check. Changing it does not create a revision, and restoring a revision leaves it as it is.
 
-- **Only the board sets `first`.** It reorders the queue of every agent that serves the routine's runs, so a board user with `tasks:assign` must set it. As an agent you get `403`, even on your own routine: ask the board. You can still set it back to `normal`.
+- **Only the board sets `first`.** It reorders the queue of every agent that serves the routine's runs, so a board user with `tasks:assign` must set it. As an agent you get `403` when you set `first` on a routine that is not already `first`, even on your own routine: ask the board. You can still set it back to `normal`. While your routine is `first`, adding triggers or starting more runs pushes the other queued work of every agent it serves further back, so ask the board before you make it run more often.
 - **Your other runs can wait.** Aging (one priority level per 30 minutes waited) works within each group only. While a `first` routine keeps runs queued, the agent's other runs wait, however long they have waited.
 - **Which issues.** It applies to the issues the routine files under its own id (origin `routine_execution` or `routine_step`). A plugin-managed routine that files its runs under the plugin's own origin, or another origin id, keeps the usual order.

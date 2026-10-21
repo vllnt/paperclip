@@ -789,6 +789,7 @@ describe("routine routes", () => {
 
     it("passes first through when the board user has tasks:assign", async () => {
       mockAccessService.canUser.mockResolvedValue(true);
+      mockRoutineService.create.mockResolvedValue({ ...routine, slotPriority: "first" });
       const app = await createApp(board);
 
       const patched = await request(app).patch(`/api/routines/${routineId}`).send({ slotPriority: "first" });
@@ -808,6 +809,10 @@ describe("routine routes", () => {
         expect.objectContaining({ slotPriority: "first" }),
         expect.anything(),
       );
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "routine.created",
+        details: expect.objectContaining({ slotPriority: "first" }),
+      }));
     });
   });
 

@@ -377,7 +377,7 @@ export function routineRoutes(
       action: "routine.created",
       entityType: "routine",
       entityId: created.id,
-      details: { title: created.title, assigneeAgentId: created.assigneeAgentId },
+      details: { title: created.title, assigneeAgentId: created.assigneeAgentId, slotPriority: created.slotPriority },
     });
     const telemetryClient = getTelemetryClient();
     if (telemetryClient) {
