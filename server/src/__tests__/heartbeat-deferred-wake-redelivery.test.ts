@@ -576,6 +576,155 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
     });
   });
 
+  it("does not let an agent's held wakes use its selection budget, so a wake that can run is promoted", async () => {
+    // Seven higher-ranked wakes on operator-stopped tasks and one runnable wake,
+    // all of one agent. Passes run every 30 s and a held wake hides for the 60 s
+    // recheck window, so if held wakes took the agent's 3 slots per pass they
+    // would fill them forever and the runnable wake would never be selected.
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, { name: "StoppedMostly", maxConcurrentRuns: 3 });
+    const heldWakeIds: string[] = [];
+    for (let index = 0; index < 7; index += 1) {
+      const issueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: `Stopped ${index}`, priority: "high" });
+      await seedRun(companyId, agentId, issueId, {
+        status: "cancelled",
+        errorCode: "cancelled",
+        resultJson: { executionCancellation: { state: "acknowledged" } },
+      });
+      heldWakeIds.push(await seedDeferredWake(companyId, agentId, issueId, { ageMs: (60 - index) * MINUTE_MS }));
+    }
+    const runnableIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: "Runnable", priority: "low" });
+    const runnableWakeId = await seedDeferredWake(companyId, agentId, runnableIssueId, { ageMs: 30 * MINUTE_MS });
+
+    const recheckMs = 60_000;
+    let promotedOnPass: number | null = null;
+    for (let pass = 1; pass <= 6 && promotedOnPass === null; pass += 1) {
+      const result = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs });
+      expect(result.failed).toBe(0);
+      if ((await wakeRow(runnableWakeId)).runId !== null) promotedOnPass = pass;
+      // The next periodic pass comes 30 s later.
+      await db
+        .update(agentWakeupRequests)
+        .set({ updatedAt: sql`${agentWakeupRequests.updatedAt} - interval '30 seconds'` })
+        .where(eq(agentWakeupRequests.companyId, companyId));
+    }
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(promotedOnPass).toBe(1);
+    for (const wakeId of heldWakeIds) {
+      expect(await wakeRow(wakeId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    }
+  });
+
+  it("finds a wake that can run in a run-completion pass without claiming or counting the agent's held wakes", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, { name: "StoppedMostly", maxConcurrentRuns: 3 });
+    const heldWakeIds: string[] = [];
+    for (let index = 0; index < 7; index += 1) {
+      const issueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: `Stopped ${index}`, priority: "high" });
+      await seedRun(companyId, agentId, issueId, {
+        status: "cancelled",
+        errorCode: "cancelled",
+        resultJson: { executionCancellation: { state: "acknowledged" } },
+      });
+      heldWakeIds.push(await seedDeferredWake(companyId, agentId, issueId, { ageMs: (60 - index) * MINUTE_MS }));
+    }
+    const runnableIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: "Runnable", priority: "low" });
+    const runnableWakeId = await seedDeferredWake(companyId, agentId, runnableIssueId, { ageMs: 30 * MINUTE_MS });
+    const updatedBefore = new Map(
+      await Promise.all(heldWakeIds.map(async (wakeId) => [wakeId, (await wakeRow(wakeId)).updatedAt.getTime()] as const)),
+    );
+
+    const pass = await heartbeat.sweepDeferredWakes({ agentId, minAgeMs: 0, recheckMs: 0 });
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(pass).toMatchObject({ promoted: 1, skippedHeld: 0, failed: 0 });
+    expect((await wakeRow(runnableWakeId)).runId).not.toBeNull();
+    for (const wakeId of heldWakeIds) {
+      const wake = await wakeRow(wakeId);
+      expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(wake.updatedAt.getTime()).toBe(updatedBefore.get(wakeId));
+    }
+  });
+
+  it("does not let held wakes use the pass-wide budget either", async () => {
+    const companyId = await seedCompany();
+    const heldWakeIds: string[] = [];
+    for (let index = 0; index < 3; index += 1) {
+      const agentId = await seedAgent(companyId, { name: `Stopped${index}`, maxConcurrentRuns: 3 });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: `Stopped ${index}`, priority: "high" });
+      await seedRun(companyId, agentId, issueId, {
+        status: "cancelled",
+        errorCode: "cancelled",
+        resultJson: { executionCancellation: { state: "acknowledged" } },
+      });
+      heldWakeIds.push(await seedDeferredWake(companyId, agentId, issueId, { ageMs: (60 - index) * MINUTE_MS }));
+    }
+    const runnableAgentId = await seedAgent(companyId, { name: "Runnable", maxConcurrentRuns: 3 });
+    const runnableIssueId = await seedIssue(companyId, { assigneeAgentId: runnableAgentId, priority: "low" });
+    const runnableWakeId = await seedDeferredWake(companyId, runnableAgentId, runnableIssueId, { ageMs: 30 * MINUTE_MS });
+
+    const pass = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 60_000, maxPromotions: 2 });
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(pass).toMatchObject({ promoted: 1, skippedHeld: 3, failed: 0 });
+    expect((await wakeRow(runnableWakeId)).runId).not.toBeNull();
+  });
+
+  it("holds every agent's wake on a held task", async () => {
+    const companyId = await seedCompany();
+    const firstId = await seedAgent(companyId, { name: "First", maxConcurrentRuns: 3 });
+    const secondId = await seedAgent(companyId, { name: "Second", maxConcurrentRuns: 3 });
+    const issueId = await seedIssue(companyId, { assigneeAgentId: firstId, title: "Stopped, shared" });
+    await seedRun(companyId, firstId, issueId, {
+      status: "cancelled",
+      errorCode: "cancelled",
+      resultJson: { executionCancellation: { state: "acknowledged" } },
+    });
+    const firstWakeId = await seedDeferredWake(companyId, firstId, issueId, { ageMs: 20 * MINUTE_MS });
+    const secondWakeId = await seedDeferredWake(companyId, secondId, issueId, {
+      ageMs: 10 * MINUTE_MS,
+      reason: "issue_comment_mentioned",
+    });
+
+    const pass = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 60_000 });
+
+    expect(pass).toMatchObject({ scanned: 2, skippedHeld: 2, skippedOperatorStop: 2, promoted: 0, failed: 0 });
+    for (const wakeId of [firstWakeId, secondWakeId]) {
+      expect(await wakeRow(wakeId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    }
+  });
+
+  it("still rechecks a held wake once its recheck window has passed", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId, { name: "Stopped", maxConcurrentRuns: 3 });
+    const issueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: "Stopped", priority: "high" });
+    await seedRun(companyId, agentId, issueId, {
+      status: "cancelled",
+      errorCode: "cancelled",
+      resultJson: { executionCancellation: { state: "acknowledged" } },
+    });
+    const wakeId = await seedDeferredWake(companyId, agentId, issueId, { ageMs: 20 * MINUTE_MS });
+    const recheckMs = 60_000;
+
+    const first = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs });
+    expect(first).toMatchObject({ scanned: 1, skippedHeld: 1, skippedOperatorStop: 1, promoted: 0 });
+    const examinedAt = (await wakeRow(wakeId)).updatedAt;
+
+    // Inside the window the wake is not read again.
+    expect(await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs })).toMatchObject({ scanned: 0 });
+
+    // After the window it is read and held again, and moves to the back of the window.
+    await db
+      .update(agentWakeupRequests)
+      .set({ updatedAt: sql`${agentWakeupRequests.updatedAt} - interval '61 seconds'` })
+      .where(eq(agentWakeupRequests.id, wakeId));
+    const later = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs });
+    expect(later).toMatchObject({ scanned: 1, skippedHeld: 1, skippedOperatorStop: 1, promoted: 0 });
+    expect((await wakeRow(wakeId)).updatedAt.getTime()).toBeGreaterThan(examinedAt.getTime());
+    expect(await wakeRow(wakeId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+  });
+
   describe("wakes parked behind an execution-recovery hold", () => {
     /**
      * The production case: a todo task, its assignee with a free
@@ -1164,6 +1313,40 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       await heartbeat.drainActiveRunExecutions();
       expect(resumed.promoted).toBe(1);
       expect((await runsForSeededWake(issueId)).length).toBe(1);
+    });
+
+    it("does not let budget-stopped wakes use the agent's selection budget, so a wake that can run is promoted", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, { name: "MostlyOverBudget", maxConcurrentRuns: 3 });
+      const blockedProjectId = randomUUID();
+      await db.insert(projects).values({
+        id: blockedProjectId,
+        companyId,
+        name: "Over budget",
+        pausedAt: new Date(),
+        pauseReason: "budget",
+      });
+      const blockedWakeIds: string[] = [];
+      for (let index = 0; index < 7; index += 1) {
+        const issueId = await seedIssue(companyId, {
+          assigneeAgentId: agentId,
+          title: `Over budget ${index}`,
+          priority: "high",
+          projectId: blockedProjectId,
+        });
+        blockedWakeIds.push(await seedDeferredWake(companyId, agentId, issueId, { ageMs: (60 - index) * MINUTE_MS }));
+      }
+      const runnableIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: "Runnable", priority: "low" });
+      const runnableWakeId = await seedDeferredWake(companyId, agentId, runnableIssueId, { ageMs: 30 * MINUTE_MS });
+
+      const pass = await heartbeat.sweepDeferredWakes({ minAgeMs: 0, recheckMs: 60_000 });
+      await heartbeat.drainActiveRunExecutions();
+
+      expect(pass).toMatchObject({ promoted: 1, skippedBudget: 7, failed: 0 });
+      expect((await wakeRow(runnableWakeId)).runId).not.toBeNull();
+      for (const wakeId of blockedWakeIds) {
+        expect(await wakeRow(wakeId)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      }
     });
   });
 

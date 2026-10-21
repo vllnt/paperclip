@@ -133,6 +133,8 @@ The adapter persists Claude Code session IDs between heartbeats. On the next wak
 
 Session resume is cwd-aware: if the agent's working directory changed since the last run, a fresh session starts instead.
 
+A fresh session also starts when the agent instructions or skills changed. Each run reads its own copy of the instructions, so the adapter compares their contents, not the path of the copy. On an SSH target, each run works in its own directory under the target's workspace. An SSH session resumes when the host workspace, host, port, user and remote workspace match the saved session. A sandbox session resumes only in the same lease. A resumed session still remembers the paths of its first run, so its prompt names this run's instructions directory on a local target, and this run's workspace on a remote target.
+
 If resume fails with an unknown session error, the adapter automatically retries with a fresh session.
 
 ### Poisoned `previous_message_id` (recovery)

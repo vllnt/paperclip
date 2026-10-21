@@ -13,6 +13,11 @@ type SkillEntry = PaperclipSkillEntry;
 
 export interface ClaudePromptBundle {
   bundleKey: string;
+  /**
+   * Names the instructions and skills without the paths of one run, so a run
+   * can resume the session of an earlier run that read the same bundle.
+   */
+  resumeKey: string;
   rootDir: string;
   addDir: string;
   instructionsFilePath: string | null;
@@ -39,9 +44,13 @@ function resolveManagedClaudePromptCacheRoot(
   );
 }
 
+interface HashSink {
+  update(data: string | Buffer): void;
+}
+
 async function hashPathContents(
   candidate: string,
-  hash: Hash,
+  hash: HashSink,
   relativePath: string,
   seenDirectories: Set<string>,
 ): Promise<void> {
@@ -85,27 +94,41 @@ async function hashPathContents(
   hash.update(`other:${relativePath}:${stat.mode}\n`);
 }
 
-async function buildClaudePromptBundleKey(input: {
-  skills: SkillEntry[];
-  instructionsContents: string | null;
-}): Promise<string> {
-  const hash = createHash("sha256");
+function hashInstructions(hash: Hash, instructionsContents: string | null): void {
   hash.update("paperclip-claude-prompt-bundle:v1\n");
-  if (input.instructionsContents) {
+  if (instructionsContents) {
     hash.update("instructions\n");
-    hash.update(input.instructionsContents);
+    hash.update(instructionsContents);
     hash.update("\n");
   } else {
     hash.update("instructions:none\n");
   }
+}
+
+async function buildClaudePromptBundleKeys(input: {
+  skills: SkillEntry[];
+  instructionsContents: string | null;
+  resumeInstructionsContents: string | null;
+}): Promise<{ bundleKey: string; resumeKey: string }> {
+  const bundleHash = createHash("sha256");
+  const resumeHash = createHash("sha256");
+  hashInstructions(bundleHash, input.instructionsContents);
+  hashInstructions(resumeHash, input.resumeInstructionsContents);
+  // One walk of the skill files feeds both keys.
+  const skillsHash: HashSink = {
+    update(data) {
+      bundleHash.update(data);
+      resumeHash.update(data);
+    },
+  };
 
   const sortedSkills = [...input.skills].sort((left, right) => left.runtimeName.localeCompare(right.runtimeName));
   for (const entry of sortedSkills) {
-    hash.update(`skill:${entry.key}:${entry.runtimeName}\n`);
-    await hashPathContents(entry.source, hash, entry.runtimeName, new Set<string>());
+    skillsHash.update(`skill:${entry.key}:${entry.runtimeName}\n`);
+    await hashPathContents(entry.source, skillsHash, entry.runtimeName, new Set<string>());
   }
 
-  return hash.digest("hex");
+  return { bundleKey: bundleHash.digest("hex"), resumeKey: resumeHash.digest("hex") };
 }
 
 async function ensureReadableFile(targetPath: string, contents: string): Promise<void> {
@@ -131,16 +154,27 @@ async function ensureReadableFile(targetPath: string, contents: string): Promise
   }
 }
 
+/**
+ * Materializes the instructions file and skill links of one prompt bundle.
+ *
+ * @param input.instructionsContents The instructions text the run reads.
+ * @param input.resumeInstructionsContents The same text without the paths of
+ *   this run; the resume key hashes it. Pass `instructionsContents` when the
+ *   text has no run-specific path.
+ * @returns The bundle, keyed by its full contents, and its resume key.
+ */
 export async function prepareClaudePromptBundle(input: {
   companyId: string;
   skills: SkillEntry[];
   instructionsContents: string | null;
+  resumeInstructionsContents: string | null;
   onLog: AdapterExecutionContext["onLog"];
 }): Promise<ClaudePromptBundle> {
-  const { companyId, skills, instructionsContents, onLog } = input;
-  const bundleKey = await buildClaudePromptBundleKey({
+  const { companyId, skills, instructionsContents, resumeInstructionsContents, onLog } = input;
+  const { bundleKey, resumeKey } = await buildClaudePromptBundleKeys({
     skills,
     instructionsContents,
+    resumeInstructionsContents,
   });
   const rootDir = path.join(resolveManagedClaudePromptCacheRoot(process.env, companyId), bundleKey);
   const skillsHome = path.join(rootDir, ".claude", "skills");
@@ -167,6 +201,7 @@ export async function prepareClaudePromptBundle(input: {
 
   return {
     bundleKey,
+    resumeKey,
     rootDir,
     addDir: rootDir,
     instructionsFilePath,
