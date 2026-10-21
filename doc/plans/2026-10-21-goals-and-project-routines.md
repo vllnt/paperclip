@@ -1,6 +1,6 @@
 # Plan: Goals with their linked work, and routines per project
 
-Status: slice 1 in progress. Slices 2 and 3 are planned.
+Status: slices 1 (#345) and 2 (#351) are merged. Slice 3 is in review.
 
 ## Context
 
@@ -51,7 +51,7 @@ Result: no migration in any slice. `issues.goal_id` and `routines.goal_id` have 
 - **Skill.** `references/routines.md`: `projectId` is optional, and how to list and create a project's routines.
 - **Tests.** Component tests for the dialog in both modes and for the project section; a CLI test for the flag; the project routines e2e test extended to create and edit in place.
 
-## Slice 2: goal links and goal pages (#351)
+## Slice 2: goal links and goal pages (merged in #351)
 
 - **Shared.** `goalId` on the routine list query; `goalAgentLinks`, which derives a goal's agents from its owner, open tasks and routines.
 - **Server.** `?goalId=` on the task and routine lists (a blank `goalId` counts as not set; a task list `goalId` that is not a UUID answers `400`, like the routine list). No links endpoint (see Schema decisions).
@@ -61,10 +61,10 @@ Result: no migration in any slice. `issues.goal_id` and `routines.goal_id` have 
 
 ## Slice 3: agents read goals
 
-- **Sandbox callback bridge.** Allow the goal focus and progress reads for remote runs, and check that the task and routine lists with `goalId` pass. Goal writes follow the existing REST permissions for agents (their write limits stay in the goal service); they are allowed through the bridge only if the REST API already allows them for the same agent.
-- **Runtime tools.** Goal read tools (list, get, and the goal's linked work if the list filters are not enough) next to the existing runtime tools, company-scoped by the run's agent.
-- **Wake payload.** The task's goal (id and title) in the wake payload's task summary, so an agent sees its goal without an extra call.
-- **Skill and CLI.** The skill explains how an agent reads its task's goal and links new work to a goal (`goalId` on task and routine writes, within existing permissions). Writing goals stays a board decision except where the existing permissions already let an agent write.
+- **Sandbox callback bridge: reads only.** The bridge admits the goal focus and progress reads, next to the goal list and goal detail that it already admitted. The task and routine lists with `goalId` already pass. Goal writes (create and update) do not pass the bridge, even where the REST API lets the same agent write. Admitting them is a separate decision, because it widens what a remote run can change.
+- **Runtime tools: none added.** Native runtime agents call the API through the OpenAPI document, which lists the goal reads and the `goalId` filters. MCP has the goal list and goal detail tools, `goalId` on the issue list tool, and the generic API request tool for the focus, the progress and a goal's routines.
+- **Wake payload.** The task's own goal (id and title) in the wake issue summary, read inside the run's company and cut like every goal text an agent reads. The wake text shows it on one line, `- issue goal: <title> (goal id <id>)`, only when the task has a goal. A wake without a goal leaves out the key, so its text and its JSON copy do not change. A chat wake shows no goal.
+- **Skill.** The "A goal's linked work" section of the API reference tells an agent how to read its task's goal, the focus and the progress, and how to link new work with `goalId` on task and routine writes, within its existing permissions. No CLI change: the CLI already reads goals, the focus and the progress.
 
 ## Coordination
 
