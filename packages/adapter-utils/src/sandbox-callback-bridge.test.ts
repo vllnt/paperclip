@@ -10,6 +10,7 @@ import { getActiveStepContext, measureStartupStep } from "./acpx-engine/startup-
 import { prepareCommandManagedRuntime } from "./command-managed-runtime.js";
 import {
   authorizeSandboxCallbackBridgeRequestWithRoutes,
+  buildBridgeForwardUrl,
   createCommandManagedSandboxCallbackBridgeQueueClient,
   createFileSystemSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
@@ -17,6 +18,7 @@ import {
   getSandboxBridgeProcessBodyLedgerSource,
   getSandboxCallbackBridgeServerSource,
   HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
+  parseCanonicalBridgeRequestTarget,
   sandboxCallbackBridgeDirectories,
   syncRemoteTextFileWithHashSkip,
   syncSandboxCallbackBridgeEntrypoint,
@@ -407,8 +409,14 @@ describe("sandbox callback bridge", () => {
     });
   });
 
+  /**
+   * Write each entry straight into the request queue, the way any process in
+   * the sandbox can. An entry carries any JSON value in any field, so a test
+   * can send a field of the wrong type. `fileId` names the queue file when the
+   * entry's own `id` is not a string.
+   */
   async function relayRawQueueEntries(
-    entries: Array<{ id: string; method: string; path: string; query: string }>,
+    entries: Array<{ id: unknown; fileId?: string } & Record<string, unknown>>,
   ): Promise<{
     responses: Map<string, { status: number; body: string }>;
     handled: Array<{ method: string; path: string; query: string }>;
@@ -427,21 +435,23 @@ describe("sandbox callback bridge", () => {
       },
     });
     cleanupFns.push(() => worker.stop());
-    for (const entry of entries) {
-      const requestPath = path.posix.join(directories.requestsDir, `${entry.id}.json`);
+    const fileNames = entries.map((entry) => entry.fileId ?? String(entry.id));
+    for (const [index, entry] of entries.entries()) {
+      const { fileId: _fileId, ...fields } = entry;
+      const requestPath = path.posix.join(directories.requestsDir, `${fileNames[index]}.json`);
       await writeFile(
         `${requestPath}.tmp`,
-        `${JSON.stringify({ ...entry, headers: {}, body: "", createdAt: new Date().toISOString() })}\n`,
+        `${JSON.stringify({ headers: {}, body: "", createdAt: new Date().toISOString(), ...fields })}\n`,
         "utf8",
       );
       await rename(`${requestPath}.tmp`, requestPath);
     }
     await worker.stop({ drainTimeoutMs: 5_000 });
     const responses = new Map<string, { status: number; body: string }>();
-    for (const entry of entries) {
+    for (const fileName of fileNames) {
       responses.set(
-        entry.id,
-        JSON.parse(await readFile(path.posix.join(directories.responsesDir, `${entry.id}.json`), "utf8")),
+        fileName,
+        JSON.parse(await readFile(path.posix.join(directories.responsesDir, `${fileName}.json`), "utf8")),
       );
     }
     return { responses, handled };
@@ -503,6 +513,135 @@ describe("sandbox callback bridge", () => {
     }
     expect(responses.get("req-canonical")?.status).toBe(200);
     expect(handled).toEqual([{ method: "GET", path: "/api/routines/r1/runs", query: "?limit=5" }]);
+  });
+
+  it("test_a_queue_entry_with_a_control_or_space_byte_is_rejected_without_calling_the_handler", async () => {
+    const rejected = [
+      { id: "req-space", method: "GET", path: "/api/routines/r 1", query: "" },
+      { id: "req-newline", method: "GET", path: "/api/routines/r1\n", query: "" },
+      { id: "req-carriage-return", method: "GET", path: "/api/routines/r\r1", query: "" },
+      { id: "req-del", method: "GET", path: "/api/routines/r\x7f1", query: "" },
+      { id: "req-query-space", method: "GET", path: "/api/routines/r1", query: "?x=a b" },
+      { id: "req-query-tab", method: "GET", path: "/api/routines/r1", query: "?x=a\tb" },
+    ];
+    const { responses, handled } = await relayRawQueueEntries([
+      ...rejected,
+      { id: "req-encoded-space", method: "GET", path: "/api/routines/r%201", query: "?x=a%20b" },
+    ]);
+
+    expect(handled).toEqual([{ method: "GET", path: "/api/routines/r%201", query: "?x=a%20b" }]);
+    for (const entry of rejected) {
+      expect(responses.get(entry.id)?.status, entry.id).toBe(400);
+      expect(JSON.parse(responses.get(entry.id)?.body ?? "{}"), entry.id).toEqual({
+        error: "Invalid request path: control_or_space_byte",
+      });
+    }
+    expect(responses.get("req-encoded-space")?.status).toBe(200);
+  });
+
+  it("test_a_queue_entry_with_a_field_of_the_wrong_type_is_a_400_and_never_reaches_the_handler", async () => {
+    const rejected: Array<{ id: unknown; fileId: string } & Record<string, unknown>> = [
+      { fileId: "req-id-number", id: 7, method: "GET", path: "/api/agents/me", query: "" },
+      { fileId: "req-method-null", id: "req-method-null", method: null, path: "/api/agents/me", query: "" },
+      { fileId: "req-method-array", id: "req-method-array", method: ["GET"], path: "/api/agents/me", query: "" },
+      { fileId: "req-path-number", id: "req-path-number", method: "GET", path: 7, query: "" },
+      { fileId: "req-query-null", id: "req-query-null", method: "GET", path: "/api/agents/me", query: null },
+      { fileId: "req-query-number", id: "req-query-number", method: "GET", path: "/api/agents/me", query: 5 },
+      { fileId: "req-query-missing", id: "req-query-missing", method: "GET", path: "/api/agents/me" },
+      { fileId: "req-query-array", id: "req-query-array", method: "GET", path: "/api/agents/me", query: ["?a=b"] },
+      { fileId: "req-headers-null", id: "req-headers-null", method: "GET", path: "/api/agents/me", query: "", headers: null },
+      { fileId: "req-headers-array", id: "req-headers-array", method: "GET", path: "/api/agents/me", query: "", headers: [] },
+      {
+        fileId: "req-header-value-number",
+        id: "req-header-value-number",
+        method: "GET",
+        path: "/api/agents/me",
+        query: "",
+        headers: { accept: 1 },
+      },
+    ];
+    const { responses, handled } = await relayRawQueueEntries([
+      ...rejected,
+      { id: "req-well-formed", method: "GET", path: "/api/agents/me", query: "" },
+    ]);
+
+    expect(handled).toEqual([{ method: "GET", path: "/api/agents/me", query: "" }]);
+    for (const entry of rejected) {
+      expect(responses.get(entry.fileId)?.status, entry.fileId).toBe(400);
+      expect(JSON.parse(responses.get(entry.fileId)?.body ?? "{}"), entry.fileId).toEqual({
+        error: "Invalid bridge request payload.",
+      });
+    }
+    expect(responses.get("req-well-formed")?.status).toBe(200);
+  });
+
+  it("test_one_encoding_rule_both_transports_accept_and_reject_the_same_targets", async () => {
+    const targets: Array<{ id: string; path: string; query: string; ok: boolean }> = [
+      { id: "enc-plain", path: "/api/routines/r1/runs", query: "?limit=5", ok: true },
+      { id: "enc-encoded-utf8", path: "/api/routines/%C3%A9", query: "?x=%C3%A9", ok: true },
+      { id: "enc-encoded-space", path: "/api/routines/a%20b", query: "?x=a%20b", ok: true },
+      { id: "enc-raw-utf8-path", path: "/api/routines/\u00e9", query: "", ok: false },
+      { id: "enc-raw-utf8-query", path: "/api/routines/r1", query: "?x=\u00e9", ok: false },
+      { id: "enc-encoded-dot", path: "/api/routines/r%2e1", query: "", ok: false },
+      { id: "enc-encoded-dot-upper", path: "/api/routines/r%2E1", query: "", ok: false },
+      { id: "enc-fragment-in-query", path: "/api/routines/r1", query: "?x=1#frag", ok: false },
+      { id: "enc-empty-query-marker", path: "/api/routines/r1", query: "?", ok: false },
+      { id: "enc-space-in-path", path: "/api/routines/r 1", query: "", ok: false },
+    ];
+    const { responses } = await relayRawQueueEntries(
+      targets.map((target) => ({ id: target.id, method: "GET", path: target.path, query: target.query })),
+    );
+
+    for (const target of targets) {
+      const http2Result = parseCanonicalBridgeRequestTarget(`${target.path}${target.query}`);
+      expect(http2Result.ok, `${target.id} (HTTP/2)`).toBe(target.ok);
+      expect(responses.get(target.id)?.status === 200, `${target.id} (queue)`).toBe(target.ok);
+    }
+  });
+
+  it("test_a_queue_query_that_is_not_empty_or_prefixed_with_a_question_mark_is_rejected", async () => {
+    const { responses, handled } = await relayRawQueueEntries([
+      { id: "query-bare", method: "GET", path: "/api/routines/r1/runs", query: "limit=5" },
+      { id: "query-prefixed", method: "GET", path: "/api/routines/r1/runs", query: "?limit=5" },
+    ]);
+
+    expect(responses.get("query-bare")?.status).toBe(400);
+    expect(JSON.parse(responses.get("query-bare")?.body ?? "{}")).toEqual({
+      error: "Invalid request path: non_canonical_query",
+    });
+    expect(responses.get("query-prefixed")?.status).toBe(200);
+    expect(handled).toEqual([{ method: "GET", path: "/api/routines/r1/runs", query: "?limit=5" }]);
+  });
+
+  describe("buildBridgeForwardUrl", () => {
+    it("resolves the canonical pathname and query against the host API origin", () => {
+      expect(buildBridgeForwardUrl("http://127.0.0.1:4000", { path: "/api/issues/abc", query: "" }).toString()).toBe(
+        "http://127.0.0.1:4000/api/issues/abc",
+      );
+      expect(
+        buildBridgeForwardUrl("http://127.0.0.1:4000", { path: "/api/issues/abc", query: "?foo=bar" }).toString(),
+      ).toBe("http://127.0.0.1:4000/api/issues/abc?foo=bar");
+      expect(
+        buildBridgeForwardUrl("https://api.example.test/", { path: "/api/issues/abc", query: "foo=bar" }).toString(),
+      ).toBe("https://api.example.test/api/issues/abc?foo=bar");
+    });
+
+    it("test_a_forward_url_off_the_host_api_origin_is_refused", () => {
+      for (const forwardPath of [
+        "//evil.example/api/issues",
+        "///evil.example/api/issues",
+        "/\\evil.example/api/issues",
+        "\\\\evil.example/api/issues",
+        "http://evil.example/api/issues",
+        "https://127.0.0.1:4000/api/issues",
+        "http://127.0.0.1:4001/api/issues",
+      ]) {
+        expect(
+          () => buildBridgeForwardUrl("http://127.0.0.1:4000", { path: forwardPath, query: "" }),
+          forwardPath,
+        ).toThrow("Bridge forward URL must keep the host API origin.");
+      }
+    });
   });
 
   it("drains already-queued requests on stop", async () => {

@@ -32,6 +32,10 @@ import {
   HTTP2_BRIDGE_SERVER_OPTIONS,
   HTTP2_BRIDGE_STREAM_RESET_BURST,
   HTTP2_BRIDGE_STREAM_RESET_RATE,
+  type CanonicalBridgeRequestPath,
+  type CanonicalBridgeRequestPathRejection,
+  type CanonicalBridgeRequestPathResult,
+  type CreateHttp2BridgeServerOptions,
   type Http2BridgeForwardRequest,
   type Http2BridgeForwardResult,
   type Http2BridgeGoawayRecord,
@@ -1809,6 +1813,61 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
     it("rejects a missing path", () => {
       expect(parseCanonicalBridgeRequestPath({})).toEqual({ ok: false, reason: "missing_path" });
     });
+
+    it("test_a_control_or_space_byte_in_the_target_is_rejected", () => {
+      const rawTargets = [
+        "/api/issues/a b",
+        "/api/issues/abc?x=a b",
+        "/api/issues/abc\t",
+        "/api/issues/a\tbc",
+        "/api/issues/abc\n",
+        "/api/issues/a\rbc",
+        "/api/issues/abc?x=1\n",
+        "/api/.\t./secrets",
+        "/api/issues/a\x01bc",
+        "/api/issues/a\x1fbc",
+        "/api/issues/a\x7fbc",
+        "/api/issues/abc ",
+      ];
+      for (const rawTarget of rawTargets) {
+        expect(parseCanonicalBridgeRequestPath({ ":path": rawTarget }), JSON.stringify(rawTarget)).toEqual({
+          ok: false,
+          reason: "control_or_space_byte",
+        });
+      }
+    });
+
+    it("test_a_percent_encoded_space_or_control_byte_is_a_canonical_target", () => {
+      expect(parseCanonicalBridgeRequestPath({ ":path": "/api/issues/a%20b?x=a%20b" })).toEqual({
+        ok: true,
+        value: { pathname: "/api/issues/a%20b", query: "?x=a%20b" },
+      });
+      expect(parseCanonicalBridgeRequestPath({ ":path": "/api/issues/a%0Ab" }).ok).toBe(true);
+    });
+
+    it("test_one_encoding_rule_rejects_what_the_url_parser_would_change", () => {
+      const rejected: Array<[string, CanonicalBridgeRequestPathRejection]> = [
+        ["/api/issues/abc#fragment", "non_canonical_path"],
+        ["/api/issues/abc?", "non_canonical_path"],
+        ["/api/issues/\u00e9", "non_canonical_path"],
+        ["/api/issues/abc?x=\u00e9", "non_canonical_path"],
+        ["/api/issues/r%2e1", "encoded_dot"],
+        ["/api/issues/r%2E1", "encoded_dot"],
+      ];
+      for (const [rawTarget, reason] of rejected) {
+        expect(parseCanonicalBridgeRequestPath({ ":path": rawTarget }), rawTarget).toEqual({ ok: false, reason });
+      }
+      expect(parseCanonicalBridgeRequestPath({ ":path": "/api/issues/%C3%A9?x=%C3%A9&y=r%2e1" })).toEqual({
+        ok: true,
+        value: { pathname: "/api/issues/%C3%A9", query: "?x=%C3%A9&y=r%2e1" },
+      });
+    });
+
+    it("re-exports the types that moved to the shared parser", () => {
+      const path: CanonicalBridgeRequestPath = { pathname: "/api/agents/me", query: "" };
+      const result: CanonicalBridgeRequestPathResult = { ok: true, value: path };
+      expect(result.ok).toBe(true);
+    });
   });
 
   it("buildHttp2BridgeForwardUrl resolves the parsed pathname and query against the base URL", () => {
@@ -1817,6 +1876,56 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
       query: "?foo=bar",
     });
     expect(url.toString()).toBe("http://127.0.0.1:4000/api/issues/abc?foo=bar");
+  });
+
+  it("test_buildHttp2BridgeForwardUrl_refuses_a_url_off_the_host_api_origin", () => {
+    for (const pathname of ["//evil.example/api", "///evil.example/api", "/\\evil.example/api", "http://evil.example/api"]) {
+      expect(() => buildHttp2BridgeForwardUrl("http://127.0.0.1:4000", { pathname, query: "" }), pathname).toThrow(
+        "Bridge forward URL must keep the host API origin.",
+      );
+    }
+  });
+
+  it("test_the_http2_host_has_no_header_allowlist_option_and_forwards_only_the_default_allowlist", async () => {
+    // The option is gone: the host applies the one default allowlist both
+    // gateways apply too. This line fails to compile if the option comes back.
+    const optionIsGone: "headerAllowlist" extends keyof CreateHttp2BridgeServerOptions ? false : true = true;
+    expect(optionIsGone).toBe(true);
+
+    const seen: Array<Record<string, string>> = [];
+    const { handle, clientSide, bridgeToken } = bindTestServer({
+      forwardRequest: async (request) => {
+        seen.push(request.headers);
+        return { status: 200, body: Buffer.alloc(0) };
+      },
+    });
+    const rawClient = connectRawClient(clientSide);
+    try {
+      const response = await new Promise<number>((resolve, reject) => {
+        const req = rawClient.request({
+          ":method": "GET",
+          ":path": "/api/agents/me",
+          authorization: `Bearer ${bridgeToken}`,
+          accept: "application/json",
+          cookie: "session=board-session",
+          "x-forwarded-for": "203.0.113.7",
+          "x-paperclip-github-capability": "run-scoped-capability",
+        });
+        let status = 0;
+        req.on("response", (headers) => {
+          status = Number(headers[":status"]) || 0;
+        });
+        req.resume();
+        req.on("end", () => resolve(status));
+        req.on("error", reject);
+        req.end();
+      });
+      expect(response).toBe(200);
+      expect(seen).toEqual([{ accept: "application/json", "x-paperclip-github-capability": "run-scoped-capability" }]);
+    } finally {
+      rawClient.close();
+      await handle.close();
+    }
   });
 
   it("classifyStreamAgainstGoaway classifies by the last processed stream id", () => {

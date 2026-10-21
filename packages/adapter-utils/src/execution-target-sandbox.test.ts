@@ -2412,7 +2412,11 @@ describe("sandbox adapter execution targets", () => {
     throw new Error(`Timed out waiting for the bridge response to ${entry.id}.`);
   }
 
-  async function startQueueBridgeForHeaderTest(runId: string, hostApiUrl: string) {
+  async function startQueueBridgeForHeaderTest(
+    runId: string,
+    hostApiUrl: string,
+    onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>,
+  ) {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-headers-"));
     cleanupDirs.push(rootDir);
     const remoteCwd = path.join(rootDir, "workspace");
@@ -2434,6 +2438,7 @@ describe("sandbox adapter execution targets", () => {
       adapterKey: "codex",
       hostApiToken: "real-run-jwt",
       hostApiUrl,
+      ...(onLog ? { onLog } : {}),
     });
     expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
     return { bridge: bridge!, runtimeRootDir };
@@ -2552,6 +2557,55 @@ describe("sandbox adapter execution targets", () => {
     } finally {
       fetchSpy.mockRestore();
       await bridge.stop();
+    }
+  });
+
+  it("test_the_bridge_debug_log_prints_the_method_and_path_but_not_the_query", async () => {
+    const querySentinel = "query-token-sentinel-4f2a";
+    const hostApiUrl = "http://127.0.0.1:9";
+    const logLines: string[] = [];
+    const previousDebug = process.env.PAPERCLIP_BRIDGE_DEBUG;
+    process.env.PAPERCLIP_BRIDGE_DEBUG = "1";
+    let started: Awaited<ReturnType<typeof startQueueBridgeForHeaderTest>>;
+    try {
+      started = await startQueueBridgeForHeaderTest("run-bridge-debug-query", hostApiUrl, async (_stream, chunk) => {
+        logLines.push(chunk);
+      });
+    } finally {
+      if (previousDebug === undefined) delete process.env.PAPERCLIP_BRIDGE_DEBUG;
+      else process.env.PAPERCLIP_BRIDGE_DEBUG = previousDebug;
+    }
+    const realFetch = globalThis.fetch;
+    const forwardedUrls: string[] = [];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.startsWith(`${hostApiUrl}/`)) return realFetch(input, init);
+      forwardedUrls.push(url);
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    try {
+      const response = await relayRawBridgeQueueEntry(started.runtimeRootDir, {
+        id: "debug-query",
+        method: "POST",
+        path: "/api/issues/issue-1/comments",
+        query: `?token=${querySentinel}`,
+        headers: { accept: "application/json" },
+        body: "{}",
+      });
+
+      expect(response.status).toBe(201);
+      // The forward keeps the query: only the log drops it.
+      expect(forwardedUrls).toEqual([`${hostApiUrl}/api/issues/issue-1/comments?token=${querySentinel}`]);
+      const logDump = logLines.join("");
+      expect(logDump).toContain("Bridge proxy POST /api/issues/issue-1/comments?<query omitted>");
+      expect(logDump).toContain("Bridge proxy response 201 for POST /api/issues/issue-1/comments?<query omitted>");
+      expect(logDump).not.toContain(querySentinel);
+    } finally {
+      fetchSpy.mockRestore();
+      await started.bridge.stop();
     }
   });
 

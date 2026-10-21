@@ -32,10 +32,10 @@ import http2 from "node:http2";
 import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
 import {
   authorizeSandboxCallbackBridgeRequestWithRoutes,
+  buildBridgeForwardUrl,
   compareBridgeTokensConstantTime,
   parseCanonicalBridgeRequestTarget,
   sanitizeSandboxCallbackBridgeHeaders,
-  DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
   type CanonicalBridgeRequestPath,
@@ -511,6 +511,15 @@ export function wrapDuplexChannelAsNodeDuplex(
 // Canonical `:path` parsing (accepted security fix 3)
 // ---------------------------------------------------------------------------
 
+// These types moved to `sandbox-callback-bridge.ts`, where both bridge hosts
+// share the parser. They stay exported here for outside TypeScript consumers
+// that import them from this module.
+export type {
+  CanonicalBridgeRequestPath,
+  CanonicalBridgeRequestPathRejection,
+  CanonicalBridgeRequestPathResult,
+} from "./sandbox-callback-bridge.js";
+
 /** The request pseudo-headers HTTP/2 allows exactly one of, per request. */
 const REQUEST_PSEUDO_HEADER_NAMES = [":method", ":scheme", ":authority", ":path"] as const;
 
@@ -535,19 +544,16 @@ export function parseCanonicalBridgeRequestPath(
 }
 
 /**
- * Build the forward URL from the one canonical parse. This mirrors
- * `buildBridgeForwardUrl` in `execution-target.ts`, which the file bridge and
- * the duplex bridge use today; a later phase wires the HTTP/2 host handler to
- * that same forward path and can consolidate the two into one export.
+ * Build the forward URL from the one canonical parse. This is the same builder
+ * the file bridge and the duplex bridge forward through
+ * (`buildBridgeForwardUrl`), so every transport applies one rule, including the
+ * check that the URL keeps the host API origin.
  */
 export function buildHttp2BridgeForwardUrl(
   baseUrl: string,
   request: CanonicalBridgeRequestPath,
 ): URL {
-  const url = new URL(request.pathname, baseUrl);
-  const query = request.query.trim();
-  url.search = query.startsWith("?") ? query.slice(1) : query;
-  return url;
+  return buildBridgeForwardUrl(baseUrl, { path: request.pathname, query: request.query });
 }
 
 // ---------------------------------------------------------------------------
@@ -712,8 +718,6 @@ export interface CreateHttp2BridgeServerOptions {
   forwardRequest: Http2BridgeForwardHandler;
   /** The route allowlist. The default is {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST}. */
   routes?: readonly SandboxCallbackBridgeRouteRule[];
-  /** The header allowlist. The default is {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST}. */
-  headerAllowlist?: readonly string[];
   /** The maximum request body size, in bytes. The default is {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES}. */
   maxBodyBytes?: number;
   /** The interval between two liveness PING frames, in milliseconds. */
@@ -1065,7 +1069,6 @@ function denyRequest(
  */
 export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions): Http2BridgeServerHandle {
   const routes = options.routes ?? DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST;
-  const headerAllowlist = options.headerAllowlist ?? DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST;
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES;
   const pingIntervalMs = options.pingIntervalMs ?? DEFAULT_HTTP2_BRIDGE_PING_INTERVAL_MS;
   const pingStallMs = options.pingStallMs ?? DEFAULT_HTTP2_BRIDGE_PING_STALL_MS;
@@ -1151,10 +1154,7 @@ export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions)
         return;
       }
 
-      const sanitizedHeaders = sanitizeSandboxCallbackBridgeHeaders(
-        toOutboundHeaderRecord(headers),
-        headerAllowlist,
-      );
+      const sanitizedHeaders = sanitizeSandboxCallbackBridgeHeaders(toOutboundHeaderRecord(headers));
 
       let body: Buffer;
       try {
