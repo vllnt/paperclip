@@ -478,6 +478,7 @@ function isSubHourlyCronExpression(expression: string, timeZone: string, after: 
 
 function nextResultText(status: string, issueId?: string | null) {
   if (status === "issue_created" && issueId) return `Created execution issue ${issueId}`;
+  if (status === "steps_attached" && issueId) return `Attached the steps to task ${issueId}`;
   if (status === "grouped") return "Added a comment to the open event group issue";
   if (status === "recovered") return "Commented that the event recovered";
   if (status === "coalesced") return "Coalesced into an existing live execution issue";

@@ -1040,8 +1040,8 @@ export interface RoutineStepConditionsBackstopResult {
 /**
  * The periodic backstop for step conditions. A step can end on a path that drops the post-commit
  * action (an update inside another transaction without a queue, or a process that stopped between
- * the commit and the action), so each pass reconciles runs that have conditions and whose root still
- * waits, at most `limit` runs per pass. A cursor on the run id moves through the rest on later passes,
+ * the commit and the action), so each pass reconciles runs that have conditions and whose root is still
+ * open (a new run root or a task that the steps were attached to), at most `limit` runs per pass. A cursor on the run id moves through the rest on later passes,
  * so runs that stay blocked for good (a plain edge from a cancelled step) never starve the others.
  * Create it once per process: the cursor lives in the returned object.
  */
@@ -1066,7 +1066,9 @@ export function routineStepConditionsBackstop(
       .where(
         and(
           eq(issues.originKind, "routine_step"),
-          eq(root.status, "blocked"),
+          // The root's own origin does not matter: a task that steps were attached to keeps its origin, and
+          // a task that no agent owns keeps its status, so `blocked` would miss it.
+          notInArray(root.status, ["done", "cancelled"]),
           sql`jsonb_path_exists(${routineRuns.triggerPayload}, ${`$.${ROUTINE_STEPS_RUN_PAYLOAD_KEY}.steps[*].after[*].when`}::jsonpath)`,
           after ? gt(issues.originRunId, after) : undefined,
         ),

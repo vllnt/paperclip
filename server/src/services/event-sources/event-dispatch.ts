@@ -626,7 +626,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           stepsToStart.push(attached);
           await deps.finalizeRun(attachRun.id, { status: "issue_created", linkedIssueId: root.id }, txDb);
           await deps.updateRoutineTouchedState(
-            { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "issue_created", issueId: root.id },
+            { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "steps_attached", issueId: root.id },
             txDb,
           );
           return { status: "issue_created", runId: attachRun.id, issueId: root.id, note: STEPS_ATTACHED_NOTE };
