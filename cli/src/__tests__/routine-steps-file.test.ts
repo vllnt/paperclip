@@ -80,6 +80,21 @@ describe("routine --steps-file", () => {
     });
   });
 
+  it("sends the conditions on after entries as they are written", async () => {
+    const conditional = [
+      { key: "review", title: "Review" },
+      { key: "ship", title: "Ship", after: [{ step: "review", when: "done" }] },
+      { key: "rework", title: "Rework", after: [{ step: "review", when: "cancelled" }] },
+      { key: "announce", title: "Announce", after: ["ship", "rework"] },
+    ];
+    const conditionalPath = path.join(dir, "conditional.json");
+    writeFileSync(conditionalPath, JSON.stringify(conditional));
+
+    await run(["routine", "update", ROUTINE_ID, "--steps-file", conditionalPath]);
+
+    expect(lastRequest().body).toEqual({ steps: conditional });
+  });
+
   it("updates only the steps when no payload is given", async () => {
     await run(["routine", "update", ROUTINE_ID, "--steps-file", stepsPath]);
 

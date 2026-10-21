@@ -257,12 +257,20 @@ const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = [
   "issue.tree_hold_wakeup_deferred",
 ] as const;
 
-export type IssuePostCommitAction = {
-  type: "cancel_native_question_run";
-  runId: string;
-  issueId: string;
-  issueStatus: string;
-};
+export type IssuePostCommitAction =
+  | {
+      type: "cancel_native_question_run";
+      runId: string;
+      issueId: string;
+      issueStatus: string;
+    }
+  | {
+      /** A step of a routine run ended: apply the run's step conditions (`reconcileRoutineStepRun`). */
+      type: "reconcile_routine_steps";
+      companyId: string;
+      rootIssueId: string;
+      routineRunId: string;
+    };
 
 /** Execute side effects that must never run before the issue transaction commits. */
 export async function executeIssuePostCommitActions(
@@ -273,7 +281,28 @@ export async function executeIssuePostCommitActions(
   const { heartbeatService } = await import("./heartbeat.js");
   const heartbeat = heartbeatService(db);
   const cancelledRunIds = new Set<string>();
+  const reconciledRoutineRunIds = new Set<string>();
   for (const action of actions) {
+    if (action.type === "reconcile_routine_steps") {
+      if (reconciledRoutineRunIds.has(action.routineRunId)) continue;
+      reconciledRoutineRunIds.add(action.routineRunId);
+      const { reconcileRoutineStepRun } = await import("./routine-steps.js");
+      try {
+        await reconcileRoutineStepRun(db, action, {
+          issueSvc: issueService(db),
+          heartbeat,
+          executePostCommitActions: (nested) => executeIssuePostCommitActions(db, nested),
+        });
+      } catch (err) {
+        // The step's own transition has committed. The periodic routine-step backstop applies the
+        // conditions on a later pass, so a failure here must not fail the request that ended the step.
+        logger.warn(
+          { err, rootIssueId: action.rootIssueId, routineRunId: action.routineRunId },
+          "routine step conditions deferred to the periodic backstop",
+        );
+      }
+      continue;
+    }
     if (cancelledRunIds.has(action.runId)) continue;
     cancelledRunIds.add(action.runId);
     try {
@@ -11295,6 +11324,20 @@ export function issueService(db: Db) {
             }
           }
           if (updated.status === "done" || updated.status === "cancelled") {
+            if (
+              updated.originKind === "routine_step" &&
+              updated.parentId &&
+              updated.originRunId
+            ) {
+              // The step's outcome may decide which later steps run. A caller that runs this update
+              // in its own transaction without a queue drops the action; the periodic backstop covers it.
+              queuedPostCommitActions.push({
+                type: "reconcile_routine_steps",
+                companyId: updated.companyId,
+                rootIssueId: updated.parentId,
+                routineRunId: updated.originRunId,
+              });
+            }
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)

@@ -1,4 +1,5 @@
-import { and, asc, eq, exists, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
+import { and, asc, eq, exists, gt, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -12,11 +13,15 @@ import {
 } from "@paperclipai/db";
 import {
   OPEN_ISSUE_STATUSES,
+  ROUTINE_STEP_SKIPPED_COMMENT,
   ROUTINE_STEPS_RUN_PAYLOAD_KEY,
+  evaluateRoutineStepRun,
   interpolateRoutineTemplate,
   orderRoutineStepsTopologically,
+  readRoutineStepsRunPayload,
   routineStartingSteps,
   routineStepPredecessorKeys,
+  routineStepsHaveConditions,
   type RoutineStep,
   type RoutineStepWarning,
   type RoutineStepsRunPayload,
@@ -34,8 +39,19 @@ import {
   isClosedExecutionWorkspaceStatus,
 } from "./execution-workspaces.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
+import {
+  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+  buildIssueBlockersResolvedWakeStateKey,
+  findExistingIssueBlockersResolvedWakeForReadyState,
+} from "./issue-dependency-wakeups.js";
 import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
-import { MAX_CHILD_ISSUES_CREATED_BY_HELPER, type DbTransaction, type issueService } from "./issues.js";
+import {
+  MAX_CHILD_ISSUES_CREATED_BY_HELPER,
+  type DbTransaction,
+  type IssuePostCommitAction,
+  type issueService,
+} from "./issues.js";
+import { isHumanOwnedBlock } from "./routable-blocked.js";
 
 /** Actor id on the activity rows a run writes for its step issues; the activity gate ignores it. */
 export const ROUTINE_STEP_ACTOR_ID = "routine-steps";
@@ -722,4 +738,374 @@ export async function inheritRoutineStepWorkspace(
       .returning({ id: issues.id });
     return updated.length > 0;
   });
+}
+
+/** The run whose step conditions to apply: the root its steps hang under and the routine run that made them. */
+export interface RoutineStepRunTarget {
+  companyId: string;
+  rootIssueId: string;
+  routineRunId: string;
+}
+
+/** What one reconcile of a run's conditions changed. */
+export interface RoutineStepRunReconcileResult {
+  /** Steps cancelled as skipped. */
+  skippedIssueIds: string[];
+  /** Issues (steps or the root) whose blocker set lost a cancelled or skipped step. */
+  releasedIssueIds: string[];
+  /** Issues whose agent got an `issue_blockers_resolved` wake. */
+  wokenIssueIds: string[];
+}
+
+export interface RoutineStepRunReconcileDeps {
+  issueSvc: Pick<IssueService, "update" | "addComment" | "listDependencyReadiness">;
+  heartbeat: IssueAssignmentWakeupDeps;
+  /** Runs the side effects that the cancels of skipped steps queued, once the reconcile has committed. */
+  executePostCommitActions: (actions: IssuePostCommitAction[]) => Promise<void>;
+}
+
+/** The `source` on the activity rows and wakes that the step conditions write. */
+const ROUTINE_STEP_CONDITIONS_SOURCE = "routine_step_conditions";
+
+const NOTHING_RECONCILED: RoutineStepRunReconcileResult = {
+  skippedIssueIds: [],
+  releasedIssueIds: [],
+  wokenIssueIds: [],
+};
+
+type LockedIssue = Pick<typeof issues.$inferSelect, "id" | "status" | "unblockDescriptor">;
+
+/**
+ * Applies the step conditions of one routine run ({@link evaluateRoutineStepRun}): cancels the
+ * blocked steps whose edges are all dead, with the comment {@link ROUTINE_STEP_SKIPPED_COMMENT}; drops
+ * cancelled and skipped steps from the blocker sets that should no longer wait for them, the root's
+ * too; and moves an issue whose blocker set became empty from `blocked` to `todo`. Once that has
+ * committed, it wakes the agents of the issues that became ready with `issue_blockers_resolved`.
+ *
+ * It is idempotent: it locks the root row, then the step rows, re-reads the statuses and re-derives
+ * everything from the steps the run recorded, so the post-commit action and the periodic backstop can
+ * race and still give one result. It changes nothing for a run without conditions, a root that is
+ * finished, or a block that a person owns (only that person may end it).
+ */
+export async function reconcileRoutineStepRun(
+  db: Db,
+  target: RoutineStepRunTarget,
+  deps: RoutineStepRunReconcileDeps,
+): Promise<RoutineStepRunReconcileResult> {
+  const { companyId, rootIssueId, routineRunId } = target;
+  const run = await db
+    .select({ triggerPayload: routineRuns.triggerPayload })
+    .from(routineRuns)
+    .where(and(eq(routineRuns.id, routineRunId), eq(routineRuns.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  const recorded = run ? readRoutineStepsRunPayload(run.triggerPayload) : null;
+  if (!recorded || !routineStepsHaveConditions(recorded.steps)) return NOTHING_RECONCILED;
+
+  const publications: ActivityPublication[] = [];
+  const queuedActions: IssuePostCommitAction[] = [];
+  const changed = await db.transaction(async (tx) => {
+    const txDb = tx as unknown as Db;
+    const root: LockedIssue | null = await tx
+      .select({ id: issues.id, status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+      .from(issues)
+      .where(and(eq(issues.id, rootIssueId), eq(issues.companyId, companyId)))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!root || root.status === "done" || root.status === "cancelled") return null;
+
+    const stepRows: LockedIssue[] = await tx
+      .select({ id: issues.id, status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.parentId, root.id),
+          eq(issues.originKind, "routine_step"),
+          eq(issues.originRunId, routineRunId),
+          inArray(issues.id, Object.values(recorded.stepIssueIds)),
+        ),
+      )
+      .orderBy(asc(issues.id))
+      .for("update");
+    const rowById = new Map(stepRows.map((row) => [row.id, row]));
+    const statusesByKey: Record<string, string> = {};
+    const heldByPeople = new Set<string>();
+    for (const [key, id] of Object.entries(recorded.stepIssueIds)) {
+      const row = rowById.get(id);
+      if (!row) continue;
+      statusesByKey[key] = row.status;
+      if (isHumanOwnedBlock(row)) heldByPeople.add(key);
+    }
+    const evaluation = evaluateRoutineStepRun(recorded.steps, statusesByKey, { heldByPeople });
+    const rowOf = (key: string): LockedIssue | null => {
+      const id = recorded.stepIssueIds[key];
+      return (id && rowById.get(id)) || null;
+    };
+
+    const skippedIssueIds: string[] = [];
+    for (const key of evaluation.skip) {
+      const row = rowOf(key);
+      if (!row) continue;
+      await deps.issueSvc.update(row.id, { status: "cancelled" }, tx, publications, queuedActions);
+      await deps.issueSvc.addComment(row.id, ROUTINE_STEP_SKIPPED_COMMENT, {}, { authorType: "system" }, tx);
+      await logActivity(
+        txDb,
+        {
+          companyId,
+          actorType: "system",
+          actorId: ROUTINE_STEP_ACTOR_ID,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: row.id,
+          details: {
+            source: ROUTINE_STEP_CONDITIONS_SOURCE,
+            status: "cancelled",
+            previousStatus: row.status,
+            routineStepSkipped: true,
+            routineRunId,
+            stepKey: key,
+          },
+        },
+        publications,
+      );
+      skippedIssueIds.push(row.id);
+    }
+
+    const releases: Array<{ issue: LockedIssue; stepKey: string | null; sourceKeys: string[] }> = [
+      ...Object.entries(evaluation.release).flatMap(([key, sourceKeys]) => {
+        const row = rowOf(key);
+        return row ? [{ issue: row, stepKey: key, sourceKeys }] : [];
+      }),
+      { issue: root, stepKey: null, sourceKeys: evaluation.releaseFromRoot },
+    ];
+    const releasedSourceById = new Map<string, string>();
+    for (const { issue, stepKey, sourceKeys } of releases) {
+      const sourceIds = new Set(sourceKeys.flatMap((key) => rowOf(key)?.id ?? []));
+      if (sourceIds.size === 0) continue;
+      const current = await tx
+        .select({ blockerIssueId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.relatedIssueId, issue.id),
+            eq(issueRelations.type, "blocks"),
+          ),
+        )
+        .then((rows) => rows.map((row) => row.blockerIssueId));
+      const [firstReleased] = current.filter((blockerIssueId) => sourceIds.has(blockerIssueId));
+      if (!firstReleased) continue;
+      const next = current.filter((blockerIssueId) => !sourceIds.has(blockerIssueId));
+      const becomesTodo = next.length === 0 && issue.status === "blocked" && !isHumanOwnedBlock(issue);
+      await deps.issueSvc.update(
+        issue.id,
+        { blockedByIssueIds: next, ...(becomesTodo ? { status: "todo" } : {}) },
+        tx,
+        publications,
+        queuedActions,
+      );
+      await logActivity(
+        txDb,
+        {
+          companyId,
+          actorType: "system",
+          actorId: ROUTINE_STEP_ACTOR_ID,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            source: ROUTINE_STEP_CONDITIONS_SOURCE,
+            routineRunId,
+            stepKey,
+            blockedByIssueIds: { from: current, to: next },
+            ...(becomesTodo ? { status: "todo", previousStatus: "blocked" } : {}),
+          },
+        },
+        publications,
+      );
+      releasedSourceById.set(issue.id, firstReleased);
+    }
+    return { skippedIssueIds, releasedSourceById };
+  });
+  if (!changed) return NOTHING_RECONCILED;
+
+  for (const publication of publications) {
+    try {
+      publishActivity(publication);
+    } catch (error) {
+      logger.warn({ err: error }, "failed to publish the activity of a routine step condition");
+    }
+  }
+  // Each skipped step's cancel queued another reconcile of this run; this one already applied every change.
+  const sideEffects = queuedActions.filter((action) => action.type !== "reconcile_routine_steps");
+  if (sideEffects.length > 0) await deps.executePostCommitActions(sideEffects);
+
+  const wokenIssueIds = await wakeReleasedRoutineIssues(db, companyId, changed.releasedSourceById, deps);
+  return {
+    skippedIssueIds: changed.skippedIssueIds,
+    releasedIssueIds: [...changed.releasedSourceById.keys()],
+    wokenIssueIds,
+  };
+}
+
+/**
+ * Wakes the agents of released issues that are now ready, the way a done blocker wakes its
+ * dependents: `issue_blockers_resolved`, keyed by the ready state, so the hook, the backstop and the
+ * dependency sweep never wake one twice. A wake that fails is logged and left to the dependency
+ * backstop (an issue that still has blockers) or to the stranded-issue sweep (a `todo` issue).
+ */
+async function wakeReleasedRoutineIssues(
+  db: Db,
+  companyId: string,
+  releasedSourceById: ReadonlyMap<string, string>,
+  deps: Pick<RoutineStepRunReconcileDeps, "issueSvc" | "heartbeat">,
+): Promise<string[]> {
+  const issueIds = [...releasedSourceById.keys()];
+  if (issueIds.length === 0) return [];
+  const readiness = await deps.issueSvc.listDependencyReadiness(companyId, issueIds);
+  const rows = await db
+    .select({
+      id: issues.id,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+      blockedTransitionAt: issues.blockedTransitionAt,
+    })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)));
+  const woken: string[] = [];
+  for (const row of rows) {
+    const ready = readiness.get(row.id);
+    if (!row.assigneeAgentId || !ready?.isDependencyReady) continue;
+    if (row.status !== "blocked" && row.status !== "todo") continue;
+    const blockerIssueIds = ready.blockerIssueIds;
+    const resolvedBlockerIssueId = releasedSourceById.get(row.id) ?? null;
+    const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
+      dependentIssueId: row.id,
+      blockerIssueIds,
+      blockedTransitionAt: row.blockedTransitionAt,
+    });
+    try {
+      const existing = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
+        companyId,
+        dependentIssueId: row.id,
+        blockerIssueIds,
+        blockedTransitionAt: row.blockedTransitionAt,
+      });
+      if (existing) continue;
+      await deps.heartbeat.wakeup(row.assigneeAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+        payload: {
+          issueId: row.id,
+          resolvedBlockerIssueId,
+          blockerIssueIds,
+          mutation: ROUTINE_STEP_CONDITIONS_SOURCE,
+        },
+        idempotencyKey,
+        requestedByActorType: "system",
+        requestedByActorId: ROUTINE_STEP_ACTOR_ID,
+        contextSnapshot: {
+          issueId: row.id,
+          taskId: row.id,
+          wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          source: ROUTINE_STEP_CONDITIONS_SOURCE,
+          resolvedBlockerIssueId,
+          blockerIssueIds,
+        },
+      });
+      woken.push(row.id);
+    } catch (error) {
+      logger.warn(
+        { err: error, issueId: row.id, idempotencyKey },
+        "failed to wake an issue that a routine step condition released; the sweeps retry it",
+      );
+    }
+  }
+  return woken;
+}
+
+/** Most runs one pass of the periodic backstop reconciles. */
+export const ROUTINE_STEP_CONDITIONS_BACKSTOP_LIMIT = 25;
+
+/** What one pass of the step-condition backstop did. */
+export interface RoutineStepConditionsBackstopResult {
+  checked: number;
+  skipped: number;
+  released: number;
+  woken: number;
+  failed: number;
+}
+
+/**
+ * The periodic backstop for step conditions. A step can end on a path that drops the post-commit
+ * action (an update inside another transaction without a queue, or a process that stopped between
+ * the commit and the action), so each pass reconciles runs that have conditions and whose root is still
+ * open (a new run root or a task that the steps were attached to), at most `limit` runs per pass. A cursor on the run id moves through the rest on later passes,
+ * so runs that stay blocked for good (a plain edge from a cancelled step) never starve the others.
+ * Create it once per process: the cursor lives in the returned object.
+ */
+export function routineStepConditionsBackstop(
+  db: Db,
+  deps: RoutineStepRunReconcileDeps,
+  options: { limit?: number } = {},
+): { reconcileOpenRuns: () => Promise<RoutineStepConditionsBackstopResult> } {
+  const limit = options.limit ?? ROUTINE_STEP_CONDITIONS_BACKSTOP_LIMIT;
+  const root = alias(issues, "routine_step_root");
+  let cursor: string | null = null;
+  // `issues.origin_run_id` is text and `routine_runs.id` is a uuid. Casting the issue side keeps the lookup on
+  // the primary key; the shape check means a malformed value joins nothing instead of failing every pass.
+  const originRunUuid = sql<string>`(case when ${issues.originRunId} ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then ${issues.originRunId}::uuid end)`;
+
+  const candidates = (after: string | null) =>
+    db
+      .selectDistinct({ companyId: issues.companyId, rootIssueId: issues.parentId, routineRunId: issues.originRunId })
+      .from(issues)
+      .innerJoin(root, and(eq(root.id, issues.parentId), eq(root.companyId, issues.companyId)))
+      .innerJoin(routineRuns, and(eq(routineRuns.id, originRunUuid), eq(routineRuns.companyId, issues.companyId)))
+      .where(
+        and(
+          eq(issues.originKind, "routine_step"),
+          // The root's own origin does not matter: a task that steps were attached to keeps its origin, and
+          // a task that no agent owns keeps its status, so `blocked` would miss it.
+          notInArray(root.status, ["done", "cancelled"]),
+          sql`jsonb_path_exists(${routineRuns.triggerPayload}, ${`$.${ROUTINE_STEPS_RUN_PAYLOAD_KEY}.steps[*].after[*].when`}::jsonpath)`,
+          after ? gt(issues.originRunId, after) : undefined,
+        ),
+      )
+      .orderBy(asc(issues.originRunId))
+      .limit(limit);
+
+  return {
+    reconcileOpenRuns: async () => {
+      let rows = await candidates(cursor);
+      if (rows.length === 0 && cursor) {
+        cursor = null;
+        rows = await candidates(null);
+      }
+      cursor = rows.length === limit ? (rows[rows.length - 1]?.routineRunId ?? null) : null;
+      const result: RoutineStepConditionsBackstopResult = { checked: 0, skipped: 0, released: 0, woken: 0, failed: 0 };
+      for (const row of rows) {
+        if (!row.rootIssueId || !row.routineRunId) continue;
+        result.checked += 1;
+        try {
+          const reconciled = await reconcileRoutineStepRun(
+            db,
+            { companyId: row.companyId, rootIssueId: row.rootIssueId, routineRunId: row.routineRunId },
+            deps,
+          );
+          result.skipped += reconciled.skippedIssueIds.length;
+          result.released += reconciled.releasedIssueIds.length;
+          result.woken += reconciled.wokenIssueIds.length;
+        } catch (error) {
+          result.failed += 1;
+          logger.warn(
+            { err: error, rootIssueId: row.rootIssueId, routineRunId: row.routineRunId },
+            "routine step condition backstop failed for one run; continuing with the rest",
+          );
+        }
+      }
+      return result;
+    },
+  };
 }

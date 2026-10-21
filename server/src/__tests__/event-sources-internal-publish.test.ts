@@ -199,6 +199,21 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
       expect(delivery!.routineRunIds).toEqual([run!.id]);
     });
 
+    it("tells that the steps were attached to the task, not that the routine created it", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const trigger = await s.listen(routine);
+      const task = await s.newTask();
+
+      await s.publish(task.id);
+
+      const [stored] = await db
+        .select({ lastResult: routineTriggers.lastResult })
+        .from(routineTriggers)
+        .where(eq(routineTriggers.id, trigger.id));
+      expect(stored!.lastResult).toBe(`Attached the steps to task ${task.id}`);
+    });
+
     it("keeps the task title out of the delivery and the run, which every agent of the company can read", async () => {
       const s = await seed();
       const routine = await s.createRoutine();

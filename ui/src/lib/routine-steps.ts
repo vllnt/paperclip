@@ -1,4 +1,12 @@
-import { routineStepsSchema, type RoutineStep } from "@paperclipai/shared";
+import {
+  routineStepAfterKey,
+  routineStepEdges,
+  routineStepPredecessorKeys,
+  routineStepsSchema,
+  type RoutineStep,
+  type RoutineStepAfterEntry,
+  type RoutineStepCondition,
+} from "@paperclipai/shared";
 
 /** The fields of a step an editor can change; the key has its own rename helper. */
 export type RoutineStepPatch = Partial<Omit<RoutineStep, "key" | "after">>;
@@ -25,16 +33,21 @@ export function updateRoutineStep(
   return steps.map((step) => (step.key === key ? { ...step, ...patch } : step));
 }
 
+function renameAfterEntry(entry: RoutineStepAfterEntry, from: string, to: string): RoutineStepAfterEntry {
+  if (routineStepAfterKey(entry) !== from) return entry;
+  return typeof entry === "string" ? to : { ...entry, step: to };
+}
+
 /**
- * Renames a step and every `after` entry that points to it. A key another step
- * already uses is ignored, so two steps never share one.
+ * Renames a step and every `after` entry that points to it, keeping its condition. A key another
+ * step already uses is ignored, so two steps never share one.
  */
 export function renameRoutineStepKey(steps: readonly RoutineStep[], from: string, to: string): RoutineStep[] {
   if (from === to || steps.some((step) => step.key === to)) return [...steps];
   return steps.map((step) => ({
     ...step,
     key: step.key === from ? to : step.key,
-    after: step.after.map((entry) => (entry === from ? to : entry)),
+    after: step.after.map((entry) => renameAfterEntry(entry, from, to)),
   }));
 }
 
@@ -42,7 +55,7 @@ export function renameRoutineStepKey(steps: readonly RoutineStep[], from: string
 export function removeRoutineStep(steps: readonly RoutineStep[], key: string): RoutineStep[] {
   return steps
     .filter((step) => step.key !== key)
-    .map((step) => ({ ...step, after: step.after.filter((entry) => entry !== key) }));
+    .map((step) => ({ ...step, after: step.after.filter((entry) => routineStepAfterKey(entry) !== key) }));
 }
 
 /** True when `key` waits for `predecessorKey`, directly or through other steps. */
@@ -54,7 +67,8 @@ function waitsForTransitively(steps: readonly RoutineStep[], key: string, predec
     const current = pending.pop();
     if (current === undefined || seen.has(current)) continue;
     seen.add(current);
-    for (const next of byKey.get(current)?.after ?? []) {
+    const step = byKey.get(current);
+    for (const next of step ? routineStepPredecessorKeys(step) : []) {
       if (next === predecessorKey) return true;
       pending.push(next);
     }
@@ -67,7 +81,7 @@ export function canRoutineStepWaitFor(steps: readonly RoutineStep[], key: string
   return key !== predecessorKey && !waitsForTransitively(steps, predecessorKey, key);
 }
 
-/** Adds or removes one predecessor of a step. */
+/** Adds or removes one predecessor of a step. A new predecessor gets a plain entry (no condition). */
 export function toggleRoutineStepPredecessor(
   steps: readonly RoutineStep[],
   key: string,
@@ -75,12 +89,58 @@ export function toggleRoutineStepPredecessor(
 ): RoutineStep[] {
   return steps.map((step) => {
     if (step.key !== key) return step;
-    const waits = step.after.includes(predecessorKey);
+    const waits = routineStepPredecessorKeys(step).includes(predecessorKey);
     return {
       ...step,
-      after: waits ? step.after.filter((entry) => entry !== predecessorKey) : [...step.after, predecessorKey],
+      after: waits
+        ? step.after.filter((entry) => routineStepAfterKey(entry) !== predecessorKey)
+        : [...step.after, predecessorKey],
     };
   });
+}
+
+/**
+ * Sets the condition on the edge from `predecessorKey` into the step `key`: `null` waits for the
+ * predecessor to be done, a condition runs the step only on that outcome. The edge keeps its place.
+ */
+export function setRoutineStepCondition(
+  steps: readonly RoutineStep[],
+  key: string,
+  predecessorKey: string,
+  when: RoutineStepCondition | null,
+): RoutineStep[] {
+  return steps.map((step) => {
+    if (step.key !== key) return step;
+    return {
+      ...step,
+      after: step.after.map((entry) =>
+        routineStepAfterKey(entry) === predecessorKey ? (when ? { step: predecessorKey, when } : predecessorKey) : entry,
+      ),
+    };
+  });
+}
+
+/** The condition on the edge from `predecessorKey` into `step`; `null` for a plain edge or none. */
+export function routineStepCondition(step: RoutineStep, predecessorKey: string): RoutineStepCondition | null {
+  return routineStepEdges(step).find((edge) => edge.step === predecessorKey)?.when ?? null;
+}
+
+/** Whether a step has a review or approval stage, so its outcomes read as approved or rejected. */
+export function isGatedRoutineStep(step: Pick<RoutineStep, "executionPolicy">): boolean {
+  return (step.executionPolicy?.stages ?? []).length > 0;
+}
+
+/**
+ * Words for a step's outcome. On a gated step `done` means approved and `cancelled` means rejected or
+ * stopped by the board; a reviewer asking for changes sends the step back and does not end it.
+ */
+export function routineStepOutcomeLabel(
+  predecessor: Pick<RoutineStep, "executionPolicy"> | undefined,
+  outcome: RoutineStepCondition,
+): string {
+  const gated = predecessor ? isGatedRoutineStep(predecessor) : false;
+  if (outcome === "done") return gated ? "approved" : "done";
+  return gated ? "rejected or stopped by the board" : "cancelled";
 }
 
 function canonicalJson(value: unknown): string {

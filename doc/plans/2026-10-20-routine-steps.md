@@ -32,7 +32,7 @@ Not built: new tables, a general workflow engine, OR-joins, loops over lists, da
 A step reuses the child-issue fields (`title`, `description`, `assigneeAgentId`, `priority`, `labelIds`, `executionPolicy`, `acceptanceCriteria`) and adds:
 
 - `key`: a lowercase slug, unique in the routine
-- `after`: `string[]`, the keys of the steps it waits for. Conditions on an edge (`when`) arrive in PR 3, which changes this field then; PR 1 has no `when` form in the type, the schema or the API.
+- `after`: the steps it waits for. An entry is a step key, or `{ step, when }` where `when` is `"done"` or `"cancelled"` (PR 3). A plain key waits for the step to be done. A step names another step once; two entries for one step with different conditions are refused.
 
 Validation: unique keys, `after` points at existing keys, no cycles, at most 25 steps, every step resolves to an agent (its own or the routine's; there are no unowned or user-owned steps because they would never be woken), agents and labels belong to the company. `{{variables}}` work through `interpolateRoutineTemplate`, and a variable that appears only in a step is added to the routine's variables.
 
@@ -50,7 +50,7 @@ Validation: unique keys, `after` points at existing keys, no cycles, at most 25 
 2. The run's task is created `blocked` and is not woken. It is woken once by the existing wakes after the last step.
 3. Steps are created in layers (first those with nothing to wait for, then those whose predecessors are all created, each layer in written order) through `createChild(root.id, ..., tx)`: `blockParentUntilDone`, blockers from `after`, `todo` without `after` and `blocked` otherwise, idempotency key `routine-run:{runId}:{stepKey}`, `originKind: "routine_step"`.
 4. After commit, only the steps without predecessors are woken.
-5. For a routine with steps, an open, visible run task of an earlier run counts as live for `skip_if_active` and `coalesce_if_active`, unless `isRoutineStepRunStalled` (`packages/shared/src/routine-steps.ts`) says the run cannot move on its own: a cancelled step never resolves its dependents, so a run whose remaining steps are all blocked behind a cancelled one is not live. PR 3 reuses the same function for skipped steps.
+5. For a routine with steps, an open, visible run task of an earlier run counts as live for `skip_if_active` and `coalesce_if_active`, unless `isRoutineStepRunStalled` (`packages/shared/src/routine-steps.ts`) says the run cannot move on its own: a cancelled step never resolves a plain dependent, so a run whose remaining steps are all blocked behind a cancelled one is not live. PR 3 extends the same function with the dead-path rule, so a step that was skipped, or a cancel that a condition handles, does not hold the run.
 6. Routine env and secrets stay on the `routine_execution` run task. Step agents do not inherit them (least privilege; can be extended if a real workflow needs it).
 
 Steps use `routine_step`, not `routine_execution`, because the unique index on open routine executions would make parallel steps collide and `findLiveExecutionIssue` would mistake a step for the routine's live run.
@@ -141,18 +141,62 @@ Routine create, update and run responses carry `warnings: RoutineStepWarning[]` 
 - Server (embedded Postgres): attach and event paths, guards, ledger dedupe, no recursion, concurrent attach, rollback keeping the task, warnings.
 - UI and CLI unit tests; `openapi-routes.test.ts`; a real-browser check of the wizard and the issue dialog.
 
-## PR 3: conditions (planned)
+## PR 3: conditions (implemented)
 
-- A step's outcome is its terminal status, `done` or `cancelled`. A reviewer asking for changes does not end a step; only a board cancel does.
-- An edge is dead when its `when` does not match its source's outcome, or its source was skipped. A step whose incoming edges are all dead is cancelled with "Skipped: condition not met", and the rule repeats downstream. Plain edges from a cancelled step are not dead, so a human cancel never silently cascades.
-- Skipped steps are removed from every blocker set in the run, then `issue_blockers_resolved` wakes go out for steps that became ready.
-- A reconcile action runs when a `routine_step` issue reaches a terminal status, with a small periodic backstop. Reconcile is idempotent: it locks the root and re-derives everything from `triggerPayload.steps` and current statuses.
-- `when` is allowed only on `after` entries; the editor warns about a step that would always be skipped.
+A step can run on the outcome of another step. No new table and no migration: the conditions are part of the recorded `steps` in the run's `triggerPayload.routineSteps`, so a run keeps the conditions it started with.
+
+### Outcome and condition
+
+- A step's outcome is its terminal status, `done` or `cancelled`. A reviewer asking for changes does not end a step; only a board cancel (or a rejection by the reviewer) does. For a step with a review or approval stage, `done` means approved and `cancelled` means rejected or stopped by the board.
+- `after: [{ step: "review", when: "done" }]` waits for `review` and runs only if it is done. `when: "cancelled"` runs only if it is cancelled. A plain key behaves as before.
+- The same entries work in the REST API, the OpenAPI schema (`oneOf` string or object), the CLI `--steps-file` and the editor. The editor shows "Wait until done" or "Wait until approved" for a plain edge, and "Only if done", "Only if approved" or "Only if rejected or stopped by the board" for a condition.
+
+### Dead-path rule
+
+`evaluateRoutineStepRun` (`packages/shared/src/routine-steps.ts`) is a pure function of the recorded steps and the current statuses of the step issues. It returns the steps to skip, the blockers to release and whether the run is stalled. `isRoutineStepRunStalled` is the same rule asked for the stalled flag only.
+
+- An edge is dead when its `when` does not match the outcome of its source, or when its source was skipped.
+- A blocked step whose edges are all dead is skipped, and the rule repeats downstream.
+- A step with a mix of dead and live edges is not skipped. Its dead blockers are released and it waits for the live ones.
+- A plain edge from a cancelled step is not dead. It is held, so the step stays visibly blocked and a cancel never cascades without a condition that asks for it.
+- A block that a person owns (`isHumanOwnedBlock`) is never skipped and counts as live work.
+- The root task waits for every step except steps that were skipped and cancelled steps whose every outgoing edge has a `when`. Such a cancel is an outcome the routine handles, so the root is not left blocked behind it. A cancelled step that a plain edge waits for still holds the root, as in PR 1.
+
+### Reconcile
+
+`reconcileRoutineStepRun` (`server/src/services/routine-steps.ts`) applies the rule to one run. It locks the root task row, then the step rows in id order (`for update`), and derives everything again from the recorded steps and the current statuses, so a second call finds nothing to do. It then:
+
+1. cancels each skipped step with the comment "Skipped: condition not met",
+2. drops the released blockers (through `issueService.update`, so blocker validation and activity run as usual),
+3. moves a `blocked` step with no blocker left to `todo`,
+4. writes an `issue.updated` activity entry with `source: "routine_step_conditions"`,
+5. after the commit, wakes every step that became ready with `issue_blockers_resolved`, using the same wake state key as the ordinary blocker wake, so a step is never woken twice for the same state.
+
+Triggers:
+
+- `issueService.update` queues a `reconcile_routine_steps` post-commit action when a `routine_step` issue reaches `done` or `cancelled`. The action reads the recorded steps first and returns at once, with no lock, when no step has a condition, so a routine without conditions behaves as in PR 1. A failure in the action is logged and does not fail the request that ended the step; the backstop applies the conditions later. The cancel of a skipped step queues one more reconcile for the same run, which finds nothing to do.
+- `routineStepConditionsBackstop` runs in `runPeriodicHeartbeatRecovery`, before `reconcileResolvedDependencyWakes`. Each tick it takes at most 25 runs whose recorded steps have a condition and whose root task is not `done` or `cancelled` (the cursor is `originRunId`, so a run that stays blocked for good does not starve the others) and reconciles them. The root can be a task that steps were attached to: it keeps its own origin, and a task that no agent owns keeps its status while the steps run, so the backstop neither reads the origin of the root nor requires `blocked`. A failure in it is logged and does not stop the other recovery steps. It repairs a run whose action was lost, for example after a restart between the commit and the action.
+
+### Design notes
+
+- A run that attached its steps to an existing task (a manual run with `targetIssueId`, or an event with `issueMode: "event_issue"`) ends as `issue_created` and never moves on, because the run status sync follows only `routine_execution` issues. The reconcile and the backstop find such a run from its recorded `routineSteps` payload and its step issues, never from the origin of the root. The trigger result of an event that attached steps says "Attached the steps to task <id>" (status `steps_attached`) instead of "Created execution issue", because the routine did not create that task.
+- Skipped steps are cancelled issues, so the board sees them and the history stays. The hint in the editor says that a step with a condition can be skipped, instead of a static warning that a step "will always be skipped": whether a branch runs depends on the outcome of a run.
+- The reconcile takes the root lock first, then the step locks, in id order. Every other writer of a step takes only its own row, so there is no cycle.
+- `origin_run_id` on an issue is text; the backstop joins `routine_runs` on a guarded `::uuid` cast of it, so a malformed value joins no run and the primary key lookup stays an index lookup.
 
 ## Follow-ups (not scheduled)
 
 - Read-only step stats per routine and step key (run count, duration, token cost, review rounds, changes-requested rate), derived from existing rows.
 - Eval-based conditions, once company evals ship.
+
+## Verification (PR 3)
+
+- Shared (unit): the dead-path rule on chains, forks, joins, mixed edges, skipped sources, a plain edge from a cancelled step, human-owned blocks, the stalled flag, conflicting conditions.
+- Server (embedded Postgres): an approved path runs and the other branch is skipped; a board cancel takes the rework branch; a plain edge from a cancelled step stays blocked; skipped steps leave every blocker set; wakes go out once; the root is released; a second reconcile changes nothing; concurrent terminal updates; the backstop (cap, cursor, malformed run id); the route flow through `PATCH /issues/:id`.
+- Tasks that steps were attached to (`routine-step-conditions-attached.test.ts`): a task with steps from an event and a task with steps from a run with `targetIssueId` each skip the dead branch, take the rework branch on a board cancel, queue the reconcile from the step's own end, and are found by the backstop, also when no agent owns the task; a finished task is left alone; the trigger result says the steps were attached.
+- Periodic recovery: the backstop runs before the dependency backstop and a failure in it is contained.
+- Boundaries: `routines-routes.test.ts` (accepts conditions, refuses conflicting ones), `openapi-routes.test.ts`, CLI `--steps-file`.
+- UI: helper tests and `RoutineStepsEditor.conditions.test.tsx`; `pnpm check:token-gates`.
 
 ## Verification (PR 1)
 
@@ -165,6 +209,8 @@ Routine create, update and run responses carry `warnings: RoutineStepWarning[]` 
 
 - Migration numbering can collide with another open migration; renumber and regenerate.
 - A run task left open keeps the routine "live" until it is done or cancelled, except a stalled run (see Dispatch, item 5).
+- A reconcile cancels step issues. A step blocked by a block that a person owns is never skipped; it holds the run until that person acts.
+- The backstop adds one indexed read per periodic tick, capped at 25 runs.
 - A rollback to a previous image runs a routine with steps as one plain task and cannot restore a revision that holds steps (see `doc/DATABASE.md`).
 - Step wakes on the event path are queued after commit and are best effort; the stranded sweep recovers a lost wake.
 - `routineSteps` and `targetIssueId` are reserved keys in a run's trigger payload: a caller's payload loses them, so a run without a task cannot pass for a run on a task.

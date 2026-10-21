@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
-import { MAX_ROUTINE_STEPS } from "@paperclipai/shared";
+import { MAX_ROUTINE_STEPS, ROUTINE_STEP_CONDITIONS } from "@paperclipai/shared";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
 import { buildOpenApiSpec, CONVEX_PLUGIN_ACTIONS, CONVEX_PLUGIN_SCHEMAS, openApiRoutes } from "../routes/openapi.js";
@@ -439,6 +439,15 @@ describe("openapi routes", () => {
       const steps = operation.requestBody.content["application/json"].schema.properties.steps;
       expect(steps.maxItems).toBe(MAX_ROUTINE_STEPS);
       expect(steps.items.properties.after.maxItems).toBe(MAX_ROUTINE_STEPS);
+      // An `after` entry is a step key, or a step key with the outcome it waits for.
+      expect(steps.items.properties.after.items.oneOf).toHaveLength(2);
+      expect(steps.items.properties.after.items.oneOf[0]).toMatchObject({ type: "string" });
+      expect(steps.items.properties.after.items.oneOf[1]).toMatchObject({
+        type: "object",
+        required: ["step", "when"],
+        additionalProperties: false,
+        properties: { step: { type: "string" }, when: { type: "string", enum: [...ROUTINE_STEP_CONDITIONS] } },
+      });
       expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["403", "404", "409", "422"]));
     }
     for (const operation of [
