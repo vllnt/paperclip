@@ -1302,7 +1302,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       expect(await closedActivity(heldIssueId)).toEqual([]);
     });
 
-    it("never expires what a person asked for or decided, an answer, a completed child, a merged wake, or a wake on a blocked task", async () => {
+    it("never expires what a person asked for or decided, an answer, a completed child, a merged wake, or a wake on a blocked or in-review task", async () => {
       const companyId = await seedCompany();
       const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
       const old = 48 * HOUR_MS;
@@ -1318,6 +1318,12 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
         actor: { type: "user", id: "board-user" },
       });
       await keep("Woken by a person", { ageMs: old, actor: { type: "user", id: "board-user" } });
+      // A decision's continuation carries the outcome a person chose, with no actor on the wake.
+      await keep("Decision resolved", {
+        ageMs: old,
+        reason: "decision_dismissed",
+        payload: { decisionId: randomUUID(), outcome: "dismissed", dismissReason: "Not now" },
+      });
       await keep("Answered by another agent", {
         ageMs: old,
         reason: "issue_commented",
@@ -1332,13 +1338,15 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       });
       await keep("A newer signal merged in", { ageMs: old, coalescedCount: 1 });
       await keep("Blocked on its blockers", { ageMs: old, reason: "issue_blockers_resolved" }, "blocked");
+      // The stranded-issue recovery re-dispatches in_review only for a pending agent review participant.
+      await keep("Waiting on a person's review", { ageMs: old }, "in_review");
       const plainIssueId = await seedIssue(companyId, { assigneeAgentId: agentId, title: "Plain old signal" });
       const plainWakeId = await seedDeferredWake(companyId, agentId, plainIssueId, { ageMs: old });
 
       const pass = await heartbeat.sweepDeferredWakes();
       await heartbeat.drainActiveRunExecutions();
 
-      expect(pass).toMatchObject({ scanned: 7, expired: 1, failed: 0 });
+      expect(pass).toMatchObject({ scanned: 9, expired: 1, failed: 0 });
       expect((await wakeRow(plainWakeId)).error).toMatch(/^Expired/);
       for (const { issueId, wakeId } of kept) {
         expect((await wakeRow(wakeId)).error ?? "").not.toMatch(/^Expired/);
@@ -1392,6 +1400,19 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
         const observedUpdatedAt = (await wakeRow(wakeId)).updatedAt;
 
         expect(await closeAsSweep({ companyId, wakeId, issueId, observedUpdatedAt, supersededAgentId: agentId })).toBe(false);
+        expect((await wakeRow(wakeId)).status).toBe("deferred_issue_execution");
+      });
+
+      it("leaves an expired wake whose issue moved to a status where a wake never expires", async () => {
+        const companyId = await seedCompany();
+        const agentId = await seedAgent(companyId, { name: "Reviewer" });
+        const issueId = await seedIssue(companyId, { assigneeAgentId: agentId });
+        const wakeId = await seedDeferredWake(companyId, agentId, issueId, { ageMs: 48 * HOUR_MS });
+        const observedUpdatedAt = (await wakeRow(wakeId)).updatedAt;
+        // The sweep read the issue as todo; it was blocked before the close took the lock.
+        await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+
+        expect(await closeAsSweep({ companyId, wakeId, issueId, observedUpdatedAt })).toBe(false);
         expect((await wakeRow(wakeId)).status).toBe("deferred_issue_execution");
       });
 
@@ -1502,7 +1523,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       ).toHaveLength(1);
     });
 
-    it("does not fold a wake with saved input, another reason, or one requested after the promotion started", async () => {
+    it("does not fold a wake with saved input, a merged wake, another reason, or one requested after the promotion started", async () => {
       const companyId = await seedCompany();
       const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });
       const issueId = await seedIssue(companyId, { assigneeAgentId: agentId });
@@ -1521,6 +1542,12 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
           ageMs: 15 * MINUTE_MS,
           reason: "issue_status_changed",
           executionWait: { reason: "execution_recovery", message: "Your message is saved." },
+        }),
+        // An earlier wake merged into it may have carried input.
+        await seedDeferredWake(companyId, agentId, issueId, {
+          ageMs: 12 * MINUTE_MS,
+          reason: "issue_status_changed",
+          coalescedCount: 1,
         }),
         // Not a plain signal.
         await seedDeferredWake(companyId, agentId, issueId, { ageMs: 10 * MINUTE_MS, reason: "execution_review_requested" }),

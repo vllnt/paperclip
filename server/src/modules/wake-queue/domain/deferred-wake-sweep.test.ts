@@ -242,12 +242,13 @@ describe("decideDeferredWakeDisposition", () => {
   });
 
   it("expires an old wake only on an issue that stranded-issue recovery dispatches again", () => {
-    for (const issueStatus of ["todo", "in_progress", "in_review"]) {
+    for (const issueStatus of ["todo", "in_progress"]) {
       expect(decideDeferredWakeDisposition(facts({ hoursAgo: 200, issueStatus }), { now, maxAgeMs: 24 * hour })).toBe(
         "expired",
       );
     }
-    for (const issueStatus of ["blocked", "backlog"]) {
+    // The recovery re-dispatches in_review only for a pending agent review participant.
+    for (const issueStatus of ["blocked", "backlog", "in_review"]) {
       expect(decideDeferredWakeDisposition(facts({ hoursAgo: 200, issueStatus }), { now, maxAgeMs: 24 * hour })).toBe(
         "promote",
       );

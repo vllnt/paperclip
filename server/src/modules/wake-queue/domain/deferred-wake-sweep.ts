@@ -71,10 +71,23 @@ export const COALESCIBLE_PARKED_WAKE_REASONS: readonly string[] = [
  * Issue statuses whose assigned work the stranded-issue recovery dispatches
  * again when no run serves it. Only a wake on such an issue may expire: if the
  * work is still needed, that recovery starts it with the issue as it is now.
- * A wake on any other issue (blocked, backlog) may be the only thing that
- * would move it, so it never expires.
+ * A wake on any other issue may be the only thing that would move it, so it
+ * never expires: `blocked` and `backlog`, and `in_review`, which that recovery
+ * re-dispatches only for a pending agent review participant.
  */
-const EXPIRABLE_ISSUE_STATUSES: ReadonlySet<string> = new Set(["todo", "in_progress", "in_review"]);
+const EXPIRABLE_ISSUE_STATUSES: ReadonlySet<string> = new Set(["todo", "in_progress"]);
+
+/**
+ * Whether a parked wake on an issue in this status may expire. The sweep's
+ * close rechecks it under the issue lock, because the status can change after
+ * the sweep read it.
+ *
+ * @param issueStatus - The issue's current status.
+ * @returns True for `todo` and `in_progress`.
+ */
+export function isExpirableIssueStatus(issueStatus: string): boolean {
+  return EXPIRABLE_ISSUE_STATUSES.has(issueStatus);
+}
 
 export type DeferredWakeDisposition =
   /** Re-deliver it through ordinary admission. */
@@ -124,7 +137,7 @@ export function decideDeferredWakeDisposition(
     return "superseded";
   }
   const expirable =
-    !wake.carriesSavedInput && wake.mergedWakeCount === 0 && EXPIRABLE_ISSUE_STATUSES.has(wake.issueStatus);
+    !wake.carriesSavedInput && wake.mergedWakeCount === 0 && isExpirableIssueStatus(wake.issueStatus);
   if (expirable && input.now.getTime() - wake.requestedAt.getTime() > input.maxAgeMs) return "expired";
   return "promote";
 }
