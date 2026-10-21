@@ -65,7 +65,7 @@ const slotPriorityOptions = [
   {
     value: "first",
     title: "Next free slot",
-    description: "Runs go before the agent's other queued work, so a scheduled run starts as soon as a run slot frees.",
+    description: "The routine's runs start as soon as a run slot frees, before the agent's other queued work, which waits meanwhile.",
   },
 ];
 

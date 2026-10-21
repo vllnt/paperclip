@@ -124,6 +124,19 @@ export function routineRoutes(
   }
 
   /**
+   * Slot priority `first` puts a routine's runs ahead of the other queued work of every agent that
+   * serves them, step agents included, so only a board user with `tasks:assign` may set it.
+   * Anyone who manages the routine may set it back to `normal`.
+   * @throws HttpError 403 for an agent, or for a board user without `tasks:assign`.
+   */
+  async function assertCanSetFirstSlotPriority(req: Request, companyId: string) {
+    if (req.actor.type === "agent") {
+      throw forbidden("Only the board can set a routine's slot priority to first");
+    }
+    await assertBoardCanAssignTasks(req, companyId);
+  }
+
+  /**
    * Steps hand work to agents, so writing them is an assignment: a board user needs
    * `tasks:assign`, and an agent may only give steps to itself, as it may only own its routines.
    */
@@ -343,6 +356,7 @@ export function routineRoutes(
     const companyId = req.params.companyId as string;
     await assertBoardCanAssignTasks(req, companyId);
     assertCanManageCompanyRoutine(req, companyId, req.body.assigneeAgentId);
+    if (req.body.slotPriority === "first") await assertCanSetFirstSlotPriority(req, companyId);
     await assertCanAssignRoutineSteps(req, companyId, req.body.steps);
     const steps = await containAgentSteps(req, companyId, req.body.projectId ?? null, req.body.steps);
     const created = await svc.create(companyId, steps ? { ...req.body, steps } : req.body, {
@@ -565,6 +579,9 @@ export function routineRoutes(
       routine.status !== "active";
     if (statusWillActivate) {
       await assertBoardCanAssignTasks(req, routine.companyId);
+    }
+    if (req.body.slotPriority === "first" && routine.slotPriority !== "first") {
+      await assertCanSetFirstSlotPriority(req, routine.companyId);
     }
     if (
       req.actor.type === "agent" &&

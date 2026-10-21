@@ -107,8 +107,11 @@ describeEmbeddedPostgres("heartbeat queued-run priority order", () => {
     issue: {
       priority: string;
       status: "todo" | "in_progress";
-      /** A routine's execution or step issue, as the routine's dispatch creates it. */
-      origin?: { kind: "routine_execution" | "routine_step"; routineId: string };
+      /**
+       * A routine's execution or step issue, as the routine's dispatch creates it, or another
+       * origin whose id only looks like one.
+       */
+      origin?: { kind: string; routineId: string };
     },
     createdAt: Date,
   ) {
@@ -315,6 +318,34 @@ describeEmbeddedPostgres("heartbeat queued-run priority order", () => {
       const order = await drainStartOrder([agedHigh.runId, inProgress.runId, tick.runId, step.runId]);
 
       expect(order).toEqual([agedHigh.runId, inProgress.runId, tick.runId, step.runId]);
+    }, 90_000);
+
+    it("gives no priority to another origin, another company's routine or an origin id that is not a uuid", async () => {
+      const ids = await insertAgent();
+      const otherCompany = await insertAgent();
+      const ownFirst = await insertRoutine(ids, "first");
+      const foreignFirst = await insertRoutine(otherCompany, "first");
+      const now = Date.now();
+      const oldest = await insertIssueRun(ids, { priority: "medium", status: "todo" }, new Date(now - 10 * MINUTE));
+      const otherOrigin = await insertIssueRun(
+        ids,
+        { priority: "medium", status: "todo", origin: { kind: "manual", routineId: ownFirst } },
+        new Date(now - 3 * MINUTE),
+      );
+      const foreign = await insertIssueRun(
+        ids,
+        { priority: "medium", status: "todo", origin: { kind: "routine_execution", routineId: foreignFirst } },
+        new Date(now - 2 * MINUTE),
+      );
+      const notUuid = await insertIssueRun(
+        ids,
+        { priority: "medium", status: "todo", origin: { kind: "routine_step", routineId: "bridge-key-1" } },
+        new Date(now - MINUTE),
+      );
+
+      const order = await drainStartOrder([oldest.runId, otherOrigin.runId, foreign.runId, notUuid.runId]);
+
+      expect(order).toEqual([oldest.runId, otherOrigin.runId, foreign.runId, notUuid.runId]);
     }, 90_000);
   });
 });

@@ -82,6 +82,10 @@ Fields:
 
 The slot priority is queue tuning, not routine content: changing it does not create a revision, and restoring a revision leaves it as it is.
 
+- **Who can set `first`.** Only a board user with the `tasks:assign` permission, because `first` reorders the queue of every agent that serves the routine's runs, step agents included. An agent gets `403`, even on its own routine. Anyone who can manage the routine can set it back to `normal`.
+- **No aging across the groups.** Aging (one priority level per 30 minutes waited) applies within each group. While a `first` routine keeps runs queued, the agent's other runs wait, however long they have waited. Use `first` for short, infrequent runs.
+- **Which issues.** It applies to the issues the routine files under its own id (origin `routine_execution` or `routine_step`). A plugin-managed routine whose plugin files its runs under the plugin's own origin, or under another origin id, keeps the usual order.
+
 ## Update Routine
 
 ```

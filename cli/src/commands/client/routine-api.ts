@@ -243,7 +243,7 @@ function addRoutineCreate(parent: Command): void {
   addCommonClientOptions(
     parent
       .command("create")
-      .description("Create a routine (payload may set steps)")
+      .description("Create a routine (payload may set steps and slotPriority)")
       .option("-C, --company-id <id>", "Company ID")
       .requiredOption("--payload-json <json>", "JSON payload")
       .option("--steps-file <path>", STEPS_FILE_DESCRIPTION)
