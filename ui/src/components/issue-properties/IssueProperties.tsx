@@ -12,6 +12,7 @@ import { Link } from "@/lib/router";
 import {
   deriveOriginatingActor,
   isArtifactReviewDocumentKey,
+  parseIssueWaitPullRequestUrl,
   type ExecutionWorkspace,
   type Issue,
   type IssueLabel,
@@ -1288,6 +1289,8 @@ export function IssueProperties({
       kind: serviceName ? "external_service" : null,
       serviceName,
       externalRef: null,
+      // The editor does not edit the wait's pull request target; keep it.
+      pullRequestUrl: issue.executionPolicy?.monitor?.pullRequestUrl ?? null,
     });
     setMonitorOpen(false);
   };
@@ -1300,6 +1303,7 @@ export function IssueProperties({
   const monitorAttemptCount = issue.monitorAttemptCount ?? monitorState?.attemptCount ?? 0;
   const monitorLastTriggeredAt = issue.monitorLastTriggeredAt ?? monitorState?.lastTriggeredAt ?? null;
   const monitorServiceName = issue.executionPolicy?.monitor?.serviceName ?? monitorState?.serviceName ?? null;
+  const monitorPullRequest = parseIssueWaitPullRequestUrl(issue.executionPolicy?.monitor?.pullRequestUrl ?? "");
   const monitorNotes = issue.executionPolicy?.monitor?.notes ?? monitorState?.notes ?? null;
   const monitorNow = useMonitorCountdown(monitorNextCheckAt);
   const monitorRelative = monitorNextCheckAt ? formatMonitorEta(monitorNextCheckAt, monitorNow) : null;
@@ -1359,6 +1363,17 @@ export function IssueProperties({
             <div>
               <div className="text-xs text-muted-foreground">Watching</div>
               <div className="text-sm">{monitorServiceName ?? "—"}</div>
+              {monitorPullRequest ? (
+                <a
+                  href={monitorPullRequest.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-sm underline underline-offset-2"
+                  data-testid="monitor-pull-request"
+                >
+                  {`${monitorPullRequest.owner}/${monitorPullRequest.repo}#${monitorPullRequest.number}`}
+                </a>
+              ) : null}
             </div>
             <div>
               <div className="text-xs text-muted-foreground">Notes</div>

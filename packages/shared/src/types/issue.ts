@@ -690,6 +690,12 @@ export interface IssueExecutionMonitorPolicy {
   kind?: IssueExecutionMonitorKind | null;
   serviceName?: string | null;
   externalRef?: string | null;
+  /**
+   * The one GitHub pull request the wait is about (`issue wait --pull-request`),
+   * canonical `https://github.com/{owner}/{repo}/pull/{n}`. While it does not
+   * change, a due check does not start a run.
+   */
+  pullRequestUrl?: string | null;
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;

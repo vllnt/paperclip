@@ -176,6 +176,8 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  ISSUE_WAIT_MAX_DELAY_MS,
+  ISSUE_WAIT_MIN_DELAY_MS,
   ISSUE_WAIT_MONITOR_MAX_ATTEMPTS,
   envBindingSchema,
   isEnvironmentDriverSupportedForAdapter,
@@ -530,11 +532,22 @@ import {
 } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorRecheckedPatch,
   buildIssueMonitorRescheduledPatch,
   buildIssueMonitorTriggeredPatch,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
+import {
+  PULL_REQUEST_FINGERPRINT_CONTEXT_KEY,
+  PULL_REQUEST_GATE_TICK_BUDGET_MS,
+  PULL_REQUEST_UNCHANGED_SKIP_REASON,
+  evaluatePullRequestWakeGate,
+  readPullRequestWaitTarget,
+  toStoredPullRequestFingerprint,
+  type PullRequestWaitTarget,
+  type PullRequestWakeGateDeps,
+} from "./pull-request-wake-gate.js";
 import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
   isVerifiedIssueTreeControlInteractionWake,
@@ -849,6 +862,12 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "agent.harness_fallback_returned",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+/** Pull-request gate misses that are configuration, not failures: logged at info. */
+const EXPECTED_PULL_REQUEST_GATE_MISSES = new Set([
+  "github_credentials_missing",
+  "github_credentials_unavailable",
+  "github_backoff",
+]);
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const ACCEPTED_PLAN_CONVERSION_SKILL_KEY =
@@ -4208,6 +4227,14 @@ interface WakeupOptions {
    * Only the deferred-wake sweep sets it; no route or payload can.
    */
   redeliverDeferredWake?: boolean;
+  /**
+   * Internal. Skip this wake when the pull request the wait targets did not
+   * change since the agent's last monitor-check run started (see
+   * pull-request-wake-gate.ts). Only the scheduled issue-monitor dispatch sets
+   * it, from a monitor armed with `issue wait --pull-request`; no route or
+   * payload can.
+   */
+  skipIfPullRequestUnchanged?: PullRequestWaitTarget;
 }
 
 type UsageTotals = {
@@ -7919,6 +7946,14 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // A run's pull-request fingerprint is the state it was admitted with. A wake
+  // merged into it later, maybe into a run that already started, must not
+  // claim that the run saw a newer state.
+  if (existing[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY] !== undefined) {
+    merged[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY] = existing[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY];
+  } else {
+    delete merged[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY];
+  }
   // Only executeRun can mint this proof. Coalescence may retain an unchanged
   // admitted proof, but must never accept a new marker from an incoming wake.
   delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
@@ -10018,6 +10053,8 @@ export interface HeartbeatServiceOptions {
     runId: string;
     issueId: string;
   }) => Promise<void>;
+  /** GitHub fetch and token seams for the unchanged-pull-request wake gate. */
+  pullRequestWakeGate?: PullRequestWakeGateDeps;
 }
 
 export async function cancelHeartbeatNativeRun(input: {
@@ -12386,6 +12423,8 @@ export function heartbeatService(
       activitySource: "manual" | "scheduled";
       /** An authenticated user's check-now: exempt from the automation window like any human wake. */
       manualUserWake?: boolean;
+      /** May skip the wake when the linked pull request is unchanged (scheduled ticks only). */
+      pullRequestGate?: boolean;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -12462,6 +12501,85 @@ export function heartbeatService(
     }
 
     const monitorWakeKey = `issue-monitor:${claimed.id}:${scheduledAtIso}`;
+    // Only the scheduled re-check of a wait the assignee aimed at one pull
+    // request (`issue wait --pull-request`) may skip while that pull request is
+    // unchanged. Every other wait, a person's check-now, server-owned monitors
+    // and the last attempt a re-arm allows always wake the agent.
+    const skipIfPullRequestUnchanged =
+      input.pullRequestGate === true &&
+      !isProviderQuotaReviewMonitor &&
+      monitor?.scheduledBy === "assignee" &&
+      (monitor.maxAttempts == null || nextAttemptCount < monitor.maxAttempts)
+        ? readPullRequestWaitTarget(monitor)
+        : null;
+    // The pull request did not change since the agent's last run, so this check
+    // is done. Keep the monitor armed for the same wait the agent chose, as if it
+    // had woken, found nothing new, and waited again.
+    const rearmUnchangedPullRequestMonitor = async (skipDetails: Record<string, unknown>) => {
+      const lastCheckMs = Math.max(
+        claimed.monitorLastTriggeredAt?.getTime() ?? 0,
+        Date.parse(String(skipDetails.baselineFinishedAt ?? "")) || 0,
+      );
+      const waitMs = lastCheckMs > 0
+        ? Math.min(ISSUE_WAIT_MAX_DELAY_MS, Math.max(ISSUE_WAIT_MIN_DELAY_MS, claimed.monitorNextCheckAt!.getTime() - lastCheckMs))
+        : ISSUE_WAIT_MIN_DELAY_MS;
+      const timeoutAt = parseMonitorDate(monitor?.timeoutAt ?? null);
+      const nextCheckAt = new Date(
+        Math.min(input.now.getTime() + waitMs, timeoutAt?.getTime() ?? Number.POSITIVE_INFINITY),
+      );
+      // The gate may have taken seconds. Re-read under a lock and re-arm only
+      // the monitor this dispatch claimed; an edit since then wins.
+      const rechecked = await db.transaction(async (tx) => {
+        const [current] = await tx
+          .select(issueMonitorDispatchColumns)
+          .from(issues)
+          .where(and(eq(issues.id, claimed.id), eq(issues.companyId, claimed.companyId)))
+          .for("update");
+        if (
+          !current ||
+          current.monitorNextCheckAt?.getTime() !== claimed.monitorNextCheckAt?.getTime() ||
+          current.monitorWakeRequestedAt?.getTime() !== claimed.monitorWakeRequestedAt?.getTime() ||
+          current.assigneeAgentId !== claimed.assigneeAgentId ||
+          current.assigneeUserId !== null ||
+          !["in_progress", "in_review"].includes(current.status)
+        ) {
+          return null;
+        }
+        const patch = buildIssueMonitorRecheckedPatch({
+          issue: current as IssueMonitorDispatchRow,
+          policy: normalizeIssueExecutionPolicy(current.executionPolicy ?? null),
+          checkedAt: input.now,
+          nextCheckAt,
+        });
+        await tx
+          .update(issues)
+          .set(patch ? { ...patch, updatedAt: new Date() } : { monitorWakeRequestedAt: null, updatedAt: new Date() })
+          .where(eq(issues.id, claimed.id));
+        return patch;
+      });
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_pull_request_unchanged",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: scheduledAtIso,
+          rescheduledAt: rechecked ? nextCheckAt.toISOString() : null,
+          attemptCount: nextAttemptCount,
+          skipReason: PULL_REQUEST_UNCHANGED_SKIP_REASON,
+          baselineRunId: skipDetails.baselineRunId ?? null,
+          fingerprintDigest: skipDetails.fingerprintDigest ?? null,
+          pullRequest: skipDetails.pullRequest ?? null,
+          source: input.activitySource,
+        },
+      });
+      return { outcome: "skipped" as const, reason: "Pull request unchanged since the agent's last check" };
+    };
     // The queue dropped or refused the wake. Keep the monitor armed: count the
     // attempt, back off, and hand the issue to owner recovery once the attempts
     // run out, so a permanently blocked agent cannot retry without end.
@@ -12593,6 +12711,7 @@ export function heartbeatService(
           reason: wakeReason,
           idempotencyKey: monitorWakeKey,
           ...(input.manualUserWake ? { manualUserWake: true } : {}),
+          ...(skipIfPullRequestUnchanged ? { skipIfPullRequestUnchanged } : {}),
           payload: {
             issueId: claimed.id,
             nextCheckAt: scheduledAtIso,
@@ -12626,7 +12745,11 @@ export function heartbeatService(
       // will not run, so the monitor stays armed.
       if (monitorWake === null) {
         const skipped = await db
-          .select({ reason: agentWakeupRequests.reason })
+          .select({
+            reason: agentWakeupRequests.reason,
+            idempotencyKey: agentWakeupRequests.idempotencyKey,
+            heartbeatSkip: sql<unknown>`${agentWakeupRequests.payload} -> 'heartbeatSkip'`,
+          })
           .from(agentWakeupRequests)
           .where(
             and(
@@ -12637,8 +12760,16 @@ export function heartbeatService(
               gte(agentWakeupRequests.updatedAt, monitorWakeStartedAt),
             ),
           )
+          // This dispatch's own receipt first.
+          .orderBy(sql`${agentWakeupRequests.idempotencyKey} is not distinct from ${monitorWakeKey} desc`)
           .limit(1)
           .then((rows) => rows[0] ?? null);
+        if (
+          skipped?.reason === PULL_REQUEST_UNCHANGED_SKIP_REASON &&
+          skipped.idempotencyKey === monitorWakeKey
+        ) {
+          return await rearmUnchangedPullRequestMonitor(parseObject(skipped.heartbeatSkip));
+        }
         if (skipped) {
           return holdMonitorForRetry(
             `Monitor wake skipped (${skipped.reason ?? "skipped"})`,
@@ -12901,6 +13032,12 @@ export function heartbeatService(
 
     let triggered = 0;
     let skipped = 0;
+    // Bound the GitHub reads one tick may make: once the deadline passes, the
+    // remaining due monitors wake without the unchanged-pull-request check. A gate
+    // already running is not cut short, so a tick can overrun the deadline by one
+    // gate's own budget (PULL_REQUEST_GATE_BUDGET_MS).
+    const pullRequestGateDeadline =
+      Date.now() + (options.pullRequestWakeGate?.tickBudgetMs ?? PULL_REQUEST_GATE_TICK_BUDGET_MS);
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {
@@ -12943,6 +13080,7 @@ export function heartbeatService(
           runId: null,
           clearOnClientError: true,
           activitySource: "scheduled",
+          pullRequestGate: Date.now() < pullRequestGateDeadline,
         });
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
@@ -30202,6 +30340,8 @@ export function heartbeatService(
       triggerDetail,
       payload,
     });
+    // Only the pull-request gate below may record the fingerprint a run starts from.
+    delete enrichedContextSnapshot[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY];
     // Keep each request's own server-derived origin, including coalesced wakes.
     // A run's merged context cannot establish which caller authored one receipt.
     // Overwrite caller-supplied nested context rather than trusting it.
@@ -30809,6 +30949,55 @@ export function heartbeatService(
           releasePolicy: activePauseHold.releasePolicy,
           interaction: true,
         };
+      }
+    }
+
+    // A scheduled re-check of a wait on one pull request that did not change
+    // carries no new information: record a skipped wake instead of starting the
+    // adapter. Every doubt wakes. Runs outside the issue lock: it may call GitHub.
+    if (opts.skipIfPullRequestUnchanged && issueId) {
+      const gate = await evaluatePullRequestWakeGate(
+        db,
+        { companyId: agent.companyId, issueId, agentId, pullRequest: opts.skipIfPullRequestUnchanged },
+        options.pullRequestWakeGate,
+      ).catch((err: unknown) => {
+        logger.warn({ err, companyId: agent.companyId, issueId, agentId }, "pull request wake gate failed; waking the agent");
+        return { outcome: "wake" as const, reason: "gate_error", fingerprint: null };
+      });
+      if (gate.outcome === "skip") {
+        const pr = gate.fingerprint.pullRequest;
+        await writeSkippedHeartbeatRequest(PULL_REQUEST_UNCHANGED_SKIP_REASON, {
+          outcome: "no_change",
+          wakeReason: reason,
+          baselineRunId: gate.baselineRunId,
+          baselineFinishedAt: gate.baselineFinishedAt,
+          fingerprintDigest: gate.fingerprint.digest,
+          pullRequest: {
+            repo: pr.repo,
+            number: pr.number,
+            state: pr.state,
+            headSha: pr.headSha,
+            checks: pr.checks,
+            status: pr.status,
+          },
+        });
+        return null;
+      }
+      if (gate.fingerprint) {
+        const stored = toStoredPullRequestFingerprint(gate.fingerprint);
+        enrichedContextSnapshot[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY] = stored;
+        payload = {
+          ...payload,
+          [DEFERRED_WAKE_CONTEXT_KEY]: {
+            ...parseObject(payload?.[DEFERRED_WAKE_CONTEXT_KEY]),
+            [PULL_REQUEST_FINGERPRINT_CONTEXT_KEY]: stored,
+          },
+        };
+      } else if (gate.reason !== "gate_error") {
+        const logContext = { companyId: agent.companyId, issueId, agentId, reason: gate.reason };
+        const message = "pull request wake gate could not read the pull request; waking the agent";
+        if (EXPECTED_PULL_REQUEST_GATE_MISSES.has(gate.reason)) logger.info(logContext, message);
+        else logger.warn(logContext, message);
       }
     }
 

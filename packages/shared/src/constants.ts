@@ -535,6 +535,9 @@ export const PROVIDER_QUOTA_MONITOR_SERVICE_NAME = "AI provider quota";
 // Server-owned monitor scheduled after Paperclip stopped a lingering background
 // task at the end of a successful run.
 export const BACKGROUND_TASK_RECHECK_MONITOR_SERVICE_NAME = "Background task re-check";
+// An agent's wait on one GitHub pull request (`issue wait --pull-request`); the
+// monitor's pullRequestUrl holds the pull request URL.
+export const PULL_REQUEST_WAIT_MONITOR_SERVICE_NAME = "GitHub pull request";
 
 export const ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES = [
   "wake_owner",

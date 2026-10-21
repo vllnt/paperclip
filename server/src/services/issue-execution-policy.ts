@@ -10,7 +10,7 @@ import type {
   IssueExecutionState,
   IssueMonitorScheduledBy,
 } from "@paperclipai/shared";
-import { issueExecutionPolicySchema, issueExecutionStateSchema } from "@paperclipai/shared";
+import { issueExecutionPolicySchema, issueExecutionStateSchema, parseIssueWaitPullRequestUrl } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 
 type AssigneeLike = {
@@ -392,6 +392,9 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       kind: parsed.data.monitor.kind ?? null,
       serviceName: normalizeMonitorText(parsed.data.monitor.serviceName),
       externalRef: redactIssueMonitorExternalRef(parsed.data.monitor.externalRef),
+      pullRequestUrl: parsed.data.monitor.pullRequestUrl
+        ? parseIssueWaitPullRequestUrl(parsed.data.monitor.pullRequestUrl)?.url ?? null
+        : null,
       timeoutAt: parsed.data.monitor.timeoutAt ?? null,
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,
@@ -1225,6 +1228,43 @@ export function buildIssueMonitorRescheduledPatch(input: {
     ) as Record<string, unknown> | null,
     monitorNextCheckAt: input.nextCheckAt,
     monitorWakeRequestedAt: null,
+  };
+}
+
+/**
+ * A due monitor check that found nothing new: it counts the attempt and records
+ * the check time like a trigger, then keeps the same monitor armed for
+ * `nextCheckAt`, as if the assignee had woken and armed the same wait again.
+ * Null when no monitor is set.
+ */
+export function buildIssueMonitorRecheckedPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  checkedAt: Date;
+  nextCheckAt: Date;
+}) {
+  const monitor = input.policy?.monitor;
+  if (!input.policy || !monitor) return null;
+  const nextMonitor = { ...monitor, nextCheckAt: input.nextCheckAt.toISOString() };
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const triggeredState = buildTriggeredMonitorState({
+    previous: derivePersistedMonitorState({
+      issue: input.issue,
+      state: existingState,
+      policy: input.policy,
+    }),
+    triggeredAt: input.checkedAt,
+  });
+  return {
+    executionPolicy: { ...input.policy, monitor: nextMonitor } as Record<string, unknown>,
+    executionState: executionStateWithMonitor(
+      existingState,
+      buildScheduledMonitorState(triggeredState, nextMonitor),
+    ) as Record<string, unknown> | null,
+    monitorNextCheckAt: input.nextCheckAt,
+    monitorWakeRequestedAt: null,
+    monitorLastTriggeredAt: input.checkedAt,
+    monitorAttemptCount: triggeredState.attemptCount,
   };
 }
 
