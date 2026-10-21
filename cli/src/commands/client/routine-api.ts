@@ -145,6 +145,7 @@ export function registerRoutineApiCommands(program: Command): void {
 }
 
 const STEPS_FILE_DESCRIPTION = "Read the routine steps (a JSON array) from a file; replaces steps in the payload";
+const PROJECT_ID_DESCRIPTION = "The project the routine belongs to; none for no project";
 
 /** Reads the JSON in a steps file; a parse error names the file, because the parser's message does not. */
 async function readStepsFile(file: string): Promise<unknown> {
@@ -157,12 +158,23 @@ async function readStepsFile(file: string): Promise<unknown> {
   }
 }
 
+/** Sets a payload field from its flag; the same field in `--payload-json` as well is refused as ambiguous. */
+function withFlagField(payload: unknown, field: string, value: unknown, flag: string): Record<string, unknown> {
+  if (!isJsonObject(payload)) throw new Error(`--payload-json must be a JSON object when ${flag} is used.`);
+  if (field in payload) throw new Error(`Pass ${field} either in --payload-json or with ${flag}, not both.`);
+  return { ...payload, [field]: value };
+}
+
 /**
- * Builds the create or update payload. `--steps-file` supplies `steps` from a file so a long
- * step list does not have to be quoted inside `--payload-json`; the server validates the steps.
+ * Builds the create or update payload. `--project-id` sets `projectId` (`none` clears it).
+ * `--steps-file` supplies `steps` from a file so a long step list does not have to be quoted
+ * inside `--payload-json`. The server validates every field.
  */
 async function routineWritePayload(opts: RoutineWriteOptions): Promise<unknown> {
-  const payload = parseJson(opts.payloadJson ?? "{}");
+  let payload = parseJson(opts.payloadJson ?? "{}");
+  if (opts.projectId !== undefined) {
+    payload = withFlagField(payload, "projectId", opts.projectId === "none" ? null : opts.projectId, "--project-id");
+  }
   if (!opts.stepsFile) return payload;
   if (!isJsonObject(payload)) throw new Error("--payload-json must be a JSON object when --steps-file is used.");
   if ("steps" in payload) throw new Error("Pass steps either in --payload-json or with --steps-file, not both.");
@@ -246,6 +258,7 @@ function addRoutineCreate(parent: Command): void {
       .description("Create a routine (payload may set steps and slotPriority)")
       .option("-C, --company-id <id>", "Company ID")
       .requiredOption("--payload-json <json>", "JSON payload")
+      .option("--project-id <id>", PROJECT_ID_DESCRIPTION)
       .option("--steps-file <path>", STEPS_FILE_DESCRIPTION)
       .action(async (opts: RoutineWriteOptions) => {
         try {
@@ -266,6 +279,7 @@ function addRoutineUpdate(parent: Command): void {
       .description("Update a routine (payload may set runContextPolicy, slotPriority and steps; steps [] clears them)")
       .argument("<id>", "ID")
       .option("--payload-json <json>", "JSON payload", "{}")
+      .option("--project-id <id>", PROJECT_ID_DESCRIPTION)
       .option("--steps-file <path>", STEPS_FILE_DESCRIPTION)
       .action(async (id: string, opts: RoutineWriteOptions) => {
         try {

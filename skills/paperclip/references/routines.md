@@ -49,7 +49,7 @@ POST /api/companies/{companyId}/routines
 | `title` | yes | Max 200 chars |
 | `description` | no | Human-readable description of the routine |
 | `assigneeAgentId` | yes | Agents: must be themselves |
-| `projectId` | yes | |
+| `projectId` | no | The project the routine belongs to; a run's task opens in it. See [A project's routines](#a-projects-routines) |
 | `goalId` | no | Inherited by run issues |
 | `parentIssueId` | no | Run issues become children of this issue |
 | `priority` | no | `critical` `high` `medium` (default) `low` |
@@ -281,6 +281,17 @@ GET /api/routines/{routineId}/event-groups?open=true
 ```
 
 The list takes optional filters that combine with AND: `q` (case-insensitive text in the title or the description), `assigneeAgentId`, `projectId`, `folderId` (`none` for routines in no folder), `status` (`active`, `paused` or `archived`) and `trigger` (`schedule`, `webhook`, `api`, `event`, or `manual` for a routine with no trigger). For example, `GET /api/companies/{companyId}/routines?assigneeAgentId={agentId}&status=active` lists one agent's active routines. The CLI takes the same filters: `paperclipai routine list --agent-id <id> --status active`.
+
+### A project's routines
+
+A routine belongs to at most one project (`projectId`). To work with one project's routines:
+
+- List them with `GET /api/companies/{companyId}/routines?projectId={projectId}`, or `paperclipai routine list --project-id <id>`.
+- Create one in the project with `projectId` in the create body, or `paperclipai routine create --project-id <id> --payload-json '{...}'`.
+- Move one to another project with `PATCH /api/routines/{routineId}` and `projectId`, or `paperclipai routine update <routineId> --project-id <id>`. Send `null`, or `--project-id none`, to take it out of any project.
+- Pause, run and edit it as any other routine.
+
+The board does the same on the project's Configuration tab.
 
 Use the generic API endpoint tables in `api-reference.md` when you need a full cross-domain reference. Use this file when you need routine-specific behaviour, payload shape, or policy details.
 

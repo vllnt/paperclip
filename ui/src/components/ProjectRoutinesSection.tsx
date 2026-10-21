@@ -2,14 +2,13 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { RoutineListItem } from "@paperclipai/shared";
 import { Plus } from "lucide-react";
-import { Link } from "@/lib/router";
 import { Button } from "@/components/ui/button";
 import { agentsApi } from "../api/agents";
 import { projectsApi } from "../api/projects";
 import { routinesApi } from "../api/routines";
 import { useToastActions } from "../context/ToastContext";
-import { newRoutineHref } from "../hooks/useNewRoutineLink";
 import { queryKeys } from "../lib/queryKeys";
+import { RoutineComposerDialog } from "./RoutineComposerDialog";
 import { RoutineListRow, nextRoutineStatus, type RoutineListAgentSummary, type RoutineListProjectSummary } from "./RoutineList";
 import { routineDetailHref } from "./RoutineContextualSidebar";
 import { RoutineRunVariablesDialog, type RoutineRunDialogSubmitData } from "./RoutineRunVariablesDialog";
@@ -22,8 +21,9 @@ export interface ProjectRoutinesSectionProps {
 }
 
 /**
- * The project Configuration tab's list of routines that belong to this project. Archived routines
- * stay hidden until the viewer asks for them.
+ * The project Configuration tab's routines: list, create, edit, pause and run the routines that
+ * belong to this project without leaving the page. Archived routines stay hidden until the viewer
+ * asks for them.
  */
 export function ProjectRoutinesSection({ companyId, projectId, canCreate = true }: ProjectRoutinesSectionProps) {
   const queryClient = useQueryClient();
@@ -32,6 +32,10 @@ export function ProjectRoutinesSection({ companyId, projectId, canCreate = true 
   const [runDialogRoutine, setRunDialogRoutine] = useState<RoutineListItem | null>(null);
   const [runningRoutineId, setRunningRoutineId] = useState<string | null>(null);
   const [statusMutationRoutineId, setStatusMutationRoutineId] = useState<string | null>(null);
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
+  // Kept after close so the dialog keeps its content while it animates out.
+  const [editingRoutine, setEditingRoutine] = useState<RoutineListItem | null>(null);
 
   const routinesQuery = useQuery({
     queryKey: queryKeys.routines.list(companyId, { projectId }),
@@ -118,14 +122,17 @@ export function ProjectRoutinesSection({ companyId, projectId, canCreate = true 
     updateRoutineStatus.mutate({ id: routine.id, status: nextRoutineStatus(routine.status, !enabled) });
   }
 
-  const newRoutineLink = canCreate ? (
-    <Button asChild size="sm" variant="outline">
-      <Link to={newRoutineHref(projectId)}>
-        <Plus className="h-3.5 w-3.5" />
-        New routine
-      </Link>
+  const newRoutineButton = canCreate ? (
+    <Button size="sm" variant="outline" onClick={() => setComposerOpen(true)}>
+      <Plus className="h-3.5 w-3.5" />
+      New routine
     </Button>
   ) : null;
+
+  function openEditor(routine: RoutineListItem) {
+    setEditingRoutine(routine);
+    setEditorOpen(true);
+  }
 
   return (
     <section className="space-y-3" aria-labelledby="project-routines-heading">
@@ -137,7 +144,7 @@ export function ProjectRoutinesSection({ companyId, projectId, canCreate = true 
               {showArchived ? "Hide archived" : `Show archived (${archivedCount})`}
             </Button>
           ) : null}
-          {visibleRoutines.length > 0 ? newRoutineLink : null}
+          {visibleRoutines.length > 0 ? newRoutineButton : null}
         </div>
       </div>
 
@@ -155,7 +162,7 @@ export function ProjectRoutinesSection({ companyId, projectId, canCreate = true 
       ) : !routinesQuery.data ? null : visibleRoutines.length === 0 ? (
         <div className="flex flex-col items-start gap-3 rounded-lg border border-border px-3 py-4 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
           <span>{archivedCount > 0 ? "Only archived routines in this project." : "No routines in this project yet."}</span>
-          {newRoutineLink}
+          {newRoutineButton}
         </div>
       ) : (
         <div className="rounded-lg border border-border">
@@ -170,10 +177,25 @@ export function ProjectRoutinesSection({ companyId, projectId, canCreate = true 
               href={routineDetailHref(routine.id)}
               onRunNow={setRunDialogRoutine}
               onToggleEnabled={handleToggleEnabled}
+              onEdit={openEditor}
             />
           ))}
         </div>
       )}
+
+      <RoutineComposerDialog
+        companyId={companyId}
+        open={composerOpen}
+        onOpenChange={setComposerOpen}
+        initialDraft={{ projectId }}
+        afterCreate="stay"
+      />
+      <RoutineComposerDialog
+        companyId={companyId}
+        open={editorOpen}
+        onOpenChange={setEditorOpen}
+        routine={editingRoutine}
+      />
 
       <RoutineRunVariablesDialog
         open={runDialogRoutine !== null}
