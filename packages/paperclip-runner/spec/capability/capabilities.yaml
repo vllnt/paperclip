@@ -2475,9 +2475,9 @@
       ]
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:slot-priority:387",
+      "id": "skill:skills/paperclip/references/routines.md:slot-priority:403",
       "sourceKind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md:387",
+      "sourceAnchor": "skills/paperclip/references/routines.md:403",
       "title": "Slot Priority",
       "expectedSemantics": "Skill guidance headed “Slot Priority”.",
       "primaryDisposition": "optional_agent_tool",
@@ -2486,13 +2486,13 @@
         "control_plane_invariant"
       ],
       "evidenceIds": [
-        "skill:skills/paperclip/references/routines.md:387"
+        "skill:skills/paperclip/references/routines.md:403"
       ]
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:a-project-s-routines:402",
+      "id": "skill:skills/paperclip/references/routines.md:a-project-s-routines:418",
       "sourceKind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md:402",
+      "sourceAnchor": "skills/paperclip/references/routines.md:418",
       "title": "A project's routines",
       "expectedSemantics": "Skill guidance headed “A project's routines”.",
       "primaryDisposition": "optional_agent_tool",
@@ -2501,7 +2501,7 @@
         "control_plane_invariant"
       ],
       "evidenceIds": [
-        "skill:skills/paperclip/references/routines.md:402"
+        "skill:skills/paperclip/references/routines.md:418"
       ]
     },
     {
