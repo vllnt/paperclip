@@ -79,6 +79,7 @@ import {
   isClaudeModelNotFoundError,
 } from "./parse.js";
 import { claudeStreamJsonUserMessage, createClaudeSteeringSession } from "./steering.js";
+import { createClaudeSessionCheckpoint, isClaudeSessionUuid } from "./session-checkpoint.js";
 import {
   materializeRemoteClaudeConfig,
   prepareClaudeConfigSeed,
@@ -779,7 +780,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runtimeMcpServerIdentity.length === 0
       ? runtimeMcpServers.length === 0
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
-  const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
+  const isValidUuid = isClaudeSessionUuid(runtimeSessionId);
   const canResumeSession =
     runtimeSessionId.length > 0 &&
     isValidUuid &&
@@ -793,6 +794,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }) &&
     adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
   const sessionId = canResumeSession ? runtimeSessionId : null;
+  // One shape for the session that the final result and the early checkpoint
+  // report, so both carry the same cwd and remote identity.
+  const buildClaudeSessionParams = (claudeSessionId: string): Record<string, unknown> => ({
+    sessionId: claudeSessionId,
+    cwd,
+    promptBundleKey: promptBundle.bundleKey,
+    mcpServerIdentity: runtimeMcpIdentity,
+    ...(executionTargetIsRemote
+      ? {
+          remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+        }
+      : {}),
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+    ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+  });
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
       "stdout",
@@ -972,6 +989,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const steering = liveInput
       ? createClaudeSteeringSession({ runId, onSteeringReady: ctx.onSteeringReady, onEvent: ctx.onEvent })
       : null;
+    // Report the session as soon as the CLI names it. The final result still
+    // carries the session, so this only matters when the process ends early.
+    const { onSessionCheckpoint } = ctx;
+    const sessionCheckpoint = onSessionCheckpoint
+      ? createClaudeSessionCheckpoint({
+          onSession: (claudeSessionId) =>
+            onSessionCheckpoint({
+              sessionParams: buildClaudeSessionParams(claudeSessionId),
+              sessionDisplayId: claudeSessionId,
+            }),
+        })
+      : null;
     let proc: RunProcessResult;
     try {
       proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
@@ -984,10 +1013,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         graceSec,
         onSpawn,
         onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog: steering
+        onLog: steering || sessionCheckpoint
           ? async (stream, chunk) => {
               try {
-                if (stream === "stdout") await steering.observeStdout(chunk);
+                if (stream === "stdout") {
+                  await sessionCheckpoint?.observeStdout(chunk);
+                  await steering?.observeStdout(chunk);
+                }
               } finally {
                 await onLog(stream, chunk);
               }
@@ -1165,22 +1197,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // calls clearTaskSessions on the next heartbeat. See RED-978 / RED-976.
     const shouldDropSessionForPoison = poisonedPreviousMessageId;
     const resolvedSessionId = shouldDropSessionForPoison ? null : rawResolvedSessionId;
-    const resolvedSessionParams = resolvedSessionId
-      ? ({
-        sessionId: resolvedSessionId,
-        cwd,
-        promptBundleKey: promptBundle.bundleKey,
-        mcpServerIdentity: runtimeMcpIdentity,
-        ...(executionTargetIsRemote
-          ? {
-              remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
-            }
-          : {}),
-        ...(workspaceId ? { workspaceId } : {}),
-        ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
-        ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
-      } as Record<string, unknown>)
-      : null;
+    const resolvedSessionParams = resolvedSessionId ? buildClaudeSessionParams(resolvedSessionId) : null;
     const parsedFailure = failed ? describeClaudeFailure(parsed) : null;
     const errorMessage = failed
       ? parsedFailure ?? `Claude exited with code ${proc.exitCode ?? -1}`

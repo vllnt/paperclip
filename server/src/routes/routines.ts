@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import {
@@ -7,14 +8,24 @@ import {
   createRoutineTriggerSchema,
   parseListRoutinesQuery,
   rotateRoutineTriggerSecretSchema,
+  routineStepSchema,
   runRoutineSchema,
   updateDocumentAnnotationThreadSchema,
   updateRoutineSchema,
   updateRoutineTriggerSchema,
+  type RoutineStep,
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
-import { accessService, documentAnnotationService, logActivity, routineService } from "../services/index.js";
+import {
+  accessService,
+  agentService,
+  documentAnnotationService,
+  logActivity,
+  projectService,
+  routineService,
+} from "../services/index.js";
+import { agentTrustService } from "../services/agent-trust.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, unauthorized, unsupportedMediaType } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -30,6 +41,7 @@ export function routineRoutes(
   });
   const documentAnnotationsSvc = documentAnnotationService(db);
   const access = accessService(db);
+  const agentTrust = agentTrustService(db, { agents: agentService(db), projects: projectService(db) });
   const routineDocumentKey = "description";
 
   function parseBooleanQuery(value: unknown) {
@@ -106,6 +118,70 @@ export function routineRoutes(
     }
   }
 
+  /**
+   * Steps hand work to agents, so writing them is an assignment: a board user needs
+   * `tasks:assign`, and an agent may only give steps to itself, as it may only own its routines.
+   */
+  async function assertCanAssignRoutineSteps(
+    req: Request,
+    companyId: string,
+    steps: RoutineStep[] | undefined,
+  ) {
+    if (!steps?.length) return;
+    await assertBoardCanAssignTasks(req, companyId);
+    if (req.actor.type !== "agent") return;
+    const actorAgentId = req.actor.agentId;
+    if (steps.some((step) => step.assigneeAgentId != null && step.assigneeAgentId !== actorAgentId)) {
+      throw forbidden("Agents can only assign routine steps to themselves");
+    }
+  }
+
+  /**
+   * Steps an agent writes become tasks it never creates itself, so they keep its containment the way
+   * a task the agent creates does: a low-trust author's trust preset and boundary are written into
+   * each step's execution policy. Steps a board user writes are returned as given.
+   */
+  async function containAgentSteps(
+    req: Request,
+    companyId: string,
+    projectId: string | null,
+    steps: RoutineStep[] | undefined,
+  ): Promise<RoutineStep[] | undefined> {
+    if (req.actor.type !== "agent" || !steps?.length) return steps;
+    const author = { agentId: req.actor.agentId, runId: req.actor.runId };
+    return Promise.all(
+      steps.map(async (step) => {
+        const executionPolicy = await agentTrust.containCreatedExecutionPolicy(
+          author,
+          companyId,
+          projectId,
+          step.executionPolicy,
+        );
+        return executionPolicy ? routineStepSchema.parse({ ...step, executionPolicy }) : step;
+      }),
+    );
+  }
+
+  /**
+   * A restore writes the steps of an old revision back as they were, so an agent that restores one
+   * meets the rules for steps it writes itself: it may only give steps to itself, and a low-trust
+   * author's containment must already be in them. A board user is covered by the route's
+   * `tasks:assign` check.
+   * @throws HttpError 403 when the revision's steps break one of those rules.
+   */
+  async function assertAgentMayRestoreSteps(req: Request, companyId: string, routineId: string, revisionId: string) {
+    if (req.actor.type !== "agent") return;
+    const snapshotRoutine = (await svc.getRevision(routineId, revisionId))?.snapshot.routine;
+    const steps = snapshotRoutine?.steps;
+    if (!snapshotRoutine || !steps?.length) return;
+    await assertCanAssignRoutineSteps(req, companyId, steps);
+    const contained = await containAgentSteps(req, companyId, snapshotRoutine.projectId ?? null, steps);
+    // Steps are JSON: a field that is `undefined` on one side and absent on the other is no difference.
+    if (!isDeepStrictEqual(JSON.parse(JSON.stringify(contained)), JSON.parse(JSON.stringify(steps)))) {
+      throw forbidden("The steps of this revision lack your containment; update the routine steps instead of restoring");
+    }
+  }
+
   async function assertCanManageExistingRoutine(req: Request, routineId: string) {
     const routine = await svc.get(routineId);
     if (!routine || !hasCompanyAccess(req, routine.companyId)) return null;
@@ -158,7 +234,9 @@ export function routineRoutes(
     const companyId = req.params.companyId as string;
     await assertBoardCanAssignTasks(req, companyId);
     assertCanManageCompanyRoutine(req, companyId, req.body.assigneeAgentId);
-    const created = await svc.create(companyId, req.body, {
+    await assertCanAssignRoutineSteps(req, companyId, req.body.steps);
+    const steps = await containAgentSteps(req, companyId, req.body.projectId ?? null, req.body.steps);
+    const created = await svc.create(companyId, steps ? { ...req.body, steps } : req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
@@ -386,7 +464,19 @@ export function routineRoutes(
     ) {
       throw forbidden("Agents can only assign routines to themselves");
     }
-    const updated = await svc.update(routine.id, req.body, {
+    const stepsWillChange = req.body.steps !== undefined && !isDeepStrictEqual(req.body.steps, routine.steps);
+    let patch = req.body;
+    if (stepsWillChange) {
+      await assertCanAssignRoutineSteps(req, routine.companyId, req.body.steps);
+      const steps = await containAgentSteps(
+        req,
+        routine.companyId,
+        req.body.projectId === undefined ? routine.projectId : req.body.projectId,
+        req.body.steps,
+      );
+      if (steps) patch = { ...req.body, steps };
+    }
+    const updated = await svc.update(routine.id, patch, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
@@ -425,6 +515,7 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    await assertAgentMayRestoreSteps(req, routine.companyId, routine.id, req.params.revisionId as string);
     const result = await svc.restoreRevision(routine.id, req.params.revisionId as string, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
@@ -633,6 +724,17 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    // Steps without their own agent go to the run's assignee, so an override hands them out like a
+    // step write does: an agent may only give them to itself.
+    const assigneeOverride = req.body.assigneeAgentId ?? null;
+    if (
+      req.actor.type === "agent" &&
+      routine.steps.length > 0 &&
+      assigneeOverride !== null &&
+      assigneeOverride !== req.actor.agentId
+    ) {
+      throw forbidden("Agents can only assign routine steps to themselves");
+    }
     const run = await svc.runRoutine(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,

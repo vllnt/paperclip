@@ -608,11 +608,11 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "POST /api/companies/{}/routines": {
     "section": "Routines",
-    "description": "Create routine (`assigneeAgentId` + `projectId` required; agents: own only)"
+    "description": "Create routine (`assigneeAgentId` + `projectId` required; agents: own only; optional `steps`, sub-tasks each run creates, see `references/routines.md` Routine steps; CLI `routine create --steps-file <path>`)"
   },
   "PATCH /api/routines/{}": {
     "section": "Routines",
-    "description": "Update routine (agents: own only, cannot reassign)"
+    "description": "Update routine (agents: own only, cannot reassign; `steps` replaces the list, CLI `routine update <id> --steps-file <path>`; `GET` returns `steps`)"
   },
   "POST /api/routines/{}/triggers": {
     "section": "Routines",

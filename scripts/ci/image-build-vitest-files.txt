@@ -21,6 +21,8 @@ packages/adapter-utils/src/ssh-multiplex.test.ts
 packages/adapter-utils/src/test-support/process-liveness.test.ts
 packages/adapter-utils/src/workspace-restore-merge.test.ts
 packages/adapters/claude-local/src/current-model-catalog.test.ts
+packages/adapters/claude-local/src/server/execute.session-checkpoint.test.ts
+packages/adapters/claude-local/src/server/session-checkpoint.test.ts
 packages/adapters/codex-local/src/company-model-catalog.test.ts
 packages/adapters/codex-local/src/server/execute.remote.test.ts
 packages/adapters/codex-local/src/server/runtime-config.test.ts
@@ -50,11 +52,14 @@ packages/shared/src/company-environment-defaults.test.ts
 packages/shared/src/routine-gate.test.ts
 packages/shared/src/validators/routine-list-query.test.ts
 server/src/__tests__/agent-config-merge-patch.test.ts
+server/src/__tests__/api-compression.test.ts
 server/src/__tests__/authz-existence-oracle-guard.test.ts
 server/src/__tests__/bundled-plugins.test.ts
 server/src/__tests__/decision-wakeup.test.ts
 server/src/__tests__/external-objects-service.test.ts
 server/src/__tests__/github-commit-details.test.ts
+server/src/__tests__/heartbeat-restart-resume.test.ts
+server/src/__tests__/heartbeat-session-checkpoint.test.ts
 server/src/__tests__/instance-settings-routes.test.ts
 server/src/__tests__/instance-settings-service.test.ts
 server/src/__tests__/issue-recovery-source-deleted.test.ts
