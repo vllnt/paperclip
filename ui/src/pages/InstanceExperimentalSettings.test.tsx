@@ -405,7 +405,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
 
     expect(container.textContent).toContain("Decisions");
     expect(container.textContent).toContain(
-      "Show the Decisions item in the main sidebar",
+      "Add the Decide and Alerts tabs to the Inbox",
     );
 
     const toggle = container.querySelector<HTMLButtonElement>(DECISIONS_TOGGLE_SELECTOR);

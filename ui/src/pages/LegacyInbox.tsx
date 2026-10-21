@@ -98,7 +98,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
-import { Tabs } from "@/components/ui/tabs";
 import {
   Select,
   SelectContent,
@@ -123,7 +122,6 @@ import {
   ListTree,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
-import { PageTabBar } from "../components/PageTabBar";
 import type { Approval, HeartbeatRun, Issue, JoinRequest } from "@paperclipai/shared";
 import {
   ACTIONABLE_APPROVAL_STATUSES,
@@ -142,6 +140,7 @@ import {
   matchesInboxIssueSearch,
   getRecentTouchedIssues,
   isInboxEntityDismissed,
+  isInboxIssueAutoArchived,
   isMineInboxTab,
   loadCollapsedInboxGroupKeys,
   loadCollapsedInboxParentIds,
@@ -166,7 +165,6 @@ import {
   type InboxFilterPreferences,
   type InboxIssueColumn,
   type InboxKeyboardNavEntry,
-  saveLastInboxTab,
   shouldShowCompanyAlerts,
   shouldShowInboxSection,
   type InboxGroupedSection,
@@ -689,7 +687,12 @@ function JoinRequestInboxRow({
   );
 }
 
-export function Inbox() {
+/**
+ * The Inbox task tabs in the legacy (non-streamlined) shell.
+ *
+ * @param tabBar - The Inbox page's tab bar, shared with the streamlined shell.
+ */
+export function Inbox({ tabBar }: { tabBar: ReactNode }) {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
   const { openNewIssue } = useDialogActions();
@@ -775,7 +778,6 @@ export function Inbox() {
   }, [setBreadcrumbs]);
 
   useEffect(() => {
-    saveLastInboxTab(tab);
     setSelectedIndex(-1);
     setSearchQuery("");
   }, [tab]);
@@ -959,7 +961,9 @@ export function Inbox() {
   );
 
   const mineIssues = useMemo(
-    () => getRecentTouchedIssues(mineIssuesRaw).filter((issue) => !locallyArchivedIssueIds.has(issue.id)),
+    () =>
+      getRecentTouchedIssues(mineIssuesRaw.filter((issue) => !isInboxIssueAutoArchived(issue)))
+        .filter((issue) => !locallyArchivedIssueIds.has(issue.id)),
     [locallyArchivedIssueIds, mineIssuesRaw],
   );
   const touchedIssues = useMemo(
@@ -1192,14 +1196,14 @@ export function Inbox() {
     [heartbeatRuns, dismissedAtByKey],
   );
   const approvalsToRender = useMemo(() => {
-    let filtered = getApprovalsForTab(approvals ?? [], tab, allApprovalFilter, currentUserId);
+    let filtered = getApprovalsForTab(approvals ?? [], tab, allApprovalFilter);
     if (tab === "mine") {
       filtered = filtered.filter(
         (a) => !isInboxEntityDismissed(dismissedAtByKey, `approval:${a.id}`, a.updatedAt),
       );
     }
     return filtered;
-  }, [approvals, tab, allApprovalFilter, currentUserId, dismissedAtByKey]);
+  }, [approvals, tab, allApprovalFilter, dismissedAtByKey]);
   const showJoinRequestsCategory =
     allCategoryFilter === "everything" || allCategoryFilter === "join_requests";
   const showTouchedCategory =
@@ -2290,23 +2294,7 @@ export function Inbox() {
           />
         </div>
         <div className="flex flex-wrap items-center justify-between gap-2">
-        <Tabs value={tab} onValueChange={(value) => navigate(`/inbox/${value}`)}>
-          <PageTabBar
-            items={[
-              {
-                value: "mine",
-                label: "Mine",
-              },
-              {
-                value: "recent",
-                label: "Recent",
-              },
-              { value: "unread", label: "Unread" },
-              { value: "blocked", label: "Blocked" },
-              { value: "all", label: "All" },
-            ]}
-          />
-        </Tabs>
+        {tabBar}
 
         <div className="flex items-center gap-2">
           <div className="relative hidden sm:block">

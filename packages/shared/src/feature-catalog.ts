@@ -242,7 +242,7 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
   enableDecisions: {
     title: "Decisions",
     description:
-      "Show the Decisions item in the main sidebar — the attention home that surfaces tasks awaiting input.",
+      "Add the Decide and Alerts tabs to the Inbox — decisions, approvals, queues and stuck work awaiting input.",
     tier: "preference",
     cloudDefault: false,
     selfHostedDefault: false,

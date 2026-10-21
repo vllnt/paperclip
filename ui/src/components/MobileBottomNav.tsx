@@ -12,7 +12,7 @@ import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
 import { SIDEBAR_SCROLL_RESET_STATE } from "../lib/navigation-scroll";
 import { cn } from "../lib/utils";
-import { useInboxBadge } from "../hooks/useInboxBadge";
+import { useDecideBadgeCount, useInboxBadge } from "../hooks/useInboxBadge";
 import { useAgentChatEnabled } from "@/hooks/useAgentChatEnabled";
 import { useCombinedInboxTasksEnabled } from "@/hooks/useCombinedInboxTasksEnabled";
 import { Badge } from "@/components/ui/badge";
@@ -43,6 +43,9 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
   const { selectedCompanyId } = useCompany();
   const { openNewIssue } = useDialogActions();
   const inboxBadge = useInboxBadge(selectedCompanyId);
+  const decideBadge = useDecideBadgeCount(selectedCompanyId);
+  // One Inbox badge: the task inbox count plus open Decide-tab items.
+  const inboxNeedsMe = inboxBadge.inbox + decideBadge;
   const { enabled: agentChatEnabled } = useAgentChatEnabled();
   const { enabled: combinedInboxTasksEnabled } = useCombinedInboxTasksEnabled();
 
@@ -62,7 +65,7 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
         to: "/inbox",
         label: "Inbox",
         icon: Inbox,
-        badge: inboxBadge.inbox,
+        badge: inboxNeedsMe,
       },
     ] : [
       { type: "link", to: "/dashboard", label: "Home", icon: House },
@@ -79,10 +82,10 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
       },
       { type: "link", to: "/agents/all", label: "Agents", icon: Users },
       ...(!combinedInboxTasksEnabled
-        ? [{ type: "link", to: "/inbox", label: "Inbox", icon: Inbox, badge: inboxBadge.inbox } as MobileNavItem]
+        ? [{ type: "link", to: "/inbox", label: "Inbox", icon: Inbox, badge: inboxNeedsMe } as MobileNavItem]
         : []),
     ],
-    [openNewIssue, inboxBadge.inbox, agentChatEnabled, combinedInboxTasksEnabled],
+    [openNewIssue, inboxBadge.inbox, inboxNeedsMe, agentChatEnabled, combinedInboxTasksEnabled],
   );
 
   return (

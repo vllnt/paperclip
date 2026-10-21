@@ -36,7 +36,7 @@ const ACTION_PAST_TENSE: Record<StalledReviewDecisionAction, string> = {
 /**
  * The three review verbs an operator can take on a *stalled* in-review issue —
  * one with no reviewer, interaction, approval, or monitor path left (PAP-16080
- * §4.4). Shared by the issue-page review panel and the /decisions card so both
+ * §4.4). Shared by the issue-page review panel and the Inbox Decide card so both
  * surfaces resolve the same way: POST /issues/:id/stalled-review-decision.
  *
  * `request_changes` requires a note (mirrors `stalledReviewDecisionSchema`);

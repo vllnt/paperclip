@@ -378,7 +378,7 @@ export function InstanceExperimentalSettings() {
 
         <ExperimentalToggleCard
           title="Decisions"
-          description="Show the Decisions item in the main sidebar — the attention home that surfaces the tasks awaiting your input — while the surface is still being evaluated."
+          description="Add the Decide and Alerts tabs to the Inbox — decisions, approvals, queues and stuck work awaiting your input — while the surface is still being evaluated."
           checked={enableDecisions}
           onCheckedChange={(checked) => toggleMutation.mutate({ enableDecisions: checked })}
           disabled={toggleMutation.isPending}

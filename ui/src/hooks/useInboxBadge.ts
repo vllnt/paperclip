@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { accessApi } from "../api/access";
+import { attentionApi } from "../api/attention";
 import { ApiError } from "../api/client";
+import { decideBadgeCount } from "../lib/attention";
 import { inboxDismissalsApi } from "../api/inboxDismissals";
 import { approvalsApi } from "../api/approvals";
 import { authApi } from "../api/auth";
@@ -13,6 +15,7 @@ import {
   filterLocalInboxArchivedIssues,
   useLocalInboxArchiveIssueIds,
 } from "../lib/inboxArchiveCache";
+import { useDecisionsEnabled } from "./useDecisionsEnabled";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "./useSharedPolling";
 import {
   buildInboxDismissedAtByKey,
@@ -175,6 +178,25 @@ export function useReadInboxItems() {
   };
 
   return { readItems, markRead, markUnread };
+}
+
+const DECIDE_BADGE_REFETCH_MS = 60_000;
+
+/**
+ * The attention part of the Inbox badge: open Decide-tab items the Inbox
+ * count does not already hold (see `decideBadgeCount`). Zero, and no polling,
+ * while the Decisions setting is off. The query asks for a one-row page because
+ * only the server's pre-pagination counts are read.
+ */
+export function useDecideBadgeCount(companyId: string | null | undefined): number {
+  const enabled = useDecisionsEnabled() && !!companyId;
+  const { data: feed } = useQuery({
+    queryKey: [...queryKeys.attention(companyId!), "decide-badge"],
+    queryFn: () => attentionApi.list(companyId!, { limit: 1 }),
+    enabled,
+    refetchInterval: DECIDE_BADGE_REFETCH_MS,
+  });
+  return enabled ? decideBadgeCount(feed) : 0;
 }
 
 export function useInboxBadge(companyId: string | null | undefined) {

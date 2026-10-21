@@ -1,6 +1,5 @@
 import {
   Inbox,
-  ListChecks,
   CircleDot,
   Target,
   LayoutDashboard,
@@ -32,12 +31,10 @@ import { SidebarStarredProjects } from "./SidebarStarredProjects.production";
 import { useDialogActions } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
 import { useSidebar } from "../context/SidebarContext";
-import { attentionApi } from "../api/attention";
 import { heartbeatsApi } from "../api/heartbeats";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { queryKeys } from "../lib/queryKeys";
-import { attentionBadgeCount } from "../lib/attention";
-import { useInboxBadge } from "../hooks/useInboxBadge";
+import { useDecideBadgeCount, useInboxBadge } from "../hooks/useInboxBadge";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn, SIDEBAR_RAIL_HIDDEN_LABEL } from "../lib/utils";
@@ -85,17 +82,9 @@ export function Sidebar() {
   const showStatusCards = experimentalSettings?.enableStatusCards === true;
   const goalsLinkPending = experimentalSettings === undefined;
   const showGoalsLink = experimentalSettings?.enableGoalsSidebarLink === true;
-  // Decisions (attention home) is an experimental surface (PAP-13481): the nav
-  // item is hidden entirely until the flag is enabled (same no-flash pattern as
-  // showWorkspacesLink — it defaults hidden, so no placeholder is needed).
-  const showDecisions = experimentalSettings?.enableDecisions === true;
-  const { data: attentionFeed } = useQuery({
-    queryKey: queryKeys.attention(selectedCompanyId!),
-    queryFn: () => attentionApi.list(selectedCompanyId!),
-    enabled: !!selectedCompanyId && showDecisions,
-    refetchInterval: 60_000,
-  });
-  const attentionCount = attentionBadgeCount(attentionFeed);
+  // One Inbox for everything that needs the board: the former Decisions page
+  // is its Decide and Alerts tabs, so their open items join the Inbox badge.
+  const decideBadge = useDecideBadgeCount(selectedCompanyId);
   const showCases = experimentalSettings?.enableCases === true;
   // Streamlined left navigation (top-level Projects link + starred children) is
   // now the standard product sidebar (PAP-12472). The former experimental
@@ -158,20 +147,11 @@ export function Sidebar() {
             to="/inbox"
             label="Inbox"
             icon={Inbox}
-            badge={inboxBadge.inbox}
-            badgeLabel="unread"
+            badge={inboxBadge.inbox + decideBadge}
+            badgeLabel="need action"
             badgeTone={inboxBadge.failedRuns > 0 ? "danger" : "default"}
             alert={inboxBadge.failedRuns > 0}
           />
-          {showDecisions ? (
-            <SidebarNavItem
-              to="/decisions"
-              label="Decisions"
-              icon={ListChecks}
-              badge={attentionCount}
-              badgeLabel="decisions"
-            />
-          ) : null}
           {showStatusCards ? (
             <SidebarNavItem to="/status" label="Status" icon={LayoutGrid} textBadge="beta" />
           ) : null}

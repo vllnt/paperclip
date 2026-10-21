@@ -1989,6 +1989,10 @@ describeEmbeddedPostgres("attention service", () => {
     });
     expect(complete.items.filter((item) => item.sourceKind === "decision")).toHaveLength(2);
     expect(complete.nextCursor).toBeNull();
+    // The Decisions page became the Inbox's Decide tab; links go there directly.
+    for (const item of complete.items.filter((entry) => entry.sourceKind === "decision")) {
+      expect(item.subject.href).toBe(`/ATC/inbox/decide?decisionId=${item.subject.id}`);
+    }
   });
 
   it("keeps this-week deadlines in the current UTC week", async () => {

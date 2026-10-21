@@ -50,7 +50,7 @@ describe("KeyboardShortcutsCheatsheet", () => {
       expect(rows, action.id).toContainEqual({ label: action.title, keys: [...action.shortcut] });
     }
     const headings = [...container.querySelectorAll("h3")].map((heading) => heading.textContent);
-    expect(headings).toEqual(["Go to", "Global", "Task detail", "Inbox", "Decisions"]);
+    expect(headings).toEqual(["Go to", "Global", "Task detail", "Inbox", "Inbox Decide and Alerts"]);
 
     flushSync(() => {
       root.unmount();

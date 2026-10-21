@@ -6,9 +6,9 @@ import { cn } from "../lib/utils";
 
 const RECENT_ACTIVITY_MS = 24 * 60 * 60 * 1000;
 
-/** Href for a queue page under the current company prefix, or `/decisions` for All. */
-export function decisionsHref(queueKey?: string | null): string {
-  return queueKey ? `/decisions/queues/${encodeURIComponent(queueKey)}` : "/decisions";
+/** Href for one queue on the Inbox Decide tab, or the whole Decide tab for All. */
+export function decideTabHref(queueKey?: string | null): string {
+  return queueKey ? `/inbox/decide?queue=${encodeURIComponent(queueKey)}` : "/inbox/decide";
 }
 
 interface DecisionQueueRailProps {
@@ -41,13 +41,13 @@ export function DecisionQueueRail({ companyId, activeQueueKey = null }: Decision
 
   return (
     <nav className="flex flex-wrap items-center gap-1.5" aria-label="Decision queues" data-decision-queue-rail>
-      <Chip href={decisionsHref(null)} active={activeQueueKey == null} label="All" />
+      <Chip href={decideTabHref(null)} active={activeQueueKey == null} label="All" />
       {queues.map((queue) => {
         const recent = now - new Date(queue.updatedAt).getTime() < RECENT_ACTIVITY_MS;
         return (
           <Chip
             key={queue.key}
-            href={decisionsHref(queue.key)}
+            href={decideTabHref(queue.key)}
             active={activeQueueKey === queue.key}
             label={queue.title}
             count={queue.itemCount}

@@ -231,6 +231,12 @@ export type {
   AttentionWorkspaceRef,
 } from "./types/attention.js";
 export { ATTENTION_SOURCE_KINDS } from "./types/attention.js";
+export {
+  ATTENTION_BLOCKING_SOURCE_KINDS,
+  ATTENTION_INBOX_TAB_BY_KIND,
+  attentionKindForSourceKind,
+  type AttentionKind,
+} from "./attention-kind.js";
 export type {
   DecisionQueue,
   DecisionQueueItem,

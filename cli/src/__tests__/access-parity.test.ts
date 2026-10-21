@@ -133,6 +133,49 @@ describe("access parity commands", () => {
       ["GET", "http://localhost:3100/api/llms/agent-configuration/codex_local.txt"],
     ]);
   });
+
+  it("lists the Inbox attention tabs, keeping one tab's items with --tab and a whole queue with --queue", async () => {
+    const feed = {
+      companyId: COMPANY_ID,
+      totalCount: 2,
+      items: [
+        { id: "decision:1", sourceKind: "decision" },
+        { id: "failed_run:1", sourceKind: "failed_run" },
+      ],
+    };
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(feed)));
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await run(["inbox", "attention", "--company-id", COMPANY_ID, "--json"]);
+    await run(["inbox", "attention", "--company-id", COMPANY_ID, "--tab", "alerts", "--queue", "triage", "--include-dismissed", "--json"]);
+    await run(["inbox", "attention", "--company-id", COMPANY_ID, "--tab", "decide", "--archived", "--json"]);
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      `http://localhost:3100/api/companies/${COMPANY_ID}/attention?all=true`,
+      `http://localhost:3100/api/companies/${COMPANY_ID}/attention?all=true&queue=triage&includeDismissed=true`,
+      `http://localhost:3100/api/companies/${COMPANY_ID}/attention?all=true&archived=true`,
+    ]);
+    const printed = log.mock.calls.map((call) => JSON.parse(String(call[0])) as { items: Array<{ id: string }> });
+    expect(printed.map((output) => output.items.map((item) => item.id))).toEqual([
+      ["decision:1", "failed_run:1"],
+      ["decision:1", "failed_run:1"],
+      ["decision:1"],
+    ]);
+  });
+
+  it("rejects an unknown --tab before calling the API", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    await run(["inbox", "attention", "--company-id", COMPANY_ID, "--tab", "mine"]);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(error.mock.calls.flat().join(" ")).toContain("--tab must be decide or alerts");
+    expect(exit).toHaveBeenCalledWith(1);
+  });
 });
 
 function jsonResponse(body: unknown = { ok: true }, init: ResponseInit = { status: 200 }): Response {

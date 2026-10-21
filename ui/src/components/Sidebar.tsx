@@ -1,6 +1,5 @@
 import {
   Inbox,
-  ListChecks,
   CircleCheck,
   Target,
   LayoutDashboard,
@@ -36,12 +35,10 @@ import { SidebarRecentTasks } from "./SidebarRecentTasks";
 import { useDialogActions } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
 import { useSidebar } from "../context/SidebarContext";
-import { attentionApi } from "../api/attention";
 import { heartbeatsApi } from "../api/heartbeats";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { queryKeys } from "../lib/queryKeys";
-import { attentionBadgeCount } from "../lib/attention";
-import { useInboxBadge } from "../hooks/useInboxBadge";
+import { useDecideBadgeCount, useInboxBadge } from "../hooks/useInboxBadge";
 import { useStreamlinedUiEnabled } from "../hooks/useStreamlinedUiEnabled";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -104,17 +101,12 @@ export function Sidebar({ children }: { children?: ReactNode }) {
   const showStatusCards = experimentalSettings?.enableStatusCards === true;
   const goalsLinkPending = experimentalSettings === undefined;
   const showGoalsLink = experimentalSettings?.enableGoalsSidebarLink === true;
-  // Decisions (attention home) is an experimental surface (PAP-13481): the nav
-  // item is hidden entirely until the flag is enabled (same no-flash pattern as
-  // showWorkspacesLink — it defaults hidden, so no placeholder is needed).
-  const showDecisions = experimentalSettings?.enableDecisions === true;
-  const { data: attentionFeed } = useQuery({
-    queryKey: queryKeys.attention(selectedCompanyId!),
-    queryFn: () => attentionApi.list(selectedCompanyId!),
-    enabled: !!selectedCompanyId && showDecisions,
-    refetchInterval: 60_000,
-  });
-  const attentionCount = attentionBadgeCount(attentionFeed);
+  // One Inbox for everything that needs the board: the former Decisions page
+  // is its Decide and Alerts tabs, so their open items join the Inbox badge.
+  // With Combined Inbox + Task List the task tabs live in Tasks (which keeps
+  // the task badge), and the Inbox row stays only for the attention tabs.
+  const decisionsEnabled = experimentalSettings?.enableDecisions === true;
+  const decideBadge = useDecideBadgeCount(selectedCompanyId);
   const showCases = experimentalSettings?.enableCases === true;
   // Conference Room Chat flag (PAP-136/PAP-137): the Conference Room nav item
   // is a new surface, hidden entirely while the flag is off (same no-flash
@@ -181,22 +173,21 @@ export function Sidebar({ children }: { children?: ReactNode }) {
               to="/inbox"
               label="Inbox"
               icon={Inbox}
-              badge={inboxBadge.inbox}
-              badgeLabel="unread"
+              badge={inboxBadge.inbox + decideBadge}
+              badgeLabel="need action"
               badgeTone={inboxBadge.failedRuns > 0 ? "danger" : "default"}
               alert={inboxBadge.failedRuns > 0}
             />
-          ) : null}
-          {agentChatEnabled && !chatRail ? <SidebarNavItem to="/chats" label="Chat" icon={MessageCircle} /> : null}
-          {showDecisions ? (
+          ) : decisionsEnabled ? (
             <SidebarNavItem
-              to="/decisions"
-              label="Decisions"
-              icon={ListChecks}
-              badge={attentionCount}
-              badgeLabel="decisions"
+              to="/inbox/decide"
+              label="Inbox"
+              icon={Inbox}
+              badge={decideBadge}
+              badgeLabel="need action"
             />
           ) : null}
+          {agentChatEnabled && !chatRail ? <SidebarNavItem to="/chats" label="Chat" icon={MessageCircle} /> : null}
           {showStatusCards ? (
             <SidebarNavItem to="/status" label="Status" icon={LayoutGrid} textBadge="beta" />
           ) : null}

@@ -1,3 +1,4 @@
+import { attentionKindForSourceKind, type AttentionKind } from "@paperclipai/shared";
 import type {
   AttentionDetailImage,
   AttentionFeed,
@@ -109,8 +110,6 @@ export function severityStyle(severity: AttentionSeverity): SeverityStyle {
 // toolbar, which is where an operator goes when they want to rank by urgency.
 // ---------------------------------------------------------------------------
 
-export type AttentionKind = "blocking" | "review";
-
 /** The task status each decision kind renders as. */
 export const ATTENTION_KIND_STATUS: Record<AttentionKind, "blocked" | "in_review"> = {
   blocking: "blocked",
@@ -119,23 +118,7 @@ export const ATTENTION_KIND_STATUS: Record<AttentionKind, "blocked" | "in_review
 
 /** Does this row report something stuck, or something waiting on a verdict? */
 export function attentionKind(item: AttentionItem): AttentionKind {
-  switch (item.sourceKind) {
-    case "decision":
-      return "review";
-    case "failed_run":
-    case "agent_error_alert":
-    case "blocker_attention":
-    case "recovery_action":
-    case "budget_alert":
-      return "blocking";
-    case "approval":
-    case "issue_thread_interaction":
-    case "join_request":
-    case "review":
-    case "productivity_review":
-    default:
-      return "review";
-  }
+  return attentionKindForSourceKind(item.sourceKind);
 }
 
 /** Task status a row borrows its glyph and colour from — feeds <StatusGlyph>. */
@@ -264,13 +247,21 @@ export function attentionImageUrl(assetId: string): string {
 }
 
 /**
- * The sidebar badge: distinct items that either surfaced today or carry an
- * explicit decide-by deadline that is due today/past. The server computes this
- * before pagination (`deskBadgeCount`), so badge polling can fetch a small
- * first page without losing the company-wide signal.
+ * Decide-tab sources the Inbox count does not already hold. Approvals, join
+ * requests and failed runs are counted once, from the Inbox side, so the
+ * combined badge never counts the same item twice.
  */
-export function attentionBadgeCount(feed: AttentionFeed | null | undefined): number {
-  return feed?.deskBadgeCount ?? 0;
+export const DECIDE_BADGE_SOURCE_KINDS = ["decision", "issue_thread_interaction", "review"] as const satisfies readonly AttentionSourceKind[];
+
+/**
+ * The attention part of the Inbox badge: open decisions, thread interactions
+ * and reviews. The server counts `countsBySourceKind` before pagination over
+ * open items only (not dismissed, snoozed or archived), so badge polling can
+ * fetch a one-row page without losing the company-wide count.
+ */
+export function decideBadgeCount(feed: AttentionFeed | null | undefined): number {
+  if (!feed) return 0;
+  return DECIDE_BADGE_SOURCE_KINDS.reduce((sum, kind) => sum + (feed.countsBySourceKind[kind] ?? 0), 0);
 }
 
 // ---------------------------------------------------------------------------

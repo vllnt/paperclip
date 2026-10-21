@@ -26,7 +26,7 @@ import { useChatConnectorsEnabled } from "./hooks/useChatConnectorsEnabled";
 import { canEnterAppsConnect } from "./pages/apps/app-connect-policy";
 import { useCompany } from "./context/CompanyContext";
 import { useDialogActions, useDialogState } from "./context/DialogContext";
-import { loadLastInboxTab } from "./lib/inbox";
+import { decideTabPathForRetiredDecisionsUrl, isInboxIssueTab, loadLastInboxTab } from "./lib/inbox";
 import { TASK_VIEW_PARAM, taskViewForInboxTab, type TaskViewKey } from "./lib/task-views";
 import {
   isOnboardingWizardActive,
@@ -77,9 +77,7 @@ const Approvals = lazy(() => import("./pages/Approvals").then((m) => ({ default:
 const ApprovalDetail = lazy(() => import("./pages/ApprovalDetail").then((m) => ({ default: m.ApprovalDetail })));
 const CompanyActivity = lazy(() => import("./pages/audit/CompanyActivity").then((m) => ({ default: m.CompanyActivity })));
 const AuditHub = lazy(() => import("./pages/audit/AuditHub").then((m) => ({ default: m.AuditHub })));
-const Inbox = lazy(() => import("./pages/Inbox").then((m) => ({ default: m.Inbox })));
-const WhatNeedsMe = lazy(() => import("./pages/WhatNeedsMe").then((m) => ({ default: m.WhatNeedsMe })));
-const DecisionQueuePage = lazy(() => import("./pages/DecisionQueuePage").then((m) => ({ default: m.DecisionQueuePage })));
+const InboxPage = lazy(() => import("./pages/inbox/InboxPage").then((m) => ({ default: m.InboxPage })));
 const BoardChat = lazy(() => import("./pages/BoardChat").then((m) => ({ default: m.BoardChat })));
 const CompanySettings = lazy(() => import("./pages/CompanySettings").then((m) => ({ default: m.CompanySettings })));
 const CompanyEnvironments = lazy(() => import("./pages/CompanyEnvironments").then((m) => ({ default: m.CompanyEnvironments })));
@@ -455,8 +453,13 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       {import.meta.env.DEV ? (
         <Route path="dev/task-chat-lab" element={<TaskChatLab />} />
       ) : null}
-      <Route path="decisions" element={<WhatNeedsMe />} />
-      <Route path="decisions/queues/:key" element={<DecisionQueuePage />} />
+      {/* The Decisions page became the Inbox's Decide tab. Its URLs live on in
+          bookmarks, comments and agent output, so these redirects stay. */}
+      <Route path="decisions" element={<RetiredDecisionsRedirect />} />
+      <Route path="decisions/queues/:key" element={<RetiredDecisionsRedirect />} />
+      <Route path="inbox/decide" element={<InboxPage tab="decide" />} />
+      <Route path="inbox/alerts" element={<InboxPage tab="alerts" />} />
+      <Route path="inbox/archived" element={<InboxPage tab="archived" />} />
       {/* Combined Inbox + Task List: Inbox is a view inside Tasks. Every /inbox/* URL still
           resolves — it redirects into the matching view — and with the flag off
           (or in the legacy shell) the standalone pages stay. /inbox/requests
@@ -474,11 +477,11 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       ) : (
         <>
           <Route path="inbox" element={<InboxRootRedirect />} />
-          <Route path="inbox/mine" element={<Inbox />} />
-          <Route path="inbox/recent" element={<Inbox />} />
-          <Route path="inbox/unread" element={<Inbox />} />
-          <Route path="inbox/blocked" element={<Inbox />} />
-          <Route path="inbox/all" element={<Inbox />} />
+          <Route path="inbox/mine" element={<InboxPage tab="mine" />} />
+          <Route path="inbox/recent" element={<InboxPage tab="recent" />} />
+          <Route path="inbox/unread" element={<InboxPage tab="unread" />} />
+          <Route path="inbox/blocked" element={<InboxPage tab="blocked" />} />
+          <Route path="inbox/all" element={<InboxPage tab="all" />} />
           <Route path="inbox/new" element={<Navigate to="/inbox/mine" replace />} />
         </>
       )}
@@ -508,9 +511,17 @@ function AppsConnectEntryRoute({
 function InboxRootRedirect() {
   const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
   const { enabled: combinedInboxTasksEnabled } = useCombinedInboxTasksEnabled();
-  return streamlinedUiEnabled && combinedInboxTasksEnabled
-    ? <TaskViewRedirect view={taskViewForInboxTab(loadLastInboxTab())} />
-    : <Navigate to={`/inbox/${loadLastInboxTab()}`} replace />;
+  const lastTab = loadLastInboxTab();
+  return streamlinedUiEnabled && combinedInboxTasksEnabled && isInboxIssueTab(lastTab)
+    ? <TaskViewRedirect view={taskViewForInboxTab(lastTab)} />
+    : <Navigate to={`/inbox/${lastTab}`} replace />;
+}
+
+/** Sends a `/decisions` or `/decisions/queues/:key` URL to the Inbox's Decide tab. */
+function RetiredDecisionsRedirect() {
+  const location = useLocation();
+  const { key } = useParams<{ key?: string }>();
+  return <Navigate to={decideTabPathForRetiredDecisionsUrl({ search: location.search, hash: location.hash, queueKey: key ?? null })} replace />;
 }
 
 /** Sends a retired Inbox/Tasks URL to its view on the merged Tasks surface. */
@@ -869,6 +880,7 @@ export function App() {
             </>
           ) : null}
           <Route path="decisions" element={<UnprefixedBoardRedirect />} />
+          <Route path="decisions/queues/:key" element={<UnprefixedBoardRedirect />} />
           <Route path="u/:userSlug" element={<UnprefixedBoardRedirect />} />
           <Route path="skills/studio" element={<UnprefixedBoardRedirect />} />
           <Route path="skills/studio/new" element={<UnprefixedBoardRedirect />} />

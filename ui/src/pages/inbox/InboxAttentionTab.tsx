@@ -1,21 +1,24 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Inbox } from "lucide-react";
-import type { Agent, AttentionItem, AttentionSubject } from "@paperclipai/shared";
+import { ATTENTION_INBOX_TAB_BY_KIND, type Agent, type AttentionItem, type AttentionSubject } from "@paperclipai/shared";
 import { useNavigate, useSearchParams } from "@/lib/router";
-import { attentionApi } from "../api/attention";
-import { agentsApi } from "../api/agents";
-import { authApi } from "../api/auth";
-import { decisionsApi } from "../api/decisions";
-import { useCompany } from "../context/CompanyContext";
-import { useBreadcrumbs } from "../context/BreadcrumbContext";
-import { useToastActions } from "../context/ToastContext";
-import { useInboxDismissals } from "../hooks/useInboxBadge";
-import { queryKeys } from "../lib/queryKeys";
+import { attentionApi } from "../../api/attention";
+import { agentsApi } from "../../api/agents";
+import { authApi } from "../../api/auth";
+import { decisionQueuesApi } from "../../api/decisionQueues";
+import { useCompany } from "../../context/CompanyContext";
+import { useBreadcrumbs } from "../../context/BreadcrumbContext";
+import { useToastActions } from "../../context/ToastContext";
+import { useInboxDismissals } from "../../hooks/useInboxBadge";
+import { useScrollRowBudget } from "../../hooks/useScrollRowBudget";
+import { queryKeys } from "../../lib/queryKeys";
 import {
   ATTENTION_AGING_DAYS,
   attentionIsAging,
+  attentionKind,
   buildAttentionFilterOptions,
+  buildDeskShelves,
   defaultAttentionFilterState,
   filterAttentionItems,
   groupAttentionItems,
@@ -24,7 +27,6 @@ import {
   loadAttentionGroupBy,
   loadAttentionSortOrder,
   loadCollapsedAttentionGroupKeys,
-  buildDeskShelves,
   planAttentionRenderRows,
   resolveAttentionDateRange,
   saveAttentionFilters,
@@ -37,106 +39,90 @@ import {
   type AttentionGroup,
   type AttentionGroupBy,
   type AttentionSortOrder,
-} from "../lib/attention";
-import { hasBlockingShortcutDialog, resolveAttentionQueueKeyAction } from "../lib/keyboardShortcuts";
-import { PageSkeleton } from "../components/PageSkeleton";
-import { AttentionQueueRow } from "../components/AttentionQueueRow";
-import { DecisionsToolbar } from "../components/DecisionsToolbar";
-import { Curtain, AgingItemRow } from "../components/DecisionShelf";
-import { DecisionQueueRail } from "../components/DecisionQueueRail";
-import { DecisionDateChips, type AttentionCustomRange } from "../components/DecisionDateChips";
-import { DecisionResolver } from "../components/DecisionResolver";
-import { IssueGroupHeader } from "../components/IssueGroupHeader";
+} from "../../lib/attention";
+import type { InboxAttentionTab as InboxAttentionTabKey } from "../../lib/inbox";
+import { hasBlockingShortcutDialog, resolveAttentionQueueKeyAction } from "../../lib/keyboardShortcuts";
+import { PageSkeleton } from "../../components/PageSkeleton";
+import { AttentionQueueRow } from "../../components/AttentionQueueRow";
+import { DecisionsToolbar } from "../../components/DecisionsToolbar";
+import { Curtain, AgingItemRow } from "../../components/DecisionShelf";
+import { DecisionQueueRail, decideTabHref } from "../../components/DecisionQueueRail";
+import { DecisionDateChips, type AttentionCustomRange } from "../../components/DecisionDateChips";
+import { QueueExcludeButton, SeedRulesCard } from "../../components/DecisionQueueControls";
+import { IssueGroupHeader } from "../../components/IssueGroupHeader";
 
-/** Curtain rows never expand; module-level so memoized rows see one identity. */
-const noopToggleExpand = () => {};
+const NO_ITEMS: AttentionItem[] = [];
 
-// Incremental rendering (PAP-13784, same pattern as IssuesList): the feed is
-// uncapped, so mounting every row up front makes the page slow to paint and
-// scroll. Render a bounded window and grow it as the scroll position nears the
-// bottom. One budget spans the active groups and the open curtains in document
-// order, so everything below the fold stays unmounted until needed.
-const INITIAL_ATTENTION_ROW_RENDER_LIMIT = 50;
-const ATTENTION_ROW_RENDER_BATCH_SIZE = 100;
-const ATTENTION_SCROLL_LOAD_THRESHOLD_PX = 480;
-const DECISION_HISTORY_VISIBLE_LIMIT = 50;
-const DECISION_HISTORY_QUERY_LIMIT = DECISION_HISTORY_VISIBLE_LIMIT + 1;
-
-export function decisionHistoryQueryEnabled(companyId: string | null | undefined, open: boolean) {
-  return Boolean(companyId && open);
+/** Which attention items a tab lists: one queue's items, or every open item of the tab's kind. */
+export function belongsOnAttentionTab(
+  item: AttentionItem,
+  tab: InboxAttentionTabKey,
+  queueKey: string | null,
+): boolean {
+  if (queueKey) return true;
+  return ATTENTION_INBOX_TAB_BY_KIND[attentionKind(item)] === tab;
 }
 
-export function decisionHistoryCount(count: number | undefined) {
-  if (count == null) return undefined;
-  return count > DECISION_HISTORY_VISIBLE_LIMIT ? `${DECISION_HISTORY_VISIBLE_LIMIT}+` : count;
-}
-
-function findScrollContainer(element: HTMLElement | null): HTMLElement | null {
-  if (!element || typeof window === "undefined") return null;
-  let current = element.parentElement;
-  while (current && current !== document.body && current !== document.documentElement) {
-    const overflowY = window.getComputedStyle(current).overflowY;
-    if (overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay") {
-      return current;
-    }
-    current = current.parentElement;
-  }
-  return null;
-}
-
-export function WhatNeedsMe() {
+/**
+ * The Inbox's Decide and Alerts tabs: the open attention feed (the former
+ * Decisions page), split by attention kind. Decide lists items waiting on a
+ * verdict and carries the decision-queue rail; `?queue=<key>` scopes it to one
+ * queue with that queue's seed rules and per-item Exclude. Alerts lists items
+ * reporting something stuck. Dismissed, snoozed, decided and expired items live
+ * on the Archived tab.
+ */
+export function InboxAttentionTab({ tab, tabBar }: { tab: InboxAttentionTabKey; tabBar: ReactNode }) {
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
+  const queryClient = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const queueKey = tab === "decide" ? searchParams.get("queue")?.trim() || null : null;
+  const deepLinkDecisionId = searchParams.get("decisionId");
+  const [deepLinkConsumed, setDeepLinkConsumed] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [selectedAttentionId, setSelectedAttentionId] = useState<string | null>(null);
   // How the current selection was made. The selection ring is the keyboard
   // cursor — it marks the row that j/k, e, x and s will act on — so it is drawn
-  // only for a keyboard-driven selection. Clicking used to set it too, which
-  // put a ring around the card for no reason the operator could act on, and
-  // only ever on rows with a See more/less toggle to click (the toggle is what
-  // set it), so the queue looked arbitrarily inconsistent. The selection itself
-  // still follows a click, so keyboard actions target the row you just used.
+  // only for a keyboard-driven selection. The selection itself still follows a
+  // click, so keyboard actions target the row you just used.
   const [selectionFromKeyboard, setSelectionFromKeyboard] = useState(false);
   const [autoExpandDone, setAutoExpandDone] = useState(false);
-  // Toolbar preferences (persisted to localStorage, Inbox pattern).
+  // Toolbar preferences (persisted to localStorage, shared by both tabs and every queue).
   const [groupBy, setGroupBy] = useState<AttentionGroupBy>(() => loadAttentionGroupBy());
   const [sortOrder, setSortOrder] = useState<AttentionSortOrder>(() => loadAttentionSortOrder());
   const [filters, setFilters] = useState<AttentionFilterState>(() => defaultAttentionFilterState);
   const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(() => new Set());
-  const [snoozedOpen, setSnoozedOpen] = useState(false);
-  const [dismissedOpen, setDismissedOpen] = useState(false);
   const [agingOpen, setAgingOpen] = useState(false);
-  const [decidedOpen, setDecidedOpen] = useState(false);
-  const [expiredOpen, setExpiredOpen] = useState(false);
-
-  // Date-range chips (PAP-16032 §4.2) — resolve to server-side activity bounds.
   const [dateRange, setDateRange] = useState<AttentionDateRangeId>("all");
   const [customRange, setCustomRange] = useState<AttentionCustomRange>({ from: null, to: null });
-
-  // `?decisionId=` deep link (PAP-16032 §4.7) — focus/expand the referenced card.
-  const [searchParams, setSearchParams] = useSearchParams();
-  const deepLinkDecisionId = searchParams.get("decisionId");
-  const [deepLinkConsumed, setDeepLinkConsumed] = useState(false);
-
-  // Optimistic hide/restore. Reset whenever a fresh feed lands (server truth).
+  // Optimistic hide after dismiss/snooze. Reset whenever a fresh feed lands (server truth).
   const [pendingHide, setPendingHide] = useState<Set<string>>(() => new Set());
-  const [pendingRestore, setPendingRestore] = useState<Set<string>>(() => new Set());
 
   const { dismiss, snooze, restore } = useInboxDismissals(selectedCompanyId);
   const { pushToast } = useToastActions();
   const navigate = useNavigate();
 
-  // Date chips resolve to server-side activity bounds. Anchored to start-of-day,
-  // so the resolved ISO strings are stable across renders within the same day —
-  // safe to key the feed query on without thrashing.
+  // Date chips resolve to server-side activity bounds anchored to start-of-day,
+  // so the ISO strings are stable within a day — safe to key the feed query on.
   const activityBounds = useMemo(
     () => resolveAttentionDateRange(dateRange, Date.now(), customRange),
     [dateRange, customRange],
   );
 
+  const { data: queues } = useQuery({
+    queryKey: queryKeys.decisionQueues.list(selectedCompanyId!),
+    queryFn: () => decisionQueuesApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId && queueKey !== null,
+  });
+  const queue = useMemo(() => queues?.find((entry) => entry.key === queueKey) ?? null, [queues, queueKey]);
+
   useEffect(() => {
-    setBreadcrumbs([{ label: "Decisions" }]);
-  }, [setBreadcrumbs]);
+    setBreadcrumbs(
+      queueKey
+        ? [{ label: "Inbox", href: decideTabHref(null) }, { label: queue?.title ?? queueKey }]
+        : [{ label: "Inbox" }],
+    );
+  }, [queue?.title, queueKey, setBreadcrumbs]);
 
   // Re-hydrate per-company preferences when the company changes.
   useEffect(() => {
@@ -149,18 +135,18 @@ export function WhatNeedsMe() {
     isLoading,
     error,
   } = useQuery({
-    // Distinct from the sidebar badge's `queryKeys.attention` so dismissed rows
-    // (needed for the curtains) never inflate the badge count. Invalidating the
-    // `["attention", companyId]` prefix still cascades to this query.
+    // Under the `["attention", companyId]` prefix, so every resolver's
+    // invalidation refreshes both tabs and the badge together.
     queryKey: [
       ...queryKeys.attention(selectedCompanyId!),
-      "with-dismissed",
+      "inbox-tab",
+      queueKey,
       activityBounds.activitySince ?? null,
       activityBounds.activityUntil ?? null,
     ],
     queryFn: () => attentionApi.list(selectedCompanyId!, {
-      includeDismissed: true,
       all: true,
+      queue: queueKey ?? undefined,
       ...activityBounds,
     }),
     enabled: !!selectedCompanyId,
@@ -171,19 +157,6 @@ export function WhatNeedsMe() {
     queryKey: queryKeys.agents.list(selectedCompanyId!),
     queryFn: () => agentsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
-  });
-
-  // Decision history — decided / expired decisions leave the open attention
-  // feed (entryRule = open only), so we fetch them directly for the curtains.
-  const { data: decidedDecisions, isLoading: decidedDecisionsLoading } = useQuery({
-    queryKey: queryKeys.decisions.list(selectedCompanyId!, "decided"),
-    queryFn: () => decisionsApi.list(selectedCompanyId!, { status: "decided", limit: DECISION_HISTORY_QUERY_LIMIT }),
-    enabled: decisionHistoryQueryEnabled(selectedCompanyId, decidedOpen),
-  });
-  const { data: expiredDecisions, isLoading: expiredDecisionsLoading } = useQuery({
-    queryKey: queryKeys.decisions.list(selectedCompanyId!, "expired"),
-    queryFn: () => decisionsApi.list(selectedCompanyId!, { status: "expired", limit: DECISION_HISTORY_QUERY_LIMIT }),
-    enabled: decisionHistoryQueryEnabled(selectedCompanyId, expiredOpen),
   });
 
   const { data: session } = useQuery({
@@ -198,60 +171,37 @@ export function WhatNeedsMe() {
     return map;
   }, [agents]);
 
-  // Reset optimistic state once the server sends a fresh snapshot.
   useEffect(() => {
     setPendingHide(new Set());
-    setPendingRestore(new Set());
   }, [feed?.generatedAt]);
 
-  const allItems = useMemo(() => feed?.items ?? [], [feed]);
-
-  const isServerHidden = (item: AttentionItem) => item.dismissal != null && item.dismissal.isActive;
-
+  const tabItems = useMemo(
+    () => (feed?.items ?? NO_ITEMS).filter((item) => belongsOnAttentionTab(item, tab, queueKey)),
+    [feed, queueKey, tab],
+  );
   const activeItems = useMemo(
-    () =>
-      allItems.filter(
-        (item) => (!isServerHidden(item) || pendingRestore.has(item.id)) && !pendingHide.has(item.id),
-      ),
-    [allItems, pendingHide, pendingRestore],
+    () => tabItems.filter((item) => !(item.dismissal?.isActive ?? false) && !pendingHide.has(item.id)),
+    [pendingHide, tabItems],
   );
 
   // The server's clock at feed time — used for the arrival/decide-by shelves and
-  // the aging idle labels so they match `deskBadgeCount` and the sidebar badge
-  // exactly, and stay stable across renders (Date.now() only as a pre-load fallback).
+  // the aging idle labels so they stay stable across renders.
   const now = useMemo(
     () => (feed?.generatedAt ? new Date(feed.generatedAt).getTime() : Date.now()),
     [feed?.generatedAt],
   );
 
   // Aging shelf (§4.4): items the server flags as idle past retention leave the
-  // live desk for their own curtain, so today's desk shows only fresh decisions.
+  // live list for their own curtain, so the tab leads with fresh items.
   const agingItems = useMemo(() => activeItems.filter(attentionIsAging), [activeItems]);
   const deskItems = useMemo(() => activeItems.filter((item) => !attentionIsAging(item)), [activeItems]);
-  const snoozedItems = useMemo(
-    () =>
-      allItems.filter(
-        (item) =>
-          item.dismissal?.kind === "snooze" && item.dismissal.isActive && !pendingRestore.has(item.id),
-      ),
-    [allItems, pendingRestore],
-  );
-  const dismissedItems = useMemo(
-    () =>
-      allItems.filter(
-        (item) =>
-          item.dismissal?.kind === "dismiss" && item.dismissal.isActive && !pendingRestore.has(item.id),
-      ),
-    [allItems, pendingRestore],
-  );
 
   const filterOptions = useMemo(() => buildAttentionFilterOptions(deskItems), [deskItems]);
 
   // Filter → sort → group, all client-side so switching re-buckets without a
-  // refetch. In the default (ungrouped) view the desk groups by arrival —
-  // "New today" then "Earlier" — with a "Decide now" shelf only when something
-  // carries an explicit, due decide-by. Any explicit
-  // group-by keeps the Inbox-style activity grouping.
+  // refetch. Ungrouped, the desk groups by arrival ("Decide now" when a
+  // decide-by is due, then "New today", then "Earlier"); an explicit group-by
+  // keeps the activity grouping.
   const groups = useMemo<AttentionGroup[]>(() => {
     const filtered = filterAttentionItems(deskItems, filters);
     if (groupBy === "none") {
@@ -267,17 +217,11 @@ export function WhatNeedsMe() {
     [collapsedGroupKeys, groups],
   );
 
-  // Rendered-row budget: only ratchets up (a hard reset mid-scroll would yank
-  // the DOM out from under the user), and resets when the company changes.
-  const [renderedRowLimit, setRenderedRowLimit] = useState(INITIAL_ATTENTION_ROW_RENDER_LIMIT);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    setRenderedRowLimit(INITIAL_ATTENTION_ROW_RENDER_LIMIT);
-  }, [selectedCompanyId]);
+  const renderedRowLimit = useScrollRowBudget(rootRef, keyboardItems.length, `${selectedCompanyId}:${tab}:${queueKey}`);
 
   // Keyboard selection may point past the budget (e.g. wrapping to the last
-  // row), so the effective limit is derived to always cover it — the selected
-  // row is then guaranteed to be in the DOM in the same commit that selects it.
+  // row), so the effective limit always covers it.
   const renderPlan = useMemo(() => {
     const selectedIndex = selectedAttentionId
       ? keyboardItems.findIndex((item) => item.id === selectedAttentionId)
@@ -285,61 +229,13 @@ export function WhatNeedsMe() {
     return planAttentionRenderRows({
       groups,
       collapsedGroupKeys,
-      snoozedItems,
-      snoozedOpen,
-      dismissedItems,
-      dismissedOpen,
+      snoozedItems: NO_ITEMS,
+      snoozedOpen: false,
+      dismissedItems: NO_ITEMS,
+      dismissedOpen: false,
       limit: Math.max(renderedRowLimit, selectedIndex + 1),
     });
-  }, [
-    collapsedGroupKeys,
-    dismissedItems,
-    dismissedOpen,
-    groups,
-    keyboardItems,
-    renderedRowLimit,
-    selectedAttentionId,
-    snoozedItems,
-    snoozedOpen,
-  ]);
-
-  const loadMoreRows = useCallback(() => {
-    setRenderedRowLimit((current) => current + ATTENTION_ROW_RENDER_BATCH_SIZE);
-  }, []);
-
-  useEffect(() => {
-    if (!renderPlan.hasMoreRows) return;
-    let animationFrameId: number | null = null;
-    const scrollContainer = findScrollContainer(rootRef.current);
-    const scrollTarget: Window | HTMLElement = scrollContainer ?? window;
-
-    const checkScrollPosition = () => {
-      if (animationFrameId !== null) return;
-      animationFrameId = window.requestAnimationFrame(() => {
-        animationFrameId = null;
-        const scrollHeight = scrollContainer?.scrollHeight ?? document.documentElement.scrollHeight;
-        if (scrollHeight === 0) return;
-        const scrollBottom = scrollContainer
-          ? scrollContainer.scrollTop + scrollContainer.clientHeight
-          : window.scrollY + window.innerHeight;
-        if (scrollBottom >= scrollHeight - ATTENTION_SCROLL_LOAD_THRESHOLD_PX) {
-          loadMoreRows();
-        }
-      });
-    };
-
-    scrollTarget.addEventListener("scroll", checkScrollPosition, { passive: true });
-    window.addEventListener("resize", checkScrollPosition);
-    // Initial check: a tall viewport (or an opened curtain) may need more rows
-    // than the current budget before any scrolling happens.
-    checkScrollPosition();
-
-    return () => {
-      scrollTarget.removeEventListener("scroll", checkScrollPosition);
-      window.removeEventListener("resize", checkScrollPosition);
-      if (animationFrameId !== null) window.cancelAnimationFrame(animationFrameId);
-    };
-  }, [loadMoreRows, renderPlan.hasMoreRows, renderedRowLimit]);
+  }, [collapsedGroupKeys, groups, keyboardItems, renderedRowLimit, selectedAttentionId]);
 
   useEffect(() => {
     if (selectedAttentionId && !keyboardItems.some((item) => item.id === selectedAttentionId)) {
@@ -354,11 +250,11 @@ export function WhatNeedsMe() {
   }, [selectedAttentionId]);
 
   // `?decisionId=` deep link (§4.7): focus and expand the referenced decision
-  // card once the feed lands, then drop the param so a later manual collapse is
-  // not re-forced on the next refetch. Wins over the generic auto-expand below.
+  // once the feed lands, then drop the param so a later manual collapse is not
+  // re-forced on the next refetch. Wins over the generic auto-expand below.
   useEffect(() => {
-    if (deepLinkConsumed || !deepLinkDecisionId || allItems.length === 0) return;
-    const target = allItems.find(
+    if (deepLinkConsumed || !deepLinkDecisionId || activeItems.length === 0) return;
+    const target = activeItems.find(
       (item) => item.sourceKind === "decision" && item.subject.id === deepLinkDecisionId,
     );
     setDeepLinkConsumed(true);
@@ -376,9 +272,9 @@ export function WhatNeedsMe() {
         { replace: true },
       );
     }
-  }, [allItems, deepLinkConsumed, deepLinkDecisionId, setSearchParams]);
+  }, [activeItems, deepLinkConsumed, deepLinkDecisionId, setSearchParams]);
 
-  // Auto-expand the topmost inline-capable decision, once.
+  // Auto-expand the topmost inline-capable item, once.
   useEffect(() => {
     if (autoExpandDone || deskItems.length === 0) return;
     const sorted = sortAttentionItems(deskItems, sortOrder);
@@ -409,9 +305,9 @@ export function WhatNeedsMe() {
     });
   };
 
-  // All row callbacks are stable (deps are setState functions, stable hook
-  // callbacks, and the stable `pushToast`) so the memoized rows only re-render
-  // when their own item/expanded/selected props change (PAP-13784).
+  // Every row callback is stable (deps are setState functions, stable hook
+  // callbacks and the stable `pushToast`), so memoized rows re-render only when
+  // their own props change (PAP-13784).
   const handleUndoDismiss = useCallback(
     (item: AttentionItem) => {
       setPendingHide((prev) => {
@@ -428,7 +324,7 @@ export function WhatNeedsMe() {
       setPendingHide((prev) => new Set(prev).add(item.id));
       dismiss(item.dismissalKey);
       setExpandedId((previous) => (previous === item.id ? null : previous));
-      // ~8s undo window; restores the row in place via T1's DELETE endpoint.
+      // ~8s undo window; restores the row in place.
       pushToast({
         id: `attention-dismiss-${item.id}`,
         dedupeKey: `attention-dismiss-${item.dismissalKey}`,
@@ -449,18 +345,29 @@ export function WhatNeedsMe() {
     },
     [snooze],
   );
-  const handleRestore = useCallback(
-    (item: AttentionItem) => {
-      setPendingRestore((prev) => new Set(prev).add(item.id));
-      restore(item.dismissalKey);
-    },
-    [restore],
-  );
   const handleToggleExpand = useCallback((item: AttentionItem) => {
     setSelectedAttentionId(item.id);
     setSelectionFromKeyboard(false);
     setExpandedId((prev) => (prev === item.id ? null : item.id));
   }, []);
+  const invalidateQueue = useCallback(() => {
+    if (!selectedCompanyId) return;
+    queryClient.invalidateQueries({ queryKey: queryKeys.attention(selectedCompanyId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.decisionQueues.list(selectedCompanyId) });
+  }, [queryClient, selectedCompanyId]);
+
+  const toggleSeedRules = useMutation({
+    mutationFn: (enabled: boolean) =>
+      decisionQueuesApi.update(selectedCompanyId!, queueKey!, { seedRulesEnabled: enabled }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.decisionQueues.list(selectedCompanyId!) }),
+    onError: (err) =>
+      pushToast({
+        title: "Could not update seeding",
+        body: err instanceof Error ? err.message : "Please try again.",
+        tone: "error",
+      }),
+  });
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const action = resolveAttentionQueueKeyAction({
@@ -510,32 +417,39 @@ export function WhatNeedsMe() {
     return <p className="text-sm text-muted-foreground">Select an organization first.</p>;
   }
 
-  if (isLoading) {
-    return <PageSkeleton variant="approvals" />;
-  }
+  const header = (
+    <div className="flex flex-wrap items-center justify-between gap-2">
+      {tabBar}
+      <DecisionsToolbar
+        visibleCount={visibleCount}
+        filterOptions={filterOptions}
+        filters={filters}
+        onFiltersChange={updateFilters}
+        groupBy={groupBy}
+        onGroupByChange={updateGroupBy}
+        sortOrder={sortOrder}
+        onSortOrderChange={updateSortOrder}
+      />
+    </div>
+  );
 
-  const hasAnything = activeItems.length > 0 || snoozedItems.length > 0 || dismissedItems.length > 0;
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        {header}
+        <PageSkeleton variant="approvals" />
+      </div>
+    );
+  }
 
   return (
     <div ref={rootRef} className="max-w-3xl space-y-4">
-      <div className="flex items-center justify-between gap-2">
-        <h1 className="text-xl font-bold">Decisions</h1>
-        <DecisionsToolbar
-          visibleCount={visibleCount}
-          filterOptions={filterOptions}
-          filters={filters}
-          onFiltersChange={updateFilters}
-          groupBy={groupBy}
-          onGroupByChange={updateGroupBy}
-          sortOrder={sortOrder}
-          onSortOrderChange={updateSortOrder}
-        />
-      </div>
+      {header}
 
       {/* Queue quicklinks + date-range chips (§4.1–§4.2). The rail self-hides
-          when the company has no queues; the chips filter the desk server-side. */}
+          when the company has no queues; the chips filter server-side. */}
       <div className="space-y-2">
-        <DecisionQueueRail companyId={selectedCompanyId} activeQueueKey={null} />
+        {tab === "decide" ? <DecisionQueueRail companyId={selectedCompanyId} activeQueueKey={queueKey} /> : null}
         <DecisionDateChips
           value={dateRange}
           custom={customRange}
@@ -546,17 +460,33 @@ export function WhatNeedsMe() {
         />
       </div>
 
+      {queueKey ? (
+        <div className="space-y-2">
+          <div className="min-w-0">
+            <h2 className="text-base font-semibold">{queue?.title ?? queueKey}</h2>
+            {queue?.description && <p className="mt-0.5 text-sm text-muted-foreground">{queue.description}</p>}
+          </div>
+          {queue && queue.seedRules.length > 0 && (
+            <SeedRulesCard
+              enabled={queue.seedRulesEnabled}
+              rules={queue.seedRules.map((rule) => rule.description)}
+              pending={toggleSeedRules.isPending}
+              onToggle={() => toggleSeedRules.mutate(!queue.seedRulesEnabled)}
+            />
+          )}
+        </div>
+      ) : null}
+
       {error && <p className="text-sm text-destructive">{(error as Error).message}</p>}
 
-      {!hasAnything ? (
-        <ZeroState />
+      {activeItems.length === 0 ? (
+        <ZeroState tab={tab} queued={queueKey !== null} />
       ) : (
         <div className="space-y-4">
           {visibleCount === 0 ? (
             <CaughtUpNote filtered={deskItems.length > 0} />
           ) : (
-            <>
-              {groups.map((group) => {
+            groups.map((group) => {
               const groupLabel = group.label;
               const collapsed = groupLabel !== null && collapsedGroupKeys.has(group.key);
               return (
@@ -582,7 +512,7 @@ export function WhatNeedsMe() {
                             item.sourceKind === "decision"
                               ? ((item.subject.metadata?.bundleId as string | null | undefined) ?? null)
                               : null;
-                          let header: ReactNode = null;
+                          let bundleHeader: ReactNode = null;
                           if (bundleId && !seenBundles.has(bundleId)) {
                             seenBundles.add(bundleId);
                             const bundleRows = rows.filter(
@@ -591,7 +521,7 @@ export function WhatNeedsMe() {
                                 ((row.subject.metadata?.bundleId as string | null | undefined) ?? null) === bundleId,
                             );
                             const first = bundleRows[0];
-                            header = (
+                            bundleHeader = (
                               <DecisionBundleHeader
                                 agentName={agentMap.get(first?.subject.metadata?.originAgentId as string)?.name ?? null}
                                 title={(first?.subject.metadata?.bundleTitle as string | null | undefined) ?? null}
@@ -602,8 +532,16 @@ export function WhatNeedsMe() {
                           }
                           return (
                             <Fragment key={item.id}>
-                              {header}
-                              <div className={bundleId ? "border-l-2 border-violet-500/40 pl-3" : undefined}>
+                              {bundleHeader}
+                              <div className={bundleId ? "space-y-1.5 border-l-2 border-violet-500/40 pl-3" : "space-y-1.5"}>
+                                {queueKey ? (
+                                  <QueueExcludeButton
+                                    item={item}
+                                    companyId={selectedCompanyId}
+                                    queueKey={queueKey}
+                                    onExcluded={invalidateQueue}
+                                  />
+                                ) : null}
                                 <AttentionQueueRow
                                   item={item}
                                   companyId={selectedCompanyId}
@@ -626,56 +564,7 @@ export function WhatNeedsMe() {
                   )}
                 </section>
               );
-              })}
-            </>
-          )}
-
-          {snoozedItems.length > 0 && (
-            <Curtain
-              label="Snoozed"
-              count={snoozedItems.length}
-              open={snoozedOpen}
-              onToggle={() => setSnoozedOpen((prev) => !prev)}
-            >
-              {renderPlan.snoozedRows.map((item) => (
-                <AttentionQueueRow
-                  key={item.id}
-                  item={item}
-                  companyId={selectedCompanyId}
-                  variant="hidden"
-                  expanded={false}
-                  onToggleExpand={noopToggleExpand}
-                  onDismiss={handleDismiss}
-                  onRestore={handleRestore}
-                  agentMap={agentMap}
-                  currentUserId={currentUserId}
-                />
-              ))}
-            </Curtain>
-          )}
-
-          {dismissedItems.length > 0 && (
-            <Curtain
-              label="Dismissed"
-              count={dismissedItems.length}
-              open={dismissedOpen}
-              onToggle={() => setDismissedOpen((prev) => !prev)}
-            >
-              {renderPlan.dismissedRows.map((item) => (
-                <AttentionQueueRow
-                  key={item.id}
-                  item={item}
-                  companyId={selectedCompanyId}
-                  variant="hidden"
-                  expanded={false}
-                  onToggleExpand={noopToggleExpand}
-                  onDismiss={handleDismiss}
-                  onRestore={handleRestore}
-                  agentMap={agentMap}
-                  currentUserId={currentUserId}
-                />
-              ))}
-            </Curtain>
+            })
           )}
 
           {agingItems.length > 0 && (
@@ -686,7 +575,7 @@ export function WhatNeedsMe() {
               onToggle={() => setAgingOpen((prev) => !prev)}
             >
               <p className="text-xs text-muted-foreground">
-                Idle past {ATTENTION_AGING_DAYS} days — kept off the desk. Keep any you still want surfaced.
+                Idle past {ATTENTION_AGING_DAYS} days — kept off the list. Keep any you still want surfaced.
               </p>
               {agingItems.map((item) => (
                 <AgingItemRow
@@ -705,57 +594,8 @@ export function WhatNeedsMe() {
               ))}
             </Curtain>
           )}
-
         </div>
       )}
-
-      <div className="space-y-4">
-        <Curtain
-          label="Decided"
-          count={decisionHistoryCount(decidedDecisions?.length)}
-          open={decidedOpen}
-          onToggle={() => setDecidedOpen((prev) => !prev)}
-        >
-          {decidedDecisionsLoading ? (
-            <p className="text-xs text-muted-foreground">Loading decided decisions…</p>
-          ) : (decidedDecisions?.length ?? 0) > 0 ? (
-            decidedDecisions!.slice(0, DECISION_HISTORY_VISIBLE_LIMIT).map((decision) => (
-              <DecisionResolver
-                key={decision.id}
-                companyId={selectedCompanyId}
-                decisionId={decision.id}
-                agentMap={agentMap}
-                initialDecision={{ ...decision, executions: decision.executions ?? [] }}
-              />
-            ))
-          ) : (
-            <p className="text-xs text-muted-foreground">No decided decisions.</p>
-          )}
-        </Curtain>
-
-        <Curtain
-          label="Expired"
-          count={decisionHistoryCount(expiredDecisions?.length)}
-          open={expiredOpen}
-          onToggle={() => setExpiredOpen((prev) => !prev)}
-        >
-          {expiredDecisionsLoading ? (
-            <p className="text-xs text-muted-foreground">Loading expired decisions…</p>
-          ) : (expiredDecisions?.length ?? 0) > 0 ? (
-            expiredDecisions!.slice(0, DECISION_HISTORY_VISIBLE_LIMIT).map((decision) => (
-              <DecisionResolver
-                key={decision.id}
-                companyId={selectedCompanyId}
-                decisionId={decision.id}
-                agentMap={agentMap}
-                initialDecision={{ ...decision, executions: decision.executions ?? [] }}
-              />
-            ))
-          ) : (
-            <p className="text-xs text-muted-foreground">No expired decisions.</p>
-          )}
-        </Curtain>
-      </div>
     </div>
   );
 }
@@ -804,7 +644,7 @@ function CaughtUpNote({ filtered }: { filtered: boolean }) {
   return (
     <div className="rounded-xl border border-dashed border-border py-10 text-center">
       <p className="text-sm font-medium text-foreground">
-        {filtered ? "No decisions match your filters." : "You're all caught up."}
+        {filtered ? "Nothing matches your filters." : "You're all caught up."}
       </p>
       {filtered && (
         <p className="mt-1 text-xs text-muted-foreground">Adjust or clear the filters to see the rest.</p>
@@ -813,7 +653,12 @@ function CaughtUpNote({ filtered }: { filtered: boolean }) {
   );
 }
 
-function ZeroState() {
+function ZeroState({ tab, queued }: { tab: InboxAttentionTabKey; queued: boolean }) {
+  const message = queued
+    ? "This queue is empty. Decisions land here when they match the queue's rules or an agent adds them."
+    : tab === "decide"
+      ? "Nothing needs a decision from you right now."
+      : "No failures, errors, blockers or budget alerts right now.";
   return (
     <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border py-20 text-center">
       <div className="mb-4 rounded-full bg-green-500/10 p-4">
@@ -822,7 +667,7 @@ function ZeroState() {
       <p className="text-lg font-semibold text-foreground">You're all caught up</p>
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
         <Inbox className="h-4 w-4" />
-        Nothing needs a decision from you right now.
+        {message}
       </p>
     </div>
   );

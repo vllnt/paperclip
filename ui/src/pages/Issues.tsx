@@ -141,7 +141,7 @@ function StreamlinedTasks() {
   if (definition.surface === "inbox") {
     return (
       <Inbox
-        tab={definition.inboxTab}
+        tab={definition.inboxTab ?? "mine"}
         surfaceLabel="Tasks"
         toolbarContext={(
           <div className="flex min-w-0 items-center gap-2">

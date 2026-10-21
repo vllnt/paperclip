@@ -58,7 +58,7 @@ const sections: ShortcutSection[] = [
     ],
   },
   {
-    title: "Decisions",
+    title: "Inbox Decide and Alerts",
     shortcuts: [
       { keys: ["j"], label: "Move down" },
       { keys: ["↓"], label: "Move down" },

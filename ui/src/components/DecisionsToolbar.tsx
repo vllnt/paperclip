@@ -37,8 +37,8 @@ interface DecisionsToolbarProps {
 }
 
 /**
- * The decisions filter / group / sort toolbar, shared verbatim by the
- * desk (WhatNeedsMe) and the per-queue page so both surfaces expose an identical
+ * The decisions filter / group / sort toolbar of the Inbox Decide and Alerts
+ * tabs, so every view of the attention feed (one queue included) has the same
  * control set. All state lives in the parent; this is presentation
  * plus the filter popover only.
  */

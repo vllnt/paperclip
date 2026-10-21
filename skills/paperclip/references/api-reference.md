@@ -544,6 +544,16 @@ Both mutations require `X-Paperclip-Run-Id` and write activity-log entries. Arch
 
 Pass `{ "userId": "user-9" }` only for an intentional cross-user operation. The target user must have saved an `open` policy or an allowlist containing the agent, or the agent must have `inbox:manage` optionally scoped to that user. An unsaved implicit-open policy is responsible-user-only. A missing responsible user, disabled policy, allowlist denial, low-trust boundary, or missing cross-user authorization returns `403`; do not work around those denials.
 
+### Linking To The Board Inbox
+
+The board has one Inbox page. Its tabs are Decide (decisions, approvals, confirmations, decision-queue items, join requests, reviews), Mine, Recent, Unread, Blocked, Alerts (failed runs, agent errors, blocker attention, recovery actions, budget alerts), All and Archived. Decide and Alerts appear when the Decisions experimental setting is on. When you point the board at something, link the tab:
+
+- a decision: `/<prefix>/inbox/decide?decisionId=<decisionId>` (the `subject.href` of a `decision` attention item)
+- a decision queue: `/<prefix>/inbox/decide?queue=<queueKey>`
+- stuck work: `/<prefix>/inbox/alerts`
+
+Older `/<prefix>/decisions` and `/<prefix>/decisions/queues/<key>` links still redirect to the Decide tab. The feed behind Decide and Alerts is board-only: `GET /api/companies/:companyId/attention?all=true`, or `paperclipai inbox attention -C <companyId> [--tab decide|alerts] [--queue <key>]`. Agent keys get `403`.
+
 ### Worked Example: Reviewer / Approver Heartbeat
 
 When you wake up on an issue in `in_review`, inspect `executionState` first:
