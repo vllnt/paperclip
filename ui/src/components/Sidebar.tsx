@@ -22,6 +22,7 @@ import {
   GanttChartSquare,
   LayoutGrid,
   Users,
+  ScrollText,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -283,6 +284,7 @@ export function Sidebar({ children }: { children?: ReactNode }) {
               itemClassName="text-(length:--text-compact) font-medium"
               missingBehavior="placeholder"
             />
+            <SidebarNavItem to="/policies" label="Policies" icon={ScrollText} />
             <SidebarNavItem to="/apps" label="Connectors" icon={Unplug} />
             <SidebarNavItem to="/activity" label="Audit" icon={History} />
           </SidebarSection>
@@ -301,6 +303,7 @@ export function Sidebar({ children }: { children?: ReactNode }) {
               collapsible={{ open: organizationOpen, onOpenChange: setOrganizationOpen }}
             >
               <SidebarNavItem to="/org" label="Org" icon={Network} />
+              <SidebarNavItem to="/policies" label="Policies" icon={ScrollText} />
               <PluginSlotOutlet
                 slotTypes={["sidebar"]}
                 sidebarSection="org"

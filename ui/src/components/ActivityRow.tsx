@@ -15,6 +15,7 @@ function entityLink(entityType: string, entityId: string, name?: string | null):
     case "agent": return `/agents/${entityId}`;
     case "project": return `/projects/${deriveProjectUrlKey(name, entityId)}`;
     case "goal": return `/goals/${entityId}`;
+    case "policy": return "/policies";
     case "approval": return `/approvals/${entityId}`;
     default: return null;
   }
@@ -42,7 +43,8 @@ export function ActivityRow({ event, agentMap, userProfileMap, entityNameMap, en
     : entityNameMap.get(`${event.entityType}:${event.entityId}`);
 
   const entityTitle = entityTitleMap?.get(`${event.entityType}:${event.entityId}`)
-    ?? (event.entityType === "issue" && typeof event.details?.issueTitle === "string" ? event.details.issueTitle : undefined);
+    ?? (event.entityType === "issue" && typeof event.details?.issueTitle === "string" ? event.details.issueTitle : undefined)
+    ?? (event.entityType === "policy" && typeof event.details?.title === "string" ? event.details.title : undefined);
 
   const link = isHeartbeatEvent && heartbeatAgentId
     ? `/agents/${heartbeatAgentId}/runs/${event.entityId}`

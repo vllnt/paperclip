@@ -518,6 +518,15 @@ Contract for a routine with steps:
 - A step without its own execution workspace reuses the one of its earliest predecessor in the same project, when it first runs.
 - Writing steps needs the task-assignment permission; an agent can only assign steps to itself. Every mutation writes an activity entry.
 
+Company policies are written rules and guardrails for a company or one of its projects (`company_policies`):
+
+- Each row links one-to-one to a `documents` row, which holds the title, the markdown body and the revision history (`document_revisions`). `project_id` is null for a company policy and set for a project policy; it cascades with the project.
+- `key` is a lowercase slug, unique per company across both scopes, so `policy://<key>` names one policy. The key cannot change.
+- `status` is `draft`, `active` or `archived`; only `active` policies apply to agents. Archiving keeps the key reserved. Delete works only on an archived policy (`409` otherwise) and removes the document and its revisions.
+- `summary` is one line of at most 280 characters. `owner_agent_id` or `owner_user_id` names one owner; both set is refused.
+- Every actor with company access reads policies (`GET /companies/:companyId/policies[/:key[/revisions]]`). Only the board writes them (`POST`, `PATCH`, `DELETE`; agents get `403`). A changed title or body saves a revision; a stale `baseRevisionId` answers `409`. Every mutation writes a `policy.created`, `policy.updated` or `policy.deleted` activity entry.
+- A policy is guidance, not an enforced setting. Approvals, execution-policy review stages, budgets, tool policies, the company skill policy and the GitHub operation checks keep enforcing limits on the server.
+
 Decision-desk triage uses company-scoped sidecars rather than adding queue fields to every attention source:
 
 - `decision_queues` stores durable named queues, optional retention overrides, server-derived creator/run provenance, and data-backed seed rules.

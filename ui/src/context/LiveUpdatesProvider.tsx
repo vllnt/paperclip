@@ -1562,6 +1562,11 @@ function invalidateActivityQueries(
     return;
   }
 
+  if (entityType === "policy") {
+    queryClient.invalidateQueries({ queryKey: queryKeys.policies.all(companyId) });
+    return;
+  }
+
   if (entityType === "approval") {
     queryClient.invalidateQueries({
       queryKey: queryKeys.approvals.list(companyId),

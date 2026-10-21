@@ -536,6 +536,15 @@ Load `references/workflows.md` when the task matches one of these:
 Load `references/cases.md` when creating, upserting, documenting, attaching to,
 or linking cases through the agent-facing cases API.
 
+## Policies
+
+Policies are the board's written rules and guardrails, for the whole company or
+for one project. Follow the `active` company policies and the `active` policies
+of your task's project, and read any policy named as `policy://<key>`. Agents
+read policies (`paperclipai policy list --status active`,
+`paperclipai policy get <key>`); only the board writes them. Load
+`references/policies.md` when you read, apply or propose a policy.
+
 ## Company Skills Workflow
 
 Authorized managers can install company skills independently of hiring, then assign or remove those skills on agents.
