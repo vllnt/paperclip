@@ -1,6 +1,6 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -361,6 +361,52 @@ describe("sandbox callback bridge", () => {
     expect(forwarded).toEqual(["GET /api/health"]);
   });
 
+  it("serves goal reads and the goal-filtered task and routine lists over the queue, and denies goal writes and lookalikes", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-goals-"));
+    cleanupDirs.push(rootDir);
+    const queueDir = path.join(rootDir, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const forwarded: string[] = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(), queueDir,
+      handleRequest: async (request) => {
+        forwarded.push(`${request.method} ${request.path}${request.query}`);
+        return { status: 200, body: "[]" };
+      },
+    });
+    cleanupFns.push(() => worker.stop());
+    const allowed = [
+      { method: "GET", path: "/api/companies/co-1/goals/focus", query: "" },
+      { method: "GET", path: "/api/companies/co-1/goals/progress", query: "" },
+      { method: "GET", path: "/api/companies/co-1/issues", query: "?goalId=goal-1&status=todo" },
+      { method: "GET", path: "/api/companies/co-1/routines", query: "?goalId=goal-1" },
+    ];
+    const denied = [
+      { method: "POST", path: "/api/companies/co-1/goals/focus", query: "", status: 403 },
+      { method: "GET", path: "/api/companies/co-1/goals/focus/extra", query: "", status: 403 },
+      { method: "GET", path: "/api/companies/co-1/goals/progressX", query: "", status: 403 },
+      // An encoded segment is not a canonical path, so the bridge refuses it before the route rules.
+      { method: "GET", path: "/api/companies/co%2F1/goals/progress", query: "", status: 400 },
+      { method: "GET", path: "/api/companies/co.1/goals/focus", query: "", status: 403 },
+      // Goal writes stay off the bridge.
+      { method: "POST", path: "/api/companies/co-1/goals", query: "", status: 403 },
+      { method: "PATCH", path: "/api/goals/goal-1", query: "", status: 403 },
+      { method: "DELETE", path: "/api/goals/goal-1", query: "", status: 403 },
+    ];
+    const requests = [...allowed.map((request) => ({ ...request, status: 200 })), ...denied];
+    for (const [index, { status: _status, ...request }] of requests.entries()) {
+      await writeFile(path.join(directories.requestsDir, `goals-${index}.json`), JSON.stringify({
+        id: `goals-${index}`, ...request, headers: {}, body: "", createdAt: new Date().toISOString(),
+      }));
+    }
+    await worker.stop({ drainTimeoutMs: 5_000 });
+    for (const [index, request] of requests.entries()) {
+      const response = JSON.parse(await readFile(path.join(directories.responsesDir, `goals-${index}.json`), "utf8"));
+      expect(response.status, JSON.stringify(request)).toBe(request.status);
+    }
+    expect(forwarded.sort()).toEqual(allowed.map((request) => `${request.method} ${request.path}${request.query}`).sort());
+  });
+
   it("denies non-allowlisted requests by default", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-default-policy-"));
     cleanupDirs.push(rootDir);
@@ -405,6 +451,104 @@ describe("sandbox callback bridge", () => {
     expect(JSON.parse(response.body)).toEqual({
       error: "Route not allowed: DELETE /api/secrets",
     });
+  });
+
+  async function relayRawQueueEntries(
+    entries: Array<{ id: string; method: string; path: string; query: string }>,
+  ): Promise<{
+    responses: Map<string, { status: number; body: string }>;
+    handled: Array<{ method: string; path: string; query: string }>;
+  }> {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-canonical-path-"));
+    cleanupDirs.push(rootDir);
+    const queueDir = path.posix.join(rootDir, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const handled: Array<{ method: string; path: string; query: string }> = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      handleRequest: async (request) => {
+        handled.push({ method: request.method, path: request.path, query: request.query });
+        return { status: 200, headers: { "content-type": "application/json" }, body: "{}" };
+      },
+    });
+    cleanupFns.push(() => worker.stop());
+    for (const entry of entries) {
+      const requestPath = path.posix.join(directories.requestsDir, `${entry.id}.json`);
+      await writeFile(
+        `${requestPath}.tmp`,
+        `${JSON.stringify({ ...entry, headers: {}, body: "", createdAt: new Date().toISOString() })}\n`,
+        "utf8",
+      );
+      await rename(`${requestPath}.tmp`, requestPath);
+    }
+    await worker.stop({ drainTimeoutMs: 5_000 });
+    const responses = new Map<string, { status: number; body: string }>();
+    for (const entry of entries) {
+      responses.set(
+        entry.id,
+        JSON.parse(await readFile(path.posix.join(directories.responsesDir, `${entry.id}.json`), "utf8")),
+      );
+    }
+    return { responses, handled };
+  }
+
+  it("rejects a queue entry whose GET path uses backslash dot segments, without calling the handler", async () => {
+    const rawPath = "/api/routines/r1\\..\\..\\secrets";
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method: "GET", path: rawPath })).toBeNull();
+    const resolvedPath = new URL(rawPath, "http://bridge.test").pathname;
+    expect(resolvedPath).toBe("/api/secrets");
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method: "GET", path: resolvedPath })).not.toBeNull();
+
+    const { responses, handled } = await relayRawQueueEntries([
+      { id: "req-backslash", method: "GET", path: rawPath, query: "" },
+    ]);
+
+    expect(handled).toEqual([]);
+    expect(responses.get("req-backslash")?.status).toBe(400);
+    expect(JSON.parse(responses.get("req-backslash")?.body ?? "{}")).toEqual({
+      error: "Invalid request path: backslash",
+    });
+  });
+
+  it("rejects a queue entry whose POST path carries a fragment, without calling the handler", async () => {
+    const rawPath = "/api/routines/r1#/run";
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method: "POST", path: rawPath })).toBeNull();
+    const resolvedPath = new URL(rawPath, "http://bridge.test").pathname;
+    expect(resolvedPath).toBe("/api/routines/r1");
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method: "POST", path: resolvedPath })).not.toBeNull();
+
+    const { responses, handled } = await relayRawQueueEntries([
+      { id: "req-fragment", method: "POST", path: rawPath, query: "" },
+    ]);
+
+    expect(handled).toEqual([]);
+    expect(responses.get("req-fragment")?.status).toBe(400);
+    expect(JSON.parse(responses.get("req-fragment")?.body ?? "{}")).toEqual({
+      error: "Invalid request path: non_canonical_path",
+    });
+  });
+
+  it("rejects every non-canonical queue entry path and forwards a canonical path and query unchanged", async () => {
+    const rejected = [
+      { id: "req-dot", method: "GET", path: "/api/routines/../secrets", query: "" },
+      { id: "req-tab-dot", method: "GET", path: "/api/routines/.\t./runs", query: "" },
+      { id: "req-trailing-tab", method: "GET", path: "/api/agents/me\t", query: "" },
+      { id: "req-encoded-dot", method: "GET", path: "/api/routines/r%2e1", query: "" },
+      { id: "req-encoded-slash", method: "GET", path: "/api/routines/r1%2f..%2fsecrets", query: "" },
+      { id: "req-query-in-path", method: "GET", path: "/api/routines/r1?x=1", query: "" },
+      { id: "req-not-origin-form", method: "GET", path: "api/routines/r1", query: "" },
+    ];
+    const { responses, handled } = await relayRawQueueEntries([
+      ...rejected,
+      { id: "req-canonical", method: "GET", path: "/api/routines/r1/runs", query: "?limit=5" },
+    ]);
+
+    for (const entry of rejected) {
+      expect(responses.get(entry.id)?.status, entry.id).toBe(400);
+    }
+    expect(responses.get("req-canonical")?.status).toBe(200);
+    expect(handled).toEqual([{ method: "GET", path: "/api/routines/r1/runs", query: "?limit=5" }]);
   });
 
   it("drains already-queued requests on stop", async () => {

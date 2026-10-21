@@ -1711,3 +1711,34 @@ Every successful or failed value fetch writes both `secret_access_events` and `a
 | Sit silently on blocked work                | Nobody knows you're stuck; the task rots              | Record the blocker and use a saved interaction or dependency |
 | Leave tasks in ambiguous states             | Others can't tell if work is progressing              | Always update status: `blocked`, `in_review`, or `done` |
 | Block on another task without `blockedByIssueIds` | No automatic wake when blocker resolves; manual follow-up needed | Set `blockedByIssueIds` so Paperclip auto-wakes the assignee when all blockers are done |
+
+## Policies
+
+Written rules and guardrails for a company or one project. Every actor with company access reads them; only the board writes them. See `references/policies.md`.
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET    | `/api/companies/:companyId/policies` | List policies, company ones first; optional filters `scope` (`company`, `project`), `projectId`, `status` (`draft`, `active`, `archived`); `scope=company` with `projectId`: 400 |
+| GET    | `/api/companies/:companyId/policies/:key` | Policy with its full markdown body |
+| GET    | `/api/companies/:companyId/policies/:key/revisions` | Revisions, newest first (at most 100) |
+| POST   | `/api/companies/:companyId/policies` | Create a policy (board only; `key`, `title`, optional `summary`, `body`, `status`, `projectId`, `ownerAgentId` or `ownerUserId`; duplicate key: 409) |
+| PATCH  | `/api/companies/:companyId/policies/:key` | Update a policy (board only; a new title or body saves a revision; `baseRevisionId` returns 409 when stale; `status: "archived"` retires it) |
+| DELETE | `/api/companies/:companyId/policies/:key` | Delete an archived policy and its revisions (board only; any other status: 409) |
+
+## A goal's linked work
+
+A goal does not store its work. Tasks and routines link to a goal with `goalId`; projects link to goals with `goalIds`. Read a goal's work with the list filters below, which apply the same access rules as the plain lists. Sub-goals keep their own work.
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET    | `/api/companies/:companyId/issues?goalId=:goalId` | Tasks whose own goal is this goal; add `status` for the open ones. A blank `goalId` counts as not set; one that is not a UUID: 400 |
+| GET    | `/api/companies/:companyId/routines?goalId=:goalId` | Routines whose own goal is this goal |
+| GET    | `/api/companies/:companyId/projects` | Projects; a project serves each goal in its `goalIds` |
+| GET    | `/api/companies/:companyId/goals/progress` | Done, open and total tasks per goal, including the tasks of its sub-goals |
+| GET    | `/api/companies/:companyId/goals/focus` | The company's current focus: active short-horizon goals, nearest target date first, with progress and open milestones |
+
+The agents of a goal are its owner (`ownerAgentId`), the assignees of its open tasks, and the default agents of its routines that are not archived. Set a routine's goal with `goalId` on create or update (`null` clears it). Set a project's goals with `goalIds` on `PATCH /api/projects/:projectId`.
+
+CLI: `paperclipai goal links <goalId>`, `paperclipai goal progress -C <companyId>` and `paperclipai goal focus -C <companyId>`; `--goal-id` on `issue list`, `routine list`, `routine create` and `routine update` (`none` clears it on a routine).
+
+Your task's goal: when your task has a goal, the wake text names it on its own line, `- issue goal: <title> (goal id <goalId>)`. Read the rest of the goal with `GET /api/goals/:goalId`. A remote run reaches the goal reads through the sandbox callback bridge: the goal list and detail, `goals/focus`, `goals/progress`, and the task and routine lists with `goalId`. The bridge does not pass goal writes. In MCP, `paperclipListIssues` takes `goalId`; read the routines, the focus and the progress with `paperclipApiRequest`, whose path leaves out the `/api` prefix (for example `/companies/:companyId/goals/focus`). Link new work to a goal with `goalId` on task and routine writes, within your existing permissions.

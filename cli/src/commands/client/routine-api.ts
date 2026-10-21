@@ -22,6 +22,7 @@ interface JsonOptions extends CompanyOptions {
 
 interface RoutineWriteOptions extends JsonOptions {
   stepsFile?: string;
+  goalId?: string;
 }
 
 interface RoutineRunOptions extends JsonOptions {
@@ -42,6 +43,7 @@ interface RoutineListOptions extends CompanyOptions {
   folderId?: string;
   status?: string;
   trigger?: string;
+  goalId?: string;
 }
 
 /** Builds the list query from the CLI flags; the server validates the values. */
@@ -54,6 +56,7 @@ function routineListQuery(opts: RoutineListOptions): string {
     ["folderId", opts.folderId],
     ["status", opts.status],
     ["trigger", opts.trigger],
+    ["goalId", opts.goalId],
   ];
   for (const [key, value] of entries) {
     if (value) params.set(key, value);
@@ -84,6 +87,7 @@ export function registerRoutineApiCommands(program: Command): void {
       .option("--folder-id <id>", "Only routines in this folder; none for routines in no folder")
       .option("--status <status>", "active, paused or archived")
       .option("--trigger <kind>", "schedule, webhook, api, event, or manual for routines with no trigger")
+      .option("--goal-id <id>", "Only routines linked to this goal; sub-goals are not included")
       .action(async (opts: RoutineListOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
@@ -181,6 +185,7 @@ export function registerRoutineApiCommands(program: Command): void {
 
 const STEPS_FILE_DESCRIPTION = "Read the routine steps (a JSON array) from a file; replaces steps in the payload";
 const PROJECT_ID_DESCRIPTION = "The project the routine belongs to; none for no project";
+const GOAL_ID_DESCRIPTION = "The goal the routine serves; none for no goal";
 
 /** Reads the JSON in a steps file; a parse error names the file, because the parser's message does not. */
 async function readStepsFile(file: string): Promise<unknown> {
@@ -201,14 +206,17 @@ function withFlagField(payload: unknown, field: string, value: unknown, flag: st
 }
 
 /**
- * Builds the create or update payload. `--project-id` sets `projectId` (`none` clears it).
- * `--steps-file` supplies `steps` from a file so a long step list does not have to be quoted
- * inside `--payload-json`. The server validates every field.
+ * Builds the create or update payload. `--project-id` sets `projectId` and `--goal-id` sets `goalId`
+ * (`none` clears either). `--steps-file` supplies `steps` from a file so a long step list does not
+ * have to be quoted inside `--payload-json`. The server validates every field.
  */
 async function routineWritePayload(opts: RoutineWriteOptions): Promise<unknown> {
   let payload = parseJson(opts.payloadJson ?? "{}");
   if (opts.projectId !== undefined) {
     payload = withFlagField(payload, "projectId", opts.projectId === "none" ? null : opts.projectId, "--project-id");
+  }
+  if (opts.goalId !== undefined) {
+    payload = withFlagField(payload, "goalId", opts.goalId === "none" ? null : opts.goalId, "--goal-id");
   }
   if (!opts.stepsFile) return payload;
   if (!isJsonObject(payload)) throw new Error("--payload-json must be a JSON object when --steps-file is used.");
@@ -294,6 +302,7 @@ function addRoutineCreate(parent: Command): void {
       .option("-C, --company-id <id>", "Company ID")
       .requiredOption("--payload-json <json>", "JSON payload")
       .option("--project-id <id>", PROJECT_ID_DESCRIPTION)
+      .option("--goal-id <id>", GOAL_ID_DESCRIPTION)
       .option("--steps-file <path>", STEPS_FILE_DESCRIPTION)
       .action(async (opts: RoutineWriteOptions) => {
         try {
@@ -315,6 +324,7 @@ function addRoutineUpdate(parent: Command): void {
       .argument("<id>", "ID")
       .option("--payload-json <json>", "JSON payload", "{}")
       .option("--project-id <id>", PROJECT_ID_DESCRIPTION)
+      .option("--goal-id <id>", GOAL_ID_DESCRIPTION)
       .option("--steps-file <path>", STEPS_FILE_DESCRIPTION)
       .action(async (id: string, opts: RoutineWriteOptions) => {
         try {

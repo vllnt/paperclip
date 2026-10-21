@@ -495,6 +495,21 @@
       ]
     },
     {
+      "id": "skill:skills/paperclip/SKILL.md:policies:746",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/SKILL.md:746",
+      "title": "Policies",
+      "expectedSemantics": "Skill guidance headed “Policies”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/SKILL.md:746"
+      ]
+    },
+    {
       "id": "skill:skills/paperclip/references/api-reference.md:paperclip-api-reference:1",
       "sourceKind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/api-reference.md:1",
@@ -1587,6 +1602,36 @@
       ],
       "evidenceIds": [
         "skill:skills/paperclip/references/api-reference.md:1698"
+      ]
+    },
+    {
+      "id": "skill:skills/paperclip/references/api-reference.md:policies:1714",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md:1714",
+      "title": "Policies",
+      "expectedSemantics": "Skill guidance headed “Policies”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/references/api-reference.md:1714"
+      ]
+    },
+    {
+      "id": "skill:skills/paperclip/references/api-reference.md:a-goal-s-linked-work:1727",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md:1727",
+      "title": "A goal's linked work",
+      "expectedSemantics": "Skill guidance headed “A goal's linked work”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/references/api-reference.md:1727"
       ]
     },
     {

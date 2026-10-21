@@ -128,6 +128,10 @@ import {
   // Goal
   createGoalSchema,
   updateGoalSchema,
+  // Company policy
+  createCompanyPolicySchema,
+  listCompanyPoliciesQuerySchema,
+  updateCompanyPolicySchema,
   // Secret
   createSecretSchema,
   updateSecretSchema,
@@ -1514,6 +1518,9 @@ const AGENT_ONLY_OPERATIONS = new Set(
 );
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/policies",
+  "PATCH /api/companies/{companyId}/policies/{key}",
+  "DELETE /api/companies/{companyId}/policies/{key}",
   "POST /api/companies/{companyId}/event-sources",
   "POST /api/companies/{companyId}/event-sources/paperclip",
   "PATCH /api/event-sources/{id}",
@@ -1768,6 +1775,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
 ]);
 
 const CREATED_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/policies",
   "POST /api/companies/{companyId}/event-sources",
   "POST /api/adapters/install",
   "POST /api/issues/{id}/git/pull-requests",
@@ -4260,14 +4268,21 @@ registry.registerPath({
   tags: ["issues"],
   summary: "List issues in a company",
   description:
-    "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract.",
+    "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract. " +
+    "`goalId` returns the issues whose own goal is that goal; issues of its sub-goals are not included. A blank `goalId` counts as not set; one that is not a UUID returns 400.",
   request: {
     params: z.object({ companyId: z.string() }),
-    query: z.object({ view: z.enum(["compact"]).optional() }).passthrough(),
+    query: z
+      .object({
+        view: z.enum(["compact"]).optional(),
+        goalId: z.string().guid().optional().describe("Only issues whose own goal is this goal"),
+      })
+      .passthrough(),
   },
   responses: {
     200: r.ok(),
     304: { description: "Not Modified" },
+    400: r.badRequest,
     401: r.unauthorized,
   },
 });
@@ -5066,8 +5081,10 @@ registry.registerPath({
   path: "/api/projects/{id}",
   tags: ["projects"],
   summary: "Delete a project",
+  description:
+    "Deletes the project with its policies. Only the board can delete a project that has policies; anyone else gets 403.",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -5173,7 +5190,7 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/routines",
   tags: ["routines"],
-  summary: "List routines in a company; optional filters q, assigneeAgentId, folderId (or none), projectId, status and trigger combine with AND",
+  summary: "List routines in a company; optional filters q, assigneeAgentId, folderId (or none), projectId, goalId, status and trigger combine with AND",
   request: { params: z.object({ companyId: z.string() }), query: listRoutinesQuerySchema },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
@@ -5657,6 +5674,80 @@ registry.registerPath({
   description: "Only the board may delete a short term goal or a milestone. Anyone else gets 403.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+// ─── Company policies ────────────────────────────────────────────────────────
+
+const companyPolicyParams = z.object({ companyId: z.string(), key: z.string() });
+const COMPANY_POLICY_GUIDANCE =
+  "A policy is written guidance for agents, not an enforced setting. Approvals, tool policies, the skill policy and budgets " +
+  "enforce rules. Every actor with company access reads policies; only the board writes them, and anyone else gets 403.";
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/policies",
+  tags: ["policies"],
+  summary: "List company policies",
+  description:
+    `${COMPANY_POLICY_GUIDANCE} Company policies come first. Filter with \`scope\` (company or project), \`projectId\` and ` +
+    "`status` (draft, active or archived). `scope=company` with `projectId` returns 400. Only active policies apply to agents.",
+  request: { params: z.object({ companyId: z.string() }), query: listCompanyPoliciesQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/policies",
+  tags: ["policies"],
+  summary: "Create a company policy",
+  description:
+    `${COMPANY_POLICY_GUIDANCE} The key is a lowercase slug, unique in the company across company and project policies, ` +
+    "and cannot change; documents reference it as `policy://<key>`. Set `projectId` for a project policy. A duplicate key returns 409.",
+  request: { params: z.object({ companyId: z.string() }), body: jsonBody(createCompanyPolicySchema) },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/policies/{key}",
+  tags: ["policies"],
+  summary: "Get a company policy with its full body",
+  request: { params: companyPolicyParams },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/policies/{key}",
+  tags: ["policies"],
+  summary: "Update a company policy",
+  description:
+    `${COMPANY_POLICY_GUIDANCE} A changed title or body saves a new revision. Pass \`baseRevisionId\` to get 409 when someone ` +
+    "saved a newer revision. Set `status` to `archived` to retire a policy and keep its key reserved.",
+  request: { params: companyPolicyParams, body: jsonBody(updateCompanyPolicySchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/companies/{companyId}/policies/{key}",
+  tags: ["policies"],
+  summary: "Delete an archived company policy",
+  description:
+    "Board only. Deletes the policy, its document and its revisions. Only an archived policy can be deleted; any other " +
+    "status returns 409. Archive is the normal way to retire a policy.",
+  request: { params: companyPolicyParams },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/policies/{key}/revisions",
+  tags: ["policies"],
+  summary: "List a company policy's revisions",
+  description: "Newest first, at most 100. Each revision holds the title and body saved at that time.",
+  request: { params: companyPolicyParams },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 // ─── Secrets ─────────────────────────────────────────────────────────────────
