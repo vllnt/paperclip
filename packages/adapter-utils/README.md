@@ -43,6 +43,30 @@ helpers in [`src/ssh.ts`](./src/ssh.ts):
 calls for adapters that want a per-run remote workspace and an automatic
 `restoreWorkspace()` finally hook.
 
+### What the SSH restore guarantees on the primary checkout
+
+After a Git-backed restore, HEAD, the index and the working tree of the local
+checkout agree, and nothing that landed there during the run is reverted or
+deleted. Several runs can share one checkout.
+
+- **The baseline comes first.** `prepareRemoteManagedRuntime` calls
+  `planWorkspaceSeed`, snapshots the local directory, and only then calls
+  `prepareWorkspaceForSshExecution`. A change that lands locally while the copy
+  is seeded is therefore never read as an edit the run made, and a file created
+  in that window is never deleted.
+- **The index follows HEAD.** When the restore integrates the run's commits,
+  `integrateImportedGitHead` moves the branch ref only. The restore then resets
+  the index to HEAD and checks out, from HEAD, each tracked file that equals the
+  blob the run committed but differs from the integrated HEAD. A plain
+  `git commit` on the checkout never deletes the run's files.
+- **Known edges.** A file the run edited after its last commit differs from the
+  run's committed blob, so on a true both-sides conflict the run's dirty file
+  wins. A path the merge deleted locally while the copy still has it stays
+  untracked. Symlinks and other non-regular files are not realigned.
+
+The invariant is pinned by
+[`src/ssh-restore-primary-coherence.test.ts`](./src/ssh-restore-primary-coherence.test.ts).
+
 The invariant is pinned by the `no-remote-git contract` case in
 [`src/ssh-fixture.test.ts`](./src/ssh-fixture.test.ts), which asserts that a
 remote-only commit propagates to the local worktree through the

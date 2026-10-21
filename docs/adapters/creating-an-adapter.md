@@ -257,7 +257,7 @@ The local execution-workspace cwd is the **only** persistence boundary across ru
 The supported round-trip:
 
 - **Per-run, on the remote side.** `prepareWorkspaceForSshExecution` (in `packages/adapter-utils/src/ssh.ts`) git-bundles the local worktree and ships it to the run's remote dir. No `git remote` is set anywhere; the bundle is the transport.
-- **End-of-run, in the adapter's `finally` block.** The adapter invokes `restoreRemoteWorkspace` (e.g. claude-local's `execute.ts`), which calls `restoreWorkspaceFromSshExecution` → `exportGitWorkspaceFromSsh` → `integrateImportedGitHead`. Remote commits made during the run land back in the local Mac worktree with no `git push` and no remote configured.
+- **End-of-run, in the adapter's `finally` block.** The adapter invokes `restoreRemoteWorkspace` (e.g. claude-local's `execute.ts`), which calls `restoreWorkspaceFromSshExecution` → `exportGitWorkspaceFromSsh` → `integrateImportedGitHead`. Remote commits made during the run land back in the local Mac worktree with no `git push` and no remote configured. After the restore, HEAD, the index and the working tree of the local worktree agree: the sync-back baseline is taken before the seed sends anything, and the restore resets the index to the integrated HEAD (see `packages/adapter-utils/README.md`).
 
 The invariant adapters must preserve:
 
