@@ -2636,6 +2636,7 @@ export {
   isRoutineDateVariableName,
   isValidRoutineDateString,
   isValidRoutineVariableName,
+  ROUTINE_TASK_VARIABLE_NAMES,
   stringifyRoutineVariableValue,
   syncRoutineVariablesWithTemplate,
 } from "./routine-variables.js";
@@ -2915,6 +2916,7 @@ export * from "./automation-wake.js";
 export * from "./routine-noop-skip.js";
 export * from "./routine-gate.js";
 export * from "./routine-steps.js";
+export * from "./routine-step-warnings.js";
 export * from "./event-sources.js";
 export * from "./run-context.js";
 export * from "./transient-retry-policy.js";

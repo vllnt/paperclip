@@ -47,6 +47,8 @@ import {
   routineDetailHref,
 } from "../components/RoutineContextualSidebar";
 import { RoutineSaveBar } from "../components/RoutineSaveBar";
+import { RoutineStepWarnings } from "../components/RoutineStepWarnings";
+import { agentNameMap, stepWarningsToast } from "../lib/routine-step-warnings";
 import {
   EDITABLE_SECTIONS,
   SECTION_FIELD_KEYS,
@@ -74,6 +76,7 @@ import {
 import type {
   RoutineDetail as RoutineDetailType,
   RoutineEnvConfig,
+  RoutineStepWarning,
   RoutineVariable,
 } from "@paperclipai/shared";
 
@@ -148,6 +151,7 @@ export function RoutineDetail() {
   const projectSelectorRef = useRef<HTMLButtonElement | null>(null);
   const [secretMessage, setSecretMessage] = useState<SecretMessage | null>(null);
   const [saveConflict, setSaveConflict] = useState(false);
+  const [stepWarnings, setStepWarnings] = useState<RoutineStepWarning[]>([]);
   const [runVariablesOpen, setRunVariablesOpen] = useState(false);
   const [overviewEditing, setOverviewEditing] = useState(false);
   const [newTrigger, setNewTrigger] = useState(createDefaultNewTrigger);
@@ -420,6 +424,10 @@ export function RoutineDetail() {
     },
     onSuccess: async (saved) => {
       setSaveConflict(false);
+      const warnings = saved.warnings ?? [];
+      setStepWarnings(warnings);
+      const warningToast = stepWarningsToast(warnings, agentNameMap(agents));
+      if (warningToast) pushToast(warningToast);
       // The saved routine is the new base, and the draft adopts it so unedited wake
       // settings do not stay dirty against a value saved or refetched in the meantime.
       const savedWakeSettings = readAutomationWakeSettings(saved.automationWakeSettings);
@@ -469,8 +477,10 @@ export function RoutineDetail() {
           ? { executionWorkspaceSettings: data.executionWorkspaceSettings }
           : {}),
       }),
-    onSuccess: async () => {
+    onSuccess: async (run) => {
       pushToast({ title: "Routine run started", tone: "success" });
+      const warningToast = stepWarningsToast(run.warnings, agentNameMap(agents));
+      if (warningToast) pushToast(warningToast);
       setRunVariablesOpen(false);
       navigateToSection("runs");
       await Promise.all([
@@ -978,6 +988,12 @@ export function RoutineDetail() {
             <h2 id="routine-section-title" className="mb-4 text-lg font-semibold">
               {SECTION_TITLES[section]}
             </h2>
+            <RoutineStepWarnings
+              warnings={stepWarnings}
+              agentNames={agentNameMap(agents)}
+              className="mb-4"
+              onDismiss={() => setStepWarnings([])}
+            />
 
             {section === "overview" && (overviewEditing ? <OverviewSection /> : <RoutineOverview />)}
             {section === "steps" && <StepsSection />}

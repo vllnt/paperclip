@@ -881,6 +881,7 @@ export async function createApp(
     chatRunRetries: chatChannels,
     feedbackExportService: opts.feedbackExportService,
     pluginWorkerManager: workerManager,
+    eventSources,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
     declineToolActionRequest: (input) => toolGateway.declineActionRequest(input),
   }));

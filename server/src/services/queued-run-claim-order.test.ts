@@ -4,6 +4,7 @@ import {
   QUEUED_RUN_PRIORITY_AGING_STEP_MS,
   type QueuedRunIssueFacts,
 } from "./queued-run-claim-order.js";
+import { PLANNED_RESTART_RESUME_RETRY_REASON } from "./execution-recovery-attempt.js";
 
 const NOW = new Date("2026-01-01T12:00:00.000Z");
 const MINUTE = 60_000;
@@ -13,14 +14,22 @@ type Run = {
   id: string;
   createdAt: Date;
   scheduledRetryAt: Date | null;
+  scheduledRetryReason?: string | null;
   issue: QueuedRunIssueFacts | null;
 };
 
-function run(id: string, waitedMs: number, issue: Partial<QueuedRunIssueFacts> | null, scheduledRetryAt: Date | null = null): Run {
+function run(
+  id: string,
+  waitedMs: number,
+  issue: Partial<QueuedRunIssueFacts> | null,
+  scheduledRetryAt: Date | null = null,
+  scheduledRetryReason: string | null = null,
+): Run {
   return {
     id,
     createdAt: new Date(NOW.getTime() - waitedMs),
     scheduledRetryAt,
+    scheduledRetryReason,
     issue: issue ? { priority: "medium", inProgress: false, dependencyReady: true, routineRunsFirst: false, ...issue } : null,
   };
 }
@@ -109,6 +118,55 @@ describe("orderQueuedRunsForClaim", () => {
         run("high", MINUTE, { priority: "high" }),
       ];
       expect(order(queue)).toEqual(["high", "medium-old", "routine-tick"]);
+    });
+  });
+
+  describe("restart resume", () => {
+    const resume = PLANNED_RESTART_RESUME_RETRY_REASON;
+    const dueNow = NOW;
+
+    it("starts a resume before older and higher-priority queued runs", () => {
+      expect(order([
+        run("critical-old", 20 * MINUTE, { priority: "critical" }),
+        run("high-in-progress", 10 * MINUTE, { priority: "high", inProgress: true }),
+        run("resume-low", 2 * MINUTE, { priority: "low" }, dueNow, resume),
+      ])).toEqual(["resume-low", "critical-old", "high-in-progress"]);
+    });
+
+    it("starts a resume before a run that aged past it", () => {
+      expect(order([
+        run("aged-low", 4 * STEP, { priority: "low" }),
+        run("resume-medium", 0, { priority: "medium" }, dueNow, resume),
+      ])).toEqual(["resume-medium", "aged-low"]);
+    });
+
+    it("keeps the usual order among several resumes", () => {
+      expect(order([
+        run("resume-low", 5 * MINUTE, { priority: "low" }, dueNow, resume),
+        run("resume-high-new", 1 * MINUTE, { priority: "high" }, dueNow, resume),
+        run("resume-high-old", 3 * MINUTE, { priority: "high" }, new Date(NOW.getTime() - 3 * MINUTE), resume),
+      ])).toEqual(["resume-high-old", "resume-high-new", "resume-low"]);
+    });
+
+    it("still starts a resume whose issue is dependency-blocked after unblocked runs", () => {
+      expect(order([
+        run("blocked-resume", 0, { priority: "critical", dependencyReady: false }, dueNow, resume),
+        run("low", MINUTE, { priority: "low" }),
+      ])).toEqual(["low", "blocked-resume"]);
+    });
+
+    it("starts a resume before a routine run set to first", () => {
+      expect(order([
+        run("routine-first", 5 * MINUTE, { priority: "critical", routineRunsFirst: true }),
+        run("resume-low", 0, { priority: "low" }, dueNow, resume),
+      ])).toEqual(["resume-low", "routine-first"]);
+    });
+
+    it("gives no priority to an ordinary scheduled retry", () => {
+      expect(order([
+        run("critical", MINUTE, { priority: "critical" }),
+        run("transient-retry", 0, { priority: "low" }, dueNow, "transient_failure"),
+      ])).toEqual(["critical", "transient-retry"]);
     });
   });
 

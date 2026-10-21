@@ -1442,9 +1442,9 @@
       "expectedMockState": "operation_result"
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:360",
+      "id": "skill:skills/paperclip/references/routines.md:387",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md#L360:slot-priority",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L387:slot-priority",
       "heading": "Slot Priority",
       "primaryDisposition": "control_plane_owned",
       "semanticOperation": "runtime_reconciliation",

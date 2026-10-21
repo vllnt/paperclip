@@ -2400,9 +2400,9 @@
       ]
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:slot-priority:360",
+      "id": "skill:skills/paperclip/references/routines.md:slot-priority:387",
       "sourceKind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md:360",
+      "sourceAnchor": "skills/paperclip/references/routines.md:387",
       "title": "Slot Priority",
       "expectedSemantics": "Skill guidance headed “Slot Priority”.",
       "primaryDisposition": "optional_agent_tool",
@@ -2411,7 +2411,7 @@
         "control_plane_invariant"
       ],
       "evidenceIds": [
-        "skill:skills/paperclip/references/routines.md:360"
+        "skill:skills/paperclip/references/routines.md:387"
       ]
     },
     {
