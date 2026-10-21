@@ -92,6 +92,17 @@ export function eventSourceRoutes(db: Db, service: EventSourceService) {
     res.status(201).json(created);
   });
 
+  router.post("/companies/:companyId/event-sources/paperclip", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertBoard(req);
+    assertCompanyAccess(req, companyId);
+    const { source, created } = await service.ensureInternal(companyId, actorIds(req));
+    if (created) {
+      await logSourceActivity(req, source, "event_source.created", { normalizer: source.normalizer, builtIn: true });
+    }
+    res.json(source);
+  });
+
   router.get("/event-sources/:id", async (req, res) => {
     const source = await getAccessibleResource(req, res, service.find(req.params.id as string), "Event source not found");
     if (!source) return;

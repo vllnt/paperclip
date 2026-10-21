@@ -379,6 +379,13 @@ export function healthRoutes(
       ? inspectDatabaseBackupHealth(opts.databaseBackupHealth)
       : undefined;
     const warnings = databaseBackup?.warnings.length ? databaseBackup.warnings : undefined;
+    const redactedDatabaseBackup = databaseBackup ? redactedDatabaseBackupHealth(databaseBackup) : undefined;
+    const redactedWarnings = redactedDatabaseBackup?.warnings.length ? redactedDatabaseBackup.warnings : undefined;
+    // Agents read this route through the run bridge to prove a deploy. The full
+    // backup block names host paths and carries the raw failure-marker text, so
+    // an agent gets the redacted shape an anonymous probe gets; board keeps the
+    // full block.
+    const redactBackupDetails = actorType === "agent";
     const nativeRecovery = exposeFullDetails
       ? await nativeRestartRecoverySummary(db).catch((error) => {
           logger.warn({ err: error }, "native recovery health summary failed");
@@ -400,8 +407,6 @@ export function healthRoutes(
         : undefined;
 
     if (!exposeFullDetails) {
-      const redactedDatabaseBackup = databaseBackup ? redactedDatabaseBackupHealth(databaseBackup) : undefined;
-      const redactedWarnings = redactedDatabaseBackup?.warnings.length ? redactedDatabaseBackup.warnings : undefined;
       res.json({
         status: healthStatus,
         deploymentMode: opts.deploymentMode,
@@ -441,8 +446,8 @@ export function healthRoutes(
       startupRecovery,
       nativeRecovery,
       ...(resourceCapacity ? { resourceCapacity } : {}),
-      ...(databaseBackup ? { databaseBackup } : {}),
-      ...(warnings ? { warnings } : {}),
+      ...(databaseBackup ? { databaseBackup: redactBackupDetails ? redactedDatabaseBackup : databaseBackup } : {}),
+      ...(warnings ? { warnings: redactBackupDetails ? redactedWarnings : warnings } : {}),
       ...(devServer ? { devServer } : {}),
       ...(workspaceReadiness ? { workspace: workspaceReadiness } : {}),
       ...(cloud ? { cloud } : {}),

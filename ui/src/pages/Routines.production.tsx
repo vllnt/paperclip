@@ -16,12 +16,14 @@ import { useToastActions } from "../context/ToastContext";
 import { buildMarkdownMentionOptions } from "../lib/company-members";
 import { cn } from "../lib/utils";
 import { queryKeys } from "../lib/queryKeys";
+import { agentNameMap, stepWarningsToast } from "../lib/routine-step-warnings";
 import { groupBy } from "../lib/groupBy";
 import { createIssueDetailLocationState } from "../lib/issueDetailBreadcrumb";
 import { collectLiveIssueIds } from "../lib/liveIssueIds";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
+import { useNewRoutineLink } from "../hooks/useNewRoutineLink";
 import { EmptyState } from "../components/EmptyState";
 import { IssuesList } from "../components/IssuesList";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -601,8 +603,10 @@ export function Routines() {
     onMutate: ({ id }) => {
       setRunningRoutineId(id);
     },
-    onSuccess: async (_, { id }) => {
+    onSuccess: async (run, { id }) => {
       setRunDialogRoutine(null);
+      const warningToast = stepWarningsToast(run.warnings, agentNameMap(agents));
+      if (warningToast) pushToast(warningToast);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.list(selectedCompanyId!) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(id) }),
@@ -747,6 +751,11 @@ export function Routines() {
     }));
     setComposerOpen(true);
   }
+
+  useNewRoutineLink((projectId) => {
+    if (projectId) setDraft((current) => ({ ...current, projectId }));
+    openCreateRoutine();
+  });
 
   async function moveSelectedRoutines(folderId: string | null) {
     const ids = selectedRoutineIds;

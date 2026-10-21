@@ -11047,6 +11047,36 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  it("keeps the stranded notice's failure summary to the run's short one-line summary", async () => {
+    const summary = "Agent exited with code 1: Tool execution failed";
+    const { issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+      retryReason: "assignment_recovery",
+      runErrorCode: "process_lost",
+      runError: `${summary}\nLast lines of stderr:\nfirst stderr line\nsecond stderr line`,
+      resultJson: {
+        errorSummary: summary,
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    const failureSummary = commentMetadataRows(comments[0]).find(
+      (row) => row.type === "key_value" && row.label === "Failure summary",
+    );
+    expect(failureSummary).toMatchObject({ type: "key_value", value: summary });
+    expect(JSON.stringify(comments[0]?.metadata)).not.toContain("second stderr line");
+  });
+
   it("blocks an already stranded recovery issue without creating a recovery child", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "todo",

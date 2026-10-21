@@ -1,5 +1,5 @@
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
-import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
+import { CONTEXT_WINDOW_EXCEEDED_ERROR_CODE, isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { selectInCommentBatches } from "../comment-id-batches.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
@@ -99,7 +99,7 @@ import {
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
+import { isExternalChatPresentationContext, readRunErrorSummary } from "../heartbeat-run-summary.js";
 import {
   CHAT_CONTROL_RECOVERY_STOP_CODE,
   CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE,
@@ -402,11 +402,11 @@ function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   if (readRecoveryRunErrorFamily(latestRun) === "provider_quota") return true;
   if (latestRun?.errorCode !== "adapter_failed") return false;
   return /(?:usage|rate|quota) limit|you(?:'|’)ve hit your (?:\w+ )?limit|quota (?:exceeded|reset)|try again after/i.test(
-    latestRun.error ?? "",
+    readRunErrorSummary(latestRun) ?? "",
   );
 }
 
-function resolveStrandedRecoveryCause(
+export function resolveStrandedRecoveryCause(
   latestRun: LatestIssueRun,
   explicitCause?: StrandedRecoveryCause,
 ): StrandedRecoveryCause {
@@ -513,6 +513,8 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "provider_tool_definition_invalid",
+  // The same prompt overflows the model's context window every time.
+  CONTEXT_WINDOW_EXCEEDED_ERROR_CODE,
   "adapter_engine_unavailable",
   "agent_not_invokable",
   "agent_not_found",
@@ -662,7 +664,7 @@ export function classifyAdapterFailureForRecovery(
   const resultJson = parseObject(latestRun.resultJson);
   const error = [
     latestRun.errorCode ?? "",
-    latestRun.error ?? "",
+    readRunErrorSummary(latestRun) ?? "",
     JSON.stringify(resultJson),
   ].join("\n");
   if (
@@ -4338,6 +4340,11 @@ export function recoveryService(
           input.successfulRunHandoffEvidence.missingDisposition,
       });
     }
+    // The short summary keeps the notice's "Failure summary" row to one line.
+    // The run page and the Inbox still show the full stored error.
+    const sourceRunErrorSummary = input.latestRun
+      ? readRunErrorSummary(input.latestRun)
+      : null;
     const escalationNotice = buildStrandedRecoveryEscalationNotice({
       seed: input.notice,
       fallbackBody: input.comment,
@@ -4353,8 +4360,8 @@ export function recoveryService(
             agentId: input.latestRun.agentId,
             status: input.latestRun.status,
             errorCode: input.latestRun.errorCode,
-            errorSummary: input.latestRun.error
-              ? redactSensitiveText(input.latestRun.error)
+            errorSummary: sourceRunErrorSummary
+              ? redactSensitiveText(sourceRunErrorSummary)
               : null,
           }
         : null,

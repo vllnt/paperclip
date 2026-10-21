@@ -79,7 +79,8 @@ export function formFromSource(source: EventSource): EventSourceFormState {
   return {
     name: source.name,
     signingMode: source.signingMode,
-    normalizer: source.normalizer,
+    // The built-in Paperclip source is never edited in this form; it has no other normalizer to offer.
+    normalizer: source.normalizer === "gatus" ? "gatus" : "generic_v1",
     endpointMapText: endpointMap ? JSON.stringify(endpointMap, null, 2) : "",
     pinned: Object.entries(source.pinnedLabels ?? {}).map(([key, value]) => newPinnedRow(key, value)),
     replayWindowSec: String(source.replayWindowSec),

@@ -17,13 +17,57 @@ export const RUN_FAILURE_CAUSES = [
   "control_plane_cancel",
   "operator_cancel",
   "adapter_failure",
+  "context_overflow",
   "unknown",
 ] as const;
 
 export type RunFailureCause = (typeof RUN_FAILURE_CAUSES)[number];
 
 /** Bump when a rule changes, so records derived under older rules can be re-derived. */
-export const RUN_FAILURE_CAUSE_RULES_VERSION = 1;
+export const RUN_FAILURE_CAUSE_RULES_VERSION = 2;
+
+/**
+ * The run's error code when the provider refused the prompt because it is larger than the
+ * model's context window. The same prompt fails the same way, so nothing retries it.
+ */
+export const CONTEXT_WINDOW_EXCEEDED_ERROR_CODE = "context_window_exceeded";
+
+/** Provider wordings of a prompt that does not fit the model's context window. */
+const CONTEXT_WINDOW_EXCEEDED_RULES: readonly RegExp[] = [
+  /\bprompt is too long\b/i,
+  /\bcontext[_ ]length[_ ]exceeded\b/i,
+  /\bcontext window (?:limit )?exceeded\b/i,
+  /\bexceeds the context window\b/i,
+  /\bran out of room in the model['’]?s context window\b/i,
+  /\bmaximum context length is \d[\d,]* tokens\b/i,
+  /\binput is too long for (?:the )?requested model\b/i,
+  /\binput token count \(?\d[\d,]*\)? exceeds the maximum number of tokens allowed\b/i,
+];
+const CONTEXT_WINDOW_SCAN_CHARS = 4000;
+/** A provider error is one short line; a longer line is more likely model output that quotes it. */
+const CONTEXT_WINDOW_MAX_LINE_CHARS = 500;
+
+/**
+ * Tells whether an adapter's terminal error message says the prompt exceeded the model's
+ * context window. Pass only the adapter's short error message, never stdout or a transcript:
+ * an agent's own output can quote these words.
+ *
+ * @param message - The adapter's terminal error message.
+ * @returns True when a short line of the message matches a provider's context-overflow wording.
+ * @example
+ * isContextWindowExceededMessage("Claude run failed: subtype=success: Prompt is too long"); // true
+ */
+export function isContextWindowExceededMessage(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return message
+    .slice(0, CONTEXT_WINDOW_SCAN_CHARS)
+    .split("\n")
+    .some(
+      (line) =>
+        line.length <= CONTEXT_WINDOW_MAX_LINE_CHARS &&
+        CONTEXT_WINDOW_EXCEEDED_RULES.some((rule) => rule.test(line)),
+    );
+}
 
 const STDERR_SCAN_CHARS = 4000;
 
@@ -117,6 +161,7 @@ const CAUSE_BY_CODE: ReadonlyMap<string, RunFailureCause> = new Map<string, RunF
   ["github_fetch_failed", "adapter_failure"],
   ["github_invalid_response", "adapter_failure"],
   ["github_unexpected_response", "adapter_failure"],
+  [CONTEXT_WINDOW_EXCEEDED_ERROR_CODE, "context_overflow"],
 ]);
 
 /** Codes that say a run failed without saying why, so stderr may refine them. */

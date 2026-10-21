@@ -8631,6 +8631,23 @@ export function issueService(db: Db) {
       return getIssueByIdentifier(identifier);
     },
 
+    /** The fields an access decision on a task needs, for the given tasks of one company. */
+    listAccessFields: async (companyId: string, ids: string[]) => {
+      if (ids.length === 0) return [];
+      return db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          projectId: issues.projectId,
+          parentId: issues.parentId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          status: issues.status,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), inArray(issues.id, ids)));
+    },
+
     getCurrentScheduledRetry: async (issueId: string) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -9393,6 +9410,36 @@ export function issueService(db: Db) {
         childIssueSummaryTruncated:
           children.length > childIssueSummaries.length,
       };
+    },
+
+    /**
+     * Adds blockers to an issue in one write, keeping the blockers it already has. Children created
+     * without `blockParentUntilDone` can then block their parent together, instead of one parent
+     * sync per child. Pass `dbOrTx` to run on a caller-owned transaction.
+     */
+    addBlockedByIssueIds: async (
+      issueId: string,
+      companyId: string,
+      blockedByIssueIds: string[],
+      dbOrTx: Db | DbTransaction = db,
+    ) => {
+      const existingBlockers = await dbOrTx
+        .select({ blockerIssueId: issueRelations.issueId })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.relatedIssueId, issueId),
+            eq(issueRelations.type, "blocks"),
+          ),
+        );
+      await syncBlockedByIssueIds(
+        issueId,
+        companyId,
+        [...existingBlockers.map((row) => row.blockerIssueId), ...blockedByIssueIds],
+        {},
+        dbOrTx,
+      );
     },
 
     /**

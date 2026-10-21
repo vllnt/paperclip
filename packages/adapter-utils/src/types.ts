@@ -87,7 +87,14 @@ export interface AdapterExecutionResult {
   exitCode: number | null;
   signal: string | null;
   timedOut: boolean;
+  /** The short error message. Failure classifiers read this text. */
   errorMessage?: string | null;
+  /**
+   * A fuller failure text for people, for example from `describeProcessExit`. A failed or timed-out
+   * run stores it as its error message in place of `errorMessage`. Classifiers keep reading
+   * `errorMessage`, so a detail never changes how a failure is classified.
+   */
+  errorDetail?: string | null;
   errorCode?: string | null;
   errorFamily?: AdapterExecutionErrorFamily | null;
   retryNotBefore?: string | null;
@@ -197,6 +204,16 @@ export interface AdapterRuntimeEvent {
 }
 
 /**
+ * A resumable session, reported while the run is still going. The fields have
+ * the same meaning as `sessionParams` and `sessionDisplayId` of
+ * `AdapterExecutionResult`.
+ */
+export interface AdapterSessionCheckpoint {
+  sessionParams: Record<string, unknown>;
+  sessionDisplayId?: string | null;
+}
+
+/**
  * Outcome of handing a board message to a running adapter process. `pending`
  * means the message reached the process's live input; it is delivered only
  * once the adapter reports a steering acknowledgement through `onEvent`.
@@ -246,6 +263,15 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
+  /**
+   * Reports a resumable session as soon as the provider names it, before
+   * `execute` returns. The host stores it for the run and its task, so a run
+   * that ends early (for example when the host restarts) still leaves a session
+   * for its retry. Report only a session that the adapter would also resume
+   * from. The call is repeatable and never throws. The final result of
+   * `execute` always replaces the checkpoint.
+   */
+  onSessionCheckpoint?: (checkpoint: AdapterSessionCheckpoint) => Promise<void>;
   /**
    * Called with a handle once the running process can take a message mid-run,
    * and with null once it no longer can. Adapters without live input never
