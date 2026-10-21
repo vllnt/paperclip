@@ -590,6 +590,107 @@ export function authorizeSandboxCallbackBridgeRequestWithRoutes(
     : `Route not allowed: ${method} ${request.path}`;
 }
 
+/** The reason a bridge request path failed the canonical parse. */
+export type CanonicalBridgeRequestPathRejection =
+  | "missing_path"
+  | "duplicate_pseudo_header"
+  | "non_origin_form"
+  | "encoded_slash"
+  | "backslash"
+  | "nul_byte"
+  | "dot_segment"
+  | "encoded_dot"
+  | "non_canonical_path";
+
+/** The one parsed pathname and query. Both the route allowlist and the forward
+ * URL builder read this same value; the host never parses a request path twice. */
+export interface CanonicalBridgeRequestPath {
+  pathname: string;
+  /** The query string, in `URL.search` form: empty, or a leading `?`. */
+  query: string;
+}
+
+export type CanonicalBridgeRequestPathResult =
+  | { ok: true; value: CanonicalBridgeRequestPath }
+  | { ok: false; reason: CanonicalBridgeRequestPathRejection };
+
+/**
+ * Parse one origin-form request target (a pathname with an optional query)
+ * exactly one time. Both bridge hosts pass the returned pathname to the route
+ * allowlist and to the forward, never a second, independent parse of the raw
+ * value.
+ *
+ * The parser rejects a target that is missing or empty, is not origin-form,
+ * or carries an encoded slash, a backslash, a NUL byte, or a dot segment
+ * (checked before URL normalization would silently remove it, and after
+ * percent-decoding each segment, so an encoded dot segment cannot slip
+ * through).
+ */
+export function parseCanonicalBridgeRequestTarget(rawPath: unknown): CanonicalBridgeRequestPathResult {
+  if (typeof rawPath !== "string" || rawPath.length === 0) {
+    return { ok: false, reason: "missing_path" };
+  }
+  // Origin-form only: a single leading "/", never "//" (network-path form) and
+  // never an absolute-form URI ("scheme://...").
+  if (!rawPath.startsWith("/") || rawPath.startsWith("//") || rawPath.includes("://")) {
+    return { ok: false, reason: "non_origin_form" };
+  }
+  if (/%2f/i.test(rawPath)) {
+    return { ok: false, reason: "encoded_slash" };
+  }
+  if (rawPath.includes("\\")) {
+    return { ok: false, reason: "backslash" };
+  }
+  if (rawPath.includes("\0") || /%00/i.test(rawPath)) {
+    return { ok: false, reason: "nul_byte" };
+  }
+  const queryIndex = rawPath.indexOf("?");
+  const rawPathname = queryIndex === -1 ? rawPath : rawPath.slice(0, queryIndex);
+  for (const segment of rawPathname.split("/")) {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      return { ok: false, reason: "non_origin_form" };
+    }
+    if (decoded === "." || decoded === "..") {
+      return { ok: false, reason: "dot_segment" };
+    }
+  }
+  // Every raw-string check above passed, and the path carries no dot segment,
+  // so `URL` normalization here changes nothing but percent-encoding; it stays
+  // safe to build the canonical pathname and query from it.
+  let url: URL;
+  try {
+    url = new URL(rawPath, "http://bridge.internal");
+  } catch {
+    return { ok: false, reason: "non_origin_form" };
+  }
+  return { ok: true, value: { pathname: url.pathname, query: url.search } };
+}
+
+/**
+ * Parse the `path` of one queue_v1 request entry. The sandbox gateway writes
+ * the pathname its own URL parser produced, with the query in its own field,
+ * so a well-formed entry parses to itself. Any process in the sandbox can
+ * write an entry, so the host refuses one that fails
+ * {@link parseCanonicalBridgeRequestTarget}, that the parse would change
+ * (a fragment, a query, a tab or newline the URL parser strips, any other
+ * normalization), or that carries a percent-encoded dot. The route allowlist
+ * and the forward then read the same pathname.
+ */
+function parseCanonicalSandboxCallbackBridgeQueuePath(rawPath: unknown): CanonicalBridgeRequestPathResult {
+  const parsed = parseCanonicalBridgeRequestTarget(rawPath);
+  if (!parsed.ok) return parsed;
+  if (parsed.value.pathname !== rawPath) {
+    return { ok: false, reason: "non_canonical_path" };
+  }
+  if (/%2e/i.test(rawPath)) {
+    return { ok: false, reason: "encoded_dot" };
+  }
+  return parsed;
+}
+
 export function sanitizeSandboxCallbackBridgeHeaders(
   headers: Record<string, string>,
   allowlist: readonly string[] = DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST,
@@ -1331,6 +1432,21 @@ export async function startSandboxCallbackBridgeWorker(input: {
           completedAt: new Date().toISOString() });
         return;
       }
+      // Parse the entry's path once, by the rule the HTTP/2 host applies. The
+      // reassignment below is deliberate: the route check and the handler both
+      // read this one canonical pathname, never the raw entry value.
+      const canonicalPath = parseCanonicalSandboxCallbackBridgeQueuePath(request.path);
+      if (!canonicalPath.ok) {
+        await finalize({
+          id: request.id,
+          status: 400,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ error: `Invalid request path: ${canonicalPath.reason}` }),
+          completedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      request = { ...request, path: canonicalPath.value.pathname };
       const denialReason = await authorizeRequest(request);
       if (denialReason) {
         await finalize({
