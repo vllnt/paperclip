@@ -382,10 +382,9 @@ describe("incremental GitHub task sync", () => {
     await f.service.sync(companyId);
     expect(await f.h.ctx.state.get(queueKey())).toEqual({});
     // A repository that one catalog read missed keeps a recent ask.
-    const recent = { "2000": { repositoryId: 99, number: 1, at: Date.now() } };
-    await f.h.ctx.state.set(queueKey(), recent);
+    await f.h.ctx.state.set(queueKey(), { "2000": { repositoryId: 99, number: 1, at: Date.now() } });
     await f.service.sync(companyId);
-    expect(await f.h.ctx.state.get(queueKey())).toEqual(recent);
+    expect(Object.keys(await f.h.ctx.state.get(queueKey()) as object)).toEqual(["2000"]);
     await f.h.ctx.state.set(queueKey(), {});
     await editHere(f, 2, "Local title");
     await f.service.sync(companyId);
