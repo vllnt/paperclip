@@ -50,6 +50,23 @@ describe("adapter session codecs", () => {
     expect(claudeSessionCodec.deserialize(claudeSessionCodec.serialize(params))).toEqual(params);
   });
 
+  it("preserves the Claude remote execution identity so a remote run can resume its session", () => {
+    const params = {
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      cwd: "/tmp/workspace",
+      promptBundleKey: "bundle-1",
+      remoteExecution: {
+        transport: "ssh",
+        host: "127.0.0.1",
+        port: 2222,
+        username: "fixture",
+        remoteCwd: "/remote/workspace",
+      },
+    };
+    expect(claudeSessionCodec.deserialize(claudeSessionCodec.serialize(params))).toEqual(params);
+    expect(claudeSessionCodec.deserialize({ ...params, remoteExecution: "not-an-object" })).not.toHaveProperty("remoteExecution");
+  });
+
   it("preserves claude ACP session params for ACP lane resumes", () => {
     const parsed = claudeSessionCodec.deserialize({
       sessionKey: "paperclip:company:agent:task:fingerprint",

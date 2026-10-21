@@ -506,15 +506,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // file that includes both the file content and the path directive, so we only
   // need --append-system-prompt-file (Claude CLI forbids using both flags together).
   let combinedInstructionsContents: string | null = null;
+  // The heartbeat gives each run its own copy of the instructions, so the path
+  // directive names this run. The resume key hashes the text without it.
+  let resumeInstructionsContents: string | null = null;
+  let resumeInstructionsNote = "";
+  const instructionsBaseDirective = instructionsFilePath
+    ? `Resolve any relative file references from ${instructionsFileDir}. ` +
+      `This base directory is authoritative for sibling instruction files such as ` +
+      `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.`
+    : "";
   if (instructionsFilePath) {
     try {
       const instructionsContent = await fs.readFile(instructionsFilePath, "utf-8");
       const pathDirective =
-        `\nThe above agent instructions were loaded from ${instructionsFilePath}. ` +
-        `Resolve any relative file references from ${instructionsFileDir}. ` +
-        `This base directory is authoritative for sibling instruction files such as ` +
-        `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.`;
+        `\nThe above agent instructions were loaded from ${instructionsFilePath}. ${instructionsBaseDirective}`;
       combinedInstructionsContents = instructionsContent + pathDirective;
+      resumeInstructionsContents = instructionsContent;
+      resumeInstructionsNote = `This run's agent instructions are at ${instructionsFilePath}. ${instructionsBaseDirective}`;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       await onLog(
@@ -537,6 +545,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     combinedInstructionsContents = combinedInstructionsContents
       ? `${combinedInstructionsContents}\n\n${skillLibraryManifest}`
       : skillLibraryManifest;
+    resumeInstructionsContents = resumeInstructionsContents
+      ? `${resumeInstructionsContents}\n\n${skillLibraryManifest}`
+      : skillLibraryManifest;
   }
   // Missing-source entries must never reach the bundle: their path does not
   // exist, so the bundle hasher would throw and fail the whole run over one
@@ -554,6 +565,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     companyId: agent.companyId,
     skills: mountableSkillEntries,
     instructionsContents: combinedInstructionsContents,
+    resumeInstructionsContents,
     onLog,
   });
   const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
@@ -775,35 +787,39 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");
   const runtimeMcpServerIdentity = asString(runtimeSessionParams.mcpServerIdentity, "");
   const hasMatchingPromptBundle =
-    runtimePromptBundleKey.length === 0 || runtimePromptBundleKey === promptBundle.bundleKey;
+    runtimePromptBundleKey.length === 0 || runtimePromptBundleKey === promptBundle.resumeKey;
   const hasMatchingMcpServers =
     runtimeMcpServerIdentity.length === 0
       ? runtimeMcpServers.length === 0
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
   const isValidUuid = isClaudeSessionUuid(runtimeSessionId);
+  const hasMatchingCwd = claudeSessionCwdMatchesExecutionTarget({
+    runtimeSessionCwd,
+    effectiveExecutionCwd,
+    executionTargetIsRemote,
+  });
+  // A remote run works in its own directory under the target's workspace, so
+  // the session identity names the target, not the directory of one run.
+  const hasMatchingRemoteExecution = adapterExecutionTargetSessionMatches(runtimeRemoteExecution, executionTarget);
   const canResumeSession =
     runtimeSessionId.length > 0 &&
     isValidUuid &&
     hasMatchingPromptBundle &&
     // Each CLI invocation loads --mcp-config, including --resume invocations.
     // Refreshing tools does not invalidate the saved conversation.
-    claudeSessionCwdMatchesExecutionTarget({
-      runtimeSessionCwd,
-      effectiveExecutionCwd,
-      executionTargetIsRemote,
-    }) &&
-    adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+    hasMatchingCwd &&
+    hasMatchingRemoteExecution;
   const sessionId = canResumeSession ? runtimeSessionId : null;
   // One shape for the session that the final result and the early checkpoint
   // report, so both carry the same cwd and remote identity.
   const buildClaudeSessionParams = (claudeSessionId: string): Record<string, unknown> => ({
     sessionId: claudeSessionId,
     cwd,
-    promptBundleKey: promptBundle.bundleKey,
+    promptBundleKey: promptBundle.resumeKey,
     mcpServerIdentity: runtimeMcpIdentity,
     ...(executionTargetIsRemote
       ? {
-          remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+          remoteExecution: adapterExecutionTargetSessionIdentity(executionTarget),
         }
       : {}),
     ...(workspaceId ? { workspaceId } : {}),
@@ -816,36 +832,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Claude session "${runtimeSessionId}" is not a valid UUID and will not be passed to --resume.\n`,
     );
   }
-  if (
-    executionTargetIsRemote &&
-    runtimeSessionId &&
-    isValidUuid &&
-    !canResumeSession
-  ) {
+  if (runtimeSessionId && isValidUuid && !hasMatchingRemoteExecution) {
+    const reason = !executionTargetIsRemote
+      ? "was saved for a remote execution target"
+      : Object.keys(runtimeRemoteExecution).length === 0
+      ? "was saved without a remote execution identity"
+      : "does not match the current remote execution identity";
     await onLog(
       "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
+      `[paperclip] Claude session "${runtimeSessionId}" ${reason} and will not be resumed in "${effectiveExecutionCwd}".\n`,
     );
-  } else if (
-    runtimeSessionId &&
-    isValidUuid &&
-    runtimeSessionCwd.length > 0 &&
-    path.resolve(runtimeSessionCwd) !== path.resolve(effectiveExecutionCwd)
-  ) {
-    await onLog(
-      "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
-    );
-  } else if (runtimeSessionId && isValidUuid && !canResumeSession) {
+  }
+  if (runtimeSessionId && isValidUuid && !hasMatchingCwd) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
     );
   }
-  if (runtimeSessionId && runtimePromptBundleKey.length > 0 && runtimePromptBundleKey !== promptBundle.bundleKey) {
+  if (runtimeSessionId && !hasMatchingPromptBundle) {
     await onLog(
       "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptBundleKey}" and will not be resumed with "${promptBundle.bundleKey}".\n`,
+      `[paperclip] Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptBundleKey}" and will not be resumed with "${promptBundle.resumeKey}".\n`,
     );
   }
   if (runtimeSessionId && !hasMatchingMcpServers) {
@@ -920,6 +927,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
+  // A resumed session still holds the paths of the run that started it. Each
+  // run reads its own instructions copy and, on a remote target, works in its
+  // own directory, so a resume prompt names the paths of this run.
+  const resumeLocationNote = joinPromptSections([
+    resumeInstructionsNote,
+    executionTargetIsRemote
+      ? `This run's workspace is ${effectiveExecutionCwd}. Workspace paths from an earlier run no longer exist.`
+      : "",
+  ], " ");
+
   const runAttempt = async (resumeSessionId: string | null) => {
     await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
     const renderedBootstrapPrompt =
@@ -938,6 +955,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const prompt = joinPromptSections([
       renderedBootstrapPrompt,
       selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
+      resumeSessionId ? resumeLocationNote : "",
       wakePrompt,
       sessionHandoffNote,
       taskContextNote,
