@@ -314,6 +314,29 @@ describe("ProjectDetail", () => {
     expect(container.querySelector('[data-testid="project-routines-section"]')).toBeNull();
   });
 
+  it("keeps an archived project's routines listed but offers no New routine for it", async () => {
+    mockLocation.pathname = "/projects/project-1/configuration";
+    mockProjectsApi.get.mockResolvedValue(project({ archivedAt: new Date("2026-05-02T00:00:00Z") }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ProjectDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector('[data-testid="project-routines-section"]')).not.toBeNull();
+    expect(mockProjectRoutinesSection).toHaveBeenCalledWith({ companyId: "company-1", projectId: "project-1", canCreate: false });
+    expect(mockProjectRoutinesSection).not.toHaveBeenCalledWith(expect.objectContaining({ canCreate: true }));
+  });
+
   it("keeps Timeline out of the project task-list controls", async () => {
     mockLocation.pathname = "/projects/project-1/issues";
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

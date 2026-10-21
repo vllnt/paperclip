@@ -7,11 +7,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { RoutineListItem } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectRoutinesSection } from "./ProjectRoutinesSection";
+import type { RoutineRunDialogSubmitData } from "./RoutineRunVariablesDialog";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const routinesListMock = vi.hoisted(() => vi.fn());
 const routinesUpdateMock = vi.hoisted(() => vi.fn());
+const routinesRunMock = vi.hoisted(() => vi.fn());
+const runDialogMock = vi.hoisted(() => vi.fn());
+// What the mocked run dialog submits, so a test chooses the viewer's run options.
+const runDialogChoice = vi.hoisted(() => ({ current: {} as RoutineRunDialogSubmitData }));
 const pushToastMock = vi.hoisted(() => vi.fn());
 const composerRenderMock = vi.hoisted(() => vi.fn());
 
@@ -21,7 +26,7 @@ vi.mock("@/lib/router", () => ({
   ),
 }));
 vi.mock("../api/routines", () => ({
-  routinesApi: { list: routinesListMock, update: routinesUpdateMock, run: vi.fn() },
+  routinesApi: { list: routinesListMock, update: routinesUpdateMock, run: routinesRunMock },
 }));
 vi.mock("../api/agents", () => ({
   agentsApi: { list: vi.fn(async () => [{ id: "agent-1", name: "Builder", icon: null }]) },
@@ -30,7 +35,18 @@ vi.mock("../api/projects", () => ({
   projectsApi: { list: vi.fn(async () => [{ id: "project-1", name: "Project Alpha", color: null }]) },
 }));
 vi.mock("../context/ToastContext", () => ({ useToastActions: () => ({ pushToast: pushToastMock }) }));
-vi.mock("./RoutineRunVariablesDialog", () => ({ RoutineRunVariablesDialog: () => null }));
+vi.mock("./RoutineRunVariablesDialog", () => ({
+  RoutineRunVariablesDialog: (props: RunDialogProps) => {
+    runDialogMock(props);
+    if (!props.open) return null;
+    return (
+      <div data-testid="run-dialog">
+        {props.routineName}
+        <button type="button" onClick={() => props.onSubmit(runDialogChoice.current)}>Submit run</button>
+      </div>
+    );
+  },
+}));
 vi.mock("./RoutineComposerDialog", () => ({
   RoutineComposerDialog: (props: ComposerProps) => {
     composerRenderMock(props);
@@ -50,6 +66,13 @@ interface ComposerProps {
   routine?: RoutineListItem | null;
   initialDraft?: { projectId?: string };
   afterCreate?: string;
+}
+
+interface RunDialogProps {
+  open: boolean;
+  routineName: string | null;
+  isPending: boolean;
+  onSubmit: (data: RoutineRunDialogSubmitData) => void;
 }
 
 async function act(callback: () => void | Promise<void>) {
@@ -91,6 +114,9 @@ describe("ProjectRoutinesSection", () => {
     queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     routinesListMock.mockReset();
     routinesUpdateMock.mockReset();
+    routinesRunMock.mockReset();
+    runDialogMock.mockReset();
+    runDialogChoice.current = {};
     pushToastMock.mockReset();
     composerRenderMock.mockReset();
   });
@@ -208,6 +234,35 @@ describe("ProjectRoutinesSection", () => {
     expect(routinesListMock.mock.calls.length).toBeGreaterThan(listCalls);
   });
 
+  it("keeps the switch at the server value and re-enables it when a status change fails", async () => {
+    routinesListMock.mockResolvedValue([routine({ id: "routine-1", title: "Nightly triage", status: "active" })]);
+    let rejectUpdate: (error: Error) => void = () => undefined;
+    routinesUpdateMock.mockReturnValue(new Promise((_, reject) => {
+      rejectUpdate = reject;
+    }));
+
+    await renderSection();
+    const toggle = () => container.querySelector<HTMLButtonElement>('[role="switch"]')!;
+    const listCalls = routinesListMock.mock.calls.length;
+    await act(() => toggle().click());
+    await flush();
+
+    expect(routinesUpdateMock).toHaveBeenCalledWith("routine-1", { status: "paused" });
+    expect(toggle().disabled).toBe(true);
+
+    rejectUpdate(new Error("Server unavailable"));
+    await flush();
+
+    expect(pushToastMock).toHaveBeenCalledWith({
+      title: "Failed to update routine",
+      body: "Server unavailable",
+      tone: "error",
+    });
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect(toggle().disabled).toBe(false);
+    expect(routinesListMock.mock.calls.length).toBe(listCalls);
+  });
+
   it("asks for a default agent instead of enabling a draft routine", async () => {
     routinesListMock.mockResolvedValue([routine({ title: "Draft routine", status: "paused", assigneeAgentId: null })]);
 
@@ -216,6 +271,99 @@ describe("ProjectRoutinesSection", () => {
 
     expect(routinesUpdateMock).not.toHaveBeenCalled();
     expect(pushToastMock).toHaveBeenCalledWith(expect.objectContaining({ title: "Default agent required" }));
+  });
+
+  async function openRowMenu(title: string) {
+    const menuTrigger = container.querySelector<HTMLButtonElement>(`[aria-label="More actions for ${title}"]`)!;
+    await act(() => {
+      menuTrigger.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await flush();
+    return [...document.body.querySelectorAll<HTMLElement>('[role="menuitem"]')]
+      .filter((item) => item.textContent?.includes("Run now") || item.textContent?.includes("Running..."));
+  }
+
+  async function openRunDialog(title: string) {
+    const [runNow] = await openRowMenu(title);
+    await act(() => runNow!.click());
+  }
+
+  it("runs a routine from its row menu with the dialog's choices, then closes the dialog and refreshes the list", async () => {
+    routinesListMock.mockResolvedValue([routine({ id: "routine-1", title: "Nightly triage" })]);
+    let resolveRun: (value: unknown) => void = () => undefined;
+    routinesRunMock.mockReturnValue(new Promise((resolve) => {
+      resolveRun = resolve;
+    }));
+    runDialogChoice.current = { variables: { branch: "main" }, assigneeAgentId: "agent-1", projectId: "project-1" };
+
+    await renderSection();
+    expect(container.querySelector('[data-testid="run-dialog"]')).toBeNull();
+    const listCalls = routinesListMock.mock.calls.length;
+
+    await openRunDialog("Nightly triage");
+    expect(container.querySelector('[data-testid="run-dialog"]')?.textContent).toContain("Nightly triage");
+    expect(runDialogMock.mock.calls.at(-1)?.[0].isPending).toBe(false);
+
+    await act(() => button("Submit run")!.click());
+    await flush();
+
+    expect(routinesRunMock).toHaveBeenCalledTimes(1);
+    expect(routinesRunMock).toHaveBeenCalledWith("routine-1", {
+      variables: { branch: "main" },
+      assigneeAgentId: "agent-1",
+      projectId: "project-1",
+    });
+    expect(runDialogMock.mock.calls.at(-1)?.[0].isPending).toBe(true);
+    expect(container.querySelector('[data-testid="run-dialog"]')).not.toBeNull();
+
+    resolveRun({});
+    await flush();
+
+    expect(container.querySelector('[data-testid="run-dialog"]')).toBeNull();
+    expect(routinesListMock.mock.calls.length).toBeGreaterThan(listCalls);
+    expect(pushToastMock).not.toHaveBeenCalled();
+    // The row is ready for the next run: its menu offers Run now, not a disabled Running...
+    const [runNow] = await openRowMenu("Nightly triage");
+    expect(runNow?.textContent).toBe("Run now");
+    expect(runNow?.hasAttribute("data-disabled")).toBe(false);
+  });
+
+  it("leaves out run options the dialog did not choose", async () => {
+    routinesListMock.mockResolvedValue([routine({ id: "routine-1", title: "Nightly triage" })]);
+    routinesRunMock.mockResolvedValue({});
+    runDialogChoice.current = { variables: {} };
+
+    await renderSection();
+    await openRunDialog("Nightly triage");
+    await act(() => button("Submit run")!.click());
+    await flush();
+
+    expect(routinesRunMock).toHaveBeenCalledWith("routine-1", {});
+  });
+
+  it("toasts a failed run and keeps the dialog open so the viewer can try again", async () => {
+    routinesListMock.mockResolvedValue([routine({ id: "routine-1", title: "Nightly triage" })]);
+    routinesRunMock.mockRejectedValueOnce(new Error("Agent is paused"));
+
+    await renderSection();
+    await openRunDialog("Nightly triage");
+    await act(() => button("Submit run")!.click());
+    await flush();
+
+    expect(pushToastMock).toHaveBeenCalledWith({
+      title: "Routine run failed",
+      body: "Agent is paused",
+      tone: "error",
+    });
+    expect(container.querySelector('[data-testid="run-dialog"]')).not.toBeNull();
+    expect(runDialogMock.mock.calls.at(-1)?.[0].isPending).toBe(false);
+
+    routinesRunMock.mockResolvedValueOnce({});
+    await act(() => button("Submit run")!.click());
+    await flush();
+
+    expect(routinesRunMock).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[data-testid="run-dialog"]')).toBeNull();
   });
 
   it("keeps a loaded list on screen when a later refetch fails", async () => {
