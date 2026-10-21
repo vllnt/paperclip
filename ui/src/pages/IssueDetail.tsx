@@ -232,6 +232,7 @@ import {
   TaskTreeControlDialog,
   TaskTreeControlMenuItems,
 } from "../components/TaskTreeControls";
+import { RunRoutineOnIssueDialog } from "../components/RunRoutineOnIssueDialog";
 import { waitForStoppedRuns } from "../lib/wait-for-stopped-runs";
 import { useIssueExternalObjects } from "../hooks/useIssueExternalObjects";
 import { IssueGalleryContext } from "../context/IssueGalleryContext";
@@ -3037,6 +3038,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const { pushToast } = useToastActions();
   const { isMobile } = useSidebar();
   const [moreOpen, setMoreOpen] = useState(false);
+  const [runRoutineOpen, setRunRoutineOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
   const [artifactsOpenRequest, setArtifactsOpenRequest] = useState<{
@@ -7401,6 +7403,18 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     ) : null}
                   </>
                 ) : null}
+                {!isTerminalIssue ? (
+                  <button
+                    className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-accent/50"
+                    onClick={() => {
+                      setRunRoutineOpen(true);
+                      setMoreOpen(false);
+                    }}
+                  >
+                    <Repeat className="h-3 w-3" />
+                    Run routine on this task
+                  </button>
+                ) : null}
                 <TaskTreeControlMenuItems
                   scope={treeControlScope}
                   canPause={
@@ -8249,6 +8263,17 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               </TabsContent>
             )}
           </Tabs>
+
+          <RunRoutineOnIssueDialog
+            open={runRoutineOpen}
+            onOpenChange={setRunRoutineOpen}
+            companyId={issue.companyId}
+            issue={{ id: issue.id, identifier: issue.identifier ?? null, title: issue.title }}
+            onStarted={() => {
+              invalidateIssueDetail();
+              invalidateIssueCollections();
+            }}
+          />
 
           <TaskTreeControlDialog
             open={treeControlOpen}

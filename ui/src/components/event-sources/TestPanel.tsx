@@ -75,7 +75,7 @@ export function TestPanel({ source }: { source: EventSource }) {
   const [mode, setMode] = useState<"form" | "json">(isGatus ? "json" : "form");
   const [form, setForm] = useState<TestForm>(initialForm);
   const [json, setJson] = useState(() =>
-    JSON.stringify(sampleTestPayload(source.normalizer), null, 2),
+    JSON.stringify(sampleTestPayload(isGatus ? "gatus" : "generic_v1"), null, 2),
   );
   const [parseError, setParseError] = useState("");
   const dryRun = useMutation({
