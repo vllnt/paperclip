@@ -3,12 +3,12 @@ import { GIT_ARCHIVE_EXCLUDES } from "./git-workspace-sync.js";
 import {
   type SshConnectionConfig,
   type SshRemoteExecutionSpec,
-  planWorkspaceSeed,
   prepareWorkspaceForSshExecution,
   runSshCommand,
   restoreWorkspaceFromSshExecution,
   sshSyncBackDependencyExcludes,
   syncDirectoryToSsh,
+  untrackedSshSyncBackDependencyDirNames,
 } from "./ssh.js";
 import {
   mergeExcludes,
@@ -832,13 +832,19 @@ export async function prepareRemoteManagedRuntime(input: {
       .catch(() => undefined);
   };
 
-  // Decide what the seed sends and snapshot the host BEFORE the first byte
-  // leaves it. A baseline taken after the transfer records a change that landed
-  // on the host while the copy was being seeded as if the copy had it, and the
-  // restore then writes the copy's older file back over that change (and deletes
-  // a file created in that window).
-  const seedPlan = syncWorkspace
-    ? await planWorkspaceSeed({ localDir: input.workspaceLocalDir, workspaceFileMode: input.workspaceFileMode })
+  const preparedWorkspace = syncWorkspace
+    ? await prepareWorkspaceForSshExecution({
+        spec: input.spec,
+        localDir: input.workspaceLocalDir,
+        remoteDir: workspaceRemoteDir,
+        onProgress: input.onProgress,
+        workspaceFileMode: input.workspaceFileMode,
+        workspaceExclude: input.workspaceExclude,
+      }).catch(async (error: unknown) => {
+        // No agent ran, so a partial upload holds nothing to keep.
+        await markNothingToKeep();
+        throw error;
+      })
     : null;
   // The sync-back tar and the merge both use the baseline's exclude list, so
   // dependency trees listed here stay on the remote and the host's own copies
@@ -847,33 +853,18 @@ export async function prepareRemoteManagedRuntime(input: {
   // "all" mode is the exact-copy contract for plain persistent directories:
   // agent-file checkpoints validate every downloaded byte against a manifest,
   // so it applies only the caller's `workspaceExclude`.
-  const baselineSnapshot = seedPlan
+  const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
-        exclude: seedPlan.gitBacked
+        exclude: preparedWorkspace.gitBacked
           ? [
               ...GIT_ARCHIVE_EXCLUDES,
               ".paperclip-runtime",
-              ...sshSyncBackDependencyExcludes(seedPlan.untrackedDependencyDirNames),
+              ...sshSyncBackDependencyExcludes(await untrackedSshSyncBackDependencyDirNames(input.workspaceLocalDir)),
             ]
           : [
               ".paperclip-runtime",
               ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : sshSyncBackDependencyExcludes()),
             ],
-      })
-    : null;
-  const preparedWorkspace = seedPlan
-    ? await prepareWorkspaceForSshExecution({
-        spec: input.spec,
-        localDir: input.workspaceLocalDir,
-        remoteDir: workspaceRemoteDir,
-        onProgress: input.onProgress,
-        workspaceFileMode: input.workspaceFileMode,
-        workspaceExclude: input.workspaceExclude,
-        plan: seedPlan,
-      }).catch(async (error: unknown) => {
-        // No agent ran, so a partial upload holds nothing to keep.
-        await markNothingToKeep();
-        throw error;
       })
     : null;
 
@@ -900,7 +891,6 @@ export async function prepareRemoteManagedRuntime(input: {
         remoteDir: workspaceRemoteDir,
         baselineSnapshot,
         restoreGitHistory: preparedWorkspace.gitBacked,
-        seedHead: seedPlan?.gitSnapshot?.headCommit,
         onProgress: input.onProgress,
       });
     }
@@ -975,7 +965,6 @@ export async function prepareRemoteManagedRuntime(input: {
           remoteDir: workspaceRemoteDir,
           baselineSnapshot,
           restoreGitHistory: preparedWorkspace.gitBacked,
-          seedHead: seedPlan?.gitSnapshot?.headCommit,
           onProgress,
         });
       }
