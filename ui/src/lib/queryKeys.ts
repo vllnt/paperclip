@@ -330,6 +330,9 @@ export const queryKeys = {
     labels: (companyId: string) => ["issues", companyId, "labels"] as const,
     listByProject: (companyId: string, projectId: string) =>
       ["issues", companyId, "project", projectId] as const,
+    /** The open tasks of a project, every page. */
+    listOpenByProject: (companyId: string, projectId: string) =>
+      ["issues", companyId, "project", projectId, "open"] as const,
     /** The open tasks whose own goal is this one. */
     listOpenByGoal: (companyId: string, goalId: string) =>
       ["issues", companyId, "goal", goalId, "open"] as const,
