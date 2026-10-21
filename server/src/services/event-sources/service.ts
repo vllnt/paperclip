@@ -1,16 +1,29 @@
 import { isIPv6 } from "node:net";
 import crypto from "node:crypto";
-import { and, asc, desc, eq, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   eventDeliveries,
   eventSources,
+  heartbeatRuns,
+  issueLabels,
+  issues,
+  labels as issueLabelRows,
   routines,
   routineTriggers,
 } from "@paperclipai/db";
 import {
+  EVENT_SOURCE_NORMALIZERS,
+  PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
+  PAPERCLIP_INTERNAL_EVENT_SOURCE,
+  PAPERCLIP_INTERNAL_EVENT_SOURCE_NAME,
+  PAPERCLIP_ISSUE_CREATED_EVENT_TYPE,
+  PAPERCLIP_ISSUE_EVENT_MAX_LABELS,
+  isUuidLike,
   matchesEvent,
+  paperclipIssueLabelEventKey,
   validateEventSourceNormalizerConfig,
+  type EventSourceNormalizer,
   type CreateEventSource,
   type EventDelivery,
   type EventDeliveryPage,
@@ -36,6 +49,7 @@ import { routineService } from "../routines.js";
 import { secretService } from "../secrets.js";
 import { verifyBearerAuthorization, verifyHmacSha256Signature } from "../webhook-auth.js";
 import { registerGatedEventHooks, type GatedEventSettlement } from "../routine-gates/hooks.js";
+import { hasOpenRoutineSteps } from "../routine-steps.js";
 import { previewEventRoutine } from "./event-dispatch.js";
 import { pruneEventData } from "./prune.js";
 import { normalizeEvent } from "./normalizers.js";
@@ -80,6 +94,48 @@ export function eventSourceIngressUrl(publicId: string): string {
   return baseUrl ? `${baseUrl.replace(/\/+$/, "")}${path}` : path;
 }
 
+/**
+ * The per-company source Paperclip publishes `issue.created` events to. It has no secret and no
+ * ingress: only the server publishes to it, and only `enabled` can change.
+ */
+function isInternalSource(row: { normalizer: string }): boolean {
+  return row.normalizer === PAPERCLIP_INTERNAL_EVENT_NORMALIZER;
+}
+
+function isConfigurableNormalizer(value: string): value is EventSourceNormalizer {
+  return EVENT_SOURCE_NORMALIZERS.some((normalizer) => normalizer === value);
+}
+
+const INTERNAL_SOURCE_MANAGED_MESSAGE =
+  "This event source is managed by Paperclip; only enabled can be changed, and it cannot be archived, rotated or tested";
+
+/**
+ * New tasks per hour the internal source attaches steps to before it folds the rest. Higher than the
+ * default of a source fed by an external sender: tasks are created by people and agents, not by an
+ * alert storm.
+ */
+const INTERNAL_SOURCE_MAX_NEW_ISSUES_PER_HOUR = 200;
+
+/** Task origins that never publish: they belong to a routine run or a conversation. */
+const UNPUBLISHED_ISSUE_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step", "chat_channel"];
+
+/** Origins of a routine's own tasks: work under them, or made while working on them, does not publish. */
+const ROUTINE_TREE_ORIGIN_KINDS: readonly string[] = ["routine_execution", "routine_step"];
+
+/**
+ * How many levels the routine tree check walks up, the task itself included. A tree deeper than this
+ * counts as a routine tree, so the check fails closed.
+ */
+const ROUTINE_TREE_MAX_DEPTH = 50;
+
+/** What publishing an internal event did. */
+export interface PublishInternalResult {
+  /** True when a routine attached its steps to the task, so the caller must not wake the task's assignee. */
+  stepsAttached: boolean;
+  /** The routine runs the event started, including failed ones. */
+  routineRunIds: string[];
+}
+
 function toApiSource(row: EventSourceRow): EventSource {
   return {
     id: row.id,
@@ -88,7 +144,7 @@ function toApiSource(row: EventSourceRow): EventSource {
     enabled: row.enabled,
     archived: row.archived,
     publicId: row.publicId,
-    ingressUrl: eventSourceIngressUrl(row.publicId),
+    ingressUrl: isInternalSource(row) ? null : eventSourceIngressUrl(row.publicId),
     secretId: row.secretId,
     signingMode: row.signingMode as EventSource["signingMode"],
     replayWindowSec: row.replayWindowSec,
@@ -246,7 +302,17 @@ export function eventSourceService(
   const cache = createEventSourceCache<CachedSource>({
     now,
     loadAll: async (previous) => {
-      const rows = await db.select().from(eventSources).where(and(eq(eventSources.enabled, true), eq(eventSources.archived, false)));
+      // The internal source has no ingress: leaving it out makes its public id as unknown as any other.
+      const rows = await db
+        .select()
+        .from(eventSources)
+        .where(
+          and(
+            eq(eventSources.enabled, true),
+            eq(eventSources.archived, false),
+            ne(eventSources.normalizer, PAPERCLIP_INTERNAL_EVENT_NORMALIZER),
+          ),
+        );
       const previousById = new Map([...previous.values()].map((value) => [value.row.id, value]));
       const loaded: Array<{ publicId: string; value: CachedSource }> = [];
       for (const row of rows) {
@@ -527,7 +593,7 @@ export function eventSourceService(
     }
 
     try {
-      return await processDelivery(source, event, claim, startedAt);
+      return (await processDelivery(source, event, claim, startedAt)).result;
     } catch (err) {
       logger.error({ err, sourceId: source.id, deliveryId: claim.deliveryId }, "event delivery processing failed");
       await finishDelivery(claim, {
@@ -669,12 +735,18 @@ export function eventSourceService(
     };
   }
 
+  /** The answer to the sender, and what each routine did with the event. */
+  interface ProcessedDelivery {
+    result: IngestResult;
+    outcomes: Record<string, EventRoutineOutcome>;
+  }
+
   async function processDelivery(
     source: EventSourceRow,
     event: NormalizedEvent,
     claim: Extract<Claim, { kind: "claimed" }>,
     startedAt: number,
-  ): Promise<IngestResult> {
+  ): Promise<ProcessedDelivery> {
     const subscribers = await findSubscribers(source, event);
     const outcomes: Record<string, EventRoutineOutcome> = { ...claim.priorOutcomes };
     const triggerIds = new Set<string>();
@@ -686,15 +758,20 @@ export function eventSourceService(
         for (const id of subscriber.triggerIds) triggerIds.add(id);
         // A re-claimed delivery only dispatches the routines that have no success yet.
         if (isSuccessfulOutcome(outcomes[subscriber.routine.id])) continue;
-        const outcome = await dispatchGate.run(() =>
-          routinesSvc.dispatchEvent({
-            routine: subscriber.routine,
-            trigger: subscriber.trigger,
-            event,
-            deliveryId: claim.deliveryId,
-            ...stormSlotFor(source.id),
-            now: new Date(now()),
-          }),
+        // The built-in source dispatches inside a task create request, so it goes ahead of queued
+        // external deliveries instead of waiting out a burst of them; the semaphore still lets one of
+        // those start after a few in a row. It keeps the shared cap, which bounds the pooled connections.
+        const outcome = await dispatchGate.run(
+          () =>
+            routinesSvc.dispatchEvent({
+              routine: subscriber.routine,
+              trigger: subscriber.trigger,
+              event,
+              deliveryId: claim.deliveryId,
+              ...stormSlotFor(source.id),
+              now: new Date(now()),
+            }),
+          { first: isInternalSource(source) },
         );
         outcomes[subscriber.routine.id] = outcome;
         if (!(await mergeOutcome(claim, subscriber.routine.id, outcome))) superseded = true;
@@ -710,9 +787,12 @@ export function eventSourceService(
     if (superseded) {
       // A newer attempt owns the delivery now; this one must not write its result.
       return {
-        status: 409,
-        body: { inProgress: true },
-        headers: { "Retry-After": String(EVENT_RETRY_AFTER_SECONDS) },
+        result: {
+          status: 409,
+          body: { inProgress: true },
+          headers: { "Retry-After": String(EVENT_RETRY_AFTER_SECONDS) },
+        },
+        outcomes,
       };
     }
 
@@ -739,9 +819,12 @@ export function eventSourceService(
       await finishDelivery(claim, { ...common, status: "failed", httpStatus: 503, error: "transient dispatch failure" });
       await touchSource(source.id, "failed");
       return {
-        status: 503,
-        body: { error: "dispatch_failed", deliveryId: claim.deliveryId, outcomes: summary },
-        headers: { "Retry-After": String(EVENT_RETRY_AFTER_SECONDS) },
+        result: {
+          status: 503,
+          body: { error: "dispatch_failed", deliveryId: claim.deliveryId, outcomes: summary },
+          headers: { "Retry-After": String(EVENT_RETRY_AFTER_SECONDS) },
+        },
+        outcomes,
       };
     }
 
@@ -752,13 +835,147 @@ export function eventSourceService(
     await finishDelivery(claim, { ...common, status, httpStatus: 202, error });
     await touchSource(source.id, status);
     return {
-      status: 202,
-      body: {
-        deliveryId: claim.deliveryId,
-        matched: subscribers.regular.length,
-        fallback: usedFallback,
-        outcomes: summary,
+      result: {
+        status: 202,
+        body: {
+          deliveryId: claim.deliveryId,
+          matched: subscribers.regular.length,
+          fallback: usedFallback,
+          outcomes: summary,
+        },
       },
+      outcomes,
+    };
+  }
+
+  // ── internal events ───────────────────────────────────────────────────────
+
+  /**
+   * The internal source of the company, when it is on and at least one event trigger listens to it.
+   * One indexed query: it is the whole cost of creating a task in a company that uses no event trigger.
+   */
+  async function findListenedInternalSource(companyId: string): Promise<EventSourceRow | null> {
+    return db
+      .select()
+      .from(eventSources)
+      .where(
+        and(
+          eq(eventSources.companyId, companyId),
+          eq(eventSources.normalizer, PAPERCLIP_INTERNAL_EVENT_NORMALIZER),
+          eq(eventSources.enabled, true),
+          eq(eventSources.archived, false),
+          sql`exists (
+            select 1 from ${routineTriggers}
+            where ${routineTriggers.eventSourceId} = ${eventSources.id}
+              and ${routineTriggers.kind} = 'event'
+              and ${routineTriggers.enabled}
+              and not ${routineTriggers.archived}
+              and not ${routineTriggers.setupPending}
+          )`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Whether the task, or a task above it, is a routine run or a routine step. A chain longer than
+   * `ROUTINE_TREE_MAX_DEPTH` counts as one too.
+   */
+  async function isInRoutineTree(companyId: string, taskId: string): Promise<boolean> {
+    const rows = await db.execute(sql`
+      with recursive tree(id, parent_id, origin_kind, depth) as (
+        select id, parent_id, origin_kind, 1 from issues where id = ${taskId} and company_id = ${companyId}
+        union all
+        select i.id, i.parent_id, i.origin_kind, t.depth + 1
+        from issues i
+        join tree t on i.id = t.parent_id
+        where i.company_id = ${companyId} and t.depth < ${ROUTINE_TREE_MAX_DEPTH}
+      )
+      select 1 from tree
+      where origin_kind in ${ROUTINE_TREE_ORIGIN_KINDS}
+        or (depth = ${ROUTINE_TREE_MAX_DEPTH} and parent_id is not null)
+      limit 1
+    `);
+    return rows.length > 0;
+  }
+
+  /**
+   * Whether the heartbeat run that created a task works on a task of a routine tree. A step's agent
+   * can create a task anywhere, beside the steps or at the top level, so its ancestors alone do not
+   * show that it came from a routine.
+   */
+  async function isCreatedInRoutineRun(companyId: string, runId: string): Promise<boolean> {
+    if (!isUuidLike(runId)) return false;
+    const run = await db
+      .select({
+        taskId: sql<string | null>`coalesce(${heartbeatRuns.contextSnapshot} ->> 'issueId', ${heartbeatRuns.contextSnapshot} ->> 'taskId')`,
+      })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    return Boolean(run?.taskId && isUuidLike(run.taskId) && (await isInRoutineTree(companyId, run.taskId)));
+  }
+
+  /**
+   * The `issue.created` event of a task, or null when the task never publishes.
+   * @param creatingRunId the heartbeat run the task was created in, if any.
+   */
+  async function buildIssueCreatedEvent(
+    companyId: string,
+    issueId: string,
+    creatingRunId: string | null,
+  ): Promise<NormalizedEvent | null> {
+    const issue = await db
+      .select({
+        id: issues.id,
+        projectId: issues.projectId,
+        parentId: issues.parentId,
+        originKind: issues.originKind,
+        hiddenAt: issues.hiddenAt,
+        conversationAgentId: issues.conversationAgentId,
+        createdByAgentId: issues.createdByAgentId,
+        createdByUserId: issues.createdByUserId,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue || issue.hiddenAt || issue.conversationAgentId) return null;
+    if (issue.originKind && UNPUBLISHED_ISSUE_ORIGIN_KINDS.includes(issue.originKind)) return null;
+    if (issue.parentId && (await isInRoutineTree(companyId, issue.parentId))) return null;
+    if (creatingRunId && (await isCreatedInRoutineRun(companyId, creatingRunId))) return null;
+
+    const names = await db
+      .select({ name: issueLabelRows.name })
+      .from(issueLabels)
+      .innerJoin(issueLabelRows, eq(issueLabelRows.id, issueLabels.labelId))
+      .where(and(eq(issueLabels.issueId, issue.id), eq(issueLabels.companyId, companyId)));
+    const labelKeys = [
+      ...new Set(names.flatMap(({ name }) => paperclipIssueLabelEventKey(name) ?? [])),
+    ]
+      .sort()
+      .slice(0, PAPERCLIP_ISSUE_EVENT_MAX_LABELS);
+
+    const eventLabels: Record<string, string> = {};
+    if (issue.projectId) eventLabels.project = issue.projectId;
+    if (issue.createdByAgentId) eventLabels.created_by = "agent";
+    else if (issue.createdByUserId) eventLabels.created_by = "user";
+    for (const key of labelKeys) eventLabels[key] = "true";
+
+    return {
+      eventId: null,
+      source: PAPERCLIP_INTERNAL_EVENT_SOURCE,
+      type: PAPERCLIP_ISSUE_CREATED_EVENT_TYPE,
+      severity: "info",
+      state: "info",
+      dedupeKey: issue.id,
+      // Deliveries and run payloads are readable by every agent of the company, which may not read this
+      // task: the event names the task by id only. The steps read the title from the task itself.
+      title: "",
+      summary: "",
+      labels: eventLabels,
+      occurredAt: new Date(now()).toISOString(),
+      url: null,
     };
   }
 
@@ -832,6 +1049,7 @@ export function eventSourceService(
 
   async function dryRun(sourceId: string, payload: Record<string, unknown>): Promise<EventSourceDryRunResult> {
     const source = await getSourceRow(sourceId);
+    if (isInternalSource(source)) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
     const normalized = safeNormalize(source, payload, new Date(now()));
     if (!normalized.ok) {
       return { event: null, validationErrors: normalized.errors, matched: [], fallback: [], wouldBe: "invalid" };
@@ -974,6 +1192,97 @@ export function eventSourceService(
       return rows.map(toApiSource);
     },
 
+    /**
+     * Returns the company's built-in Paperclip source, creating it on the first call. Calls that race
+     * on a company take turns on an advisory lock, so there is never more than one: the table has no
+     * unique key for it.
+     * @returns the source, and whether this call created it.
+     */
+    ensureInternal: async (companyId: string, actor: EventActor): Promise<{ source: EventSource; created: boolean }> =>
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip-internal-event-source:${companyId}`}, 0))`,
+        );
+        const existing = await tx
+          .select()
+          .from(eventSources)
+          .where(and(eq(eventSources.companyId, companyId), eq(eventSources.normalizer, PAPERCLIP_INTERNAL_EVENT_NORMALIZER)))
+          .orderBy(asc(eventSources.createdAt), asc(eventSources.id))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) return { source: toApiSource(existing), created: false };
+        const [row] = await tx
+          .insert(eventSources)
+          .values({
+            companyId,
+            name: PAPERCLIP_INTERNAL_EVENT_SOURCE_NAME,
+            publicId: crypto.randomBytes(12).toString("hex"),
+            secretId: null,
+            normalizer: PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
+            maxNewIssuesPerHour: INTERNAL_SOURCE_MAX_NEW_ISSUES_PER_HOUR,
+            createdByAgentId: actor.agentId ?? null,
+            createdByUserId: actor.userId ?? null,
+            updatedByAgentId: actor.agentId ?? null,
+            updatedByUserId: actor.userId ?? null,
+          })
+          .returning();
+        if (!row) throw new Error("The built-in event source was not created");
+        return { source: toApiSource(row), created: true };
+      }),
+
+    /**
+     * Publishes the `issue.created` event of a task that was just created, and runs the routines that
+     * listen to it before returning, so the caller knows whether to wake the task's assignee. It never
+     * throws: a failure is logged, recorded on the delivery, and reported as no steps attached.
+     * A company with no enabled event trigger on its internal source costs one query and writes nothing.
+     */
+    publishInternal: async (
+      companyId: string,
+      input: { issueId: string; creatingRunId?: string | null },
+    ): Promise<PublishInternalResult> => {
+      const nothing: PublishInternalResult = { stepsAttached: false, routineRunIds: [] };
+      let claim: Extract<Claim, { kind: "claimed" }> | null = null;
+      try {
+        const source = await findListenedInternalSource(companyId);
+        if (!source) return nothing;
+        const event = await buildIssueCreatedEvent(companyId, input.issueId, input.creatingRunId ?? null);
+        if (!event) return nothing;
+        const startedAt = now();
+        const attempt = await claimDelivery(
+          source,
+          event,
+          sha256Hex(`${source.id}:${event.source}:${event.type}:${input.issueId}`),
+          null,
+          startedAt,
+        );
+        if (attempt.kind !== "claimed") return nothing;
+        claim = attempt;
+        const { outcomes } = await processDelivery(source, event, attempt, startedAt);
+        const settled = Object.values(outcomes);
+        const attachedHere = settled.some(
+          (outcome) => outcome.status === "issue_created" && outcome.issueId === input.issueId && outcome.note === "steps_attached",
+        );
+        return {
+          // A manual run on the task may have attached its steps first and so refused this event's;
+          // the assignee must stay asleep all the same. The delivery is settled: a failed check must
+          // not record it as failed.
+          stepsAttached:
+            attachedHere || (await hasOpenRoutineSteps(db, companyId, input.issueId).catch(() => false)),
+          routineRunIds: settled.flatMap((outcome) => outcome.runId ?? []),
+        };
+      } catch (err) {
+        logger.warn({ err, companyId, issueId: input.issueId }, "publishing an internal event failed");
+        if (!claim) return nothing;
+        await finishDelivery(claim, {
+          status: "failed",
+          error: (err instanceof Error ? err.message : String(err)).slice(0, 2000),
+        }).catch(() => undefined);
+        // A failure after the steps were attached must still keep the assignee asleep.
+        const attached = await hasOpenRoutineSteps(db, companyId, input.issueId).catch(() => false);
+        return { stepsAttached: attached, routineRunIds: [] };
+      }
+    },
+
     get: async (id: string): Promise<EventSource> => toApiSource(await getSourceRow(id)),
     find: async (id: string): Promise<EventSource | null> => {
       const row = await db.select().from(eventSources).where(eq(eventSources.id, id)).then((rows) => rows[0] ?? null);
@@ -1026,9 +1335,12 @@ export function eventSourceService(
 
     update: async (id: string, patch: UpdateEventSource, actor: EventActor): Promise<EventSource> => {
       const existing = await getSourceRow(id);
-      const nextNormalizer = (patch.normalizer ?? existing.normalizer) as EventSource["normalizer"];
+      const changesMoreThanEnabled = Object.entries(patch).some(([key, value]) => key !== "enabled" && value !== undefined);
+      if (isInternalSource(existing) && changesMoreThanEnabled) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
+      const nextNormalizer = patch.normalizer ?? existing.normalizer;
       const nextConfig = patch.normalizerConfig === undefined ? existing.normalizerConfig : patch.normalizerConfig;
       if (patch.normalizer !== undefined || patch.normalizerConfig !== undefined) {
+        if (!isConfigurableNormalizer(nextNormalizer)) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
         const error = validateEventSourceNormalizerConfig(nextNormalizer, nextConfig);
         if (error) throw unprocessable(error);
       }
@@ -1059,6 +1371,7 @@ export function eventSourceService(
     /** Soft delete: the source stops answering, its history stays. */
     archive: async (id: string, actor: EventActor): Promise<EventSource> => {
       const existing = await getSourceRow(id);
+      if (isInternalSource(existing)) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
       const [row] = await db
         .update(eventSources)
         .set({ archived: true, updatedByAgentId: actor.agentId ?? null, updatedByUserId: actor.userId ?? null, updatedAt: new Date() })
@@ -1073,6 +1386,7 @@ export function eventSourceService(
       actor: EventActor,
     ): Promise<{ source: EventSource; secretMaterial: EventSourceSecretMaterial }> => {
       const existing = await getSourceRow(id);
+      if (isInternalSource(existing)) throw conflict(INTERNAL_SOURCE_MANAGED_MESSAGE);
       if (!existing.secretId) throw conflict("Event source has no secret to rotate");
       const secretValue = crypto.randomBytes(24).toString("hex");
       await secretsSvc.rotate(existing.secretId, { value: secretValue }, { agentId: actor.agentId ?? null, userId: actor.userId ?? null });

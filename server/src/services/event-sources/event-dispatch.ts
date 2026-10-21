@@ -4,6 +4,8 @@ import { issues, routineEventGroups, routineRuns, routines, routineTriggers } fr
 import {
   DEFAULT_EVENT_GROUPING,
   OPEN_ISSUE_STATUSES,
+  PAPERCLIP_INTERNAL_EVENT_SOURCE,
+  PAPERCLIP_ISSUE_CREATED_EVENT_TYPE,
   ROUTINE_GATE_SKIP_REASON,
   ROUTINE_GATE_TRIGGER_INACTIVE_REASON,
   eventGroupingSchema,
@@ -19,6 +21,7 @@ import { logger } from "../../middleware/logger.js";
 import type { issueService } from "../issues.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "../issue-assignment-wakeup.js";
 import {
+  attachRoutineStepsToIssue,
   createRoutineRunIssues,
   hasOpenRoutineSteps,
   startAttachedRoutineSteps,
@@ -54,6 +57,11 @@ type GroupRow = typeof routineEventGroups.$inferSelect;
 /** Statuses of an issue that still absorbs repeats. Mirrors the open set of `issues_open_routine_execution_uq`. */
 const OUTCOME_ERROR_MAX_LENGTH = 500;
 
+/** Outcome note and run failure reason when the source's new-issues-per-hour budget has no slot left for a task. */
+const NEW_ISSUE_BUDGET_SPENT_REASON = "new_issue_budget_spent";
+/** Outcome note when the routine's steps went under the task that was created. */
+const STEPS_ATTACHED_NOTE = "steps_attached";
+
 export type EventFailureClass = "permanent" | "transient";
 
 /** A failure the dispatcher already knows the class of. */
@@ -73,6 +81,22 @@ export function classifyEventDispatchError(err: unknown): EventFailureClass {
   if (err instanceof EventDispatchError) return err.failureClass;
   if (err instanceof HttpError && err.status >= 400 && err.status < 500) return "permanent";
   return "transient";
+}
+
+/**
+ * What an `event_issue` trigger needs at dispatch, re-checked because the routine may have changed
+ * since the trigger was saved. Each failure is permanent: a retry of the same event cannot pass.
+ */
+function assertCanAttachToCreatedTask(routine: RoutineRow, event: NormalizedEvent, gated: boolean): void {
+  if (event.source !== PAPERCLIP_INTERNAL_EVENT_SOURCE || event.type !== PAPERCLIP_ISSUE_CREATED_EVENT_TYPE) {
+    throw new EventDispatchError("Only a Paperclip task event can start routine steps on a task", "permanent");
+  }
+  if ((routine.steps ?? []).length === 0) {
+    throw new EventDispatchError("The routine has no steps to start on the task", "permanent");
+  }
+  if (gated) {
+    throw new EventDispatchError("A gate script cannot decide whether steps start on a created task", "permanent");
+  }
 }
 
 function failedOutcome(err: unknown, extra: Partial<EventRoutineOutcome> = {}): EventRoutineOutcome {
@@ -109,6 +133,11 @@ export interface EventDispatchDeps {
   resolveResponsibleUserId(executor: Db, routine: RoutineRow): Promise<string | null>;
   /** Whether the routine has a gate script that applies to event triggers. */
   gateApplies?(routine: RoutineRow): boolean;
+  /**
+   * Refuses, before an existing task is touched, when the agent of a step that would start now
+   * could not be woken (budget hard-stop, paused agent). Reads on `executor`, the attach savepoint.
+   */
+  assertStepsCanStart?(routine: RoutineRow, task: { projectId: string | null }, executor: Db): Promise<void>;
   /** Called after a run was parked as `gating`, so the gate worker can pick it up. */
   onGating?(runId: string): void;
 }
@@ -401,6 +430,8 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
     const grouping = parseGrouping(trigger.eventGrouping);
     const primaryFingerprint = eventGroupFingerprint(renderEventGroupKey(grouping.groupKey, event));
     const appendTargetId = typeof grouping.issueMode === "object" ? grouping.issueMode.appendToIssueId : null;
+    const attachToCreatedTask = grouping.issueMode === "event_issue";
+    if (attachToCreatedTask) assertCanAttachToCreatedTask(routine, event, gateApplies || gated !== null);
 
     const outcome = await db.transaction(async (tx): Promise<EventRoutineOutcome> => {
       const txDb = tx as unknown as Db;
@@ -544,6 +575,52 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
           .set({ triggerPayload: { ...(run.triggerPayload ?? {}), postedComment: posted } })
           .where(eq(routineRuns.id, run.id));
       };
+
+      // The built-in source's task event: the routine's steps go under the task that was just created,
+      // which costs one of the source's new-issue slots like any other task the routine would open.
+      if (attachToCreatedTask) {
+        const taskId = event.dedupeKey;
+        slot.taken = await input.consumeStormSlot();
+        if (!slot.taken) {
+          const spent = await startRun(primaryFingerprint, { newIssueBudgetSpent: true });
+          await deps.finalizeRun(
+            spent.id,
+            { status: "skipped", failureReason: NEW_ISSUE_BUDGET_SPENT_REASON, completedAt: now },
+            txDb,
+          );
+          await deps.updateRoutineTouchedState(
+            { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "skipped_new_issue_budget" },
+            txDb,
+          );
+          return { status: "storm_folded", runId: spent.id, issueId: taskId, note: NEW_ISSUE_BUDGET_SPENT_REASON };
+        }
+        const attachRun = await startRun(primaryFingerprint);
+        try {
+          const { root, attached } = await attachRoutineStepsToIssue({
+            tx: txDb,
+            issueSvc,
+            companyId: routine.companyId,
+            issueId: taskId,
+            run: attachRun,
+            routine,
+            steps: routine.steps ?? [],
+            defaultAssigneeAgentId: prepared.assigneeAgentId,
+            variables: prepared.variables,
+            assertCanStart: async (task, executor) => {
+              await deps.assertStepsCanStart?.(routine, task, executor);
+            },
+          });
+          stepsToStart.push(attached);
+          await deps.finalizeRun(attachRun.id, { status: "issue_created", linkedIssueId: root.id }, txDb);
+          await deps.updateRoutineTouchedState(
+            { routineId: routine.id, triggerId: trigger.id, triggeredAt: now, status: "issue_created", issueId: root.id },
+            txDb,
+          );
+          return { status: "issue_created", runId: attachRun.id, issueId: root.id, note: STEPS_ATTACHED_NOTE };
+        } catch (err) {
+          return failRun(attachRun, err, { issueId: taskId });
+        }
+      }
 
       // A retry of a delivery whose comment landed but whose wake failed: only the wake is left to do.
       const posted = gatingRow
@@ -911,6 +988,13 @@ export async function previewEventRoutine(
   const { routine, trigger, event } = input;
   const grouping = parseGrouping(trigger.eventGrouping);
   let groupKey = renderEventGroupKey(grouping.groupKey, event);
+  if (grouping.issueMode === "event_issue") {
+    return {
+      groupKey,
+      action: input.stormBudgetSpent ? "storm_folded" : "new_issue",
+      issueId: event.dedupeKey,
+    };
+  }
   const appendTargetId = typeof grouping.issueMode === "object" ? grouping.issueMode.appendToIssueId : null;
   const appendTarget = appendTargetId ? await loadAppendTarget(db, routine, appendTargetId) : null;
   let open = await findOpenGroup(db, routine, eventGroupFingerprint(groupKey), appendTarget?.id ?? null);

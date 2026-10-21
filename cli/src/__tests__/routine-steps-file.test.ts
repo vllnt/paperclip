@@ -42,7 +42,7 @@ describe("routine --steps-file", () => {
     writeFileSync(stepsPath, JSON.stringify(STEPS));
     writeFileSync(notAnArrayPath, JSON.stringify({ key: "build" }));
     invalidJsonPath = path.join(dir, "invalid.json");
-    writeFileSync(invalidJsonPath, '[{ "key": "build", ');
+    writeFileSync(invalidJsonPath, "SECRET_VALUE_IN_FILE");
   });
 
   afterAll(() => {
@@ -117,5 +117,6 @@ describe("routine --steps-file", () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining(invalidJsonPath));
+    expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("SECRET_VALUE"));
   });
 });

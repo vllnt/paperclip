@@ -147,7 +147,10 @@ export function WebhookReview({ signingMode = "bearer", state = "configured", pr
     routinesApi.listRuns = async () => routine.recentRuns;
     routinesApi.activity = async () => fresh ? [] : routineActivity;
     routinesApi.listRevisions = async () => [];
-    routinesApi.update = async (_id, patch) => (routine = { ...routine, ...patch });
+    routinesApi.update = async (_id, patch) => {
+      routine = { ...routine, ...patch };
+      return { ...routine, warnings: [] };
+    };
     routinesApi.createTrigger = async (_id, input) => {
       const trigger: RoutineTrigger = {
         ...webhook(String(input.signingMode ?? "bearer"), routine.triggers.length + 1, webhookUrl), ...input,

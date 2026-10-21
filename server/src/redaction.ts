@@ -6,7 +6,12 @@ import {
 } from "@paperclipai/adapter-utils/command-redaction";
 import { hasCredentialKeyName, redactSecretShapedText } from "@paperclipai/adapter-utils/log-value-redaction";
 
-const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
+// The keyword alternation on its own. Unanchored text scans must start at the
+// keyword: a leading `[A-Za-z0-9_-]*` re-reads the whole run of name
+// characters from every start position, which is quadratic in the run length.
+const SECRET_FIELD_KEYWORD_PATTERN = String.raw`(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
+// A whole field name, for patterns anchored with `^...$` (one start position).
+const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*${SECRET_FIELD_KEYWORD_PATTERN}`;
 
 const SECRET_PAYLOAD_KEY_RE = new RegExp(`^(?:${SECRET_FIELD_NAME_PATTERN})(?:_plain|_ref)?$`, "i");
 // Authorization reasons are policy decision codes, not credentials. They must
@@ -354,13 +359,13 @@ const CLI_SECRET_FLAG_RE = new RegExp(
   "i",
 );
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
+  String.raw`(${SECRET_FIELD_KEYWORD_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
     "`" +
     String.raw`\r\n]+((?:"|'))`,
   "gi",
 );
 const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
+  String.raw`(${SECRET_FIELD_KEYWORD_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
   "gi",
 );
 const SECRET_TEXT_HINTS = [
