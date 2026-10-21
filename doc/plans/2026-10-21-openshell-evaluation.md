@@ -19,9 +19,10 @@ without the user's go on the recommended option.
   - An open upstream pull request already drafts it.
   - Low-trust runs already require a sandbox driver.
 - **What it adds.** Today Paperclip's guardrails act mostly on its own HTTP API.
-  Inside provider sandboxes it enforces no filesystem, L7 or credential policy.
-  Its only network enforcement there is host-level egress filtering on the
-  Kubernetes provider. OpenShell would add all of these.
+  Inside provider sandboxes it enforces no L7 rule, no filesystem rule beyond
+  Codex's own sandbox, and no per-service binding for arbitrary secrets. Only
+  the Kubernetes and Modal providers filter egress, by host or address.
+  OpenShell would add all of these.
 - **Policies link.** A later, separate "controls" part of a policy could
   compile into an OpenShell policy per run, with the strictest rule winning.
   **Policies slice 1 needs no schema hook.** The owner of the Policies work has
@@ -89,8 +90,8 @@ boundary, and the agent is frozen if the supervisor link drops
   | Runtime | Supervisor | Channel | Direct egress blocked by |
   |---|---|---|---|
   | Docker, Podman | its own container | Unix socket on a driver volume | workload container has no network |
-  | Kubernetes | its own pod | mutual TLS service | `NetworkPolicy` (the CNI must enforce it) |
-  | MicroVM (libkrun; KVM or Apple Hypervisor) | host process | vsock | guest has no network device |
+  | Kubernetes | its own pod | mutual TLS service | `NetworkPolicy`, which the CNI must enforce [O4 L282] |
+  | MicroVM (libkrun; KVM or Apple Hypervisor [O3 L130; O4 L215]) | host process | vsock | guest has no network device |
 
 - **Docs caveat:** `docs/security/best-practices.mdx` at the same tag still
   describes a network namespace with a veth pair and a proxy on the host-side
@@ -136,9 +137,10 @@ boundary, and the agent is frozen if the supervisor link drops
     `allowed_ips` endpoints [O6 L146-150];
   - a rule for `host.openshell.internal` can reach gateway-host services
     [O6 L149-150].
-- **Binary identity:** a rule matches the calling executable or a parent. Each
-  executable is pinned to its first observed SHA-256, and a changed file is
-  denied [O6 L526-531; O11 L80-92].
+- **Binary identity:** a rule matches the calling executable or a parent, so a
+  rule that lists an agent's executable also covers every tool the agent starts
+  [O21 L72-74; O11 L83]. Each executable is pinned to its first observed
+  SHA-256, and a changed file is denied [O6 L526-531; O11 L80-92].
 - **Credentials ("providers"):** the agent sees only a placeholder. The proxy
   swaps in the real value only on HTTP requests to endpoints bound to that
   provider (headers, query, path, opt-in bodies, SigV4). It cannot do this for
@@ -149,7 +151,9 @@ boundary, and the agent is frozen if the supervisor link drops
 - **Where the active policy comes from:** a gateway-wide global policy, else the
   sandbox's saved policy, else a policy in the image, else a restrictive default
   [O5 L55-64]. The global policy *replaces* sandbox policies; it does not limit
-  them [O5 L82-88]. Providers add rules on top ("effective policy")
+  them. While it is active, OpenShell also blocks sandbox policy changes and
+  proposal approvals, and drops provider-contributed rules [O5 L82-88]. So a
+  per-run policy needs a gateway with no global policy. Providers add rules on top ("effective policy")
   [O5 L69-74]. The default allows no network. It grants the working
   directory, `/tmp` and `/dev/null` read-write and a few system paths
   read-only [O17 L26-47].
@@ -306,27 +310,52 @@ Full paths for the diagram:
     (`packages/adapter-utils/src/server-utils.ts:4882-4885`);
   - it runs as the same OS user, with no uid change
     (`server-utils.ts:4924-4930`);
-  - the only OS-level confinement is the opt-in, Linux-only `bwrap` wrapper
-    (`packages/adapter-utils/src/local-process-sandbox.ts:347-349`). It can
-    confine files to the workspace (`filesystemScope: "workspace"`,
-    `local-process-sandbox.ts:353-358`), unshare the network and offer an
-    allowlisting proxy, but has no uid change and no seccomp
-    (`local-process-sandbox.ts:341-345, 378-383, 475-488`).
+  - OS-level confinement comes from two partial mechanisms:
+    - the opt-in, Linux-only `bwrap` wrapper
+      (`packages/adapter-utils/src/local-process-sandbox.ts:347-349`). It can
+      confine files to the workspace (`filesystemScope: "workspace"`,
+      `local-process-sandbox.ts:353-358`), unshare the network and offer an
+      allowlisting proxy, but has no uid change and no seccomp
+      (`local-process-sandbox.ts:341-345, 378-383, 475-488`);
+    - Codex's own sandbox. codex-local asks for
+      `sandbox_mode="workspace-write"` only when its bypass is off, and the
+      bypass is on by default unless network access is off or a sandbox is
+      set explicitly
+      (`packages/adapters/codex-local/src/server/codex-args.ts:62-70`;
+      `packages/adapters/codex-local/src/index.ts:12`). The native runner gives
+      Codex a workspace-only permission profile by default
+      (`packages/paperclip-runner/src/drivers/codex/codex-security-config.ts:225-246`).
 - **Inside provider sandboxes, enforcement is thin:**
   - Paperclip relies on the provider to isolate the sandbox from the host, and
     "does not enforce these provider rules today"
     (`packages/plugins/sandbox-providers/SANDBOX-REQUIREMENTS.md:42-48, 67-68`).
   - For general internet access, "Paperclip does not enforce this policy
     inside the sandbox" (`SANDBOX-REQUIREMENTS.md:70-71`).
-  - One provider is a partial exception. The Kubernetes provider writes a
-    deny-all plus allowlist egress NetworkPolicy
-    (`packages/plugins/sandbox-providers/kubernetes/src/network-policy.ts:47-139`).
-    Filtering by host name needs `egressMode: "cilium"`
-    (`kubernetes/src/manifest.ts:74-77`). In standard mode a host-name
-    allowlist falls back to all public IPv4 on ports 80 and 443
-    (`kubernetes/src/plugin.ts:227-230`).
-  - So Paperclip enforces no filesystem, L7 (method and path) or credential
-    rule inside a provider sandbox, and host-level egress only on Kubernetes.
+  - In a sandbox target, the native runner switches Codex to a profile that
+    can write the whole sandbox root
+    (`server/src/services/native-runtime/native-session-executor.ts:12374-12376`;
+    `codex-security-config.ts:225-227, 236-239`).
+  - Two providers filter egress:
+    - the Kubernetes provider writes a deny-all plus allowlist egress
+      NetworkPolicy
+      (`packages/plugins/sandbox-providers/kubernetes/src/network-policy.ts:47-139`).
+      Filtering by host name needs `egressMode: "cilium"`
+      (`kubernetes/src/manifest.ts:74-77`). In standard mode a host-name
+      allowlist falls back to all public IPv4 on ports 80 and 443
+      (`kubernetes/src/plugin.ts:227-230`);
+    - the Modal provider can block all egress or allow a list of CIDRs
+      (`packages/plugins/sandbox-providers/modal/src/plugin.ts:127-141`;
+      `modal/src/manifest.ts:80-90`).
+  - Paperclip scopes two of its own credentials there: the host swaps the
+    bridge token for the real one (`execution-target.ts:4709-4713, 4749`),
+    and `git`/`gh` go through its launcher wrappers
+    (`packages/adapter-utils/src/github-launcher.ts:1398-1416`). Other secrets,
+    such as model keys, arrive as plain environment variables
+    (`packages/adapters/claude-local/src/server/execute.ts:309-317`).
+  - So inside a provider sandbox Paperclip enforces no L7 (method and path)
+    rule, no filesystem rule beyond Codex's own sandbox when it is on, and no
+    per-service binding for other secrets. Egress is filtered by host or
+    address only on Kubernetes and Modal.
 
 ### 2.2 The seam: a sandbox-provider plugin
 
@@ -392,9 +421,9 @@ Slice 1 below should start from `#9220`, not from scratch.
 | Paperclip path | What it does today (file:line) | OpenShell would |
 |---|---|---|
 | Local adapters | `runChildProcess` → `resolveSpawnTarget` → `spawn` (`server-utils.ts:3786-3871, 4851, 4924-4930`); optional Linux-only `bwrap` for claude-local and codex-local in CLI mode only, which can confine files to the workspace (`local-process-sandbox.ts:341, 347-349, 353-358`; `packages/adapters/claude-local/src/server/acp.ts:105-108`) | **Not apply in production.** It cannot run in the app container (section 4.1). A host-local wrapper at `resolveSpawnTarget` is possible later on a Linux host and could supersede `bwrap`, but it is not proposed. |
-| SSH workers | `buildSshSpawnTarget` runs `exec env K=V cmd` remotely (`packages/adapter-utils/src/ssh.ts:1567-1671`); the workspace moves by git bundle plus tar (`ssh.ts:2017-2073, 2075-2172`); the command runs as the SSH account through a plain `exec env` line (`ssh.ts:1605-1607`), and the `bwrap` wrapper applies only to local targets (`execution-target.ts:939`) | **Replace, for opted-in runs.** Run an OpenShell gateway on the worker host and reach it through the provider plugin. Wrapping the SSH `exec` line would add a second lifecycle over SSH, so SSH stays as it is for other runs. |
+| SSH workers | `buildSshSpawnTarget` runs `exec env K=V cmd` remotely (`packages/adapter-utils/src/ssh.ts:1567-1671`); the workspace moves by git bundle plus tar (`ssh.ts:2017-2073, 2075-2172`); the command runs as the SSH account through a plain `exec env` line (`ssh.ts:1605-1607`), and the `bwrap` wrapper applies only to local targets (`execution-target.ts:941`) | **Replace, for opted-in runs.** Run an OpenShell gateway on the worker host and reach it through the provider plugin. Wrapping the SSH `exec` line would add a second lifecycle over SSH, so SSH stays as it is for other runs. |
 | Daytona runner | Daytona provider plugin; image from `docker/daytona-runner/Dockerfile:48` running as user `daytona` (`docker/daytona-runner/Dockerfile:133`); commands through `sandbox.process.executeCommand` (`packages/plugins/sandbox-providers/daytona/src/plugin.ts:1739`) | **Not apply.** OpenShell would be a peer provider, not a layer inside Daytona (section 4.3). |
-| Native runner | `paperclip-runnerd` started locally (`packages/paperclip-runner/src/control-plane/durable-prp-control-plane.ts:3584-3589`) or in a sandbox through `runner.execute` (`server/src/services/native-runtime/native-session-executor.ts:10446-10465`); runner API restricted by `server/src/services/native-runtime/runner-api-policy.ts:1-66` | **Wrap through the provider.** The remote launcher runs unchanged. The runner needs either an ingress endpoint (`runnerWebSocketIngress`) or one egress rule to the runner URL (`packages/adapter-utils/src/runner-connectivity.ts:20-31`). OpenShell's service exposure [O13 L495] is **unverified** for this use. The runner API policy stays. |
+| Native runner | `paperclip-runnerd` started locally (`packages/paperclip-runner/src/control-plane/durable-prp-control-plane.ts:3584-3589`) or in a sandbox through `runner.execute` (`server/src/services/native-runtime/native-session-executor.ts:10446-10465`); runner API restricted by `server/src/services/native-runtime/runner-api-policy.ts:1-66` | **Wrap through the provider.** The remote launcher detaches the runner daemon with `nohup setsid … &` from a one-shot exec with a 20 s timeout (`native-session-executor.ts:10446-10465`). Whether an OpenShell sandbox keeps a detached process alive after its exec ends is **unverified** (spike row 16). The runner needs either an ingress endpoint (`runnerWebSocketIngress`) or one egress rule to the runner URL (`packages/adapter-utils/src/runner-connectivity.ts:20-31`). OpenShell's service exposure [O13 L495] is **unverified** for this use. The runner API policy stays. |
 | Execution environments and leases | `environments.driver` plus the provider in config (`packages/db/src/schema/environments.ts:4-30`); leases with `ephemeral` / `reuse_by_environment` / `retain_on_failure` (`packages/shared/src/constants.ts:607-618`; `packages/db/src/schema/environment_leases.ts:8-53`) | **Extend, with no change to the core provider interface** (shipping needs the registrations in section 2.2). A new provider key under driver `sandbox`. An ephemeral lease is one sandbox per run; a reused lease keeps the sandbox. |
 | Sandbox-callback-bridge allowlist | route and header allowlist (`packages/adapter-utils/src/sandbox-callback-bridge.ts:160-315`); the host swaps the bridge token for the real agent JWT (`execution-target.ts:4709-4713, 4749`) | **Keep.** OpenShell does not see Paperclip routes or actors. The two are complementary: OpenShell fences the network, the bridge fences the Paperclip API. |
 | Low-trust runtime containment | requires `selectedEnvironmentDriver === "sandbox"` (`server/src/services/low-trust-runtime-containment.ts:84-88`); runner network off unless the preset is standard (`server/src/services/heartbeat.ts:26331-26335`); API-side denials in `server/src/services/authorization.ts:985-1117` | **Wrap and strengthen.** An OpenShell provider satisfies the sandbox requirement and adds the egress and filesystem enforcement that is missing today. API-side containment stays. |
@@ -414,11 +443,11 @@ on `origin/main`.)
 
 | Guardrail | Today | With OpenShell |
 |---|---|---|
-| "Only talk to approved hosts", "no data exfiltration" | guidance; host allowlists exist only in `bwrap` (local Linux claude/codex runs) and the Kubernetes provider (exact host names only in `cilium` mode) | **Enforced:** egress allowlist per binary, deny by default |
+| "Only talk to approved hosts", "no data exfiltration" | guidance; allowlists exist only in `bwrap` (local Linux claude/codex runs), the Kubernetes provider (exact host names only in `cilium` mode) and the Modal provider (CIDRs or block-all) | **Enforced:** egress allowlist per binary and its child processes, deny by default |
 | "Only use approved package registries" | guidance, with the same two exceptions | **Enforced:** egress allowlist |
 | "Read-only access to service X" | guidance | **Enforced:** REST `access: read-only` with `enforce` |
 | "Never call production or metadata endpoints" | guidance | **Enforced:** deny rules; metadata is never an allowed destination [O6 L141-146] |
-| "Stay inside the workspace; don't read home or secret files" | guidance; `bwrap` `filesystemScope: "workspace"` for local Linux claude/codex runs only (`local-process-sandbox.ts:353-358`) | **Enforced in every OpenShell sandbox:** `filesystem_policy` (Landlock), with `hard_requirement` |
+| "Stay inside the workspace; don't read home or secret files" | guidance; `bwrap` `filesystemScope: "workspace"` for local Linux claude/codex runs (`local-process-sandbox.ts:353-358`), and Codex's own sandbox when it is on (section 2.1) | **Enforced in every OpenShell sandbox:** `filesystem_policy` (Landlock), with `hard_requirement` |
 | "Secret X is used only with service Y" | env injection, so the agent sees the value (`packages/adapters/claude-local/src/server/execute.ts:309-317`) | **Enforced:** provider binding with placeholders [O10 L432-477] |
 | Protected branches, pull request for every change | GitHub classifier and launcher | stays in Paperclip and GitHub |
 | Which MCP tools, with which arguments | `tool_policies` | stays in Paperclip |
@@ -458,11 +487,24 @@ wins:**
 - **Paperclip baseline:** Paperclip adds the endpoints the run itself needs,
   such as the adapter's model API. A save that would block that baseline is
   rejected with a clear error, not discovered mid-run.
-- **Formal check:** the compiled run policy is the candidate. The boundary is
-  the company's controls plus the Paperclip baseline plus the rules the
-  attached OpenShell providers contribute [O5 L69-74]. `openshell-prover` can
-  check that the candidate stays inside that boundary [O9 L19-23, L49-61]. A
-  widened project rule then fails before it ships.
+- **Formal check, with limits.** The compiled run policy is the candidate. The
+  boundary is the company's controls plus the Paperclip baseline plus the
+  rules the attached OpenShell providers contribute [O5 L69-74].
+  `openshell-prover` checks that the candidate allows nothing beyond the
+  boundary [O9 L19-23, L49-61]. It returns `unsupported`, not pass or fail,
+  for:
+  - different paths, even when one is inside the other [O9 L188-191];
+  - a result that depends on the sandbox's working directory [O9 L192-193];
+  - an exact binary path that the boundary covers only with a glob
+    [O9 L218-221];
+  - an endpoint in `audit` mode [O9 L233-235].
+
+  So the compiler must render the boundary and the candidate with the same
+  path and binary lists, run the prover only on the `enforce` rendering, and
+  treat `unsupported` as a failure. *Inference:* workspace-relative `fs.*`
+  rules with `include_workdir: true` may make many filesystem checks
+  `unsupported`. Spike row 12 records which. If too many are, the prover stays
+  advisory and the strictest-wins merge is the guarantee.
 - **Who can attach controls:** only board-authored scopes (company, project,
   routine, agent config). A `policy://` mention in issue text pulls in guidance
   only. Merging can only narrow access, so a mention could not widen it, but
@@ -509,12 +551,19 @@ network_policies:
   - In the Daytona runner image, `gh` is the binary `/usr/local/bin/gh`
     (`docker/daytona-runner/Dockerfile:96`).
   - `claude`, `codex` and `opencode` there are `sh` wrappers that `exec` a
-    Node package bin (`docker/daytona-runner/Dockerfile:105-107`). The
-    connection then comes from the Node interpreter.
+    package bin (`docker/daytona-runner/Dockerfile:105-107`). Codex's npm
+    entrypoint then launches a native executable
+    (`packages/paperclip-runner/src/drivers/codex/codex-security-config.ts:53-54`).
+    *Inference:* for a CLI written in Node, the connection comes from the Node
+    interpreter. Spike row 15 records which binary OpenShell reports for each.
   - *Inference:* Node CLIs that share one interpreter cannot be told apart by
-    binary, which weakens per-binary scoping. An OpenShell image should give
-    each CLI its own executable where it can, and the compiler must emit
-    resolved paths from the image manifest.
+    binary. An OpenShell image should give each CLI its own executable where it
+    can, and the compiler must emit resolved paths from the image manifest.
+- **A binary rule covers the agent's whole process tree.** A rule matches a
+  listed binary's child processes too [O21 L72-74]. So the `model_api` rule
+  above also lets every tool that `claude` starts reach the model API, with any
+  credential the provider injects there. *Inference:* per-binary scoping
+  separates agents, not an agent from its tools.
 - Only `gh` may reach `api.github.com` here. A `git` push to `github.com` would
   need its own rule.
 
@@ -580,7 +629,10 @@ The flow:
    the run's issue (an interaction or a Decision, per slice 4). Its options are:
    allow for this run; allow and add to the project policy; reject with a
    reason. The OpenShell API call to list proposals is **unverified**; the CLI
-   is `openshell rule get --status pending` [O8 L116-122].
+   is `openshell rule get <sandbox-name> --status pending` [O8 L116-122].
+   This flow needs a gateway with no global policy, which blocks proposal
+   approvals [O5 L84-88]. The plugin should refuse such a gateway at
+   environment validation.
 3. **A proposal outside the company boundary never reaches the board as a
    one-click approval.** It is rejected with "exceeds company policy", because
    widening needs a company policy edit.
@@ -638,7 +690,7 @@ Each opted-in worker host would need:
   `server/src/services/environment-execution-target.ts:416-420`).
 - So its generic sync writes files in chunks of 4 MiB of base64, one `exec`
   with stdin per chunk
-  (`packages/adapter-utils/src/command-managed-runtime.ts:159, 296, 304-306, 330-334`).
+  (`packages/adapter-utils/src/command-managed-runtime.ts:160-161, 296, 304-306, 330-334`).
 - That chunk is exactly OpenShell's 4 MiB pending-stdin cap per exec channel
   [O13 L321]. Whether a chunk at the cap passes is **unverified**; spike row 10
   checks it.
@@ -713,11 +765,11 @@ Each opted-in worker host would need:
 | | A. Default runtime for every run | B. Opt-in sandbox provider that policies can require | C. Don't adopt; borrow ideas |
 |---|---|---|---|
 | Cost | High: every path moves, including local and production. Every agent image must be rebuilt, and macOS development needs Docker Desktop. | Medium: one plugin, one image, a policy compiler and an approval bridge | Low to medium |
-| Risk | High: a young project with breaking minors and recent critical CVEs becomes a single dependency for all work | Contained to opted-in runs; fails closed | Low; enforcement stays as weak as today inside sandboxes, and the controls that compile are host-level only (see below) |
+| Risk | High: a young project with breaking minors and recent critical CVEs becomes a single dependency for all work | Contained to opted-in runs; fails closed | Low; enforcement stays as weak as today inside sandboxes, and only host- or address-level egress and workspace-only file rules compile, on some providers and runs (see below) |
 | Migration | big bang, or a long dual-run | per environment: create an `openshell` environment and point agents or projects at it | none |
 | Rollback | hard: you have to re-home every run | disable the plugin or archive the environment. Runs that a policy requires to be sandboxed stay blocked until another provider is chosen, never silently unsandboxed | n/a |
 | Code removed | maybe `bwrap` (`local-process-sandbox.ts`) and some providers, later | none at first | none |
-| Code added | everything in B, plus local and SSH rewiring | `sandbox-providers/openshell` and its bundling entries (section 2.2), the controls table, the compiler, placement, and the board-gate bridge (core changes in slices 2–5) | controls compiled into existing enforcement: the Kubernetes provider's egress NetworkPolicy (`packages/plugins/sandbox-providers/kubernetes/src/network-policy.ts:47-139`) and the `bwrap` allowlist (`local-process-sandbox.ts:475-488`) |
+| Code added | everything in B, plus local and SSH rewiring | `sandbox-providers/openshell` and its bundling entries (section 2.2), the controls table, the compiler, placement, and the board-gate bridge (core changes in slices 2–5) | controls compiled into existing enforcement: the Kubernetes provider's egress NetworkPolicy (`packages/plugins/sandbox-providers/kubernetes/src/network-policy.ts:47-139`), the Modal provider's block-all or CIDR allowlist (`modal/src/plugin.ts:127-141`), the `bwrap` allowlist (`local-process-sandbox.ts:475-488`) and Codex's own sandbox settings |
 
 **Recommendation: B, gated by a spike.**
 
@@ -734,20 +786,23 @@ Each opted-in worker host would need:
     needs no change to the core provider interface, only the bundling entries
     in section 2.2.
 - **Why B over C:**
-  - inside provider sandboxes, Paperclip enforces no filesystem, L7 or
-    credential rule, and host-level egress only on Kubernetes (section 2.1);
+  - inside provider sandboxes, Paperclip enforces no L7 rule, no filesystem
+    rule beyond Codex's own sandbox, and no per-service binding for other
+    secrets; only Kubernetes and Modal filter egress, by host or address
+    (section 2.1);
   - low-trust work already depends on a sandbox driver
     (`low-trust-runtime-containment.ts:84-88`);
-  - OpenShell gives kernel-level filesystem rules, per-binary L7 egress,
-    credential placeholders and a proposal flow that Paperclip would otherwise
-    have to build.
+  - OpenShell gives kernel-level filesystem rules, L7 egress per binary (and
+    its child processes), credential placeholders and a proposal flow that
+    Paperclip would otherwise have to build.
 - **If the spike fails, fall back to C.** Only part of the controls model in
   section 3 survives:
-  - `egress.allow` compiles to host-level allowlists: the Kubernetes provider's
-    NetworkPolicy (exact host names only with Cilium) and the `bwrap` proxy
-    allowlist (local Linux claude/codex runs);
+  - `egress.allow` compiles to host- or address-level allowlists: the
+    Kubernetes provider's NetworkPolicy (exact host names only with Cilium),
+    the Modal provider's CIDR allowlist or block-all (IP literals only), and
+    the `bwrap` proxy allowlist (local Linux claude/codex runs);
   - `fs.*` compiles to `bwrap` `filesystemScope: "workspace"` on local Linux
-    runs only;
+    runs, and to Codex's own workspace sandbox for Codex runs;
   - method and path rules, `egress.deny` on paths, `credential.bind` and
     `mode: audit` have no target and stay guidance.
 
@@ -774,7 +829,8 @@ CLI and the paperclip skill together (rule 8).
 2. **Policy controls, audit only.**
    - The additive `company_policy_controls` table, with board-only CRUD and
      activity logging.
-   - The pure compiler, with unit tests and a prover check.
+   - The pure compiler, with unit tests. A prover check runs on the `enforce`
+     rendering, where the prover supports it (section 3.2).
    - A "would deny" preview, and a CLI `paperclipai policy controls …`.
 3. **Enforcement.**
    - Merge controls company → project → routine → agent per run.
@@ -810,14 +866,16 @@ was run. **The spike needs a host from the operator:**
 | 6 | Egress | unlisted host denied with `policy_denied`; `GET` allowed; `DELETE` denied under `enforce`, allowed under `audit` |
 | 7a | Gateway killed mid-run | the running sandbox's behavior is recorded; no new sandbox starts; the run fails clearly |
 | 7b | Supervisor link dropped mid-run | the agent freezes [O2 L181-183], then resumes or fails clearly |
-| 8 | A broken policy revision | rejected; the previous policy stays active |
+| 8a | A policy revision the gateway rejects | rejected; the previous policy stays active [O7 L206-207] |
+| 8b | A revision the gateway accepts but the sandbox cannot load | with the default `fail_closed`, traffic is blocked until a valid revision arrives [O7 L211-221]; the run fails clearly |
 | 9 | Replace the CLI binary mid-run | requests denied (documents the pinning risk) |
 | 10 | A 200 MB repo through `upload` and `download`; and one exec with exactly 4 MiB of base64 stdin, as Paperclip's generic sync sends | byte-identical round trip; the 4 MiB chunk passes or the generic sync is ruled out |
 | 11 | Paperclip's callback bridge over `exec`, with the bridge on loopback | works with no egress rule to Paperclip |
-| 12 | Prover: compiled candidate against company boundary plus baseline | passes; a widened candidate fails |
+| 12 | Prover: compiled `enforce` candidate against the company boundary plus baseline | record pass, fail or `unsupported` per section; a widened candidate never passes |
 | 13 | Codex and other Rust or Go CLIs with the injected CA | TLS works |
 | 14 | `hard_requirement` with an unusable filesystem rule set | the sandbox refuses to start |
-| 15 | A Node CLI started through an `sh` wrapper | the policy matches the resolved interpreter; record which binary OpenShell reports |
+| 15 | Each CLI started through an `sh` wrapper | the policy matches the resolved executable; record which binary OpenShell reports for each |
+| 16 | The native runner's launcher: a daemon detached with `nohup setsid` from a short exec | the daemon survives after the exec ends and connects to Paperclip |
 
 The bars in rows 2–4 are proposals for the decision owner to confirm.
 
@@ -866,6 +924,7 @@ The bars in rows 2–4 are proposals for the decision owner to confirm.
 | O18 | `providers/claude-code.yaml` |
 | O19 | `GOVERNANCE.md`, `MAINTAINERS.md` |
 | O20 | `e2e/rust/tests/internet_network_perf.rs` |
+| O21 | `docs/how-it-works/policies/network-rules.mdx` |
 
 **Advisories, GitHub and CNCF:**
 
