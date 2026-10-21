@@ -109,7 +109,7 @@ describe("claude sandbox auth-missing check", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: { engine: "cli", command: "claude" },
+      config: { engine: "cli", command: "claude", model: "claude-opus-4-8" },
       executionTarget: sandboxTarget,
       environmentName: "Daytona",
     });
@@ -130,7 +130,7 @@ describe("claude sandbox auth-missing check", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: { engine: "cli", command: "claude" },
+      config: { engine: "cli", command: "claude", model: "claude-opus-4-8" },
       executionTarget: sshTarget,
       environmentName: "Remote host",
     });

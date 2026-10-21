@@ -127,6 +127,7 @@ describe("claude remote execution", () => {
       config: {
         engine: "cli",
         command: "claude",
+        model: "claude-opus-5",
         instructionsFilePath: instructionsPath,
         env: {
           QA_PROJECT_WORKSPACE_CWD: workspaceDir,
@@ -513,6 +514,7 @@ describe("claude remote execution", () => {
       config: {
         engine: "cli",
         command: "claude",
+        model: "claude-sonnet-5",
       },
       context: {
         paperclipWorkspace: {
@@ -895,6 +897,7 @@ describe("claude remote execution", () => {
       config: {
         engine: "cli",
         command: "claude",
+        model: "claude-sonnet-5",
         env: { ANTHROPIC_API_KEY: "fixture-anthropic-key" },
       },
       context: {
