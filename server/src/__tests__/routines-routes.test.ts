@@ -142,6 +142,8 @@ const mockProjectService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockTrackRoutineCreated = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
+// The step warnings read agents from the database, which these route tests do not have.
+const mockRoutineStepWarnings = vi.hoisted(() => vi.fn());
 
 function registerModuleMocks() {
   vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
@@ -167,10 +169,16 @@ function registerModuleMocks() {
     logActivity: mockLogActivity,
   }));
 
+  vi.doMock("../services/routine-steps.js", async () => ({
+    ...(await vi.importActual<typeof import("../services/routine-steps.js")>("../services/routine-steps.js")),
+    routineStepWarnings: mockRoutineStepWarnings,
+  }));
+
   vi.doMock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
     documentAnnotationService: () => mockAnnotationService,
+    issueService: () => ({ getById: vi.fn() }),
     logActivity: mockLogActivity,
     projectService: () => mockProjectService,
     routineService: () => mockRoutineService,
@@ -214,12 +222,14 @@ describe("routine routes", () => {
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../services/activity-log.js");
     vi.doUnmock("../services/routines.js");
+    vi.doUnmock("../services/routine-steps.js");
     vi.doUnmock("../routes/routines.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
+    mockRoutineStepWarnings.mockResolvedValue([]);
     mockRoutineService.list.mockResolvedValue([routine]);
     mockRoutineService.create.mockResolvedValue(routine);
     mockRoutineService.get.mockResolvedValue(routine);
