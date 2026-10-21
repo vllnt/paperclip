@@ -30,7 +30,7 @@ import {
   type PluginManagedProjectDeclaration,
   type PluginManagedProjectResolution,
 } from "@paperclipai/shared";
-import { unprocessable } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runtime-read-model.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -949,9 +949,11 @@ export function projectService(db: Db) {
 
     /**
      * Deletes a project. Its policies go with it, together with their documents and revisions,
-     * so no policy text stays behind. Returns the deleted project and the keys of its removed policies.
+     * so no policy text stays behind. Only the board writes policies, so a caller that may not remove
+     * them (`removePolicies: false`) gets 403 when the project has any. Returns the deleted project
+     * and the keys of its removed policies.
      */
-    remove: (id: string) =>
+    remove: (id: string, options: { removePolicies: boolean }) =>
       db.transaction(async (tx) => {
         // Lock the project first: a policy cannot then be created in it or moved into it meanwhile.
         const locked = await tx
@@ -966,6 +968,9 @@ export function projectService(db: Db) {
           .from(companyPolicies)
           .where(eq(companyPolicies.projectId, id))
           .for("update");
+        if (projectPolicies.length > 0 && !options.removePolicies) {
+          throw forbidden("Only the board can delete a project that has policies.");
+        }
         const row = await tx
           .delete(projects)
           .where(eq(projects.id, id))

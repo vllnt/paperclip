@@ -16,7 +16,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { companyPolicyRoutes } from "../routes/company-policies.js";
 import { buildOpenApiSpec } from "../routes/openapi.js";
-import { projectService } from "../services/projects.js";
+import { projectRoutes } from "../routes/projects.js";
 import {
   describeEmbeddedPostgres,
   seedCompanyWithBoardAccess,
@@ -33,6 +33,7 @@ function createApp(db: Db, actor: Express.Request["actor"]) {
     next();
   });
   app.use("/api", companyPolicyRoutes(db));
+  app.use("/api", projectRoutes(db));
   app.use(errorHandler);
   return app;
 }
@@ -193,9 +194,10 @@ describeEmbeddedPostgres("company policy routes", () => {
     expect(cleared.body.summary).toBeNull();
   });
 
-  it("removes a project's policies with their documents when the project is deleted", async () => {
+  it("lets only the board delete a project that has policies, and removes their documents with it", async () => {
     const seeded = await seedCompanyWithBoardAccess(ctx.db, "Policies");
     const project = await seedProject(ctx.db, seeded.companyId);
+    const agent = await seedAgent(ctx.db, seeded.companyId);
     const app = createApp(ctx.db, seeded.actor);
     const url = `/api/companies/${seeded.companyId}/policies`;
     const projectPolicy = await request(app)
@@ -203,9 +205,22 @@ describeEmbeddedPostgres("company policy routes", () => {
       .send({ key: "release", title: "Release", body: "Tag every release.", status: "active", projectId: project.id });
     const companyPolicy = await request(app).post(url).send({ key: "naming", title: "Naming", status: "active" });
 
-    const removed = await projectService(ctx.db).remove(project.id);
+    const agentApp = createApp(ctx.db, agentActor(seeded.companyId, agent.id));
+    const emptyProject = await seedProject(ctx.db, seeded.companyId, "Scratch");
+    expect((await request(agentApp).delete(`/api/projects/${emptyProject.id}`)).status).toBe(200);
+    const agentDelete = await request(agentApp).delete(`/api/projects/${project.id}`);
+    expect(agentDelete.status).toBe(403);
+    expect(agentDelete.body.error).toBe("Only the board can delete a project that has policies.");
+    expect((await request(app).get(url)).body.map((policy: { key: string }) => policy.key)).toEqual(["naming", "release"]);
 
-    expect(removed?.removedPolicyKeys).toEqual(["release"]);
+    const boardDelete = await request(app).delete(`/api/projects/${project.id}`);
+    expect(boardDelete.status).toBe(200);
+    expect(boardDelete.body.id).toBe(project.id);
+    const [deletedEntry] = await ctx.db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.action, "project.deleted"), eq(activityLog.entityId, project.id)));
+    expect(deletedEntry?.details).toEqual({ removedPolicyKeys: ["release"] });
     expect((await request(app).get(url)).body.map((policy: { key: string }) => policy.key)).toEqual(["naming"]);
     const remainingDocuments = await ctx.db.select({ id: documents.id }).from(documents);
     expect(remainingDocuments.map((row) => row.id)).toEqual([companyPolicy.body.documentId]);

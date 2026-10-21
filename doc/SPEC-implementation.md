@@ -520,7 +520,7 @@ Contract for a routine with steps:
 
 Company policies are written rules and guardrails for a company or one of its projects (`company_policies`):
 
-- Each row links one-to-one to a `documents` row, which holds the title, the markdown body and the revision history (`document_revisions`). `project_id` is null for a company policy and set for a project policy. Deleting a project deletes its policies with their documents and revisions, and the `project.deleted` activity entry lists their keys (`removedPolicyKeys`).
+- Each row links one-to-one to a `documents` row, which holds the title, the markdown body and the revision history (`document_revisions`). `project_id` is null for a company policy and set for a project policy. Deleting a project deletes its policies with their documents and revisions, and the `project.deleted` activity entry lists their keys (`removedPolicyKeys`). Only the board can delete a project that has policies; an agent gets `403`.
 - `key` is a lowercase slug, unique per company across both scopes, so `policy://<key>` names one policy. The key cannot change.
 - `status` is `draft`, `active` or `archived`; only `active` policies apply to agents. Archiving keeps the key reserved. Delete works only on an archived policy (`409` otherwise) and removes the document and its revisions.
 - `summary` is one line of at most 280 characters; an empty summary is stored as null. `owner_agent_id` or `owner_user_id` names one owner; both set is refused.

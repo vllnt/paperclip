@@ -789,7 +789,7 @@ export function projectRoutes(db: Db, options: { pluginWorkerManager?: Pick<Plug
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
-    const removed = await svc.remove(id);
+    const removed = await svc.remove(id, { removePolicies: req.actor.type === "board" });
     if (!removed) {
       res.status(404).json({ error: "Project not found" });
       return;

@@ -68,5 +68,6 @@ paperclipai policy delete code-review --yes
 - Archive a policy to retire it. The key stays reserved, so old
   `policy://<key>` references never point at a different policy.
 - Delete works only on an archived policy. Any other status returns `409`.
-- Deleting a project also deletes its policies.
+- Deleting a project also deletes its policies, so only the board can delete a
+  project that has policies. An agent gets `403`.
 - A duplicate key returns `409`.
