@@ -10,7 +10,7 @@ export {
 } from "./cli-capabilities.js";
 export {
   parseClaudeStreamJson,
-  parseClaudeRunLogUsage,
+  createClaudeRunLogUsageReader,
   describeClaudeFailure,
   isClaudeMaxTurnsResult,
   isClaudeProviderQuotaError,

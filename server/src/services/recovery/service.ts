@@ -972,7 +972,7 @@ export function recoveryService(
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
     /**
      * Records the usage that a run streamed before it ended with no adapter result. The watchdog
-     * fold calls it after it settled a run, and a failure never undoes the fold.
+     * fold and the orphan reap call it after they settled a run, and a failure never undoes that.
      */
     recordRunUsage?: (runId: string) => Promise<void>;
     /**
@@ -6574,6 +6574,9 @@ export function recoveryService(
     // Telemetry is best-effort background work; it must not delay clearing
     // the stale lock below, so fire it and do not await it.
     void emitAgentTaskRun(db, updated);
+    // The lost process printed no adapter result: keep the usage it streamed
+    // into the run log. Background work too, for the same reason.
+    void deps.recordRunUsage?.(updated.id).catch(() => undefined);
     runningProcesses.delete(run.id);
     // The run update above already committed the terminal status. The audit
     // event is best-effort: if the insert fails, the caller must still treat

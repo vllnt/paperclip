@@ -1,7 +1,8 @@
 import { createInterface } from "node:readline";
 import { and, desc, eq, isNotNull, ne, sql } from "drizzle-orm";
+import type { AdapterRunLogUsageReader } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
-import { agentRuntimeState, agents, heartbeatRuns } from "@paperclipai/db";
+import { agentRuntimeState, agents, costEvents, heartbeatRuns } from "@paperclipai/db";
 import { HEARTBEAT_RUN_TERMINAL_STATUSES, type BillingType, type CostStatus } from "@paperclipai/shared";
 import { findServerAdapter } from "../adapters/index.js";
 import { parseObject } from "../adapters/utils.js";
@@ -11,9 +12,14 @@ import type { BudgetServiceHooks } from "./budgets.js";
 import { getRunLogStore, type RunLogStore } from "./run-log-store.js";
 
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
+/** The run to record. Any copy of its row will do: the recovery reads the row again. */
+type RunLogUsageTarget = Pick<HeartbeatRunRow, "id" | "companyId" | "usageJson">;
 
-/** Stdout text read from one run log is capped, so a runaway log cannot exhaust the heap. */
-const MAX_RUN_LOG_STDOUT_CHARS = 64 * 1024 * 1024;
+/**
+ * A stdout line longer than this is skipped unread. A usage line is small (an assistant message is
+ * bounded by the model's output limit); a line this long is a tool result, which holds no usage.
+ */
+const MAX_RUN_LOG_STDOUT_LINE_CHARS = 4 * 1024 * 1024;
 
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set(HEARTBEAT_RUN_TERMINAL_STATUSES);
 const USAGE_KEYS = ["inputTokens", "cachedInputTokens", "outputTokens", "costUsd", "cacheAdjustedCostUsd"] as const;
@@ -51,52 +57,60 @@ export function runHasRecordedUsage(usageJson: unknown): boolean {
 }
 
 /**
- * Reads the stdout stream of one run back from its log. The log is one JSON record per line
- * (`{ts, stream, chunk}`); the stdout chunks join into the text the adapter printed.
+ * Feeds the stdout lines of one run's log to `reader`, in order. The log is one JSON record per line
+ * (`{ts, stream, chunk}`); the stdout chunks join into the lines the adapter printed. It streams the
+ * file, so memory holds one record and one stdout line, never the log. Returns false when the run
+ * has no log to read.
  */
-async function readRunLogStdout(store: RunLogStore, run: HeartbeatRunRow): Promise<string | null> {
-  if (run.logStore !== "local_file" || !run.logRef) return null;
-  const handle = { store: "local_file" as const, logRef: run.logRef };
-  const chunks: string[] = [];
-  let chars = 0;
-  const take = (line: string) => {
-    if (!line) return;
-    try {
-      const record = JSON.parse(line) as { stream?: unknown; chunk?: unknown };
-      if (record.stream === "stdout" && typeof record.chunk === "string" && chars < MAX_RUN_LOG_STDOUT_CHARS) {
-        chunks.push(record.chunk);
-        chars += record.chunk.length;
-      }
-    } catch {
-      // A line cut by a crash is not a record; the stream before it still counts.
+async function readRunLogStdoutLines(
+  store: RunLogStore,
+  run: HeartbeatRunRow,
+  reader: AdapterRunLogUsageReader,
+): Promise<boolean> {
+  if (run.logStore !== "local_file" || !run.logRef || !store.openReadStream) return false;
+  const input = await store.openReadStream({ store: "local_file", logRef: run.logRef });
+  let line = "";
+  let lineTooLong = false;
+  const take = (text: string) => {
+    if (lineTooLong) return;
+    if (line.length + text.length > MAX_RUN_LOG_STDOUT_LINE_CHARS) {
+      line = "";
+      lineTooLong = true;
+      return;
     }
+    line += text;
+  };
+  const endLine = () => {
+    if (!lineTooLong && line) reader.readLine(line);
+    line = "";
+    lineTooLong = false;
   };
 
-  if (store.openReadStream) {
-    const input = await store.openReadStream(handle);
-    const lines = createInterface({ input, crlfDelay: Infinity });
-    for await (const line of lines) take(line);
-  } else {
-    let offset = 0;
-    let carry = "";
-    for (;;) {
-      const page = await store.read(handle, { offset, limitBytes: 1_000_000 });
-      const text = carry + page.content;
-      const parts = text.split("\n");
-      carry = parts.pop() ?? "";
-      for (const line of parts) take(line);
-      if (page.nextOffset === undefined || page.nextOffset <= offset) break;
-      offset = page.nextOffset;
+  for await (const recordLine of createInterface({ input, crlfDelay: Infinity })) {
+    let record: unknown;
+    try {
+      record = JSON.parse(recordLine);
+    } catch {
+      // A line cut by a crash is not a record; the stream before it still counts.
+      continue;
     }
-    take(carry);
+    const { stream, chunk } = parseObject(record);
+    if (stream !== "stdout" || typeof chunk !== "string") continue;
+    const parts = chunk.split("\n");
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      take(parts[index]);
+      endLine();
+    }
+    take(parts[parts.length - 1]);
   }
-  return chunks.length > 0 ? chunks.join("") : null;
+  endLine();
+  return true;
 }
 
 /**
  * Records the usage of a run that ended without an adapter result: a restart, a stop, the
  * watchdog fold. The adapters stream their usage into the run log while they work, so the log
- * still holds it. The adapter reads the log back (`parseRunLogUsage`); this service writes the
+ * still holds it. The adapter reads the log back (`createRunLogUsageReader`); this service writes the
  * run's `usageJson` and its cost event once, and marks the usage `partial` when the stream
  * stopped before the provider's final totals.
  */
@@ -129,17 +143,26 @@ export function createRunLogUsageRecovery(deps: RunLogUsageRecoveryDeps) {
     };
   }
 
-  async function recover(run: HeartbeatRunRow): Promise<RecoveredRunUsage | null> {
+  async function recover(target: RunLogUsageTarget): Promise<RecoveredRunUsage | null> {
+    // Read the row again before the log: the caller's copy can be stale, and a finalization that
+    // landed since keeps its own usage.
+    const [run] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, target.id), eq(heartbeatRuns.companyId, target.companyId)));
+    if (!run || !TERMINAL_STATUSES.has(run.status) || runHasRecordedUsage(run.usageJson)) return null;
+    // A run that never started an adapter has no usage to find, and no log.
+    if (!run.startedAt || !run.logRef) return null;
+
     const [agent] = await db
       .select({ adapterType: agents.adapterType })
       .from(agents)
       .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId)));
-    const parseRunLogUsage = agent ? findServerAdapter(agent.adapterType)?.parseRunLogUsage : undefined;
-    if (!parseRunLogUsage) return null;
-
-    const stdout = await readRunLogStdout(deps.runLogStore ?? getRunLogStore(), run);
-    if (!stdout) return null;
-    const found = parseRunLogUsage(stdout);
+    const createReader = agent ? findServerAdapter(agent.adapterType)?.createRunLogUsageReader : undefined;
+    if (!createReader) return null;
+    const reader = createReader();
+    if (!(await readRunLogStdoutLines(deps.runLogStore ?? getRunLogStore(), run, reader))) return null;
+    const found = reader.finish();
     if (!found) return null;
 
     const { inputTokens, outputTokens } = found.usage;
@@ -147,7 +170,7 @@ export function createRunLogUsageRecovery(deps: RunLogUsageRecoveryDeps) {
     if (inputTokens <= 0 && outputTokens <= 0 && cachedInputTokens <= 0 && found.costUsd === null) return null;
 
     const profile = await readBillingProfile(run);
-    const provider = profile.provider ?? "unknown";
+    const provider = found.provider ?? profile.provider ?? "unknown";
     const biller = profile.biller ?? provider;
     const model = found.model ?? "unknown";
     const costCents = ledger.billedCostCents(found.costUsd, profile.billingType);
@@ -182,16 +205,6 @@ export function createRunLogUsageRecovery(deps: RunLogUsageRecoveryDeps) {
 
     try {
       const scope = await ledger.resolveScope(run.companyId, run);
-      await db
-        .update(agentRuntimeState)
-        .set({
-          totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
-          totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
-          totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
-          totalCostCents: sql`${agentRuntimeState.totalCostCents} + ${costCents}`,
-          updatedAt: new Date(),
-        })
-        .where(eq(agentRuntimeState.agentId, run.agentId));
       await costs.createEvent(run.companyId, {
         heartbeatRunId: run.id,
         agentId: run.agentId,
@@ -209,12 +222,30 @@ export function createRunLogUsageRecovery(deps: RunLogUsageRecoveryDeps) {
         costCents,
         occurredAt: new Date(),
       });
-    } catch (err) {
-      // Hand the run back, so the next terminal write or startup repair can try again.
       await db
-        .update(heartbeatRuns)
-        .set({ usageJson: null, updatedAt: new Date() })
-        .where(and(eq(heartbeatRuns.id, run.id), sql`${heartbeatRuns.usageJson} ->> 'usageSource' = 'run_log'`));
+        .update(agentRuntimeState)
+        .set({
+          totalInputTokens: sql`${agentRuntimeState.totalInputTokens} + ${inputTokens}`,
+          totalOutputTokens: sql`${agentRuntimeState.totalOutputTokens} + ${outputTokens}`,
+          totalCachedInputTokens: sql`${agentRuntimeState.totalCachedInputTokens} + ${cachedInputTokens}`,
+          totalCostCents: sql`${agentRuntimeState.totalCostCents} + ${costCents}`,
+          updatedAt: new Date(),
+        })
+        .where(eq(agentRuntimeState.agentId, run.agentId));
+    } catch (err) {
+      // Hand the run back, so the next terminal write or startup repair can try again, but only
+      // while no cost event holds it: a failure after the event's insert must not count it twice.
+      const [event] = await db
+        .select({ id: costEvents.id })
+        .from(costEvents)
+        .where(and(eq(costEvents.companyId, run.companyId), eq(costEvents.heartbeatRunId, run.id)))
+        .limit(1);
+      if (!event) {
+        await db
+          .update(heartbeatRuns)
+          .set({ usageJson: null, updatedAt: new Date() })
+          .where(and(eq(heartbeatRuns.id, run.id), sql`${heartbeatRuns.usageJson} ->> 'usageSource' = 'run_log'`));
+      }
       throw err;
     }
 
@@ -227,14 +258,12 @@ export function createRunLogUsageRecovery(deps: RunLogUsageRecoveryDeps) {
 
   /**
    * Records the run's usage from its log when the run is terminal, started an adapter, and has no
-   * usage yet. Never throws: a failure is logged and the run keeps its (empty) usage. Calls for one
-   * run share one pass, so a caller that must finish before the process exits can await the same
-   * work that a background caller started.
+   * usage yet; it reads the row again first. Never throws: a failure is logged and the run keeps
+   * its (empty) usage. Calls for one run share one pass, so a caller that must finish before the
+   * process exits can await the same work that a background caller started.
    */
-  function recordRunUsageFromLog(run: HeartbeatRunRow): Promise<RecoveredRunUsage | null> {
-    if (!TERMINAL_STATUSES.has(run.status)) return Promise.resolve(null);
-    // A run that never started an adapter has no usage to find, and no log.
-    if (!run.startedAt || !run.logRef) return Promise.resolve(null);
+  function recordRunUsageFromLog(run: RunLogUsageTarget): Promise<RecoveredRunUsage | null> {
+    // Usage is never taken off a run, so a copy that holds usage needs no read.
     if (runHasRecordedUsage(run.usageJson)) return Promise.resolve(null);
     const pending = inFlight.get(run.id);
     if (pending) return pending;

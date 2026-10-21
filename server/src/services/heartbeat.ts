@@ -10305,7 +10305,7 @@ export function heartbeatService(
   };
   const budgets = budgetService(db, budgetHooks);
   // Records the usage of a run that ends with no adapter result (a restart, a stop, the watchdog
-  // fold) from what its adapter streamed into the run log.
+  // fold, the orphan reap) from what its adapter streamed into the run log.
   const runLogUsage = createRunLogUsageRecovery({
     db,
     budgetHooks,
@@ -10317,13 +10317,20 @@ export function heartbeatService(
         resolveLedgerCostStatus({ costUsd, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }),
     },
   });
+  // A run whose executor still runs in this process is left to that executor: it writes the
+  // adapter's usage, or reads the log itself once it ends (see the end of executeRunAttempt). A
+  // stop that ends the run first must not record the log as well, or the run counts twice.
+  function recordRunLogUsageUnlessExecuting(run: typeof heartbeatRuns.$inferSelect) {
+    if (activeRunExecutions.has(run.id)) return Promise.resolve(null);
+    return runLogUsage.recordRunUsageFromLog(run);
+  }
   const harnessFallback = harnessFallbackService(db);
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
     recordRunUsage: async (runId) => {
       const run = await getRun(runId);
-      if (run) await runLogUsage.recordRunUsageFromLog(run);
+      if (run) await recordRunLogUsageUnlessExecuting(run);
     },
     scheduleRecoveryRetry: async (runId) => {
       const [run] = await db
@@ -13951,7 +13958,7 @@ export function heartbeatService(
     void reportRunFailure(db, updated, failureReport);
     // A run that ends with no adapter result (a stop, a restart, a lost process) keeps the
     // usage its adapter streamed into the run log. A run that has usage is skipped at once.
-    void runLogUsage.recordRunUsageFromLog(updated);
+    void recordRunLogUsageUnlessExecuting(updated);
   }
 
   async function setRunStatus(
@@ -16535,9 +16542,6 @@ export function heartbeatService(
   ) {
     const message = `Interrupted by graceful server shutdown (${signal})`;
     let interrupted = interruptedRun;
-    // The drain ends the run with no adapter result: keep the usage that the adapter streamed.
-    // It shares the pass that the status write started, and a repair on the next start repeats it.
-    await runLogUsage.recordRunUsageFromLog(interrupted);
     await setWakeupStatus(interrupted.wakeupRequestId, "cancelled", {
         finishedAt: now,
         error: null,
@@ -16585,6 +16589,11 @@ export function heartbeatService(
     await finalizeAgentStatus(interrupted.agentId, "interrupted", message, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(interrupted),
     });
+    // The drain ends the run with no adapter result: keep the usage that the adapter streamed.
+    // It reads the whole log, so it comes after the steps above that the restart needs, and before
+    // the marker, so a repair on the next start repeats it when the drain was cut. An executor never
+    // writes usage onto an `interrupted` run, so this cannot count a run twice.
+    await runLogUsage.recordRunUsageFromLog(interrupted);
     await db
       .update(heartbeatRuns)
       .set({
@@ -30476,6 +30485,10 @@ export function heartbeatService(
         }
         clearAdapterSteering(run.id);
       }
+      // A run that ended while this executor ran (a stop, the watchdog fold) was left to it, and
+      // the adapter may have had no usage to report: read the log now, before the next queued run
+      // starts, so the daily cost cap sees it. It reads the row again and skips a run with usage.
+      if (latestRun) await runLogUsage.recordRunUsageFromLog(latestRun);
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
       if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {

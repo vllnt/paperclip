@@ -1,4 +1,4 @@
-import type { UsageSummary } from "@paperclipai/adapter-utils";
+import type { AdapterRunLogUsageReader, UsageSummary } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
@@ -139,62 +139,82 @@ export function parseClaudeStreamJson(stdout: string) {
   };
 }
 
-/**
- * The usage a Claude run streamed into its stdout log, read back after the run ended without an
- * adapter result (a restart, a stop, the watchdog fold). A final `result` line carries the exact
- * per-run totals and the cost, so it wins. Without one the stream still has the per-message usage
- * of every `assistant` event: those add up to a lower bound of the run's tokens, marked `partial`,
- * and the CLI prints no cost before its final line.
- */
-export function parseClaudeRunLogUsage(stdout: string): {
-  usage: UsageSummary;
-  costUsd: number | null;
-  model: string | null;
-  partial: boolean;
-} | null {
-  const parsed = parseClaudeStreamJson(stdout);
-  if (parsed.resultJson && parsed.usage) {
-    return {
-      usage: parsed.usage,
-      costUsd: parsed.costUsd,
-      model: parsed.model || null,
-      partial: false,
-    };
-  }
+const RUN_LOG_USAGE_LINE_RE = /"(?:usage|modelUsage|init)"/;
 
+/**
+ * Reads the usage a Claude run streamed into its stdout log, after the run ended without an adapter
+ * result (a restart, a stop, the watchdog fold). A `result` line carries the exact totals and the
+ * cost of the process so far (`modelUsage` and `total_cost_usd` are cumulative, as in
+ * parseClaudeStreamJson). The per-message usage of the `assistant` events after the last `result`
+ * adds the turn that was still running, as for a steered run cut in a later turn: those counts are a
+ * lower bound, marked `partial`, and the CLI prints no cost before a turn's `result` line.
+ */
+export function createClaudeRunLogUsageReader(): AdapterRunLogUsageReader {
+  let initModel = "";
+  let messageModel = "";
+  const turnUsage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+  let resultUsage: UsageSummary | null = null;
+  let resultCostUsd: number | null = null;
   // One API message streams as several `assistant` events with the same message id and a growing
   // output count, so the last event of an id holds its usage. Subagent messages have their own ids.
-  const usageByMessageId = new Map<string, Record<string, unknown>>();
-  let model = "";
+  let usageByMessageId = new Map<string, Record<string, unknown>>();
   let anonymousMessages = 0;
-  for (const rawLine of stdout.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    const event = parseJson(line);
-    if (!event) continue;
-    const type = asString(event.type, "");
-    if (type === "system" && asString(event.subtype, "") === "init") {
-      model = asString(event.model, model);
-      continue;
-    }
-    if (type !== "assistant") continue;
-    const message = parseObject(event.message);
-    const usageObj = parseObject(message.usage);
-    if (Object.keys(usageObj).length === 0) continue;
-    model = asString(message.model, model);
-    usageByMessageId.set(asString(message.id, "") || `anonymous-${anonymousMessages++}`, usageObj);
-  }
-  if (usageByMessageId.size === 0) return null;
 
-  const usage: UsageSummary = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
-  for (const usageObj of usageByMessageId.values()) {
-    // Cache-creation tokens are billed prompt tokens, as in claudeModelUsageTotals.
-    usage.inputTokens +=
-      asNumber(usageObj.input_tokens, 0) + asNumber(usageObj.cache_creation_input_tokens, 0);
-    usage.cachedInputTokens = (usage.cachedInputTokens ?? 0) + asNumber(usageObj.cache_read_input_tokens, 0);
-    usage.outputTokens += asNumber(usageObj.output_tokens, 0);
-  }
-  return { usage, costUsd: null, model: model || null, partial: true };
+  return {
+    readLine(rawLine) {
+      // Only the init, assistant and result events matter, and each names its usage or init: a
+      // large tool result is skipped unparsed.
+      if (!RUN_LOG_USAGE_LINE_RE.test(rawLine)) return;
+      const event = parseJson(rawLine.trim());
+      if (!event) return;
+      const type = asString(event.type, "");
+      if (type === "system" && asString(event.subtype, "") === "init") {
+        initModel = asString(event.model, initModel);
+        return;
+      }
+      if (type === "result") {
+        const usageObj = parseObject(event.usage);
+        turnUsage.inputTokens += asNumber(usageObj.input_tokens, 0);
+        turnUsage.cachedInputTokens += asNumber(usageObj.cache_read_input_tokens, 0);
+        turnUsage.outputTokens += asNumber(usageObj.output_tokens, 0);
+        resultUsage = claudeModelUsageTotals(event.modelUsage) ?? { ...turnUsage };
+        const costRaw = event.total_cost_usd;
+        resultCostUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
+        // This result counts every message before it.
+        usageByMessageId = new Map();
+        return;
+      }
+      if (type !== "assistant") return;
+      const message = parseObject(event.message);
+      const usageObj = parseObject(message.usage);
+      if (Object.keys(usageObj).length === 0) return;
+      messageModel = asString(message.model, messageModel);
+      usageByMessageId.set(asString(message.id, "") || `anonymous-${anonymousMessages++}`, usageObj);
+    },
+
+    finish() {
+      if (!resultUsage && usageByMessageId.size === 0) return null;
+      const usage: UsageSummary = {
+        inputTokens: resultUsage?.inputTokens ?? 0,
+        outputTokens: resultUsage?.outputTokens ?? 0,
+        cachedInputTokens: resultUsage?.cachedInputTokens ?? 0,
+      };
+      for (const usageObj of usageByMessageId.values()) {
+        // Cache-creation tokens are billed prompt tokens, as in claudeModelUsageTotals.
+        usage.inputTokens +=
+          asNumber(usageObj.input_tokens, 0) + asNumber(usageObj.cache_creation_input_tokens, 0);
+        usage.cachedInputTokens = (usage.cachedInputTokens ?? 0) + asNumber(usageObj.cache_read_input_tokens, 0);
+        usage.outputTokens += asNumber(usageObj.output_tokens, 0);
+      }
+      return {
+        usage,
+        costUsd: resultCostUsd,
+        model: initModel || messageModel || null,
+        provider: "anthropic",
+        partial: !resultUsage || usageByMessageId.size > 0,
+      };
+    },
+  };
 }
 
 function extractClaudeErrorMessages(parsed: Record<string, unknown>): string[] {

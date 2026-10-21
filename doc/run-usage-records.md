@@ -14,12 +14,15 @@ This is the **run-log data path** in `AGENTS.md`. The rows stay in the instance 
 
 ## Runs that end without an adapter result
 
-A server shutdown, a stop and the active-run watchdog fold end a run before its adapter prints the provider's final totals, so the run row would hold no usage. The server then reads the usage back from the run's own log, once, when the run turns terminal (for a shutdown: when the interrupted run is repaired on the next start).
+A server shutdown, a stop, the active-run watchdog fold and the orphan reap end a run before its adapter prints the provider's final totals, so the run row would hold no usage. The server then reads the usage back from the run's own log, once, when the run turns terminal. A shutdown does it as the last step of its drain, so the next start repeats it when the drain was cut.
 
-- The adapter parses its own stream (`parseRunLogUsage` on the server adapter module). `claude_local` takes the exact totals and the cost from a final `result` line when the log holds one. Otherwise it adds up the usage of each assistant message (one snapshot per message id) and marks the usage `partial`.
+- The adapter reads its own stream (`createRunLogUsageReader` on the server adapter module). The server feeds it the run's stdout one line at a time and skips a line longer than 4 MiB (a tool result, never a usage line), so a large log costs one pass and no more memory than one line.
+- `claude_local` takes the totals and the cost of the last `result` line (cumulative for the process). It adds the usage of each assistant message after that line (one snapshot per message id): the turn that was still running, as in a steered run cut in a later turn. Without that turn the usage is exact; with it, or with no `result` line at all, the usage is marked `partial`.
 - The run's `usage_json` gets `usageSource: "run_log"` and `partial: true|false`. The row derives as `derived`.
-- A partial count has no cost: the CLI prints the cost only in its final `result` line, and the server keeps no price table. Its cost event carries the tokens, `cost_status: "unpriced"` and 0 cents, so the daily cap counts a recovered run only where the log holds the cost.
-- A run that already holds usage (a normal finalization, or a self-handoff flush) is never overwritten. One conditional write claims the empty `usage_json`, so a recovery and a normal finalization cannot both record.
+- The CLI prints a cost only in a turn's `result` line, and the server keeps no price table. A partial count holds the cost of the turns that finished, or none; with none, its cost event carries the tokens, `cost_status: "unpriced"` and 0 cents, so the daily cap counts a recovered run only where the log holds a cost.
+- A run that already holds usage (a normal finalization, or a self-handoff flush) is never overwritten. The server reads the row again before the log, and one conditional write claims the empty `usage_json`, so a recovery and a normal finalization cannot both record.
+- A run whose executor still runs in the server process is left to that executor: a stop that ends it first does not read the log. The executor writes the adapter's usage, or reads the log itself once it ends, before the agent's next queued run starts.
+- A failure after the cost event was written keeps the claim, so the next pass cannot count the run twice. A failure before it hands the run back for the next terminal write or startup repair.
 - A run that never started an adapter has no log and no usage; it stays empty.
 
 ## How rows are written

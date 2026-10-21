@@ -3,13 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
   agentRuntimeState,
   agentWakeupRequests,
   companies,
+  companySkills,
   costEvents,
   createDb,
   heartbeatRunEvents,
@@ -17,13 +18,17 @@ import {
   issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
+import type { UsageSummary } from "@paperclipai/adapter-utils";
+import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { findServerAdapter, registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS } from "../services/recovery/service.js";
 import { getRunLogStore } from "../services/run-log-store.js";
+import { createRunLogUsageRecovery, type RunLogUsageLedger } from "../services/run-log-usage-recovery.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -99,6 +104,7 @@ describeEmbeddedPostgres("heartbeat run log usage recovery", () => {
     await db.delete(issues);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
+    await db.delete(companySkills);
     await db.delete(companies);
   });
 
@@ -256,18 +262,17 @@ describeEmbeddedPostgres("heartbeat run log usage recovery", () => {
     return run;
   }
 
-  /** The cancel and the terminal-status hooks record in the background: wait for the write. */
+  async function costEventsOf(runId: string) {
+    return db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+  }
+
+  /** The cancel and the terminal-status hooks record in the background: wait for its cost event. */
   async function waitForUsage(runId: string) {
     for (let attempt = 0; attempt < 100; attempt += 1) {
-      const run = await readRun(runId);
-      if (run.usageJson) return run;
+      if ((await costEventsOf(runId)).length > 0) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     return readRun(runId);
-  }
-
-  async function costEventsOf(runId: string) {
-    return db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
   }
 
   describe("a restart that ends the run", () => {
@@ -334,6 +339,222 @@ describeEmbeddedPostgres("heartbeat run log usage recovery", () => {
         partial: true,
       });
       expect(await costEventsOf(seeded.runId)).toHaveLength(1);
+    });
+  });
+
+  describe("a stop that ends a run whose executor still runs", () => {
+    const STOP_RACE_ADAPTER = "run_log_usage_stop_race_test";
+    /** What the adapter reports after the stop ended its process: its own parse of the stream, or none. */
+    let adapterUsage: UsageSummary | null = null;
+    let reportStreamed: () => void = () => undefined;
+
+    beforeAll(() => {
+      registerServerAdapter({
+        type: STOP_RACE_ADAPTER,
+        // A real child process: it streams the usage lines, then works until the stop ends it. It
+        // takes a moment to exit after the signal, and the adapter answers as soon as the signal
+        // lands: the executor reaches its finalization while the stop is still settling the run.
+        execute: async (ctx) => {
+          let streamed = "";
+          let reportStopping: () => void = () => undefined;
+          const stopping = new Promise<void>((resolve) => {
+            reportStopping = resolve;
+          });
+          const child = runChildProcess(
+            ctx.runId,
+            process.execPath,
+            [
+              "-e",
+              "process.stdout.write(process.env.RUN_LOG_LINES ?? '');" +
+                "process.on('SIGTERM', () => { process.stdout.write('stopping\\n'); setTimeout(() => process.exit(0), 200); });" +
+                "setInterval(() => {}, 1000);",
+            ],
+            {
+              cwd: os.tmpdir(),
+              env: { RUN_LOG_LINES: KILLED_RUN_STDOUT.join("") },
+              timeoutSec: 60,
+              graceSec: 5,
+              onLog: async (stream, chunk) => {
+                await ctx.onLog(stream, chunk);
+                streamed += chunk;
+                if (streamed.includes('"msg-2"')) reportStreamed();
+                if (streamed.includes("stopping")) reportStopping();
+              },
+              onSpawn: ctx.onSpawn,
+            },
+          );
+          void child.catch(() => undefined);
+          await Promise.race([stopping, child]);
+          return {
+            exitCode: null,
+            signal: "SIGTERM",
+            timedOut: false,
+            provider: "anthropic",
+            biller: "anthropic",
+            model: MODEL,
+            billingType: "subscription_included",
+            ...(adapterUsage ? { usage: adapterUsage } : {}),
+          };
+        },
+        createRunLogUsageReader: findServerAdapter("claude_local")?.createRunLogUsageReader,
+        testEnvironment: async () => ({
+          adapterType: STOP_RACE_ADAPTER,
+          status: "pass",
+          checks: [],
+          testedAt: new Date().toISOString(),
+        }),
+      });
+    });
+
+    afterAll(() => unregisterServerAdapter(STOP_RACE_ADAPTER));
+
+    /** Starts a real run, stops it once its log holds the usage, and waits for its executor to end. */
+    async function stopLiveRun() {
+      const agent = await seedAgent({ adapterType: STOP_RACE_ADAPTER });
+      const heartbeat = heartbeatService(db);
+      const streamed = new Promise<void>((resolve) => {
+        reportStreamed = resolve;
+      });
+      const started = await heartbeat.invoke(agent.agentId, "on_demand", {}, "manual");
+      if (!started) throw new Error("The run did not start");
+      await streamed;
+
+      const cancelled = await heartbeat.cancelRun(started.id, "Stopped by the board");
+
+      expect(cancelled?.status).toBe("cancelled");
+      await heartbeat.drainActiveRunExecutions();
+      const [runtime] = await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, agent.agentId));
+      return { runId: started.id, runtime };
+    }
+
+    it("counts the usage once when the adapter still reports it after the stop", async () => {
+      adapterUsage = { inputTokens: 130, cachedInputTokens: 2_100, outputTokens: 100 };
+
+      const { runId, runtime } = await stopLiveRun();
+
+      const run = await readRun(runId);
+      expect(run.status).toBe("cancelled");
+      expect(run.usageJson).toMatchObject({ inputTokens: 130, cachedInputTokens: 2_100, outputTokens: 100 });
+      expect(await costEventsOf(runId)).toHaveLength(1);
+      expect(runtime).toMatchObject({ totalInputTokens: 130, totalCachedInputTokens: 2_100, totalOutputTokens: 100 });
+    });
+
+    it("records the usage from the log when the adapter reports none after the stop", async () => {
+      adapterUsage = null;
+
+      const { runId, runtime } = await stopLiveRun();
+
+      const run = await waitForUsage(runId);
+      expect(run.status).toBe("cancelled");
+      expect(run.usageJson).toMatchObject({
+        inputTokens: 130,
+        cachedInputTokens: 2_100,
+        outputTokens: 100,
+        usageSource: "run_log",
+        partial: true,
+        // No earlier run says how this agent is billed; the adapter still names its provider.
+        provider: "anthropic",
+      });
+      expect(await costEventsOf(runId)).toHaveLength(1);
+      expect(runtime).toMatchObject({ totalInputTokens: 130, totalCachedInputTokens: 2_100, totalOutputTokens: 100 });
+    });
+  });
+
+  describe("the orphan reap", () => {
+    it("records the usage of a run whose issue closed while its process was lost", async () => {
+      const seeded = await seedRunningRun(await seedAgent({ billingType: "subscription_included" }), {
+        stdout: KILLED_RUN_STDOUT,
+        sourceStatus: "done",
+      });
+
+      const sweep = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(sweep.terminalizedRunIds).toEqual([seeded.runId]);
+      const run = await waitForUsage(seeded.runId);
+      expect(run.usageJson).toMatchObject({
+        inputTokens: 130,
+        cachedInputTokens: 2_100,
+        outputTokens: 100,
+        usageSource: "run_log",
+        partial: true,
+      });
+      expect(await costEventsOf(seeded.runId)).toHaveLength(1);
+    });
+  });
+
+  describe("the recovery pass", () => {
+    const ledger: RunLogUsageLedger = {
+      resolveScope: async () => ({ issueId: null, projectId: null, billingCode: null }),
+      normalizeBillingType: () => "subscription_included",
+      billedCostCents: () => 0,
+      costStatus: () => "unpriced",
+    };
+
+    /** A run a stop has already ended, with no usage yet. */
+    async function seedStoppedRun(stdout: string[]) {
+      const seeded = await seedRunningRun(await seedAgent(), { stdout });
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "cancelled", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, seeded.runId));
+      return readRun(seeded.runId);
+    }
+
+    it("reads the row again and leaves the log unread when the caller's copy is stale", async () => {
+      const stale = await seedStoppedRun(KILLED_RUN_STDOUT);
+      // A normal finalization recorded the adapter's usage after the caller read its copy.
+      await db.update(heartbeatRuns).set({ usageJson: { inputTokens: 7, outputTokens: 3 } }).where(eq(heartbeatRuns.id, stale.id));
+      const store = getRunLogStore();
+      const openReadStream = vi.spyOn(store, "openReadStream");
+
+      try {
+        expect(await createRunLogUsageRecovery({ db, ledger, runLogStore: store }).recordRunUsageFromLog(stale)).toBeNull();
+        expect(openReadStream).not.toHaveBeenCalled();
+      } finally {
+        openReadStream.mockRestore();
+      }
+      expect(await costEventsOf(stale.id)).toHaveLength(0);
+    });
+
+    it("skips a stdout line past the line cap and still reads the result line after it", async () => {
+      // A tool result larger than any usage line; the reader never holds it whole.
+      const toolResult = line({ type: "user", message: { content: [{ type: "tool_result", content: "x".repeat(5 * 1024 * 1024) }] } });
+      const run = await seedStoppedRun([initEvent, toolResult, ...FINISHED_RUN_STDOUT.slice(1)]);
+
+      expect(await createRunLogUsageRecovery({ db, ledger }).recordRunUsageFromLog(run)).toEqual({
+        inputTokens: 1_200,
+        cachedInputTokens: 5_000,
+        outputTokens: 800,
+        costUsd: 0.42,
+        partial: false,
+      });
+    });
+
+    it("keeps a run whose cost event landed when a later step fails, so the next pass cannot count it twice", async () => {
+      const run = await seedStoppedRun(KILLED_RUN_STDOUT);
+      // The cost event is inserted, then the update of the company's spend fails once.
+      let failSpendUpdate = true;
+      const failingDb = new Proxy(db, {
+        get(target, property, receiver) {
+          if (property !== "update") return Reflect.get(target, property, receiver);
+          return (table: Parameters<typeof db.update>[0]) => {
+            if (table === companies && failSpendUpdate) {
+              failSpendUpdate = false;
+              throw new Error("spend update failed");
+            }
+            return target.update(table);
+          };
+        },
+      });
+      const recovery = createRunLogUsageRecovery({ db: failingDb, ledger });
+
+      expect(await recovery.recordRunUsageFromLog(run)).toBeNull();
+      expect(await costEventsOf(run.id)).toHaveLength(1);
+      // The next terminal write or the startup repair passes the row as it is now.
+      expect(await recovery.recordRunUsageFromLog(await readRun(run.id))).toBeNull();
+
+      expect(await costEventsOf(run.id)).toHaveLength(1);
+      expect((await readRun(run.id)).usageJson).toMatchObject({ usageSource: "run_log", inputTokens: 130 });
     });
   });
 

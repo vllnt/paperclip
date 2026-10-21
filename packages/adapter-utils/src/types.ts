@@ -39,13 +39,26 @@ export interface UsageSummary {
 /**
  * The usage a run streamed into its stdout log, read back after the run ended without an adapter
  * result. `partial` is true when the stream stopped before the provider's final totals, so the
- * counts are a lower bound.
+ * counts (and a cost, when the stream held one) are a lower bound.
  */
 export interface AdapterRunLogUsage {
   usage: UsageSummary;
   costUsd: number | null;
   model: string | null;
+  /** The provider the adapter reports for its runs, when the adapter knows it. */
+  provider?: string | null;
   partial: boolean;
+}
+
+/**
+ * Reads the usage of one run from its stdout log, one line at a time. The host feeds every stdout
+ * line in order and then calls `finish`, so a reader keeps only small state, never the stream.
+ */
+export interface AdapterRunLogUsageReader {
+  /** One stdout line, without its line break. */
+  readLine(line: string): void;
+  /** The usage the lines held, or null when they held none. */
+  finish(): AdapterRunLogUsage | null;
 }
 
 export type AdapterBillingType =
@@ -556,12 +569,11 @@ export interface ServerAdapterModule {
    */
   getQuotaWindows?: () => Promise<ProviderQuotaResult>;
   /**
-   * Optional: read the usage that a run streamed into its stdout log. The host calls it for a run
-   * that ended with no adapter result (a restart, a stop, the watchdog fold), so the tokens it
-   * streamed still count. Receives the run's whole stdout text; returns null when the stream holds
-   * no usage. Must be pure and must not throw.
+   * Optional: read the usage that a run streamed into its stdout log. The host creates one reader
+   * for a run that ended with no adapter result (a restart, a stop, the watchdog fold), so the
+   * tokens it streamed still count. The reader must be pure and must not throw.
    */
-  parseRunLogUsage?: (stdout: string) => AdapterRunLogUsage | null;
+  createRunLogUsageReader?: () => AdapterRunLogUsageReader;
   /**
    * Optional: detect the currently configured model from local config files.
    * Returns the detected model/provider and the config source, or null if
