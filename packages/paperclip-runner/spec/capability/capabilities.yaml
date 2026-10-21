@@ -2445,6 +2445,21 @@
       ]
     },
     {
+      "id": "skill:skills/paperclip/references/routines.md:a-project-s-routines:402",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/routines.md:402",
+      "title": "A project's routines",
+      "expectedSemantics": "Skill guidance headed “A project's routines”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/references/routines.md:402"
+      ]
+    },
+    {
       "id": "skill:skills/paperclip/references/workflows.md:paperclip-workflow-playbooks:1",
       "sourceKind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/workflows.md:1",
