@@ -45,6 +45,7 @@ import {
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure, truncateAtGrapheme, type ExecutionBlocker } from "@paperclipai/shared";
+import { CONTEXT_WINDOW_EXCEEDED_ERROR_CODE, isContextWindowExceededMessage } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
@@ -1036,6 +1037,8 @@ type DeferredWakeHeldReason =
 // bounded transient budget instead of ending as a plain `adapter_failed`.
 const WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE = "workspace_restore_lock_timeout";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
+const CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE =
+  "Not retried automatically: the prompt is larger than the model's context window, so the same run would fail the same way. Start a fresh session or shorten what the run replays, then wake the agent again.";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON =
@@ -1299,6 +1302,11 @@ function readHeartbeatRunErrorFamily(
 ) {
   if (run.errorCode === "provider_quota") {
     return "provider_quota";
+  }
+  // A context overflow fails the same way every time, whatever family the
+  // adapter guessed from its output.
+  if (run.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) {
+    return null;
   }
   if (
     run.errorCode === "codex_transient_upstream" ||
@@ -16823,6 +16831,24 @@ export function heartbeatService(
     return nextSlot.getTime() > input.dueAt.getTime() ? nextSlot : input.dueAt;
   }
 
+  /** Says in the run log why a context overflow gets no automatic retry. */
+  async function recordContextWindowExceededNotRetried(run: typeof heartbeatRuns.$inferSelect) {
+    if (run.errorCode !== CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) return;
+    // The event only explains the outcome; a write failure must not skip the
+    // retry and release steps that follow it.
+    try {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE,
+        payload: { errorCode: CONTEXT_WINDOW_EXCEEDED_ERROR_CODE },
+      });
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to record why a context overflow is not retried");
+    }
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -16841,6 +16867,11 @@ export function heartbeatService(
     if (run.errorCode === "provider_tool_definition_invalid") {
       return { outcome: "not_scheduled" as const,
         reason: "Repair the invalid tool definitions before starting a new attempt.",
+        issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
+    if (run.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) {
+      return { outcome: "not_scheduled" as const,
+        reason: CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE,
         issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
     }
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
@@ -28363,16 +28394,22 @@ export function heartbeatService(
           : runErrorSummary;
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
+        // The provider's own refusal of an oversized prompt wins over the code
+        // the adapter guessed, so no retry path sends the same prompt again.
+        const contextWindowExceeded =
+          outcome === "failed" && isContextWindowExceededMessage(adapterResult.errorMessage);
         const runErrorCode =
           outcome === "timed_out"
             ? "timeout"
             : outcome === "cancelled"
               ? (latestRun?.errorCode ?? "cancelled")
-              : outcome === "failed"
-                ? (adapterResult.errorCode ??
-                  recordedResponsibleUserDenialCode ??
-                  "adapter_failed")
-                : null;
+              : contextWindowExceeded
+                ? CONTEXT_WINDOW_EXCEEDED_ERROR_CODE
+                : outcome === "failed"
+                  ? (adapterResult.errorCode ??
+                    recordedResponsibleUserDenialCode ??
+                    "adapter_failed")
+                  : null;
 
         let logSummary: {
           bytes: number | null;
@@ -28790,6 +28827,7 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
+          await recordContextWindowExceededNotRetried(livenessRun);
           const harnessFallbackOutcome = outcome === "failed" && !isMaxTurnExhaustionRun(livenessRun)
             ? await handleProviderQuotaFailure({
                 run: livenessRun,
@@ -29167,6 +29205,9 @@ export function heartbeatService(
           recordedResponsibleUserDenialCode ??
           nativeTerminalFailureCode ??
           (restoreLockTimeoutFailure ? WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE : null) ??
+          (isContextWindowExceededMessage(err instanceof Error ? err.message : null)
+            ? CONTEXT_WINDOW_EXCEEDED_ERROR_CODE
+            : null) ??
           "adapter_failed";
         logger.error({ err, runId }, "heartbeat execution failed");
 
@@ -29284,6 +29325,7 @@ export function heartbeatService(
           ) {
             await finalizeIssueCommentPolicy(livenessRun, agent);
           }
+          await recordContextWindowExceededNotRetried(livenessRun);
           if (livenessRun.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE) {
             // Only this branch tolerates a scheduling error; the other keeps
             // propagating it as it always did.

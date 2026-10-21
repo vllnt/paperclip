@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray, lte, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, chatTaskHandoffs as handoffs,
   heartbeatRuns, issueComments, issueDocuments, issues, type Db } from "@paperclipai/db";
+import { CONTEXT_WINDOW_EXCEEDED_ERROR_CODE } from "@paperclipai/shared";
 import { instanceSettingsService } from "./instance-settings.js";
 
 export const CHAT_COMPLETION_WAKE_REASON = "chat_task_completed";
@@ -180,14 +181,18 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
         // A published reply is acknowledged in its own transaction, independent of run outcome.
         const [latest] = await db.select().from(deliveries).where(eq(deliveries.id, id));
         if (!latest || !pending.includes(latest.status as typeof pending[number])) return;
-        await db.update(deliveries).set({ status: claimed.attempts + 1 >= MAX_ATTEMPTS ? "exhausted" : "pending",
+        // A turn whose prompt overflowed the context window overflows again on
+        // the same conversation session, so it ends the delivery's attempts.
+        const exhausted = claimed.attempts + 1 >= MAX_ATTEMPTS
+          || (run?.status === "failed" && run.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE);
+        await db.update(deliveries).set({ status: exhausted ? "exhausted" : "pending",
           attempts: claimed.attempts + 1, targetRunId: null, nextAttemptAt: new Date(),
           error: run?.error ?? "Completion turn ended without a reply" })
           .where(and(eq(deliveries.id, id), inArray(deliveries.status, [...pending])));
         // The failed run is already terminal. Reclaim the advanced attempt now;
         // a second lease interval would only delay restart recovery. The atomic
         // claim and fresh wake key still serialize competing sweepers.
-        if (claimed.attempts + 1 < MAX_ATTEMPTS) await deliver(id);
+        if (!exhausted) await deliver(id);
         return;
       }
       if (wakes.some(w => ["queued", "claimed", "deferred_issue_execution", "coalesced"].includes(w.status))) return;
