@@ -287,7 +287,8 @@ export function RoutineComposerDialog({
   const projectById = useMemo(() => new Map((projects ?? []).map((project) => [project.id, project])), [projects]);
   const currentAssignee = draft.assigneeAgentId ? agentById.get(draft.assigneeAgentId) ?? null : null;
   const currentProject = draft.projectId ? projectById.get(draft.projectId) ?? null : null;
-  const canSave = !saveRoutine.isPending && Boolean(draft.title.trim()) && (!routine || editPatch !== null);
+  // A closing dialog cannot save: after an edit its draft still differs from the routine it opened with.
+  const canSave = open && !saveRoutine.isPending && Boolean(draft.title.trim()) && (!routine || editPatch !== null);
 
   function close() {
     onOpenChange(false);
