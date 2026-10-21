@@ -97,3 +97,48 @@ describe("parseTrustProxyEnv", () => {
     );
   });
 });
+
+// `req.ip` is what the invite and login rate limits read. Express resolves it
+// with proxy-addr: the peer address is the client unless it falls inside the
+// trusted subnets, and only then is X-Forwarded-For believed. proxy-addr
+// before 2.0.8 matched IPv4 clients (plain or IPv4-mapped IPv6) against any
+// IPv6 trust entry whose leading bits are zero, so an untrusted client could
+// pick its own `req.ip`.
+describe("req.ip under a subnet TRUST_PROXY", () => {
+  const SPOOFED = "198.51.100.9";
+
+  function ipFor(raw: string, peer: string): string {
+    const app = appWithEnv(raw);
+    // Build the request as Express does, minus the socket: `req.ip` reads the
+    // peer address and the X-Forwarded-For header through the app's trust setting.
+    const req: express.Request = Object.create(app.request, {
+      socket: { value: { remoteAddress: peer } },
+      headers: { value: { "x-forwarded-for": SPOOFED } },
+    });
+    return req.ip ?? "";
+  }
+
+  it("ignores X-Forwarded-For from an IPv4-mapped IPv6 client outside the trusted IPv4 subnet", () => {
+    expect(ipFor("10.0.0.0/8", "::ffff:203.0.113.5")).toBe("::ffff:203.0.113.5");
+  });
+
+  it("still believes X-Forwarded-For from an IPv4-mapped IPv6 proxy inside the trusted IPv4 subnet", () => {
+    expect(ipFor("10.0.0.0/8", "::ffff:10.1.2.3")).toBe(SPOOFED);
+  });
+
+  it.each(["::/1", "::/64", "::ffff:a00:0/8"])(
+    "IPv6 trust entry %s does not trust an IPv4 or IPv4-mapped client",
+    (raw) => {
+      expect(ipFor(raw, "::ffff:203.0.113.5")).toBe("::ffff:203.0.113.5");
+      expect(ipFor(raw, "203.0.113.5")).toBe("203.0.113.5");
+    },
+  );
+
+  it("trusts a full-length IPv4-mapped subnet only for addresses inside it", () => {
+    const raw = "::ffff:a00:0/104";
+    expect(ipFor(raw, "10.1.2.3")).toBe(SPOOFED);
+    expect(ipFor(raw, "::ffff:10.1.2.3")).toBe(SPOOFED);
+    expect(ipFor(raw, "::ffff:203.0.113.5")).toBe("::ffff:203.0.113.5");
+    expect(ipFor(raw, "203.0.113.5")).toBe("203.0.113.5");
+  });
+});
