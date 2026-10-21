@@ -130,7 +130,8 @@ function readUsageBasis(usage: Record<string, unknown>): string | null {
 
 /**
  * `measured` is a count the provider reported for this run. `derived` is a server-side baseline
- * subtraction. `declared` is a count that rests on a claim nobody has checked: the Codex
+ * subtraction, or a count the server read back from the run's own log after the run ended with no
+ * adapter result (`usageSource: "run_log"`). `declared` is a count that rests on a claim nobody has checked: the Codex
  * app-server runner path (only the `codex_local` CLI path was checked on real data, and its counts
  * are per run), a Codex adapter other than `codex_local`, or a cached count that is larger than
  * the input of a provider whose input should include it.
@@ -138,12 +139,13 @@ function readUsageBasis(usage: Record<string, unknown>): string | null {
 function resolveUsageQuality(input: {
   hasTokens: boolean;
   usageBasis: string | null;
+  fromRunLog: boolean;
   adapterType: string | null;
   driverKind: string | null;
   consistent: boolean;
 }): RunUsageQuality {
   if (!input.hasTokens) return "missing";
-  if (input.usageBasis === "session_delta") return "derived";
+  if (input.usageBasis === "session_delta" || input.fromRunLog) return "derived";
   if (!input.consistent) return "declared";
   if (isCodexFamily(input.driverKind)) return "declared";
   if (isCodexFamily(input.adapterType) && input.adapterType !== VERIFIED_CODEX_ADAPTER) return "declared";
@@ -234,6 +236,7 @@ export function deriveRunUsageRecord(input: DeriveRunUsageRecordInput): RunUsage
     usageQuality: resolveUsageQuality({
       hasTokens: inputTokens !== null || cacheReadTokens !== null || outputTokens !== null,
       usageBasis,
+      fromRunLog: usage.usageSource === "run_log",
       adapterType,
       driverKind,
       consistent,

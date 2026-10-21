@@ -3,6 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  companyMemberships,
   createDb,
   eventDeliveries,
   eventSources,
@@ -10,13 +11,14 @@ import {
   issueLabels,
   issues,
   labels,
+  projects,
   routineRuns,
   routines,
   routineTriggers,
 } from "@paperclipai/db";
 import { eventGroupingSchema, type RoutineStep } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { seedEventFixture } from "./helpers/event-source-fixture.js";
+import { FIXTURE_BOARD_USER_ID, seedEventFixture } from "./helpers/event-source-fixture.js";
 import { untilAStatementWaitsForALock } from "./helpers/lock-wait.js";
 
 // Lets a test make the routine dispatch throw after the delivery is claimed, before or after the run.
@@ -488,6 +490,98 @@ describeEmbeddedPostgres("starting routine steps from the built-in Paperclip eve
       expect(after!.status).toBe("todo");
       expect(await s.childrenOf(task.id)).toHaveLength(0);
       expect(s.fx.wakeups).toEqual([]);
+    });
+
+    describe("when the trigger's author may not assign the steps there", () => {
+      const protectedPolicy = {
+        authorizationPolicy: {
+          assignmentPolicy: { mode: "protected" },
+          protectedAgent: { blockAssignment: true, blockReason: "Release owner only" },
+          managedBy: "permissions-extension",
+        },
+      };
+
+      it("refuses a task that blocks the assignment, leaves it alone and still attaches to a task that does not", async () => {
+        const s = await seed();
+        const routine = await s.createRoutine();
+        await s.listen(routine);
+        const guarded = await s.newTask({ title: "Guarded" });
+        await db
+          .update(issues)
+          .set({ executionPolicy: protectedPolicy as never })
+          .where(eq(issues.id, guarded.id));
+        const open = await s.newTask({ title: "Open" });
+
+        const refused = await s.publish(guarded.id);
+        const allowed = await s.publish(open.id);
+
+        expect(refused.stepsAttached).toBe(false);
+        const runs = await s.runsOf(routine.id);
+        const failed = runs.find((run) => run.status === "failed");
+        expect(failed).toMatchObject({ status: "failed" });
+        expect(failed!.failureReason).toContain("Parent issue");
+        const [after] = await db.select().from(issues).where(eq(issues.id, guarded.id));
+        expect(after).toMatchObject({ status: "todo", assigneeAgentId: s.leadId });
+        expect(await s.childrenOf(guarded.id)).toEqual([]);
+        expect(allowed.stepsAttached).toBe(true);
+        expect(await s.childrenOf(open.id)).toHaveLength(2);
+        expect(s.fx.wakeups.map((wake) => wake.agentId)).toEqual([s.builderId]);
+      });
+
+      it("refuses a task whose project blocks the assignment", async () => {
+        const s = await seed();
+        const routine = await s.createRoutine();
+        await s.listen(routine);
+        await db
+          .update(projects)
+          .set({ executionWorkspacePolicy: protectedPolicy as never })
+          .where(eq(projects.id, s.fx.projectId));
+        const task = await s.newTask();
+
+        const result = await s.publish(task.id);
+
+        expect(result.stepsAttached).toBe(false);
+        const [run] = await s.runsOf(routine.id);
+        expect(run).toMatchObject({ status: "failed" });
+        expect(run!.failureReason).toContain("Target project");
+        const [delivery] = await s.deliveries();
+        expect(delivery).toMatchObject({ status: "failed" });
+        expect(await s.childrenOf(task.id)).toEqual([]);
+        expect(s.fx.wakeups).toEqual([]);
+      });
+
+      it("refuses once the author has left the company", async () => {
+        const s = await seed();
+        const routine = await s.createRoutine();
+        await s.listen(routine);
+        await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.principalId, FIXTURE_BOARD_USER_ID));
+        const task = await s.newTask();
+
+        const result = await s.publish(task.id);
+
+        expect(result.stepsAttached).toBe(false);
+        const [run] = await s.runsOf(routine.id);
+        expect(run).toMatchObject({ status: "failed" });
+        const [after] = await db.select().from(issues).where(eq(issues.id, task.id));
+        expect(after!.status).toBe("todo");
+        expect(await s.childrenOf(task.id)).toEqual([]);
+      });
+
+      it("refuses a trigger that has no author", async () => {
+        const s = await seed();
+        const routine = await s.createRoutine();
+        await s.listen(routine);
+        await db.update(routineTriggers).set({ createdByUserId: null }).where(eq(routineTriggers.routineId, routine.id));
+        const task = await s.newTask();
+
+        const result = await s.publish(task.id);
+
+        expect(result.stepsAttached).toBe(false);
+        const [run] = await s.runsOf(routine.id);
+        expect(run).toMatchObject({ status: "failed" });
+        expect(run!.failureReason).toContain("no author");
+        expect(await s.childrenOf(task.id)).toEqual([]);
+      });
     });
 
     it("fails the run and keeps the task when the routine lost its steps after the trigger was saved", async () => {
