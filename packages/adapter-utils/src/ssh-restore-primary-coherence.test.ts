@@ -232,6 +232,55 @@ describe("SSH restore keeps the primary checkout coherent", () => {
     expect(await workingFile(fixture.host, "ci/risk-tiers.yml")).toBe("tiers");
   }, 90_000);
 
+  it("branch-switch-no-commit: a run that moves its copy to an older commit and commits nothing does not revert the primary's newer file", async () => {
+    const fixture = await createFixture();
+    await put(fixture.host, "data/instr.md", "instructions v-new\n");
+    const newHead = await commitAll(fixture.host, "reconcile (primary HEAD)");
+    const prepared = await prepare(fixture, "run-1");
+    // The run checks out the old history and ends there without a commit of its own.
+    await git(prepared.workspaceRemoteDir, "reset", "-q", "--hard", fixture.oldHead);
+
+    await prepared.restoreWorkspace();
+
+    await expectCoherent(fixture.host);
+    expect(await git(fixture.host, "rev-parse", "HEAD")).toBe(newHead);
+    expect(await workingFile(fixture.host, "data/instr.md")).toBe("instructions v-new");
+    expect((await inspectPrimary(fixture.host)).status).toBe("");
+  }, 90_000);
+
+  it("read-only: a run that changes nothing keeps a commit, a hand edit and a staged change that landed on the primary during the run", async () => {
+    const fixture = await createFixture();
+    const prepared = await prepare(fixture, "run-1");
+    await put(fixture.host, "data/instr.md", "instructions v-new\n");
+    const newHead = await commitAll(fixture.host, "reconcile landed during the run");
+    await put(fixture.host, "data/other.md", "other edited by hand\n");
+    await put(fixture.host, "README.md", "readme staged by hand\n");
+    await git(fixture.host, "add", "README.md");
+
+    await prepared.restoreWorkspace();
+
+    expect(await git(fixture.host, "rev-parse", "HEAD")).toBe(newHead);
+    expect(await workingFile(fixture.host, "data/instr.md")).toBe("instructions v-new");
+    expect(await workingFile(fixture.host, "data/other.md")).toBe("other edited by hand");
+    expect(await git(fixture.host, "diff", "--cached", "--name-only")).toBe("README.md");
+    expect(await workingFile(fixture.host, "README.md")).toBe("readme staged by hand");
+  }, 90_000);
+
+  it("merge-refused: when the file merge refuses after the run's commit is integrated, the index still follows HEAD", async () => {
+    const fixture = await createFixture();
+    const prepared = await prepare(fixture, "run-1");
+    // The run replaces the directory data/ with a file, while a file appears in data/ on the primary.
+    await git(prepared.workspaceRemoteDir, "rm", "-r", "-q", "data");
+    await put(prepared.workspaceRemoteDir, "data", "now a file\n");
+    const runHead = await commitAll(prepared.workspaceRemoteDir, "run replaces data/ with a file");
+    await put(fixture.host, "data/new-on-primary.md", "created during the run\n");
+
+    await expect(prepared.restoreWorkspace()).rejects.toThrow();
+
+    expect(await git(fixture.host, "rev-parse", "HEAD")).toBe(runHead);
+    expect(await git(fixture.host, "diff", "--cached", "--name-status")).toBe("");
+  }, 90_000);
+
   it("seed-race: a commit that lands while the copy is being seeded is not written back as a run edit", async () => {
     const fixture = await createFixture();
     // The change lands after the working tree reached the copy. The copy keeps the old file.

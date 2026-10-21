@@ -1301,8 +1301,10 @@ async function integrateImportedGitHead(input: {
  * has already merged, not a dirty edit: it follows HEAD. A file the run edited
  * after its last commit differs from the run's committed blob and stays as it
  * is, so a true both-sides conflict still resolves as "the run's dirty file
- * wins". Symlinks and other non-regular files are left alone. Call it with the
- * index already reset to HEAD.
+ * wins". Symlinks and other non-regular files are left alone. Call it after
+ * the file merge. When the ref moved, reset the index to HEAD first; when it
+ * did not, the index is left as it is, so changes staged by hand on paths it
+ * does not realign stay staged.
  */
 async function realignTrackedFilesWithHead(input: { localDir: string; importedHead: string }): Promise<void> {
   const driftedFrom = async (commit: string): Promise<string[]> =>
@@ -2164,6 +2166,15 @@ export async function restoreWorkspaceFromSshExecution(input: {
       const headToIntegrate = importedHead && !(await localHistoryContains(input.localDir, importedHead))
         ? importedHead
         : null;
+      // A run that moved its copy to another commit of the local history and
+      // committed nothing integrates nothing, yet its copy holds that commit's
+      // files, which the merge writes over the local ones. Those files follow
+      // the local HEAD too. A run that stayed on the local HEAD needs no hook.
+      const localHead = importedHead && !headToIntegrate
+        ? await runLocalGit(input.localDir, ["rev-parse", "HEAD"], { timeout: 10_000, maxBuffer: 16 * 1024 })
+          .then((result) => result.stdout.trim(), () => null)
+        : null;
+      const headToRealign = headToIntegrate ?? (localHead && importedHead !== localHead ? importedHead : null);
       // `stagingDir` is fresh and empty, so extract into it directly rather
       // than through a second staging copy.
       await extractDirectoryFromSsh({
@@ -2181,20 +2192,22 @@ export async function restoreWorkspaceFromSshExecution(input: {
         onLockWaitProgress: input.onProgress,
         // Git history advances via integrateImportedGitHead; the working tree
         // still comes from the remote file snapshot so dirty remote edits win.
+        // The ref moves without the index, so the index is reset to the
+        // integrated HEAD right after the ref moves, before the merge can
+        // fail: a later restore of the same head integrates nothing and would
+        // never reset it, and a plain `git commit` would delete the run's files.
         beforeApply: headToIntegrate
           ? async () => {
             await integrateImportedGitHead({
               localDir: input.localDir,
               importedHead: headToIntegrate,
             });
+            await resetLocalGitIndexToHead({ localDir: input.localDir });
           }
           : undefined,
-        // The ref moved without the index or the tree. Reset the index to the
-        // integrated HEAD, or a plain `git commit` would delete the run's files.
-        afterApply: headToIntegrate
+        afterApply: headToRealign
           ? async () => {
-            await resetLocalGitIndexToHead({ localDir: input.localDir });
-            await realignTrackedFilesWithHead({ localDir: input.localDir, importedHead: headToIntegrate });
+            await realignTrackedFilesWithHead({ localDir: input.localDir, importedHead: headToRealign });
           }
           : undefined,
       });

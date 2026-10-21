@@ -1081,15 +1081,46 @@ export async function integrateImportedGitHead(input: {
   throw new Error(`Failed to integrate concurrent remote git history for ${input.importedHead.slice(0, 12)} after multiple retries.`);
 }
 
+/** How often, and how long apart, a reset retries while another git process holds the index. */
+const INDEX_LOCK_RETRY_ATTEMPTS = 10;
+const INDEX_LOCK_RETRY_DELAY_MS = 200;
+
+async function localGitIndexLocked(localDir: string): Promise<boolean> {
+  const lockPath = await runLocalGit(localDir, ["rev-parse", "--git-path", "index.lock"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  }).then((result) => result.stdout.trim(), () => "");
+  if (!lockPath) return false;
+  return fs.access(path.resolve(localDir, lockPath)).then(() => true, () => false);
+}
+
 export async function resetLocalGitIndexToHead(input: {
   localDir: string;
   checkWorkingTreeClean?: boolean;
 }): Promise<void> {
   try {
-    await runLocalGit(input.localDir, ["reset", "--quiet", "HEAD", "--", "."], {
-      timeout: 60_000,
-      maxBuffer: 1024 * 1024,
-    });
+    let retriedWithoutLock = false;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await runLocalGit(input.localDir, ["reset", "--quiet", "HEAD", "--", "."], {
+          timeout: 60_000,
+          maxBuffer: 1024 * 1024,
+        });
+        break;
+      } catch (error) {
+        if (attempt >= INDEX_LOCK_RETRY_ATTEMPTS) throw error;
+        // Another git process holds the index for a moment: wait for it,
+        // judged by its lock file, rather than fail the restore. A lock
+        // released between the failure and this check gets one more try.
+        if (await localGitIndexLocked(input.localDir)) {
+          await new Promise((resolve) => setTimeout(resolve, INDEX_LOCK_RETRY_DELAY_MS));
+        } else if (retriedWithoutLock) {
+          throw error;
+        } else {
+          retriedWithoutLock = true;
+        }
+      }
+    }
   } catch (error) {
     const detail = error && typeof error === "object"
       ? [
