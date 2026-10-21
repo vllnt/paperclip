@@ -1,5 +1,12 @@
 import { Plus, X } from "lucide-react";
-import { ISSUE_PRIORITIES, type RoutineStep } from "@paperclipai/shared";
+import {
+  ISSUE_PRIORITIES,
+  ROUTINE_STEP_CONDITIONS,
+  ROUTINE_STEP_SKIPPED_COMMENT,
+  routineStepPredecessorKeys,
+  routineStepsHaveConditions,
+  type RoutineStep,
+} from "@paperclipai/shared";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,7 +24,10 @@ import {
   canRoutineStepWaitFor,
   removeRoutineStep,
   renameRoutineStepKey,
+  routineStepCondition,
+  routineStepOutcomeLabel,
   routineStepsIssues,
+  setRoutineStepCondition,
   toggleRoutineStepPredecessor,
   updateRoutineStep,
 } from "../lib/routine-steps";
@@ -25,6 +35,8 @@ import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySel
 import { MarkdownEditor, type MentionOption } from "./MarkdownEditor";
 
 const INHERIT_PRIORITY = "inherit";
+/** The select value of an edge without a condition: wait until the other step is done. */
+const PLAIN_EDGE = "plain";
 
 export function RoutineStepsEditor({
   steps,
@@ -48,8 +60,8 @@ export function RoutineStepsEditor({
         <span className="flex-1 text-muted-foreground">
           Each run creates one task per step under the run&apos;s task. A step with nothing in
           &ldquo;Starts after&rdquo; begins at once; the others begin when the steps they wait for are
-          done. Steps can use <code className="font-mono">{"{{placeholders}}"}</code> like the
-          instructions do.
+          done, or, with a condition, only when those steps end the way it asks. Steps can use{" "}
+          <code className="font-mono">{"{{placeholders}}"}</code> like the instructions do.
         </span>
         <Button variant="secondary" size="sm" onClick={() => onChange(addRoutineStep(steps))}>
           <Plus className="mr-1.5 h-3.5 w-3.5" />
@@ -107,7 +119,8 @@ function StepCard({
   mentionOptions: MentionOption[];
 }) {
   const others = steps.filter((other) => other.key !== step.key);
-  const waitsFor = new Set(step.after);
+  const predecessorKeys = routineStepPredecessorKeys(step);
+  const waitsFor = new Set(predecessorKeys);
   const needsAgent = !step.assigneeAgentId && defaultAgentName === null;
   const inputId = `routine-step-${index}`;
 
@@ -237,6 +250,60 @@ function StepCard({
           <p className="text-xs text-muted-foreground">Nothing selected: this step starts with the run.</p>
         ) : null}
       </div>
+
+      {predecessorKeys.length > 0 ? (
+        <div className="space-y-1.5">
+          <Label>Conditions</Label>
+          <ul className="space-y-2">
+            {predecessorKeys.map((predecessorKey) => {
+              const predecessor = steps.find((other) => other.key === predecessorKey);
+              const when = routineStepCondition(step, predecessorKey);
+              return (
+                <li key={predecessorKey} className="flex flex-wrap items-center gap-2">
+                  <span className="min-w-24 font-mono text-xs">{predecessorKey}</span>
+                  <Select
+                    value={when ?? PLAIN_EDGE}
+                    onValueChange={(value) =>
+                      onChange(
+                        setRoutineStepCondition(
+                          steps,
+                          step.key,
+                          predecessorKey,
+                          ROUTINE_STEP_CONDITIONS.find((condition) => condition === value) ?? null,
+                        ),
+                      )
+                    }
+                  >
+                    <SelectTrigger
+                      aria-label={`Condition on ${predecessorKey} for step ${index + 1}`}
+                      className="min-w-56"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={PLAIN_EDGE}>
+                        Wait until {routineStepOutcomeLabel(predecessor, "done")}
+                      </SelectItem>
+                      {ROUTINE_STEP_CONDITIONS.map((condition) => (
+                        <SelectItem key={condition} value={condition}>
+                          Only if {routineStepOutcomeLabel(predecessor, condition)}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </li>
+              );
+            })}
+          </ul>
+          {routineStepsHaveConditions([step]) ? (
+            <p className="text-xs text-muted-foreground">
+              When no condition matches, this step is skipped (&ldquo;{ROUTINE_STEP_SKIPPED_COMMENT}&rdquo;), and so
+              are the steps that only wait for it. &ldquo;Wait until&rdquo; keeps the step blocked if the other step is
+              cancelled.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
     </li>
   );
 }

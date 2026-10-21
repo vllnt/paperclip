@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_ROUTINE_STEPS,
   ROUTINE_STEPS_RUN_PAYLOAD_KEY,
+  evaluateRoutineStepRun,
   isRoutineRunIssueOriginKind,
   isRoutineStepRunStalled,
   orderRoutineStepsTopologically,
   readRoutineStepsRunPayload,
   routineStartingSteps,
+  routineStepEdges,
   routineStepTemplateTexts,
+  routineStepsHaveConditions,
   routineStepsSchema,
 } from "./routine-steps.js";
 import {
@@ -76,9 +79,42 @@ describe("routineStepsSchema", () => {
     expect(routineStepsSchema.safeParse(many.slice(0, MAX_ROUTINE_STEPS)).success).toBe(true);
   });
 
-  it("accepts step keys in after and nothing else", () => {
-    expect(routineStepsSchema.safeParse([step("a"), step("b", [{ step: "a", when: "done" }])]).success).toBe(false);
+  it("accepts step keys and conditional entries in after, and nothing else", () => {
+    const parsed = routineStepsSchema.parse([
+      step("a"),
+      step("b", [{ step: "a", when: "done" }]),
+      step("c", [{ step: "a", when: "cancelled" }, "b"]),
+    ]);
+    expect(parsed[2]!.after).toEqual([{ step: "a", when: "cancelled" }, "b"]);
     expect(routineStepsSchema.safeParse([step("a"), step("b", [7])]).success).toBe(false);
+    expect(routineStepsSchema.safeParse([step("a"), step("b", [{ step: "a" }])]).success).toBe(false);
+    expect(routineStepsSchema.safeParse([step("a"), step("b", [{ step: "a", when: "failed" }])]).success).toBe(false);
+    expect(
+      routineStepsSchema.safeParse([step("a"), step("b", [{ step: "a", when: "done", extra: 1 }])]).success,
+    ).toBe(false);
+  });
+
+  it("checks conditional entries like plain ones: unknown steps, the step itself and cycles", () => {
+    expect(issueMessages([step("a"), step("b", [{ step: "x", when: "done" }])])).toContain(
+      'Step "b" waits for unknown step "x"',
+    );
+    expect(issueMessages([step("a", [{ step: "a", when: "cancelled" }])])).toContain("A step cannot wait for itself");
+    expect(issueMessages([step("a", [{ step: "b", when: "done" }]), step("b", ["a"])])).toContain(
+      "Routine steps contain a cycle",
+    );
+  });
+
+  it("rejects one predecessor named twice with different conditions and accepts a repeat of the same one", () => {
+    expect(issueMessages([step("a"), step("b", ["a", { step: "a", when: "cancelled" }])])).toContain(
+      'Step "b" waits for step "a" more than once with different conditions',
+    );
+    expect(
+      issueMessages([step("a"), step("b", [{ step: "a", when: "done" }, { step: "a", when: "cancelled" }])]),
+    ).toHaveLength(1);
+    expect(issueMessages([step("a"), step("b", [{ step: "a", when: "done" }, { step: "a", when: "done" }])])).toEqual(
+      [],
+    );
+    expect(issueMessages([step("a"), step("b", ["a", "a"])])).toEqual([]);
   });
 
   it("rejects an after list longer than the step limit", () => {
@@ -206,6 +242,155 @@ describe("isRoutineStepRunStalled", () => {
     expect(isRoutineStepRunStalled(chain, { a: "done", b: "cancelled" })).toBe(false);
     expect(isRoutineStepRunStalled(chain, { a: "done", b: "cancelled", c: "missing" })).toBe(false);
     expect(isRoutineStepRunStalled([], {})).toBe(false);
+  });
+
+  it("is not stalled when a cancel takes a conditional branch, and is stalled when nothing handles it", () => {
+    const gated = [
+      { key: "review", after: [] },
+      { key: "merge", after: [{ step: "review", when: "done" as const }] },
+      { key: "rework", after: [{ step: "review", when: "cancelled" as const }] },
+    ];
+    expect(isRoutineStepRunStalled(gated, { review: "cancelled", merge: "blocked", rework: "blocked" })).toBe(false);
+    expect(isRoutineStepRunStalled(gated, { review: "cancelled", merge: "cancelled", rework: "done" })).toBe(false);
+    const noRework = gated.slice(0, 2);
+    expect(isRoutineStepRunStalled(noRework, { review: "cancelled", merge: "cancelled" })).toBe(false);
+    const leaf = [...gated, { key: "notes", after: [] }];
+    expect(
+      isRoutineStepRunStalled(leaf, { review: "done", merge: "done", rework: "cancelled", notes: "cancelled" }),
+    ).toBe(true);
+  });
+});
+
+describe("evaluateRoutineStepRun", () => {
+  const when = (step: string, outcome: "done" | "cancelled") => ({ step, when: outcome });
+  const gated = [
+    { key: "review", after: [] },
+    { key: "merge", after: [when("review", "done")] },
+    { key: "rework", after: [when("review", "cancelled")] },
+    { key: "join", after: ["merge", "rework"] },
+  ];
+
+  it("changes nothing while the gated step is still open", () => {
+    expect(
+      evaluateRoutineStepRun(gated, { review: "in_review", merge: "blocked", rework: "blocked", join: "blocked" }),
+    ).toEqual({ skip: [], release: {}, releaseFromRoot: [], stalled: false });
+  });
+
+  it("skips the rework branch when the gate is approved, and the join waits only for the merge", () => {
+    const evaluation = evaluateRoutineStepRun(gated, {
+      review: "done",
+      merge: "blocked",
+      rework: "blocked",
+      join: "blocked",
+    });
+    expect(evaluation.skip).toEqual(["rework"]);
+    expect(evaluation.release).toEqual({ join: ["rework"] });
+    expect(evaluation.releaseFromRoot).toEqual(["rework"]);
+    expect(evaluation.stalled).toBe(false);
+  });
+
+  it("takes the rework branch when the board cancels the gated step", () => {
+    const evaluation = evaluateRoutineStepRun(gated, {
+      review: "cancelled",
+      merge: "blocked",
+      rework: "blocked",
+      join: "blocked",
+    });
+    expect(evaluation.skip).toEqual(["merge"]);
+    expect(evaluation.release).toEqual({ rework: ["review"], join: ["merge"] });
+    expect([...evaluation.releaseFromRoot].sort()).toEqual(["merge", "review"]);
+    expect(evaluation.stalled).toBe(false);
+  });
+
+  it("is idempotent: once its changes are applied, evaluating again finds nothing more to do", () => {
+    const first = evaluateRoutineStepRun(gated, { review: "done", merge: "blocked", rework: "blocked", join: "blocked" });
+    expect(first.skip).toEqual(["rework"]);
+    const again = evaluateRoutineStepRun(gated, { review: "done", merge: "blocked", rework: "cancelled", join: "blocked" });
+    expect(again.skip).toEqual([]);
+    expect(again.release).toEqual(first.release);
+    expect(again.releaseFromRoot).toEqual(first.releaseFromRoot);
+  });
+
+  it("repeats the rule downstream: a step behind a skipped step is skipped too", () => {
+    const chain = [
+      { key: "review", after: [] },
+      { key: "rework", after: [when("review", "cancelled")] },
+      { key: "recheck", after: ["rework"] },
+      { key: "report", after: ["recheck"] },
+    ];
+    const evaluation = evaluateRoutineStepRun(chain, {
+      review: "done",
+      rework: "blocked",
+      recheck: "blocked",
+      report: "blocked",
+    });
+    expect(evaluation.skip).toEqual(["rework", "recheck", "report"]);
+    expect(evaluation.releaseFromRoot).toEqual(["rework", "recheck", "report"]);
+  });
+
+  it("keeps a plain edge from a cancelled step held: no cascade and no release", () => {
+    const chain = [
+      { key: "build", after: [] },
+      { key: "test", after: ["build"] },
+    ];
+    const evaluation = evaluateRoutineStepRun(chain, { build: "cancelled", test: "blocked" });
+    expect(evaluation).toEqual({ skip: [], release: {}, releaseFromRoot: [], stalled: true });
+  });
+
+  it("does not skip a step with one live edge left, and releases its dead edges", () => {
+    const mixed = [
+      { key: "a", after: [] },
+      { key: "b", after: [] },
+      { key: "c", after: [when("a", "done"), "b"] },
+    ];
+    const evaluation = evaluateRoutineStepRun(mixed, { a: "cancelled", b: "in_progress", c: "blocked" });
+    expect(evaluation.skip).toEqual([]);
+    expect(evaluation.release).toEqual({ c: ["a"] });
+    expect(evaluation.releaseFromRoot).toEqual(["a"]);
+    expect(evaluation.stalled).toBe(false);
+  });
+
+  it("does not skip a step someone already moved on, but releases its dead edges", () => {
+    const evaluation = evaluateRoutineStepRun(gated, {
+      review: "done",
+      merge: "in_progress",
+      rework: "todo",
+      join: "blocked",
+    });
+    expect(evaluation.skip).toEqual([]);
+    expect(evaluation.release).toEqual({});
+    expect(evaluation.stalled).toBe(false);
+  });
+
+  it("does not release a cancelled step from the root when one of its outgoing edges is plain", () => {
+    const steps = [
+      { key: "a", after: [] },
+      { key: "b", after: [when("a", "cancelled")] },
+      { key: "c", after: ["a"] },
+    ];
+    const evaluation = evaluateRoutineStepRun(steps, { a: "cancelled", b: "blocked", c: "blocked" });
+    expect(evaluation.release).toEqual({ b: ["a"] });
+    expect(evaluation.releaseFromRoot).toEqual([]);
+    expect(evaluation.stalled).toBe(false);
+    expect(evaluateRoutineStepRun(steps, { a: "cancelled", b: "done", c: "blocked" }).stalled).toBe(true);
+  });
+
+  it("changes nothing and keeps the run live when the recorded graph is not valid", () => {
+    expect(evaluateRoutineStepRun([{ key: "a", after: ["x"] }], { a: "blocked" })).toEqual({
+      skip: [],
+      release: {},
+      releaseFromRoot: [],
+      stalled: false,
+    });
+  });
+
+  it("reports whether a run has conditions and lists its edges", () => {
+    expect(routineStepsHaveConditions(gated)).toBe(true);
+    expect(routineStepsHaveConditions([{ after: ["a"] }, { after: [] }])).toBe(false);
+    expect(routineStepEdges({ after: ["a", when("b", "cancelled"), "a"] })).toEqual([
+      { step: "a", when: null },
+      { step: "b", when: "cancelled" },
+    ]);
   });
 });
 
