@@ -387,6 +387,7 @@ import {
   MAX_EXCERPT_BYTES,
 } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { createRunLogUsageRecovery } from "./run-log-usage-recovery.js";
 import {
   authorizeChatConversationForBoundRun,
   isExternalChatWaitAuthorizationContention,
@@ -10304,10 +10305,34 @@ export function heartbeatService(
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
+  // Records the usage of a run that ends with no adapter result (a restart, a stop, the watchdog
+  // fold, the orphan reap) from what its adapter streamed into the run log.
+  const runLogUsage = createRunLogUsageRecovery({
+    db,
+    budgetHooks,
+    ledger: {
+      resolveScope: (companyId, run) => resolveLedgerScopeForRun(db, companyId, run),
+      normalizeBillingType: normalizeLedgerBillingType,
+      billedCostCents: normalizeBilledCostCents,
+      costStatus: (costUsd) =>
+        resolveLedgerCostStatus({ costUsd, inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }),
+    },
+  });
+  // A run whose executor still runs in this process is left to that executor: it writes the
+  // adapter's usage, or reads the log itself once it ends (see the end of executeRunAttempt). A
+  // stop that ends the run first must not record the log as well, or the run counts twice.
+  function recordRunLogUsageUnlessExecuting(run: typeof heartbeatRuns.$inferSelect) {
+    if (activeRunExecutions.has(run.id)) return Promise.resolve(null);
+    return runLogUsage.recordRunUsageFromLog(run);
+  }
   const harnessFallback = harnessFallbackService(db);
   const recovery = recoveryService(db, {
     enqueueWakeup,
     liveRunExecutions,
+    recordRunUsage: async (runId) => {
+      const run = await getRun(runId);
+      if (run) await recordRunLogUsageUnlessExecuting(run);
+    },
     scheduleRecoveryRetry: async (runId) => {
       const [run] = await db
         .select()
@@ -13932,6 +13957,9 @@ export function heartbeatService(
     clearHeartbeatRunRuntimeStatus(updated.id);
     void emitAgentTaskRun(db, updated);
     void reportRunFailure(db, updated, failureReport);
+    // A run that ends with no adapter result (a stop, a restart, a lost process) keeps the
+    // usage its adapter streamed into the run log. A run that has usage is skipped at once.
+    void recordRunLogUsageUnlessExecuting(updated);
   }
 
   async function setRunStatus(
@@ -16562,6 +16590,11 @@ export function heartbeatService(
     await finalizeAgentStatus(interrupted.agentId, "interrupted", message, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(interrupted),
     });
+    // The drain ends the run with no adapter result: keep the usage that the adapter streamed.
+    // It reads the whole log, so it comes after the steps above that the restart needs, and before
+    // the marker, so a repair on the next start repeats it when the drain was cut. An executor never
+    // writes usage onto an `interrupted` run, so this cannot count a run twice.
+    await runLogUsage.recordRunUsageFromLog(interrupted);
     await db
       .update(heartbeatRuns)
       .set({
@@ -29177,6 +29210,8 @@ export function heartbeatService(
               .update(heartbeatRuns)
               .set({
                 ...finalRunPatch,
+                // A stop that won the race may already have recorded the usage found in the run log.
+                usageJson: finalRunPatch.usageJson ?? undefined,
                 resultJson: cancellationResultJson(persistedRunWrite.run, status, finalRunPatch.resultJson, runErrorCode, runErrorMessage),
                 finishedAt:
                   persistedRunWrite.run.finishedAt ?? finalRunPatch.finishedAt,
@@ -30506,6 +30541,10 @@ export function heartbeatService(
         }
         clearAdapterSteering(run.id);
       }
+      // A run that ended while this executor ran (a stop, the watchdog fold) was left to it, and
+      // the adapter may have had no usage to report: read the log now, before the next queued run
+      // starts, so the daily cost cap sees it. It reads the row again and skips a run with usage.
+      if (latestRun) await runLogUsage.recordRunUsageFromLog(latestRun);
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
       if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {

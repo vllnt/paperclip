@@ -17,6 +17,7 @@ import {
   testEnvironment as claudeTestEnvironment,
   sessionCodec as claudeSessionCodec,
   getQuotaWindows as claudeGetQuotaWindows,
+  createClaudeRunLogUsageReader,
   getConfigSchema as getClaudeConfigSchema,
   CLAUDE_SETUP_TOKEN_COMMAND,
   parseSetupTokenPrompt,
@@ -281,6 +282,7 @@ const claudeLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: claudeAgentConfigurationDoc,
   getConfigSchema: getClaudeConfigSchema,
   getQuotaWindows: claudeGetQuotaWindows,
+  createRunLogUsageReader: createClaudeRunLogUsageReader,
   loginCapability: claudeLoginCapability,
 };
 
