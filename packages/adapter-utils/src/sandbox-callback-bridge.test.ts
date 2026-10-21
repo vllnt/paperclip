@@ -361,6 +361,51 @@ describe("sandbox callback bridge", () => {
     expect(forwarded).toEqual(["GET /api/health"]);
   });
 
+  it("serves goal reads and the goal-filtered task and routine lists over the queue, and denies goal writes and lookalikes", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-goals-"));
+    cleanupDirs.push(rootDir);
+    const queueDir = path.join(rootDir, "queue");
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const forwarded: string[] = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(), queueDir,
+      handleRequest: async (request) => {
+        forwarded.push(`${request.method} ${request.path}${request.query}`);
+        return { status: 200, body: "[]" };
+      },
+    });
+    cleanupFns.push(() => worker.stop());
+    const allowed = [
+      { method: "GET", path: "/api/companies/co-1/goals/focus", query: "" },
+      { method: "GET", path: "/api/companies/co-1/goals/progress", query: "" },
+      { method: "GET", path: "/api/companies/co-1/issues", query: "?goalId=goal-1&status=todo" },
+      { method: "GET", path: "/api/companies/co-1/routines", query: "?goalId=goal-1" },
+    ];
+    const denied = [
+      { method: "POST", path: "/api/companies/co-1/goals/focus", query: "" },
+      { method: "GET", path: "/api/companies/co-1/goals/focus/extra", query: "" },
+      { method: "GET", path: "/api/companies/co-1/goals/progressX", query: "" },
+      { method: "GET", path: "/api/companies/co%2F1/goals/progress", query: "" },
+      { method: "GET", path: "/api/companies/co.1/goals/focus", query: "" },
+      // Goal writes stay off the bridge.
+      { method: "POST", path: "/api/companies/co-1/goals", query: "" },
+      { method: "PATCH", path: "/api/goals/goal-1", query: "" },
+      { method: "DELETE", path: "/api/goals/goal-1", query: "" },
+    ];
+    const requests = [...allowed, ...denied];
+    for (const [index, request] of requests.entries()) {
+      await writeFile(path.join(directories.requestsDir, `goals-${index}.json`), JSON.stringify({
+        id: `goals-${index}`, ...request, headers: {}, body: "", createdAt: new Date().toISOString(),
+      }));
+    }
+    await worker.stop({ drainTimeoutMs: 5_000 });
+    for (const [index] of requests.entries()) {
+      const response = JSON.parse(await readFile(path.join(directories.responsesDir, `goals-${index}.json`), "utf8"));
+      expect(response.status, JSON.stringify(requests[index])).toBe(index < allowed.length ? 200 : 403);
+    }
+    expect(forwarded.sort()).toEqual(allowed.map((request) => `${request.method} ${request.path}${request.query}`).sort());
+  });
+
   it("denies non-allowlisted requests by default", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-default-policy-"));
     cleanupDirs.push(rootDir);
