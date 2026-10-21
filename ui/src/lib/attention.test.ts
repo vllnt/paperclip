@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { ATTENTION_SOURCE_KINDS } from "@paperclipai/shared";
 import type { AttentionFeed, AttentionItem, AttentionSourceKind } from "@paperclipai/shared";
 import {
   ATTENTION_GROUP_BY_KEY,
   ATTENTION_GROUP_BY_OPTIONS,
-  attentionBadgeCount,
   attentionDateBucket,
   attentionDetailLine,
   attentionIsNewToday,
@@ -13,6 +13,7 @@ import {
   buildAttentionFilterOptions,
   buildDeskShelves,
   countActiveAttentionFilters,
+  decideBadgeCount,
   defaultAttentionFilterState,
   filterAttentionItems,
   groupAttentionItems,
@@ -111,23 +112,34 @@ describe("isInlineResolvable", () => {
   });
 });
 
-describe("attentionBadgeCount", () => {
-  it("uses the server's pre-pagination desk badge count", () => {
+describe("decideBadgeCount", () => {
+  it("counts open decisions, interactions and reviews from the pre-pagination counts", () => {
+    const countsBySourceKind = Object.fromEntries(
+      ATTENTION_SOURCE_KINDS.map((kind) => [kind, 0]),
+    ) as AttentionFeed["countsBySourceKind"];
+    countsBySourceKind.decision = 2;
+    countsBySourceKind.issue_thread_interaction = 3;
+    countsBySourceKind.review = 1;
+    // Counted once, from the Inbox side, or not badge-worthy at all.
+    countsBySourceKind.approval = 4;
+    countsBySourceKind.join_request = 1;
+    countsBySourceKind.failed_run = 5;
+    countsBySourceKind.blocker_attention = 2;
     const feed: AttentionFeed = {
       companyId: "c1",
       generatedAt: "2026-07-09T12:00:00Z",
-      totalCount: 3,
-      deskBadgeCount: 2,
+      totalCount: 18,
+      deskBadgeCount: 9,
       nextCursor: "next-page",
-      countsBySourceKind: {} as AttentionFeed["countsBySourceKind"],
-      items: [buildItem({ id: "1" }), buildItem({ id: "2" }), buildItem({ id: "3" })],
+      countsBySourceKind,
+      items: [buildItem({ id: "1" })],
     };
-    expect(attentionBadgeCount(feed)).toBe(2);
+    expect(decideBadgeCount(feed)).toBe(6);
   });
 
   it("is zero for an empty or missing feed", () => {
-    expect(attentionBadgeCount(null)).toBe(0);
-    expect(attentionBadgeCount(undefined)).toBe(0);
+    expect(decideBadgeCount(null)).toBe(0);
+    expect(decideBadgeCount(undefined)).toBe(0);
   });
 });
 

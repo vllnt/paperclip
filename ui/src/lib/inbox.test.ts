@@ -18,7 +18,9 @@ import {
   buildInboxKeyboardNavEntries,
   buildInboxDismissedAtByKey,
   computeInboxBadgeData,
+  decideTabPathForRetiredDecisionsUrl,
   filterInboxIssues,
+  getArchivedInboxIssues,
   getArchivedInboxSearchIssues,
   getAvailableInboxIssueColumns,
   getInboxWorkItemKey,
@@ -30,6 +32,7 @@ import {
   getUnreadTouchedIssues,
   groupInboxWorkItems,
   isInboxEntityDismissed,
+  isInboxIssueAutoArchived,
   isMineInboxTab,
   loadInboxFilterPreferences,
   loadInboxIssueColumns,
@@ -53,6 +56,7 @@ import {
   shouldShowCompanyAlerts,
   shouldResetInboxWorkspaceGrouping,
   shouldShowInboxSection,
+  visibleInboxModuleTabs,
   type InboxWorkItem,
 } from "./inbox";
 
@@ -444,7 +448,7 @@ describe("inbox helpers", () => {
     expect(issues).toHaveLength(2);
   });
 
-  it("shows actionable approvals on mine, while recent and unread stay company-wide", () => {
+  it("keeps only actionable approvals on mine and unread; resolved ones leave the needs-me tabs", () => {
     const approvals = [
       {
         ...makeApprovalWithTimestamps("approval-approved", "approved", "2026-03-11T02:00:00.000Z"),
@@ -460,9 +464,8 @@ describe("inbox helpers", () => {
       },
     ];
 
-    expect(getApprovalsForTab(approvals, "mine", "all", "user-1").map((approval) => approval.id)).toEqual([
+    expect(getApprovalsForTab(approvals, "mine", "all").map((approval) => approval.id)).toEqual([
       "approval-revision",
-      "approval-approved",
       "approval-pending",
     ]);
     expect(getApprovalsForTab(approvals, "recent", "all").map((approval) => approval.id)).toEqual([
@@ -491,7 +494,7 @@ describe("inbox helpers", () => {
       },
     ];
 
-    expect(getApprovalsForTab(approvals, "mine", "all", "user-1").map((approval) => approval.id)).toEqual([
+    expect(getApprovalsForTab(approvals, "mine", "all").map((approval) => approval.id)).toEqual([
       "approval-agent-requested",
     ]);
 
@@ -1111,6 +1114,69 @@ describe("inbox helpers", () => {
     localStorage.clear();
     saveLastInboxTab("blocked");
     expect(loadLastInboxTab()).toBe("blocked");
+  });
+
+  it("remembers the Decide, Alerts and Archived tabs and ignores unknown values", () => {
+    localStorage.clear();
+    for (const tab of ["decide", "alerts", "archived"] as const) {
+      saveLastInboxTab(tab);
+      expect(loadLastInboxTab()).toBe(tab);
+    }
+    localStorage.setItem("paperclip:inbox:last-tab", "decisions");
+    expect(loadLastInboxTab()).toBe("mine");
+  });
+
+  it("shows the attention tabs only with Decisions on, and the task tabs only outside Tasks", () => {
+    expect(visibleInboxModuleTabs({ decisionsEnabled: true, issueTabsInTasks: false, current: "mine" })).toEqual([
+      "decide", "mine", "recent", "unread", "blocked", "alerts", "all", "archived",
+    ]);
+    expect(visibleInboxModuleTabs({ decisionsEnabled: false, issueTabsInTasks: false, current: "mine" })).toEqual([
+      "mine", "recent", "unread", "blocked", "all", "archived",
+    ]);
+    expect(visibleInboxModuleTabs({ decisionsEnabled: true, issueTabsInTasks: true, current: "decide" })).toEqual([
+      "decide", "alerts", "archived",
+    ]);
+    // A deep link keeps its own tab even when the setting would hide it.
+    expect(visibleInboxModuleTabs({ decisionsEnabled: false, issueTabsInTasks: false, current: "decide" })).toEqual([
+      "decide", "mine", "recent", "unread", "blocked", "all", "archived",
+    ]);
+  });
+
+  it("sends retired Decisions URLs to the Decide tab, keeping the queue, params and hash", () => {
+    expect(decideTabPathForRetiredDecisionsUrl({ search: "", hash: "", queueKey: null })).toBe("/inbox/decide");
+    expect(decideTabPathForRetiredDecisionsUrl({ search: "?decisionId=d-1", hash: "#top", queueKey: null }))
+      .toBe("/inbox/decide?decisionId=d-1#top");
+    expect(decideTabPathForRetiredDecisionsUrl({ search: "", hash: "", queueKey: "triage" }))
+      .toBe("/inbox/decide?queue=triage");
+    expect(decideTabPathForRetiredDecisionsUrl({ search: "?decisionId=d-1", hash: "", queueKey: "prs & merges" }))
+      .toBe("/inbox/decide?decisionId=d-1&queue=prs+%26+merges");
+  });
+
+  it("auto-archives done tasks from Mine until they have something unread", () => {
+    const done = { ...makeIssue("done-read", false), status: "done" as const };
+    const doneUnread = { ...makeIssue("done-unread", true), status: "done" as const };
+    const open = { ...makeIssue("open-read", false), status: "in_progress" as const };
+
+    expect(isInboxIssueAutoArchived(done)).toBe(true);
+    expect(isInboxIssueAutoArchived(doneUnread)).toBe(false);
+    expect(isInboxIssueAutoArchived(open)).toBe(false);
+  });
+
+  it("lists archived and auto-archived tasks on the Archived tab, and only archived ones as mine to move back", () => {
+    const archived = { ...makeIssue("archived", false), status: "todo" as const };
+    const autoArchived = { ...makeIssue("auto", false), status: "done" as const };
+    const active = { ...makeIssue("active", false), status: "in_progress" as const };
+    const doneUnread = { ...makeIssue("done-unread", true), status: "done" as const };
+
+    const rows = getArchivedInboxIssues({
+      touchedIssues: [archived, autoArchived, active, doneUnread],
+      mineIssues: [autoArchived, active, doneUnread],
+    });
+
+    expect(rows.map((row) => [row.issue.id, row.archivedByMe]).sort()).toEqual([
+      ["archived", true],
+      ["auto", false],
+    ]);
   });
 
   it("persists inbox filters per company", () => {

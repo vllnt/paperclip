@@ -9,8 +9,7 @@ import type {
   AttentionSourceKind,
 } from "@paperclipai/shared";
 import { Routes, Route } from "@/lib/router";
-import { WhatNeedsMe } from "@/pages/WhatNeedsMe";
-import { DecisionQueuePage } from "@/pages/DecisionQueuePage";
+import { InboxAttentionTab } from "@/pages/inbox/InboxAttentionTab";
 import { AttentionQueueRow } from "@/components/AttentionQueueRow";
 import type { DecisionQueueDto } from "@/api/decisionQueues";
 import { queryKeys } from "@/lib/queryKeys";
@@ -369,7 +368,7 @@ function PrimeDeskFixtures({
     queryClient.setQueryData(queryKeys.agents.list(companyId), AGENTS);
     if (items) {
       queryClient.setQueryData(
-        [...queryKeys.attention(companyId), "with-dismissed", null, null],
+        [...queryKeys.attention(companyId), "inbox-tab", null, null, null],
         feed(items),
       );
     }
@@ -377,7 +376,7 @@ function PrimeDeskFixtures({
       // The queue feed key carries the resolved activity bounds (null/null for
       // the default "all" range), matching the page's real query key.
       queryClient.setQueryData(
-        [...queryKeys.attention(companyId), "queue", "prs", null, null],
+        [...queryKeys.attention(companyId), "inbox-tab", "prs", null, null],
         feed(queueItems),
       );
     }
@@ -461,7 +460,7 @@ export const TodaysDesk: Story = {
   render: () => (
     <PrimeDeskFixtures items={DESK_ITEMS}>
       <div className="p-6">
-        <WhatNeedsMe />
+        <InboxAttentionTab tab="decide" tabBar={null} />
       </div>
     </PrimeDeskFixtures>
   ),
@@ -476,7 +475,7 @@ export const DeskClearToday: Story = {
   render: () => (
     <PrimeDeskFixtures items={CLEAR_TODAY_ITEMS}>
       <div className="p-6">
-        <WhatNeedsMe />
+        <InboxAttentionTab tab="decide" tabBar={null} />
       </div>
     </PrimeDeskFixtures>
   ),
@@ -487,7 +486,7 @@ export const AgingShelf: Story = {
   render: () => (
     <PrimeDeskFixtures items={AGING_ITEMS}>
       <div className="p-6">
-        <WhatNeedsMe />
+        <InboxAttentionTab tab="decide" tabBar={null} />
       </div>
     </PrimeDeskFixtures>
   ),
@@ -531,8 +530,8 @@ export const QueuePage: Story = {
       ]}
     >
       <div className="p-6">
-        <Routes location="/decisions/queues/prs">
-          <Route path="/decisions/queues/:key" element={<DecisionQueuePage />} />
+        <Routes location="/inbox/decide?queue=prs">
+          <Route path="/inbox/decide" element={<InboxAttentionTab tab="decide" tabBar={null} />} />
         </Routes>
       </div>
     </PrimeDeskFixtures>

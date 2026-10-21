@@ -1,5 +1,10 @@
 import { Command } from "commander";
 import {
+  ATTENTION_INBOX_TAB_BY_KIND,
+  attentionKindForSourceKind,
+  type AttentionFeed,
+} from "@paperclipai/shared";
+import {
   addCommonClientOptions,
   apiPath,
   handleCommandError,
@@ -15,6 +20,15 @@ interface CompanyOptions extends BaseClientOptions {
 interface JsonPayloadOptions extends CompanyOptions {
   payloadJson?: string;
 }
+
+interface InboxAttentionOptions extends CompanyOptions {
+  tab?: string;
+  queue?: string;
+  includeDismissed?: boolean;
+  archived?: boolean;
+}
+
+const INBOX_ATTENTION_TABS = Object.values(ATTENTION_INBOX_TAB_BY_KIND);
 
 interface QueryOptions extends CompanyOptions {
   query?: string;
@@ -292,6 +306,7 @@ export function registerAccessCommands(program: Command): void {
   const inbox = program.command("inbox").description("Board inbox operations");
   addCompanyList(inbox, "dismissals", "List dismissed inbox items", "inbox-dismissals");
   addCompanyPost(inbox, "dismiss", "Dismiss an inbox item", "inbox-dismissals");
+  addInboxAttentionCommand(inbox);
 
   const boardClaim = program.command("board-claim").description("Board claim token operations");
   addCommonClientOptions(
@@ -416,6 +431,52 @@ function addJsonPut(parent: Command, name: string, description: string, path: st
       handleCommandError(err);
     }
   }));
+}
+
+/**
+ * The Inbox's Decide and Alerts tabs: the open attention feed (decisions,
+ * approvals, queue items, stuck work). `--tab` keeps one tab's items, split
+ * the same way as the UI; the feed's counts stay feed-wide.
+ */
+function addInboxAttentionCommand(inbox: Command): void {
+  addCommonClientOptions(
+    inbox
+      .command("attention")
+      .description("List open attention items (the Inbox Decide and Alerts tabs)")
+      .option("-C, --company-id <id>", "Company ID")
+      .option("--tab <tab>", `Only one tab's items: ${INBOX_ATTENTION_TABS.join(" or ")}`)
+      .option("--queue <key>", "Only one decision queue's items")
+      .option("--include-dismissed", "Include snoozed and dismissed items")
+      .option("--archived", "List archived items instead of open ones")
+      .action(async (opts: InboxAttentionOptions) => {
+        try {
+          const tab = opts.tab?.trim();
+          if (tab !== undefined && !INBOX_ATTENTION_TABS.some((value) => value === tab)) {
+            throw new Error(`--tab must be ${INBOX_ATTENTION_TABS.join(" or ")}`);
+          }
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const params = new URLSearchParams({ all: "true" });
+          if (opts.queue) params.set("queue", opts.queue);
+          if (opts.includeDismissed) params.set("includeDismissed", "true");
+          if (opts.archived) params.set("archived", "true");
+          const feed = await ctx.api.get<AttentionFeed>(
+            `${apiPath`/api/companies/${ctx.companyId}`}/attention?${params.toString()}`,
+          );
+          const output = feed && tab
+            ? {
+              ...feed,
+              items: feed.items.filter(
+                (item) => ATTENTION_INBOX_TAB_BY_KIND[attentionKindForSourceKind(item.sourceKind)] === tab,
+              ),
+            }
+            : feed;
+          printOutput(output, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
 }
 
 function addCompanyList(parent: Command, name: string, description: string, path: string): void {

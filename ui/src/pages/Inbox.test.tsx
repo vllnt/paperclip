@@ -146,6 +146,14 @@ import {
   InboxIssueTrailingColumns,
   formatJoinRequestInboxLabel,
 } from "./Inbox";
+import { isInboxModuleTab } from "../lib/inbox";
+import { InboxPage } from "./inbox/InboxPage";
+
+/** The Inbox page as the route for the mocked location renders it. */
+function InboxAtRoute() {
+  const segment = routerMock.location.pathname.split("/").pop();
+  return <InboxPage tab={isInboxModuleTab(segment) ? segment : "mine"} />;
+}
 
 vi.mock("@/lib/router", () => ({
   Link: ({ children, className, ...props }: ComponentProps<"a">) => (
@@ -407,7 +415,7 @@ describe("Inbox toolbar", () => {
       const root = createRoot(container);
       try {
         await act(async () => {
-          root.render(<QueryClientProvider client={queryClient}><Inbox /></QueryClientProvider>);
+          root.render(<QueryClientProvider client={queryClient}><InboxAtRoute /></QueryClientProvider>);
         });
         await vi.waitFor(() => {
           expect(apiMocks.heartbeatRunsList).toHaveBeenCalled();
@@ -450,7 +458,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -487,7 +495,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -515,7 +523,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -585,7 +593,7 @@ describe("Inbox toolbar", () => {
       await act(async () => {
         root.render(
           <QueryClientProvider client={queryClient}>
-            <Inbox />
+            <InboxAtRoute />
           </QueryClientProvider>,
         );
       });
@@ -656,7 +664,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -686,7 +694,7 @@ describe("Inbox toolbar", () => {
       await act(async () => {
         root.render(
           <QueryClientProvider client={queryClient}>
-            <Inbox />
+            <InboxAtRoute />
           </QueryClientProvider>,
         );
       });
@@ -718,7 +726,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -751,7 +759,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -800,7 +808,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -842,7 +850,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -875,7 +883,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -906,7 +914,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -945,7 +953,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -1008,7 +1016,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -1077,7 +1085,7 @@ describe("Inbox toolbar", () => {
       await act(async () => {
         root.render(
           <QueryClientProvider client={queryClient}>
-            <Inbox />
+            <InboxAtRoute />
           </QueryClientProvider>,
         );
       });
@@ -1166,7 +1174,7 @@ describe("Inbox toolbar", () => {
       await act(async () => {
         root.render(
           <QueryClientProvider client={queryClient}>
-            <Inbox />
+            <InboxAtRoute />
           </QueryClientProvider>,
         );
       });
@@ -1236,7 +1244,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -1300,7 +1308,7 @@ describe("Inbox toolbar", () => {
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <Inbox />
+          <InboxAtRoute />
         </QueryClientProvider>,
       );
     });
@@ -1351,7 +1359,7 @@ describe("Inbox toolbar", () => {
       await act(async () => {
         root.render(
           <QueryClientProvider client={queryClient}>
-            <Inbox />
+            <InboxAtRoute />
           </QueryClientProvider>,
         );
       });

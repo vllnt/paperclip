@@ -80,7 +80,8 @@ vi.mock("../api/instanceSettings", () => ({
 
 const mockInboxBadge = vi.hoisted(() => ({ inbox: 0, failedRuns: 0 }));
 
-vi.mock("../hooks/useInboxBadge", () => ({
+vi.mock("../hooks/useInboxBadge", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../hooks/useInboxBadge")>()),
   useInboxBadge: () => mockInboxBadge,
 }));
 
@@ -158,7 +159,7 @@ describe("Sidebar", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
-    mockAttentionApi.list.mockResolvedValue({ items: [] });
+    mockAttentionApi.list.mockResolvedValue({ items: [], countsBySourceKind: {} });
     mockSidebar.isMobile = false;
     mockSidebar.collapsed = false;
     mockSidebar.collapseLocked = false;
@@ -465,6 +466,25 @@ describe("Sidebar", () => {
       });
     });
 
+    it("keeps an Inbox row for the Decide tab while Decisions is on, badged with open decisions only", async () => {
+      mockInboxBadge.inbox = 7;
+      mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableCombinedInboxTasks: true, enableDecisions: true });
+      mockAttentionApi.list.mockResolvedValue({ items: [], countsBySourceKind: { decision: 2 } });
+      const root = await renderSidebar();
+
+      await vi.waitFor(() => {
+        const inboxLink = [...container.querySelectorAll("a")].find((anchor) => anchor.getAttribute("href") === "/inbox/decide");
+        expect(inboxLink?.textContent).toContain("Inbox");
+        expect(inboxLink?.textContent).toContain("2");
+      });
+      const tasksLink = [...container.querySelectorAll("a")].find((anchor) => anchor.getAttribute("href") === "/issues");
+      expect(tasksLink?.textContent).toContain("7");
+
+      flushSync(() => {
+        root.unmount();
+      });
+    });
+
     it("adds no chat surfaces while Agent Chat is off", async () => {
       mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableCombinedInboxTasks: true, enableAgentChat: false });
       const root = await renderSidebar();
@@ -499,7 +519,7 @@ describe("Sidebar", () => {
     });
   });
 
-  it("shows Status directly below Decisions in primary navigation", async () => {
+  it("shows one Inbox entry, with Status directly below it, and no Decisions entry", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
       enableDecisions: true,
       enableStatusCards: true,
@@ -507,16 +527,37 @@ describe("Sidebar", () => {
     const root = await renderSidebar();
 
     const primaryNavLinks = [...container.querySelectorAll("nav > div:first-child a")];
-    const decisionsLink = primaryNavLinks.find(
-      (anchor) => anchor.textContent?.trim() === "Decisions",
-    );
+    const inboxLinks = primaryNavLinks.filter((anchor) => anchor.getAttribute("href")?.startsWith("/inbox"));
     const statusLink = primaryNavLinks.find((anchor) => anchor.getAttribute("href") === "/status");
 
+    expect(inboxLinks).toHaveLength(1);
+    expect(primaryNavLinks.some((anchor) => anchor.getAttribute("href") === "/decisions")).toBe(false);
+    expect(container.textContent).not.toContain("Decisions");
     expect(statusLink?.textContent).toContain("Status");
     expect(statusLink?.textContent).toContain("beta");
     expect(statusLink?.textContent).not.toContain("exp");
     expect(statusLink?.textContent).not.toContain("cards");
-    expect(primaryNavLinks.indexOf(statusLink!)).toBe(primaryNavLinks.indexOf(decisionsLink!) + 1);
+    expect(primaryNavLinks.indexOf(statusLink!)).toBe(primaryNavLinks.indexOf(inboxLinks[0]!) + 1);
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("adds open decisions, interactions and reviews to the Inbox badge, but not items it already counts", async () => {
+    mockInboxBadge.inbox = 3;
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableDecisions: true });
+    mockAttentionApi.list.mockResolvedValue({
+      items: [],
+      countsBySourceKind: { decision: 2, issue_thread_interaction: 1, review: 1, approval: 4, failed_run: 5 },
+    });
+    const root = await renderSidebar();
+
+    await vi.waitFor(() => {
+      const inboxLink = [...container.querySelectorAll("a")].find((anchor) => anchor.getAttribute("href") === "/inbox");
+      expect(inboxLink?.textContent).toContain("7");
+    });
+    expect(mockAttentionApi.list).toHaveBeenCalledWith("company-1", { limit: 1 });
 
     flushSync(() => {
       root.unmount();

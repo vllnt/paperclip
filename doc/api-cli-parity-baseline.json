@@ -84,7 +84,6 @@
     "GET /api/companies/{companyId}/ai-connections/{connectionId}/active-runs",
     "GET /api/companies/{companyId}/ai-connections/{connectionId}/usage",
     "GET /api/companies/{companyId}/artifacts",
-    "GET /api/companies/{companyId}/attention",
     "GET /api/companies/{companyId}/audit/agent-actions",
     "GET /api/companies/{companyId}/audit/agent-actions.csv",
     "GET /api/companies/{companyId}/browser-use-cloud/grants/{grantId}/profiles",

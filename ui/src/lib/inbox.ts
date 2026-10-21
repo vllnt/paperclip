@@ -28,7 +28,26 @@ export const INBOX_GROUP_BY_KEY = "paperclip:inbox:group-by";
 export const INBOX_FILTER_PREFERENCES_KEY_PREFIX = "paperclip:inbox:filters";
 export const INBOX_COLLAPSED_GROUPS_KEY_PREFIX = "paperclip:inbox:collapsed-groups";
 export const INBOX_COLLAPSED_PARENTS_KEY_PREFIX = "paperclip:inbox:collapsed-parents";
+/** The Inbox tabs that list tasks; Combined Inbox + Task List turns these into Tasks views. */
 export type InboxTab = "mine" | "recent" | "unread" | "blocked" | "all";
+/**
+ * Every tab of the Inbox, in tab-bar order. Decide and Alerts list the
+ * attention feed (the former Decisions page), split by attention kind; Archived
+ * holds what left the needs-me tabs.
+ */
+export const INBOX_MODULE_TABS = ["decide", "mine", "recent", "unread", "blocked", "alerts", "all", "archived"] as const;
+export type InboxModuleTab = (typeof INBOX_MODULE_TABS)[number];
+export type InboxAttentionTab = Extract<InboxModuleTab, "decide" | "alerts">;
+export const INBOX_MODULE_TAB_LABELS: Record<InboxModuleTab, string> = {
+  decide: "Decide",
+  mine: "Mine",
+  recent: "Recent",
+  unread: "Unread",
+  blocked: "Blocked",
+  alerts: "Alerts",
+  all: "All",
+  archived: "Archived",
+};
 export type InboxCategoryFilter =
   | "everything"
   | "issues_i_touched"
@@ -675,24 +694,74 @@ export function resolveInboxNestingEnabled(preferenceEnabled: boolean, isMobile:
   return preferenceEnabled && !isMobile;
 }
 
-export function loadLastInboxTab(): InboxTab {
+export function isInboxModuleTab(value: string | null | undefined): value is InboxModuleTab {
+  return INBOX_MODULE_TABS.some((tab) => tab === value);
+}
+
+export function isInboxIssueTab(tab: InboxModuleTab): tab is InboxTab {
+  return tab !== "decide" && tab !== "alerts" && tab !== "archived";
+}
+
+export function isInboxAttentionTab(tab: InboxModuleTab): tab is InboxAttentionTab {
+  return tab === "decide" || tab === "alerts";
+}
+
+/**
+ * The tabs the Inbox shows. The attention tabs follow the Decisions setting;
+ * the task tabs leave when Combined Inbox + Task List hosts them inside Tasks.
+ * The current tab always stays, so a deep link never lands on a missing tab.
+ */
+export function visibleInboxModuleTabs({
+  decisionsEnabled,
+  issueTabsInTasks,
+  current,
+}: {
+  decisionsEnabled: boolean;
+  issueTabsInTasks: boolean;
+  current: InboxModuleTab;
+}): InboxModuleTab[] {
+  return INBOX_MODULE_TABS.filter((tab) => {
+    if (tab === current) return true;
+    if (isInboxAttentionTab(tab)) return decisionsEnabled;
+    if (isInboxIssueTab(tab)) return !issueTabsInTasks;
+    return true;
+  });
+}
+
+/**
+ * Where a retired Decisions URL lands: the Decide tab, with a queue page's key
+ * as `?queue=` and every other query param (such as `?decisionId=`) and the
+ * hash kept.
+ *
+ * @example
+ * decideTabPathForRetiredDecisionsUrl({ search: "?decisionId=d1", hash: "", queueKey: "triage" })
+ * // "/inbox/decide?decisionId=d1&queue=triage"
+ */
+export function decideTabPathForRetiredDecisionsUrl({
+  search,
+  hash,
+  queueKey,
+}: {
+  search: string;
+  hash: string;
+  queueKey: string | null;
+}): string {
+  const params = new URLSearchParams(search);
+  if (queueKey) params.set("queue", queueKey);
+  const query = params.toString();
+  return `/inbox/decide${query ? `?${query}` : ""}${hash}`;
+}
+
+export function loadLastInboxTab(): InboxModuleTab {
   try {
     const raw = localStorage.getItem(INBOX_LAST_TAB_KEY);
-    if (
-      raw === "all"
-      || raw === "unread"
-      || raw === "recent"
-      || raw === "mine"
-      || raw === "blocked"
-    ) return raw;
-    if (raw === "new") return "mine";
-    return "mine";
+    return isInboxModuleTab(raw) ? raw : "mine";
   } catch {
     return "mine";
   }
 }
 
-export function saveLastInboxTab(tab: InboxTab) {
+export function saveLastInboxTab(tab: InboxModuleTab) {
   try {
     localStorage.setItem(INBOX_LAST_TAB_KEY, tab);
   } catch {
@@ -774,23 +843,24 @@ export function getUnreadTouchedIssues(issues: Issue[]): Issue[] {
   return issues.filter((issue) => issue.isUnreadForMe);
 }
 
+/**
+ * Mine and Unread are needs-me views, so they keep only approvals still waiting
+ * on a verdict; a resolved approval auto-archives out of them and stays in
+ * Recent, All and the approval pages.
+ */
 export function getApprovalsForTab(
   approvals: Approval[],
   tab: InboxTab,
   filter: InboxApprovalFilter,
-  currentUserId?: string | null,
 ): Approval[] {
   const sortedApprovals = [...approvals].sort(
     (a, b) => normalizeTimestamp(b.updatedAt) - normalizeTimestamp(a.updatedAt),
   );
 
-  if (tab === "mine") {
-    return sortedApprovals.filter((approval) => isApprovalVisibleInMine(approval, currentUserId));
-  }
-  if (tab === "recent") return sortedApprovals;
-  if (tab === "unread") {
+  if (tab === "mine" || tab === "unread") {
     return sortedApprovals.filter((approval) => ACTIONABLE_APPROVAL_STATUSES.has(approval.status));
   }
+  if (tab === "recent") return sortedApprovals;
   if (filter === "all") return sortedApprovals;
 
   return sortedApprovals.filter((approval) => {
@@ -799,13 +869,35 @@ export function getApprovalsForTab(
   });
 }
 
-export function isApprovalVisibleInMine(
-  approval: Approval,
-  currentUserId?: string | null,
-): boolean {
-  if (ACTIONABLE_APPROVAL_STATUSES.has(approval.status)) return true;
-  if (!currentUserId) return false;
-  return approval.requestedByUserId === currentUserId || approval.decidedByUserId === currentUserId;
+/**
+ * A done task with nothing unread for me needs nothing more from me, so it
+ * auto-archives out of Mine into the Archived tab. A done task with an unread
+ * update stays until I have seen it.
+ */
+export function isInboxIssueAutoArchived(issue: Pick<Issue, "status" | "isUnreadForMe">): boolean {
+  return issue.status === "done" && !issue.isUnreadForMe;
+}
+
+/**
+ * The Archived tab's tasks: every task I touched that Mine no longer shows,
+ * either because I archived it or because it auto-archived as done. Both lists
+ * come from the same touched-by-me query, so Mine is a subset of touched.
+ */
+export function getArchivedInboxIssues({
+  touchedIssues,
+  mineIssues,
+}: {
+  touchedIssues: Issue[];
+  mineIssues: Issue[];
+}): Array<{ issue: Issue; archivedByMe: boolean }> {
+  const mineById = new Map(mineIssues.map((issue) => [issue.id, issue]));
+  return [...touchedIssues]
+    .sort(sortIssuesByMostRecentActivity)
+    .flatMap((issue): Array<{ issue: Issue; archivedByMe: boolean }> => {
+      const mineIssue = mineById.get(issue.id);
+      if (!mineIssue) return [{ issue, archivedByMe: true }];
+      return isInboxIssueAutoArchived(mineIssue) ? [{ issue: mineIssue, archivedByMe: false }] : [];
+    });
 }
 
 export function approvalActivityTimestamp(approval: Approval): number {
@@ -1283,7 +1375,6 @@ export function computeInboxBadgeData({
 }): InboxBadgeData {
   const actionableApprovals = approvals.filter(
     (approval) =>
-      isApprovalVisibleInMine(approval, currentUserId) &&
       ACTIONABLE_APPROVAL_STATUSES.has(approval.status) &&
       !isInboxEntityDismissed(dismissedAtByKey, `approval:${approval.id}`, approval.updatedAt),
   ).length;

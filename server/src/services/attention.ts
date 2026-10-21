@@ -1303,7 +1303,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           companyId,
           sourceKind: "decision",
           subject: { kind: "decision", id: decision.id, companyId, title: decision.title, identifier: null, status: decision.status,
-            href: `/${prefix}/decisions?decisionId=${decision.id}`,
+            href: `/${prefix}/inbox/decide?decisionId=${decision.id}`,
             metadata: { originIssueId: decision.originIssueId, originAgentId: decision.originAgentId, bundleId: decision.bundleId,
               bundleTitle: decision.bundleId ? bundleTitleMap.get(decision.bundleId) ?? null : null } },
           whyNow: "An agent decision is waiting for a board response.",

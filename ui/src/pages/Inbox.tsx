@@ -1,7 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { deriveOriginatingActor, INBOX_MINE_ISSUE_STATUS_FILTER, isHeartbeatRunVisibleInMine } from "@paperclipai/shared";
+import { deriveOriginatingActor, isHeartbeatRunVisibleInMine } from "@paperclipai/shared";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "@/hooks/useSharedPolling";
 import { approvalsApi } from "../api/approvals";
 import { accessApi } from "../api/access";
@@ -25,6 +25,7 @@ import { useToastActions } from "../context/ToastContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useSidebar } from "../context/SidebarContext";
 import { queryKeys } from "../lib/queryKeys";
+import { INBOX_ISSUE_LIST_LIMIT, inboxMineIssuesQuery, inboxTouchedIssuesQuery } from "../lib/inboxIssueQueries";
 import { useDialogActions } from "../context/DialogContext";
 import { useIssueExternalObjectSummaries } from "../hooks/useIssueExternalObjects";
 import {
@@ -104,7 +105,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
-import { Tabs } from "@/components/ui/tabs";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Inbox as InboxIcon,
@@ -122,7 +122,6 @@ import {
   ListTree,
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
-import { PageTabBar } from "../components/PageTabBar";
 import type { Approval, HeartbeatRun, Issue, JoinRequest } from "@paperclipai/shared";
 import {
   ACTIONABLE_APPROVAL_STATUSES,
@@ -141,6 +140,7 @@ import {
   matchesInboxIssueSearch,
   getRecentTouchedIssues,
   isInboxEntityDismissed,
+  isInboxIssueAutoArchived,
   isMineInboxTab,
   loadCollapsedInboxGroupKeys,
   loadCollapsedInboxParentIds,
@@ -190,7 +190,6 @@ import {
 } from "../lib/task-date-groups";
 
 const INBOX_HEARTBEAT_RUN_LIMIT = 200;
-const INBOX_ISSUE_LIST_LIMIT = 500;
 const INBOX_HOT_PATH_STALE_MS = 30_000;
 const INBOX_COLLECTION_KEY = "inbox";
 
@@ -790,31 +789,30 @@ function InboxCollectionToolbar({
 }
 
 /**
- * PAP-670: the inbox stopped being its own page and became the "My work" half
- * of Tasks. `Tasks` hosts this component and drives it through these props, so
- * every inbox behaviour (unread state, archive, date groups, the mixed
- * approval / failed-run / join-request rows) survives the merge by construction
- * rather than being reimplemented on the task list.
- *
- * With no props it is still the standalone `/inbox/*` page, which the legacy
- * (non-streamlined) shell continues to use.
+ * The task tabs of the Inbox. Two hosts drive this component through these
+ * props, so every inbox behaviour (unread state, archive, date groups, the
+ * mixed approval / failed-run / join-request rows) is built once:
+ *   - the Inbox page (`InboxPage`), which puts its tab bar in the toolbar;
+ *   - Tasks, when Combined Inbox + Task List (PAP-670) makes these tabs views
+ *     of the task list.
+ * The legacy (non-streamlined) shell renders its own copy with the same tab bar.
  */
 export interface InboxSurfaceProps {
-  /** Which view to render. Falls back to the last path segment when absent. */
-  tab?: InboxTab;
-  /** Replaces the inbox tab bar in the toolbar's context slot. */
-  toolbarContext?: ReactNode;
+  /** Which task tab to render. */
+  tab: InboxTab;
+  /** The host's tab bar or views menu, in the toolbar's context slot. */
+  toolbarContext: ReactNode;
   /** Breadcrumb and back-link label; "Inbox" when standalone, "Tasks" when hosted. */
   surfaceLabel?: string;
 }
 
-export function Inbox(props: InboxSurfaceProps = {}) {
+export function Inbox(props: InboxSurfaceProps) {
   const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
-  return streamlinedUiEnabled ? <StreamlinedInbox {...props} /> : <LegacyInbox />;
+  return streamlinedUiEnabled ? <StreamlinedInbox {...props} /> : <LegacyInbox tabBar={props.toolbarContext} />;
 }
 
 function StreamlinedInbox({
-  tab: tabOverride,
+  tab,
   toolbarContext,
   surfaceLabel = "Inbox",
 }: InboxSurfaceProps) {
@@ -850,16 +848,6 @@ function StreamlinedInbox({
   const { readItems, markRead: markItemRead, markUnread: markItemUnread } = useReadInboxItems();
   const { allCategoryFilter, allApprovalFilter, issueFilters } = filterPreferences;
 
-  const pathSegment = location.pathname.split("/").pop() ?? "mine";
-  const pathTab: InboxTab =
-    pathSegment === "mine"
-    || pathSegment === "recent"
-    || pathSegment === "all"
-    || pathSegment === "unread"
-    || pathSegment === "blocked"
-      ? pathSegment
-      : "mine";
-  const tab: InboxTab = tabOverride ?? pathTab;
   const canArchiveFromTab = isMineInboxTab(tab);
   const issueLinkState = useMemo(
     () =>
@@ -987,26 +975,18 @@ function StreamlinedInbox({
     staleTime: INBOX_HOT_PATH_STALE_MS,
   });
   usePublishSharedQueryData(sharedInboxIssues, issues, issuesUpdatedAt);
+  const mineIssuesQuery = inboxMineIssuesQuery(selectedCompanyId!);
   const {
     data: mineIssuesRaw = [],
     isLoading: isMineIssuesLoading,
     dataUpdatedAt: mineIssuesUpdatedAt,
   } = useQuery({
-    queryKey: [...queryKeys.issues.listMineByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const,
-    queryFn: () =>
-      issuesApi.listCompact(selectedCompanyId!, {
-        touchedByUserId: "me",
-        inboxArchivedByUserId: "me",
-        status: INBOX_MINE_ISSUE_STATUS_FILTER,
-        includeRoutineExecutions: true,
-        includeLiveDescendantSummary: true,
-        limit: INBOX_ISSUE_LIST_LIMIT,
-      }).then((rows) => rows as Issue[]),
+    ...mineIssuesQuery,
     enabled: !!selectedCompanyId,
     refetchOnWindowFocus: false,
     staleTime: INBOX_HOT_PATH_STALE_MS,
   });
-  const mineIssuesQueryKey = [...queryKeys.issues.listMineByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const;
+  const mineIssuesQueryKey = mineIssuesQuery.queryKey;
   const sharedMineIssues = useSharedPollingQuery<Issue[]>({
     companyId: selectedCompanyId,
     resourceKey: "inbox:mine-issues",
@@ -1014,25 +994,18 @@ function StreamlinedInbox({
     enabled: !!selectedCompanyId,
   });
   usePublishSharedQueryData(sharedMineIssues, mineIssuesRaw, mineIssuesUpdatedAt);
+  const touchedIssuesQuery = inboxTouchedIssuesQuery(selectedCompanyId!);
   const {
     data: touchedIssuesRaw = [],
     isLoading: isTouchedIssuesLoading,
     dataUpdatedAt: touchedIssuesUpdatedAt,
   } = useQuery({
-    queryKey: [...queryKeys.issues.listTouchedByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const,
-    queryFn: () =>
-      issuesApi.listCompact(selectedCompanyId!, {
-        touchedByUserId: "me",
-        status: INBOX_MINE_ISSUE_STATUS_FILTER,
-        includeRoutineExecutions: true,
-        includeLiveDescendantSummary: true,
-        limit: INBOX_ISSUE_LIST_LIMIT,
-      }).then((rows) => rows as Issue[]),
+    ...touchedIssuesQuery,
     enabled: !!selectedCompanyId,
     refetchOnWindowFocus: false,
     staleTime: INBOX_HOT_PATH_STALE_MS,
   });
-  const touchedIssuesQueryKey = [...queryKeys.issues.listTouchedByMe(selectedCompanyId!), "compact", "with-routine-executions", "live-descendant-summary", INBOX_ISSUE_LIST_LIMIT] as const;
+  const touchedIssuesQueryKey = touchedIssuesQuery.queryKey;
   const sharedTouchedIssues = useSharedPollingQuery<Issue[]>({
     companyId: selectedCompanyId,
     resourceKey: "inbox:touched-issues",
@@ -1093,7 +1066,9 @@ function StreamlinedInbox({
   );
 
   const mineIssues = useMemo(
-    () => getRecentTouchedIssues(mineIssuesRaw).filter((issue) => !locallyArchivedIssueIds.has(issue.id)),
+    () =>
+      getRecentTouchedIssues(mineIssuesRaw.filter((issue) => !isInboxIssueAutoArchived(issue)))
+        .filter((issue) => !locallyArchivedIssueIds.has(issue.id)),
     [locallyArchivedIssueIds, mineIssuesRaw],
   );
   const touchedIssues = useMemo(
@@ -1331,14 +1306,14 @@ function StreamlinedInbox({
     [heartbeatRuns, dismissedAtByKey],
   );
   const approvalsToRender = useMemo(() => {
-    let filtered = getApprovalsForTab(approvals ?? [], tab, allApprovalFilter, currentUserId);
+    let filtered = getApprovalsForTab(approvals ?? [], tab, allApprovalFilter);
     if (tab === "mine") {
       filtered = filtered.filter(
         (a) => !isInboxEntityDismissed(dismissedAtByKey, `approval:${a.id}`, a.updatedAt),
       );
     }
     return filtered;
-  }, [approvals, tab, allApprovalFilter, currentUserId, dismissedAtByKey]);
+  }, [approvals, tab, allApprovalFilter, dismissedAtByKey]);
   const showJoinRequestsCategory =
     allCategoryFilter === "everything" || allCategoryFilter === "join_requests";
   const showTouchedCategory =
@@ -2422,19 +2397,7 @@ function StreamlinedInbox({
       <InboxCollectionToolbar
         streamlined={streamlinedUiEnabled}
         ariaLabel={`${surfaceLabel} controls`}
-        context={toolbarContext ?? (
-          <Tabs value={tab} onValueChange={(value) => navigate(`/inbox/${value}`)}>
-            <PageTabBar
-              items={[
-                { value: "mine", label: "Mine" },
-                { value: "recent", label: "Recent" },
-                { value: "unread", label: "Unread" },
-                { value: "blocked", label: "Blocked" },
-                { value: "all", label: "All" },
-              ]}
-            />
-          </Tabs>
-        )}
+        context={toolbarContext}
         search={(
           <div className="relative ml-auto w-full sm:w-(--sz-220px)">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />

@@ -362,4 +362,18 @@ describe("Decisions routes", () => {
     expect(appSource).not.toContain('path="training"');
     expect(appSource).not.toContain('path="training/:id"');
   });
+
+  it("redirects the retired Decisions URLs to the Inbox Decide tab", () => {
+    expect(appSource).toContain('<Route path="decisions" element={<RetiredDecisionsRedirect />} />');
+    expect(appSource).toContain('<Route path="decisions/queues/:key" element={<RetiredDecisionsRedirect />} />');
+    expect(appSource).toContain('<Route path="decisions/queues/:key" element={<UnprefixedBoardRedirect />} />');
+    expect(appSource).not.toContain("WhatNeedsMe");
+    expect(appSource).not.toContain("DecisionQueuePage");
+  });
+
+  it("serves the attention and archived tabs from the Inbox page in every shell", () => {
+    for (const tab of ["decide", "alerts", "archived"]) {
+      expect(appSource).toContain(`<Route path="inbox/${tab}" element={<InboxPage tab="${tab}" />} />`);
+    }
+  });
 });
