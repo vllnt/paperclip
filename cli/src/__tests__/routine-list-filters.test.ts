@@ -46,6 +46,7 @@ describe("routine list filters", () => {
     await run(["routine", "list", "--folder-id", "none"]);
     await run(["routine", "list", "--folder-id", FOLDER_ID, "--status", "paused", "--trigger", "manual"]);
     await run(["routine", "list", "--project-id", "p1", "--trigger", "schedule"]);
+    await run(["routine", "list", "--goal-id", "g1", "--status", "active"]);
 
     expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual([
       BASE,
@@ -54,6 +55,7 @@ describe("routine list filters", () => {
       `${BASE}?folderId=none`,
       `${BASE}?folderId=${FOLDER_ID}&status=paused&trigger=manual`,
       `${BASE}?projectId=p1&trigger=schedule`,
+      `${BASE}?status=active&goalId=g1`,
     ]);
   });
 });

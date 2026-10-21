@@ -37,6 +37,7 @@ interface RoutineListOptions extends CompanyOptions {
   folderId?: string;
   status?: string;
   trigger?: string;
+  goalId?: string;
 }
 
 /** Builds the list query from the CLI flags; the server validates the values. */
@@ -49,6 +50,7 @@ function routineListQuery(opts: RoutineListOptions): string {
     ["folderId", opts.folderId],
     ["status", opts.status],
     ["trigger", opts.trigger],
+    ["goalId", opts.goalId],
   ];
   for (const [key, value] of entries) {
     if (value) params.set(key, value);
@@ -70,6 +72,7 @@ export function registerRoutineApiCommands(program: Command): void {
       .option("--folder-id <id>", "Only routines in this folder; none for routines in no folder")
       .option("--status <status>", "active, paused or archived")
       .option("--trigger <kind>", "schedule, webhook, api, event, or manual for routines with no trigger")
+      .option("--goal-id <id>", "Only routines linked to this goal; sub-goals are not included")
       .action(async (opts: RoutineListOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
