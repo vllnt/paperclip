@@ -76,6 +76,7 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
+  evalInputRetentionDays: number;
   tempSweepRunGraceMinutes: number;
   tempSweepIntervalMinutes: number;
   serveUi: boolean;
@@ -291,6 +292,14 @@ export function loadConfig(): Config {
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
       : 7;
+  // Company evals keep the (secret-redacted) input of a run this many days, then clear it and keep
+  // only the hash and the size. 0 stores no input. A negative or non-numeric value uses 30.
+  const evalInputRetentionDaysEnv = process.env.PAPERCLIP_EVAL_INPUT_RETENTION_DAYS?.trim();
+  const evalInputRetentionDaysRaw = Number(evalInputRetentionDaysEnv);
+  const evalInputRetentionDays =
+    evalInputRetentionDaysEnv && Number.isFinite(evalInputRetentionDaysRaw) && evalInputRetentionDaysRaw >= 0
+      ? Math.floor(evalInputRetentionDaysRaw)
+      : 30;
   // The temp sweep removes a per-run temp entry only after its run finished
   // this many minutes ago. Values between 0 and 1 use 1; zero, a negative or a
   // non-numeric value uses 15.
@@ -355,6 +364,7 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
+    evalInputRetentionDays,
     tempSweepRunGraceMinutes,
     tempSweepIntervalMinutes,
     serveUi:

@@ -154,7 +154,7 @@ issues); negatives that are too easy inflate precision.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PAPERCLIP_JUDGE_DAILY_CALL_CAP` | `5000` | Model calls per company per UTC day. `0` disables model calls. |
+| `PAPERCLIP_JUDGE_DAILY_CALL_CAP` | `5000` | Model calls per company per UTC day. `0` disables model calls. [Company evals](./company-evals.md) share this cap. |
 | `PAPERCLIP_JUDGE_TIMEOUT_MS` | `4000` | Hard timeout per model request. |
 | `PAPERCLIP_JUDGE_ZERO_DATA_RETENTION` | `false` | `true` sends the gateway's `zeroDataRetention` option. Tested 2026-10-09 with the Paperclip gateway key: every request returned a gateway 500, so it was not usable and all checks fell back to tier 1. Leave it `false` unless the gateway team has zero-data-retention enabled for Jev, and re-test with the live smoke test first. |
 

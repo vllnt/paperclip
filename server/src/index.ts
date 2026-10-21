@@ -2,6 +2,7 @@ import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { runUsageRecordService } from "./services/run-usage-records.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
 import { sshRunDirectoryReaperService } from "./services/ssh-run-directory-reaper.js";
+import { createEvalInputRetention } from "./modules/evals/index.js";
 /// <reference path="./types/express.d.ts" />
 // Kicks off the OTel bootstrap as early as possible (no-op unless
 // OTEL_EXPORTER_OTLP_ENDPOINT is set). startServer() awaits
@@ -924,6 +925,7 @@ async function startServerWithDatabaseTeardown(
     chatWebhookPublicBaseUrl: config.chatWebhookPublicBaseUrl,
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
+    evalInputRetentionDays: config.evalInputRetentionDays,
     announcements: { enabled: config.announcementsEnabled, feedUrl: config.announcementsFeedUrl },
     pluginMigrationDb: pluginMigrationDb as any,
     betterAuthHandler,
@@ -1304,6 +1306,7 @@ async function startServerWithDatabaseTeardown(
   // scheduler tick is much shorter than a sweep needs, so this one runs at most
   // every ten minutes, starting with the first tick.
   const SSH_RUN_DIRECTORY_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+  const EVAL_INPUT_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
   const sshRunDirectoryReaper = sshRunDirectoryReaperService(db as any);
   let lastSshRunDirectorySweepAt = 0;
   const scheduleSshRunDirectorySweep = () => {
@@ -1317,6 +1320,23 @@ async function startServerWithDatabaseTeardown(
       })
       .catch((err) => {
         logger.error({ err }, "SSH run directory sweep failed");
+      }));
+  };
+  // Stored eval inputs are cleared once they pass their retention. The sweep is cheap and capped
+  // per run, so it shares the ten-minute pace of the SSH run-directory sweep.
+  const evalInputRetention = createEvalInputRetention(db);
+  let lastEvalInputSweepAt = 0;
+  const scheduleEvalInputRetentionSweep = () => {
+    if (heartbeatSchedulerStopped) return;
+    if (Date.now() - lastEvalInputSweepAt < EVAL_INPUT_SWEEP_INTERVAL_MS) return;
+    lastEvalInputSweepAt = Date.now();
+    trackHeartbeatSchedulerWork(evalInputRetention
+      .sweep()
+      .then((cleared) => {
+        if (cleared > 0) logger.info({ cleared }, "company eval input retention sweep cleared inputs");
+      })
+      .catch((err) => {
+        logger.error({ err }, "company eval input retention sweep failed");
       }));
   };
   const githubConnectionEvents = githubConnectionEventService(db as any, {
@@ -1691,6 +1711,7 @@ async function startServerWithDatabaseTeardown(
     // Retry any orphan sandbox teardown left by a failed acquire before a server
     // restart, so a leaked sandbox does not stay allocated across the restart.
     await runEnvironmentLeaseCleanupSweep(0);
+    scheduleEvalInputRetentionSweep();
 
     const runRetentionSweep = async () => {
       const activeCompanies = await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
@@ -1756,6 +1777,7 @@ async function startServerWithDatabaseTeardown(
         scheduleSetupTokenReaperSweep();
         scheduleEnvironmentLeaseCleanupSweep();
         scheduleSshRunDirectorySweep();
+        scheduleEvalInputRetentionSweep();
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(routines
@@ -1875,6 +1897,8 @@ async function startServerWithDatabaseTeardown(
     // this path retries the teardown at startup and on the interval, exactly as
     // the enabled path does.
     await runEnvironmentLeaseCleanupSweep(0);
+    // With the scheduler off, eval inputs are cleared once at startup only.
+    scheduleEvalInputRetentionSweep();
     startHeartbeatSchedulerInterval(() => {
       scheduleExternalObjectRefreshSweep(new Date());
       scheduleEnvironmentLeaseCleanupSweep();

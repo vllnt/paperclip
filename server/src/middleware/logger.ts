@@ -4,6 +4,7 @@ import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import {
   isBrowserSignInInputHttpRequest,
+  isCompanyEvalHttpRequest,
   isRuntimeGitHubHttpRequest,
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
@@ -169,10 +170,11 @@ export function createHttpLogger(baseLogger: Logger) {
         const ctx = (res as any).__errorContext;
         if (
           isRuntimeGitHubHttpRequest(req.method, requestClassificationUrl(req)) ||
-          isBrowserSignInInputHttpRequest(requestClassificationUrl(req))
+          isBrowserSignInInputHttpRequest(requestClassificationUrl(req)) ||
+          isCompanyEvalHttpRequest(requestClassificationUrl(req))
         ) {
-          // Command arguments (message bodies), git objects and sign-in
-          // keystrokes (passwords, one-time codes) stay out of logs.
+          // Command arguments (message bodies), git objects, sign-in
+          // keystrokes (passwords, one-time codes) and eval inputs stay out of logs.
           return { reqBody: "[REDACTED]" };
         }
         if (isPrivateWebhook(req)) {

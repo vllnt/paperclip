@@ -12,32 +12,9 @@ import {
   createJudgeUsageStore,
   readJudgeConfig,
   type JudgeClient,
-  type JudgeKeyResolver,
   type JudgeTransport,
 } from "./judge-client.js";
-import { secretService } from "./secrets.js";
-
-/**
- * Looks up the company's own gateway key in its secrets. A company without the secret gets
- * `undefined`, so its issue text is never sent anywhere. Each read is audited as a system access
- * by `consumerId`.
- */
-export function createCompanySecretKeyResolver(db: Db, consumerId = "duplicate-detection"): JudgeKeyResolver {
-  const secrets = secretService(db);
-  return async (companyId) => {
-    const secret = await secrets.getByName(companyId, JUDGE_API_KEY_SECRET_NAME);
-    if (!secret) return undefined;
-    const value = await secrets.resolveSecretValue(companyId, secret.id, "latest", {
-      accessContext: {
-        consumerType: "system",
-        consumerId,
-        actorType: "system",
-        actorId: consumerId,
-      },
-    });
-    return value.trim() || undefined;
-  };
-}
+import { createCompanySecretKeyResolver } from "./judge-key-resolver.js";
 
 /**
  * Wires duplicate detection for the running server: each company's own gateway key from its secrets,
