@@ -1540,7 +1540,7 @@ Signed external alert ingress; `event` routine triggers subscribe to a source. S
 
 | Method | Path          | Description                                                                 |
 | ------ | ------------- | --------------------------------------------------------------------------- |
-| GET    | `/api/health` | Server `status` and running build `commit`; see `SKILL.md` "Proving a Deploy" |
+| GET    | `/api/health` | Server `status` and running build `commit`; see `references/deploy-proof.md` |
 
 ### Secrets
 

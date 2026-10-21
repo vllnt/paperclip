@@ -296,9 +296,12 @@ describe("paperclip skill utils", () => {
 
   it("keeps the external-chat shortcut behind the server-verified harness boundary", async () => {
     const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
-    const shortcut = skillBody.match(
-      /## Server-Verified External Chat Turns(?<body>[\s\S]*?)\n## The Heartbeat Procedure/,
+    const chatBody = await fs.readFile(path.resolve("skills/paperclip/references/chat.md"), "utf8");
+    const shortcut = chatBody.match(
+      /## Server-Verified External Chat Turns(?<body>[\s\S]*)$/,
     )?.groups?.body;
+    expect(skillBody).toContain("references/chat.md");
+    expect(skillBody).toContain("server-verified external chat turn");
 
     expect(shortcut).toBeTruthy();
     const normalizedShortcut = shortcut!.replace(/\s+/g, " ");
@@ -314,7 +317,7 @@ describe("paperclip skill utils", () => {
       "For non-native adapters, invoke `bash scripts/paperclip-upload-artifact.sh`",
     );
     expect(normalizedShortcut).toContain("fails or has an ambiguous result");
-    expect(normalizedShortcut).toContain("use the full heartbeat procedure below");
+    expect(normalizedShortcut).toContain("use the full heartbeat procedure in `SKILL.md`");
     expect(normalizedShortcut).toContain(
       "recovery, governed-action, issue-thread-interaction, hold",
     );
@@ -520,12 +523,14 @@ describe("paperclip skill utils", () => {
 
   it("uses the authoritative PATCH response to confirm monitor scheduling", async () => {
     const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
+    const monitorsBody = await fs.readFile(path.resolve("skills/paperclip/references/monitors.md"), "utf8");
 
-    expect(skillBody).toContain("Use that request's default full response");
-    expect(skillBody).toContain("do not issue a confirming GET");
-    expect(skillBody).toContain("`monitorNextCheckAt` is non-null");
-    expect(skillBody).toContain("`assigneeAgentId` is set");
-    expect(skillBody).toContain("`assigneeUserId` is null");
+    expect(skillBody).toContain("references/monitors.md");
+    expect(monitorsBody).toContain("Use that request's default full response");
+    expect(monitorsBody).toContain("do not issue a confirming GET");
+    expect(monitorsBody).toContain("`monitorNextCheckAt` is non-null");
+    expect(monitorsBody).toContain("`assigneeAgentId` is set");
+    expect(monitorsBody).toContain("`assigneeUserId` is null");
   });
 
   it("tells agents to end their turn with issue wait instead of a background process", async () => {

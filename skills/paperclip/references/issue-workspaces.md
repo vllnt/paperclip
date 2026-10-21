@@ -2,6 +2,8 @@
 
 Use this reference when an issue has an isolated execution workspace and you need to inspect or run that workspace's services, especially for QA/browser verification.
 
+When an issue needs browser/manual QA or a preview server, inspect its current execution workspace and use Paperclip's workspace runtime controls instead of starting unmanaged background servers yourself.
+
 ## Discover the Workspace
 
 Start from the issue, not from memory:

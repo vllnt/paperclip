@@ -29,8 +29,8 @@ describe("published hiring and human-input examples", () => {
     for (const { body } of waits) expect(updateIssueSchema.safeParse(substituteIds(body))).toMatchObject({ success: true });
   });
 
-  it("includes a complete valid text-field recipe in the skill itself", () => {
-    const skill = readFileSync(new URL("../../../skills/paperclip/SKILL.md", import.meta.url), "utf8");
+  it("includes a complete valid text-field recipe in the skill itself (references/human-input.md)", () => {
+    const skill = readFileSync(new URL("../../../skills/paperclip/references/human-input.md", import.meta.url), "utf8");
     const section = skill.split('<a id="asking-for-human-input"></a>')[1]!;
     const body = JSON.parse(section.match(/```json\n([\s\S]*?)\n```/)![1]);
     const normalized = createIssueThreadInteractionSchema.parse(substituteIds(body));
