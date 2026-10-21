@@ -309,8 +309,9 @@ async function listOpenGoalTasks(api: PaperclipApiClient, companyId: string, goa
     const page = (await api.get<Issue[]>(`${apiPath`/api/companies/${companyId}/issues`}?${params}`)) ?? [];
     tasks.push(...page);
     const last = page.at(-1);
-    // The server can drop rows the caller may not see after it applies the page limit, so a short
-    // page is not the last one; only an empty page is.
+    // The server drops rows the caller may not see after it applies the page limit, so a short page
+    // is not the last one. An empty page ends the read: a caller with narrow access can still miss
+    // rows behind a full page of rows it may not see, until the list returns its raw cursor.
     if (!last) return tasks;
     afterId = last.id;
   }
