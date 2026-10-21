@@ -1266,17 +1266,19 @@ describe("claude execute", () => {
     expect(calls).toBe(2);
   });
 
-  it("allows remote session resumes when saved cwd is the host workspace", () => {
+  it("resumes a session only in the host workspace it was saved with", () => {
     expect(claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd: "/host/workspace",
-      effectiveExecutionCwd: "/remote/workspace",
-      executionTargetIsRemote: true,
+      hostCwd: "/host/workspace",
     })).toBe(true);
     expect(claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd: "/host/workspace",
-      effectiveExecutionCwd: "/remote/workspace",
-      executionTargetIsRemote: false,
+      hostCwd: "/host/other-workspace",
     })).toBe(false);
+    expect(claudeSessionCwdMatchesExecutionTarget({
+      runtimeSessionCwd: "",
+      hostCwd: "/host/workspace",
+    })).toBe(true);
   });
 
   it("reuses a stable Paperclip-managed Claude prompt bundle across equivalent runs", async () => {
@@ -1644,7 +1646,8 @@ describe("claude execute", () => {
       expect(capture2.argv).toContain("11111111-1111-4111-8111-111111111111");
       expect(second.sessionParams?.promptBundleKey).toBe(first.sessionParams?.promptBundleKey);
       // The resumed session still holds run-1's instructions path, so the prompt names this run's copy.
-      expect(capture2.prompt).toContain(`This run's agent instructions are at ${instructionsPath2}.`);
+      expect(capture2.prompt).toContain(`Resolve any relative file references from ${path.dirname(instructionsPath2)}/.`);
+      expect(capture1.prompt).not.toContain("Resolve any relative file references");
       expect(logs.join("")).not.toContain("will not be resumed");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;

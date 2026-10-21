@@ -132,13 +132,21 @@ interface ClaudeRuntimeConfig {
   extraArgs: string[];
 }
 
+/**
+ * A session saves the host workspace it ran in, also for a remote target,
+ * whose runs work in a per-run copy of that workspace. So a session resumes
+ * only in the same host workspace.
+ *
+ * @param input.runtimeSessionCwd The host cwd the session was saved with.
+ * @param input.hostCwd The host cwd of this run.
+ * @returns Whether the session may resume in this run's workspace.
+ */
 export function claudeSessionCwdMatchesExecutionTarget(input: {
   runtimeSessionCwd: string;
-  effectiveExecutionCwd: string;
-  executionTargetIsRemote: boolean;
+  hostCwd: string;
 }): boolean {
-  if (input.executionTargetIsRemote || input.runtimeSessionCwd.length === 0) return true;
-  return path.resolve(input.runtimeSessionCwd) === path.resolve(input.effectiveExecutionCwd);
+  if (input.runtimeSessionCwd.length === 0) return true;
+  return path.resolve(input.runtimeSessionCwd) === path.resolve(input.hostCwd);
 }
 
 function buildLoginResult(input: {
@@ -522,7 +530,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `\nThe above agent instructions were loaded from ${instructionsFilePath}. ${instructionsBaseDirective}`;
       combinedInstructionsContents = instructionsContent + pathDirective;
       resumeInstructionsContents = instructionsContent;
-      resumeInstructionsNote = `This run's agent instructions are at ${instructionsFilePath}. ${instructionsBaseDirective}`;
+      // A remote run reads its instructions copy at a remote path that the task
+      // guidance names, so only a local run gets this host path.
+      resumeInstructionsNote = executionTargetIsRemote ? "" : instructionsBaseDirective;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       await onLog(
@@ -793,11 +803,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? runtimeMcpServers.length === 0
       : runtimeMcpServerIdentity === runtimeMcpIdentity;
   const isValidUuid = isClaudeSessionUuid(runtimeSessionId);
-  const hasMatchingCwd = claudeSessionCwdMatchesExecutionTarget({
-    runtimeSessionCwd,
-    effectiveExecutionCwd,
-    executionTargetIsRemote,
-  });
+  const hasMatchingCwd = claudeSessionCwdMatchesExecutionTarget({ runtimeSessionCwd, hostCwd: cwd });
   // A remote run works in its own directory under the target's workspace, so
   // the session identity names the target, not the directory of one run.
   const hasMatchingRemoteExecution = adapterExecutionTargetSessionMatches(runtimeRemoteExecution, executionTarget);
@@ -846,7 +852,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (runtimeSessionId && isValidUuid && !hasMatchingCwd) {
     await onLog(
       "stdout",
-      `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
+      `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}".\n`,
     );
   }
   if (runtimeSessionId && !hasMatchingPromptBundle) {
@@ -933,7 +939,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const resumeLocationNote = joinPromptSections([
     resumeInstructionsNote,
     executionTargetIsRemote
-      ? `This run's workspace is ${effectiveExecutionCwd}. Workspace paths from an earlier run no longer exist.`
+      ? `This run's workspace is ${effectiveExecutionCwd}. Work only in this run's workspace; do not use workspace paths from an earlier run.`
       : "",
   ], " ");
 

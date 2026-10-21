@@ -351,86 +351,120 @@ describe("claude remote execution", () => {
     expect(call?.[2]).toContain("12345678-1234-4abc-9def-123456789012");
   });
 
-  it("resumes a remote SSH Claude session in the agent's next run, through the session codec", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-next-run-"));
-    cleanupDirs.push(rootDir);
-    const workspaceDir = path.join(rootDir, "workspace");
-    await mkdir(workspaceDir, { recursive: true });
+  describe("resuming a remote SSH Claude session in the agent's next run", () => {
     const claudeSessionId = "12345678-1234-4abc-9def-123456789012";
-    const logs: string[] = [];
-    const runOnce = async (runId: string, sessionParams: Record<string, unknown> | null) => {
-      // The heartbeat gives each run its own copy of the agent instructions.
-      const instructionsPath = path.join(rootDir, "runs", runId, "live", "AGENTS.md");
-      await mkdir(path.dirname(instructionsPath), { recursive: true });
-      await writeFile(instructionsPath, "Use the remote workspace.\n", "utf8");
-      return execute({
-        runId,
-        agent: {
-          id: "agent-1",
-          companyId: "company-1",
-          name: "Claude Coder",
-          adapterType: "claude_local",
-          adapterConfig: {},
-        },
-        runtime: {
-          sessionId: null,
-          sessionParams,
-          sessionDisplayId: null,
-          taskKey: null,
-        },
-        config: {
-          engine: "cli",
-          command: "claude",
-          // A model with no minimum CLI version, so each run makes one CLI call.
-          model: "claude-sonnet-5",
-          instructionsFilePath: instructionsPath,
-        },
-        context: {
-          paperclipWorkspace: {
-            cwd: workspaceDir,
-            source: "project_primary",
+
+    const setup = async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-next-run-"));
+      cleanupDirs.push(rootDir);
+      const logs: string[] = [];
+      const runOnce = async (
+        runId: string,
+        sessionParams: Record<string, unknown> | null,
+        target: { workspace?: string; username?: string } = {},
+      ) => {
+        const workspaceDir = path.join(rootDir, target.workspace ?? "workspace");
+        await mkdir(workspaceDir, { recursive: true });
+        // The heartbeat gives each run its own copy of the agent instructions.
+        const instructionsPath = path.join(rootDir, "runs", runId, "live", "AGENTS.md");
+        await mkdir(path.dirname(instructionsPath), { recursive: true });
+        await writeFile(instructionsPath, "Use the remote workspace.\n", "utf8");
+        return execute({
+          runId,
+          agent: {
+            id: "agent-1",
+            companyId: "company-1",
+            name: "Claude Coder",
+            adapterType: "claude_local",
+            adapterConfig: {},
           },
-        },
-        executionTransport: {
-          remoteExecution: {
-            host: "127.0.0.1",
-            port: 2222,
-            username: "fixture",
-            remoteWorkspacePath: "/remote/workspace",
-            remoteCwd: "/remote/workspace",
-            privateKey: "PRIVATE KEY",
-            knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
-            strictHostKeyChecking: true,
+          runtime: {
+            sessionId: null,
+            sessionParams,
+            sessionDisplayId: null,
+            taskKey: null,
           },
-        },
-        onLog: async (_stream, chunk) => {
-          logs.push(chunk);
-        },
+          config: {
+            engine: "cli",
+            command: "claude",
+            // A model with no minimum CLI version, so each run makes one CLI call.
+            model: "claude-sonnet-5",
+            instructionsFilePath: instructionsPath,
+          },
+          context: {
+            paperclipWorkspace: {
+              cwd: workspaceDir,
+              source: "project_primary",
+            },
+          },
+          executionTransport: {
+            remoteExecution: {
+              host: "127.0.0.1",
+              port: 2222,
+              username: target.username ?? "fixture",
+              remoteWorkspacePath: "/remote/workspace",
+              remoteCwd: "/remote/workspace",
+              privateKey: "PRIVATE KEY",
+              knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+              strictHostKeyChecking: true,
+            },
+          },
+          onLog: async (_stream, chunk) => {
+            logs.push(chunk);
+          },
+        });
+      };
+      runChildProcess.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: [
+          JSON.stringify({ type: "system", subtype: "init", session_id: claudeSessionId, model: "claude-sonnet" }),
+          JSON.stringify({ type: "result", session_id: claudeSessionId, result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }),
+        ].join("\n"),
+        stderr: "",
+        pid: 123,
+        startedAt: new Date().toISOString(),
       });
+      const first = await runOnce("run-ssh-first", null);
+      // The heartbeat saves and loads the session through the adapter's codec.
+      const saved = sessionCodec.deserialize(sessionCodec.serialize(first.sessionParams ?? null));
+      const callOf = (index: number) =>
+        runChildProcess.mock.calls[index] as unknown as [string, string, string[], { stdin?: string }];
+      return { logs, runOnce, saved, callOf };
     };
-    runChildProcess.mockResolvedValueOnce({
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      stdout: [
-        JSON.stringify({ type: "system", subtype: "init", session_id: claudeSessionId, model: "claude-sonnet" }),
-        JSON.stringify({ type: "result", session_id: claudeSessionId, result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }),
-      ].join("\n"),
-      stderr: "",
-      pid: 123,
-      startedAt: new Date().toISOString(),
+
+    it("resumes on the same target and names this run's workspace", async () => {
+      const { logs, runOnce, saved, callOf } = await setup();
+      await runOnce("run-ssh-second", saved);
+
+      expect(runChildProcess).toHaveBeenCalledTimes(2);
+      expect(callOf(0)[3].stdin).not.toContain("Work only in this run's workspace");
+      expect(callOf(1)[2]).toContain("--resume");
+      expect(callOf(1)[2]).toContain(claudeSessionId);
+      expect(callOf(1)[3].stdin).toContain(
+        "This run's workspace is /remote/workspace/.paperclip-runtime/runs/run-ssh-second/workspace.",
+      );
+      // The host path of the instructions copy does not exist on the remote.
+      expect(callOf(1)[3].stdin).not.toContain("Resolve any relative file references");
+      expect(logs.join("")).not.toContain("will not be resumed");
     });
 
-    const first = await runOnce("run-ssh-first", null);
-    // The heartbeat saves and loads the session through the adapter's codec.
-    await runOnce("run-ssh-second", sessionCodec.deserialize(sessionCodec.serialize(first.sessionParams ?? null)));
+    it("starts a fresh session in another host workspace", async () => {
+      const { logs, runOnce, saved, callOf } = await setup();
+      await runOnce("run-ssh-second", saved, { workspace: "other-workspace" });
 
-    expect(runChildProcess).toHaveBeenCalledTimes(2);
-    const second = runChildProcess.mock.calls[1] as unknown as [string, string, string[], { stdin?: string }];
-    expect(second[2]).toContain("--resume");
-    expect(second[2]).toContain(claudeSessionId);
-    expect(second[3].stdin).toContain("/remote/workspace/.paperclip-runtime/runs/run-ssh-second/workspace");
-    expect(logs.join("")).not.toContain("will not be resumed");
+      expect(callOf(1)[2]).not.toContain("--resume");
+      expect(logs.join("")).toContain("was saved for cwd");
+    });
+
+    it("starts a fresh session as another remote user", async () => {
+      const { logs, runOnce, saved, callOf } = await setup();
+      await runOnce("run-ssh-second", saved, { username: "other-user" });
+
+      expect(callOf(1)[2]).not.toContain("--resume");
+      expect(logs.join("")).toContain("does not match the current remote execution identity");
+    });
   });
 
   it("forwards the duplex_channel_lost transport code on the unparsed Claude result path", async () => {
