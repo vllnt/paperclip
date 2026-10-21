@@ -5,7 +5,7 @@ import { register } from "../src/worker.js";
 import { seedConnection } from "./connection.js";
 import { GitHubClient, GitHubError } from "../src/github.js";
 import { matchingRule, mergeSnapshots, validateSettings } from "../src/sync.js";
-import { QUEUE_LIMIT, QUEUE_PER_REPOSITORY, QUEUE_RETRY_MS, resumeFrom } from "../src/sync-window.js";
+import { QUEUE_LIMIT, QUEUE_RETRY_MS, resumeFrom } from "../src/sync-window.js";
 import type { AutomationRule, GitHubIssue } from "../src/contracts.js";
 const companyId = "c1";
 const actor = { companyId, actor: { type: "user" as const, userId: "u1", companyId, agentId: null, runId: null } };
@@ -384,10 +384,26 @@ describe("incremental GitHub task sync", () => {
     expect(await f.service.sync(companyId)).toMatchObject({ imported: 1, partial: false });
     expect((await f.native()).find(task => task.originId === "61")?.title).toBe("New on GitHub");
     const first = read();
-    expect(first.size).toBeLessThanOrEqual(QUEUE_PER_REPOSITORY);
     f.get.mockClear();
     await f.service.sync(companyId);
     expect([...read()].filter(number => first.has(number))).toEqual([]);
+  });
+  it("looks at 20 queued issues of a repository in a run, and at the rest in the next run", async () => {
+    const f = await fixture();
+    f.remote.clear();
+    for (let number = 1; number <= 26; number++) f.remote.set(number, edited(number, number));
+    await f.service.sync(companyId);
+    // 25 tasks are edited here. Issue 26, the newest, is the one that each walk lists again; it has no edit.
+    for (const task of (await f.native()).filter(item => Number(item.originId) <= 25)) {
+      await f.h.ctx.issues.update(task.id, { title: `Local ${task.originId}` }, companyId);
+      await f.h.emit("issue.updated", { id: task.id }, { companyId, actorType: "user", entityId: task.id });
+    }
+    await f.service.sync(companyId);
+    expect(f.update).toHaveBeenCalledTimes(20);
+    expect(Object.keys(await f.h.ctx.state.get(queueKey()) as object)).toHaveLength(5);
+    await f.service.sync(companyId);
+    expect(f.update).toHaveBeenCalledTimes(25);
+    expect(await f.h.ctx.state.get(queueKey())).toEqual({});
   });
   it("pushes an edit of a later repository in the same run, although an earlier repository's walk took a long time", async () => {
     const f = await fixture();
