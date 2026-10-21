@@ -250,7 +250,8 @@ function cloudHeaders(token, userId, role) {
   };
 }
 
-async function request(base, method, route, { headers = {}, body, timeoutMs = 30_000 } = {}) {
+// Longer than any wait a fault causes, so the longest request is measured, not cut off.
+async function request(base, method, route, { headers = {}, body, timeoutMs = 90_000 } = {}) {
   const response = await fetch(base + route, {
     method,
     headers: body ? { ...headers, "content-type": "application/json" } : headers,
@@ -417,10 +418,13 @@ function phaseReport(phase, records, census, budgetWarnings, wakeKeys) {
   if (routes.assign) routes.assign.wakeShare = routes.assign.answered2xx ? (routes.assign.woken ?? 0) / routes.assign.answered2xx : null;
   // The bound of the budget itself (plan section 8, F4): at most 2 × the calls
   // plus 10 a second attempts, converted to statements with the census. The
-  // census counts a request, which is an upper bound of one attempt.
+  // census counts a request, which is an upper bound of one attempt. A
+  // request that a fault holds sends its statements in a later phase, so the
+  // calls of a phase are the requests active in it, not only those started in it.
   const perRequest = census.statementsPerRequest;
   const largest = Math.max(0, ...Object.values(perRequest));
-  const statementBound = Object.entries(routes).reduce((sum, [name, route]) => sum + 2 * route.requests * (perRequest[name] ?? largest), 0)
+  const active = records.filter((record) => record.startedAt < phase.endPerf && record.startedAt + record.durationMs > phase.startPerf);
+  const statementBound = active.reduce((sum, record) => sum + 2 * (perRequest[record.route] ?? largest), 0)
     + 10 * seconds * largest + census.idleStatementsPerSecond * seconds;
   const refusedRetries = budgetWarnings
     .filter((warning) => warning.time >= phase.startEpoch && warning.time < phase.endEpoch)

@@ -11,7 +11,8 @@
  * Modes, switched at run time with `setMode`:
  * - `pass`: forward everything.
  * - `flap`: hold each new connection `holdMs` before connecting it, and reset
- *   each connection `lifeMs` after it was accepted.
+ *   it `lifeMs` after it reaches the database. Open connections are reset
+ *   `lifeMs` after the switch.
  * - `refuse`: close the listener, so every new connection is refused, and
  *   reset the open ones.
  * - `stall`: stop forwarding on every connection, open or new, for `stallMs`,
@@ -78,7 +79,9 @@ function emptyStats() {
     refused: 0,
     peakOpen: 0,
     peakInFlight: 0,
+    resets: 0,
     resetLifetimesMs: [],
+    since: performance.now(),
   };
 }
 
@@ -114,7 +117,9 @@ export async function startFaultProxy({ targetHost = "127.0.0.1", targetPort, li
   /** A fault: both sockets end with a TCP reset. */
   function reset(connection) {
     if (!forget(connection)) return;
-    stats.resetLifetimesMs.push(performance.now() - connection.acceptedAt);
+    stats.resets += 1;
+    // A failed attempt is a connection opened in this window, not an older one the fault ended.
+    if (connection.acceptedAt >= stats.since) stats.resetLifetimesMs.push(performance.now() - connection.acceptedAt);
     connection.client.resetAndDestroy();
     connection.upstream?.resetAndDestroy();
   }
@@ -202,8 +207,12 @@ export async function startFaultProxy({ targetHost = "127.0.0.1", targetPort, li
     client.on("close", () => closeBoth(connection));
 
     if (mode.name === "flap") {
-      connection.lifeTimer = setTimeout(() => reset(connection), mode.lifeMs);
-      setTimeout(() => connectUpstream(connection), mode.holdMs);
+      // Hold the new connection, then give it its life once it reaches the database.
+      const { lifeMs, holdMs } = mode;
+      setTimeout(() => {
+        connectUpstream(connection);
+        if (!connection.closed && mode.name === "flap") connection.lifeTimer = setTimeout(() => reset(connection), lifeMs);
+      }, holdMs);
     } else if (mode.name === "stall") {
       client.resume();
     } else {
@@ -262,8 +271,9 @@ export async function startFaultProxy({ targetHost = "127.0.0.1", targetPort, li
       const busiest = (map) => Math.max(0, ...map.values());
       const lifetimes = [...stats.resetLifetimesMs].sort((a, b) => a - b);
       return {
-        resets: lifetimes.length,
-        // The time from accept to reset of a failed connection: the failed-attempt time of the F4 auth bound.
+        resets: stats.resets,
+        // The time from accept to reset of a connection opened in this window:
+        // the failed-attempt time of the F4 auth bound.
         medianResetLifetimeMs: lifetimes.length === 0 ? null : lifetimes[Math.floor((lifetimes.length - 1) / 2)],
         statements: stats.statements,
         busiestStatementSecond: busiest(stats.statementsPerSecond),

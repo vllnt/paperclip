@@ -121,19 +121,36 @@ describe("fault proxy", () => {
     await client.ended;
   });
 
-  it("flap: holds a new connection, then resets it after its life", async () => {
-    await proxy.setMode("flap", { lifeMs: 80, holdMs: 30 });
+  it("flap: holds a new connection, gives it its life after the hold, then resets it", async () => {
+    await proxy.setMode("flap", { lifeMs: 80, holdMs: 60 });
     proxy.resetStats();
     const started = Date.now();
     const client = connect(proxy.port);
     await client.opened;
     client.socket.write(startup());
+    // The life starts when the hold ends, so the connection reaches the database.
     await until(() => client.state.received.length >= 6);
-    assert.ok(Date.now() - started >= 25, "answered before the hold ended");
+    assert.ok(Date.now() - started >= 55, "answered before the hold ended");
     assert.equal(await client.ended, "ECONNRESET");
     const stats = proxy.stats();
     assert.equal(stats.resets, 1);
-    assert.ok(stats.medianResetLifetimeMs >= 75);
+    assert.ok(stats.medianResetLifetimeMs >= 130, `lifetime ${stats.medianResetLifetimeMs} ms is shorter than hold + life`);
+    await proxy.setMode("pass");
+  });
+
+  it("flap: counts only connections accepted since resetStats in the failed-attempt time", async () => {
+    await proxy.setMode("pass");
+    const client = connect(proxy.port);
+    await client.opened;
+    client.socket.write(startup());
+    await until(() => client.state.received.length >= 6);
+    await sleep(150);
+    proxy.resetStats();
+    await proxy.setMode("flap", { lifeMs: 20, holdMs: 10 });
+    assert.equal(await client.ended, "ECONNRESET");
+    const stats = proxy.stats();
+    assert.equal(stats.resets, 1);
+    assert.equal(stats.medianResetLifetimeMs, null);
     await proxy.setMode("pass");
   });
 
