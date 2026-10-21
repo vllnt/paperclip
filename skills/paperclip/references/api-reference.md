@@ -1496,6 +1496,7 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies). `targetIssueId` (UUID) starts the routine's steps on that existing task: `202` with the run and `warnings`; `404` task not in the company, `409` task busy (status not backlog/todo/blocked, live run, open steps) or the routine was edited while the run started (send it again), `422` no steps or task refused. CLI `routine run <id> --target-issue <uuid-or-identifier>` |
 | POST   | `/api/routine-triggers/public/:publicId/fire` | Fire webhook trigger from external system |
 | GET    | `/api/routines/:routineId/runs` | Run history (default 50) |
+| GET    | `/api/companies/:companyId/routines/timeline` | Every routine with its runs in a window, the next fires of its schedule triggers (at most 500), and the links between routines, steps, event sources, goals and projects. `?from=&to=` are ISO date-times with an offset; the default is a day back and a day ahead; at most 31 days (`400`). CLI `routine timeline` |
 | GET    | `/api/routines/:routineId/event-groups` | Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`) |
 
 ### Event Sources

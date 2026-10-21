@@ -456,6 +456,9 @@ export const queryKeys = {
         ? (["routines", companyId, projectId ?? "__all-projects__", narrowing] as const)
         : (["routines", companyId, projectId ?? "__all-projects__"] as const);
     },
+    /** Under `all`, so a routine change refreshes the timeline too. */
+    timeline: (companyId: string, from: string, to: string) =>
+      ["routines", companyId, "timeline", from, to] as const,
     detail: (id: string) => ["routines", "detail", id] as const,
     runs: (id: string) => ["routines", "runs", id] as const,
     revisions: (id: string) => ["routines", "revisions", id] as const,

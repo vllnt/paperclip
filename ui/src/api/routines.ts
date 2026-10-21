@@ -8,11 +8,12 @@ import type {
   RoutineRun,
   RoutineRunSummary,
   RoutineStepWarning,
+  RoutineTimelineResult,
   RoutineTrigger,
   RoutineTriggerSecretMaterial,
 } from "@paperclipai/shared";
 import { activityApi } from "./activity";
-import { api } from "./client";
+import { api, type RequestOptions } from "./client";
 
 /** Routine create and update answer with the saved routine plus the non-blocking step warnings. */
 export type RoutineWriteResponse = Routine & { warnings: RoutineStepWarning[] };
@@ -42,6 +43,12 @@ export interface RestoreRoutineRevisionResponse {
   secretMaterials: RestoreRoutineRevisionSecretMaterial[];
 }
 
+/** The window of the routines timeline; both are ISO instants with an offset. */
+export interface RoutineTimelineParams {
+  from?: string;
+  to?: string;
+}
+
 /** Filters of the company routine list; each one maps to a `GET .../routines` query parameter. */
 export type RoutineListFilters = { [K in keyof ListRoutinesQuery]?: ListRoutinesQuery[K] | null };
 
@@ -53,6 +60,13 @@ export const routinesApi = {
     }
     const query = params.toString();
     return api.get<RoutineListItem[]>(`/companies/${companyId}/routines${query ? `?${query}` : ""}`);
+  },
+  timeline: (companyId: string, params: RoutineTimelineParams = {}, options?: RequestOptions) => {
+    const search = new URLSearchParams();
+    if (params.from) search.set("from", params.from);
+    if (params.to) search.set("to", params.to);
+    const query = search.toString();
+    return api.get<RoutineTimelineResult>(`/companies/${companyId}/routines/timeline${query ? `?${query}` : ""}`, options);
   },
   create: (companyId: string, data: Record<string, unknown>) =>
     api.post<RoutineWriteResponse>(`/companies/${companyId}/routines`, data),

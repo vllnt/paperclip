@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { WorkTimelineResult } from "@paperclipai/shared";
-import { chooseTickStepMs, computeLayout, issueColor, shortLabel, type LayoutOptions } from "./layout";
+import { AXIS_H, SECTION_H, chooseTickStepMs, computeLayout, issueColor, shortLabel, type LayoutOptions } from "./layout";
 
 const DAY = "2026-07-02";
 const t = (hhmm: string) => `${DAY}T${hhmm}:00.000Z`;
@@ -223,6 +223,58 @@ describe("human activity markers", () => {
   it("still excludes a human with no in-window events", () => {
     const layout = computeLayout(sample(), OPTS); // events: []
     expect(layout.rows.map((r) => r.actor.type)).not.toContain("user");
+  });
+});
+
+describe("row options for a caller that lists every actor", () => {
+  const rowsOf = (layout: ReturnType<typeof computeLayout>) => layout.rows.map((r) => r.actor.id);
+
+  it("keeps an actor with no run in the window when asked", () => {
+    const layout = computeLayout(sample(), { ...OPTS, keepEmptyActors: true });
+    expect(rowsOf(layout)).toContain("user:dotta");
+    const empty = layout.rows.find((r) => r.actor.id === "user:dotta")!;
+    expect(empty.bars).toEqual([]);
+    expect(empty.laneCount).toBe(1);
+    expect(empty.h).toBeGreaterThanOrEqual(OPTS.rowH);
+  });
+
+  it("orders rows with the given comparison instead of by first run", () => {
+    const byName = computeLayout(sample(), {
+      ...OPTS,
+      compareActors: (a, b) => a.name.localeCompare(b.name),
+    });
+    const names = byName.rows.map((r) => r.actor.name);
+    expect(names).toEqual([...names].sort((a, b) => a.localeCompare(b)));
+  });
+
+  it("starts a titled band where the group changes and pushes the rows below it down", () => {
+    const plain = computeLayout(sample(), OPTS);
+    const grouped = computeLayout(sample(), {
+      ...OPTS,
+      sectionOf: (actor) => (actor.type === "agent" ? "Agents" : "Others"),
+    });
+    const titled = grouped.rows.filter((r) => r.sectionTitle !== null);
+    // the plain layout has no bands and starts at the top
+    expect(plain.rows.every((r) => r.sectionTitle === null)).toBe(true);
+    expect(plain.rows[0]!.y).toBe(0);
+    // two groups, two bands, the first row of each carries the title
+    expect(titled.map((r) => r.sectionTitle).sort()).toEqual(["Agents", "Others"]);
+    expect(grouped.rows[0]!.y).toBe(SECTION_H);
+    expect(grouped.height).toBe(plain.height + 2 * SECTION_H);
+    // rows of one group sit together and never overlap
+    for (let i = 1; i < grouped.rows.length; i++) {
+      const prev = grouped.rows[i - 1]!;
+      const row = grouped.rows[i]!;
+      expect(row.y).toBe(prev.y + prev.h + (row.sectionTitle === null ? 0 : SECTION_H));
+    }
+    expect(grouped.height).toBeGreaterThan(AXIS_H);
+  });
+
+  it("widens a bar to the narrowest width asked for", () => {
+    const narrow = computeLayout(sample(), OPTS).rows.flatMap((r) => r.bars);
+    const wide = computeLayout(sample(), { ...OPTS, minBarPx: 12 }).rows.flatMap((r) => r.bars);
+    expect(Math.min(...narrow.map((b) => b.x2 - b.x1))).toBeGreaterThanOrEqual(3);
+    expect(Math.min(...wide.map((b) => b.x2 - b.x1))).toBeGreaterThanOrEqual(12);
   });
 });
 
