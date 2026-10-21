@@ -212,6 +212,7 @@ export function companyService(db: Db) {
     requireBoardApprovalForNewAgents: companies.requireBoardApprovalForNewAgents,
     interactionResolverGovernance: companies.interactionResolverGovernance,
     duplicateDetectionMode: companies.duplicateDetectionMode,
+    issueTriageMode: companies.issueTriageMode,
     automationWakeSettings: companies.automationWakeSettings,
     routineNoopSkipSettings: companies.routineNoopSkipSettings,
     runContextPolicy: companies.runContextPolicy,

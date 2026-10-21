@@ -74,6 +74,8 @@ import {
   upsertIssueWatchdogSchema,
   findSimilarIssuesSchema,
   labelDuplicatePairSchema,
+  issueTriageEntrySchema,
+  listIssueTriageQuerySchema,
   runnerGoalActionRequestSchema,
   // Project
   createProjectSchema,
@@ -4383,6 +4385,25 @@ registry.registerPath({
   request: { params: z.object({ id: z.string() }) },
   responses: {
     200: r.ok(),
+    401: r.unauthorized,
+    404: { ...r.notFound, description: "Issue not found, or it belongs to another company" },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/triage",
+  tags: ["issues"],
+  summary: "List the recorded triage of an issue: suggested priority, category and owner, with the model's probabilities",
+  request: { params: z.object({ id: z.string() }), query: listIssueTriageQuerySchema },
+  responses: {
+    200: r.ok(
+      z.object({
+        items: z.array(issueTriageEntrySchema.extend({ id: z.string(), createdAt: z.string() })),
+        nextCursor: z.string().nullable(),
+      }),
+    ),
+    400: r.badRequest,
     401: r.unauthorized,
     404: { ...r.notFound, description: "Issue not found, or it belongs to another company" },
   },

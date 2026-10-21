@@ -70,7 +70,9 @@ import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
 import { issueDuplicateRoutes } from "./routes/issue-duplicates.js";
-import { createDuplicateDetection } from "./services/duplicate-detection-factory.js";
+import { createCompanyJudgeClient, createDuplicateDetection } from "./services/duplicate-detection-factory.js";
+import { createIssueTriage } from "./modules/issue-triage/index.js";
+import { issueTriageRoutes } from "./routes/issue-triage.js";
 import { setIssueCreatedListener } from "./services/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
 import { issueGitLinkRoutes } from "./routes/issue-git-links.js";
@@ -875,8 +877,17 @@ export async function createApp(
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
   const duplicateDetection = createDuplicateDetection(db);
-  setIssueCreatedListener((event) => void duplicateDetection.checkAfterCreate(event));
+  const issueTriage = createIssueTriage({
+    db,
+    judge: createCompanyJudgeClient(db, "issue-triage"),
+    heartbeat: heartbeatService(db, { pluginWorkerManager: workerManager }),
+  });
+  setIssueCreatedListener((event) => {
+    void duplicateDetection.checkAfterCreate(event);
+    void issueTriage.checkAfterCreate(event);
+  });
   api.use(issueDuplicateRoutes(db, duplicateDetection));
+  api.use(issueTriageRoutes(db, issueTriage));
   api.use(issueRoutes(db, opts.storageService, {
     chatRunRetries: chatChannels,
     feedbackExportService: opts.feedbackExportService,

@@ -61,6 +61,8 @@ provider's default retention applies until it is confirmed otherwise (see Settin
 Roll out in this order: informed opt-in and retention confirmed → `suggest` → label real pairs → run the
 calibration script for that company → `comment` only if precision at 0.9 is at least 0.9.
 
+Issue triage ([issue-triage.md](issue-triage.md)) uses the same judge client, key, cap and cache.
+
 ## API and CLI
 
 ```

@@ -390,6 +390,7 @@ npx paperclipai company current [--company-id <company-id>]
 npx paperclipai company stats
 npx paperclipai company create --payload-json '{...}'
 npx paperclipai company update <company-id> --payload-json '{...}'
+npx paperclipai company update <company-id> --issue-triage-mode off|suggest|apply
 npx paperclipai company branding:update <company-id> --payload-json '{...}'
 npx paperclipai company archive <company-id>
 npx paperclipai company export <company-id> --out ./company --include company,agents,projects,issues,skills
@@ -428,6 +429,7 @@ npx paperclipai issue create --company-id <company-id> --title "..." [--descript
 npx paperclipai issue similar --company-id <company-id> --title "..." [--description "..."] [--parent-id <issue-id>]
 npx paperclipai issue duplicate-pairs <issue-id-or-identifier>
 npx paperclipai issue duplicate-label --company-id <company-id> <pair-id> duplicate|keep_both
+npx paperclipai issue triage <issue-id-or-identifier> [--limit 20] [--cursor <cursor>]
 npx paperclipai issue update <issue-id> [--status in_progress] [--comment "..."]
 npx paperclipai issue delete <issue-id> --yes
 npx paperclipai issue comment <issue-id> --body "..." [--attachment-id <id...>] [--reopen]

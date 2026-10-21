@@ -1,4 +1,4 @@
-import { companyRunTiersSchema } from "@paperclipai/shared";
+import { ISSUE_TRIAGE_MODES, companyRunTiersSchema, type IssueTriageMode } from "@paperclipai/shared";
 import { Command } from "commander";
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -55,7 +55,13 @@ interface CompanyJsonOptions extends BaseClientOptions {
 }
 interface CompanyUpdateOptions extends CompanyJsonOptions {
   runContextJson?: string;
+  issueTriageMode?: string;
   transientRetryPolicyJson?: string;
+}
+function parseIssueTriageMode(raw: string): IssueTriageMode {
+  const mode = ISSUE_TRIAGE_MODES.find((candidate) => candidate === raw);
+  if (!mode) throw new Error(`--issue-triage-mode must be one of: ${ISSUE_TRIAGE_MODES.join(", ")}`);
+  return mode;
 }
 interface AgentMeResponse {
   id: string;
@@ -1491,6 +1497,10 @@ export function registerCompanyCommands(program: Command): void {
         "Company run-context policy as JSON (maxComments, maxCommentChars, maxTotalCommentChars, window, truncationMarker, byWakeReason), or null to clear",
       )
       .option(
+        "--issue-triage-mode <mode>",
+        `Issue triage mode: ${ISSUE_TRIAGE_MODES.join(", ")} (off = nothing is sent; suggest = record only; apply = also fill an empty assignee of a todo issue)`,
+      )
+      .option(
         "--transient-retry-policy-json <json>",
         'Company transient-retry policy, e.g. {"perIssuePerHour":2,"suppressWhenBlocked":true,"wakeTypes":{"transient_failure_retry":{"perIssuePerHour":1}}}. perIssuePerHour 0 = unlimited (default).',
       )
@@ -1500,12 +1510,17 @@ export function registerCompanyCommands(program: Command): void {
           const payload = {
             ...(opts.payloadJson ? (parseJson(opts.payloadJson) as Record<string, unknown>) : {}),
             ...(opts.runContextJson ? { runContextPolicy: parseJson(opts.runContextJson) } : {}),
+            ...(opts.issueTriageMode === undefined
+              ? {}
+              : { issueTriageMode: parseIssueTriageMode(opts.issueTriageMode) }),
             ...(opts.transientRetryPolicyJson === undefined
               ? {}
               : { transientRetryPolicy: parseJson(opts.transientRetryPolicyJson) }),
           };
           if (Object.keys(payload).length === 0) {
-            throw new Error("Provide --payload-json, --run-context-json or --transient-retry-policy-json.");
+            throw new Error(
+              "Provide --payload-json, --run-context-json, --issue-triage-mode or --transient-retry-policy-json.",
+            );
           }
           printOutput(await ctx.api.patch(apiPath`/api/companies/${companyId}`, payload), { json: ctx.json });
         } catch (err) {

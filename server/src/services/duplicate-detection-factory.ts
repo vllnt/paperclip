@@ -40,20 +40,29 @@ export function createCompanySecretKeyResolver(db: Db, consumerId = "duplicate-d
 }
 
 /**
+ * The judge client every governed Jev caller shares in shape: the company's own gateway key from its
+ * secrets (each read audited as `consumerId`), the daily cap backed by the database, and the default
+ * timeout and answer cache.
+ */
+export function createCompanyJudgeClient(db: Db, consumerId: string): JudgeClient {
+  const config = readJudgeConfig();
+  return createJudgeClient({
+    config,
+    usage: createJudgeUsageStore(db, config.dailyCallCap),
+    resolveApiKey: createCompanySecretKeyResolver(db, consumerId),
+  });
+}
+
+/**
  * Wires duplicate detection for the running server: each company's own gateway key from its secrets,
  * the daily cap backed by the database, and system comments posted through the issue service.
  * Create it once so the pre-create check and the after-create check share one answer cache.
  */
 export function createDuplicateDetection(db: Db): DuplicateDetectionService {
-  const config = readJudgeConfig();
   const issues = issueService(db);
   return duplicateDetectionService({
     db,
-    judge: createJudgeClient({
-      config,
-      usage: createJudgeUsageStore(db, config.dailyCallCap),
-      resolveApiKey: createCompanySecretKeyResolver(db),
-    }),
+    judge: createCompanyJudgeClient(db, "duplicate-detection"),
     postSystemComment: (issueId, body, tx) => issues.addComment(issueId, body, {}, { authorType: "system" }, tx),
   });
 }

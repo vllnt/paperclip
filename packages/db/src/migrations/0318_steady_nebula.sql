@@ -1,0 +1,1 @@
+ALTER TABLE "companies" ADD COLUMN "issue_triage_mode" text DEFAULT 'off' NOT NULL;

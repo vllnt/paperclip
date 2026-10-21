@@ -20,7 +20,9 @@ import {
   type FindSimilarIssuesResult,
   type HeartbeatRun,
   type IssueDuplicatePair,
+  type IssueTriagePage,
   labelDuplicatePairSchema,
+  listIssueTriageQuerySchema,
   linkIssueApprovalSchema,
   previewIssueTreeControlSchema,
   rejectIssueThreadInteractionSchema,
@@ -52,6 +54,7 @@ import {
   serializeFeedbackTraces,
 } from "./feedback.js";
 import { formatIssueTree, type IssueTreeResponse } from "./issue-tree.js";
+import { formatIssueTriage } from "./issue-triage.js";
 
 interface IssueBaseOptions extends BaseClientOptions {
   status?: string;
@@ -460,6 +463,34 @@ export function registerIssueCommands(program: Command): void {
             apiPath`/api/issues/${idOrIdentifier}/duplicate-pairs`,
           );
           printOutput(pairs, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("triage")
+      .description("Show the recorded triage of an issue: suggested priority, category and owner, with the model's probabilities")
+      .argument("<idOrIdentifier>", "Issue ID or identifier (e.g. PC-12)")
+      .option("--limit <n>", "Records per page (1-100)")
+      .option("--cursor <cursor>", "Cursor from a previous page's nextCursor")
+      .action(async (idOrIdentifier: string, opts: BaseClientOptions & { limit?: string; cursor?: string }) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const query = listIssueTriageQuerySchema.parse({ limit: opts.limit, cursor: opts.cursor });
+          const params = new URLSearchParams();
+          if (query.limit !== undefined) params.set("limit", String(query.limit));
+          if (query.cursor !== undefined) params.set("cursor", query.cursor);
+          const suffix = params.size > 0 ? `?${params.toString()}` : "";
+          const page = await ctx.api.get<IssueTriagePage>(`${apiPath`/api/issues/${idOrIdentifier}/triage`}${suffix}`);
+          if (ctx.json) {
+            printOutput(page, { json: true });
+            return;
+          }
+          for (const line of formatIssueTriage(page?.items ?? [])) console.log(line);
+          if (page?.nextCursor) console.log(`\nnext page: --cursor ${page.nextCursor}`);
         } catch (err) {
           handleCommandError(err);
         }

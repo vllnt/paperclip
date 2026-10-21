@@ -133,6 +133,7 @@ export function createBoundedRunner(
   concurrency: number,
   maxPending: number,
   deadlineMs: number = AFTER_CREATE_DEADLINE_MS,
+  label: string = "duplicate check",
 ): (job: () => Promise<void>) => Promise<void> {
   let active = 0;
   const pending: Array<() => void> = [];
@@ -150,7 +151,7 @@ export function createBoundedRunner(
           pending.shift()?.();
         };
         const deadline = setTimeout(() => {
-          logger.warn({ deadlineMs }, "duplicate check exceeded its deadline; freeing its slot");
+          logger.warn({ deadlineMs }, `${label} exceeded its deadline; freeing its slot`);
           release();
         }, deadlineMs);
         void Promise.resolve()
@@ -161,7 +162,7 @@ export function createBoundedRunner(
       if (active < concurrency) start();
       else if (pending.length < maxPending) pending.push(start);
       else {
-        logger.warn({ maxPending }, "duplicate check queue full; skipping check");
+        logger.warn({ maxPending }, `${label} queue full; skipping check`);
         resolve();
       }
     });

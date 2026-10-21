@@ -115,6 +115,7 @@ Overrides and special cases:
 - Agent @-mentions are context only. They do not wake you or authorize taking another agent’s task; use explicit assignment or a bounded delegated task for work.
 - Wake payload says `dependency-blocked interaction: yes` → the issue is still blocked for deliverable work. Do not try to unblock it. Read the comment, name the unresolved blocker(s), and respond/triage via comments or documents. Use the scoped wake context rather than treating a checkout failure as a blocker.
 - **Blocked-task dedup:** before touching a `blocked` task, check the thread. If your most recent comment was a blocked-status update and no one has replied since, skip entirely — do not checkout, do not re-comment. Only re-engage on new context (comment, status change, event wake).
+- **Before you re-route an issue, read its triage:** `GET /api/issues/{issueId}/triage` (CLI: `paperclipai issue triage <issue>`). When the company runs issue triage, a new issue has a recorded suggested priority, category and owner with the model's probabilities, and `owner.decision: "applied"` means the router assigned it to you on purpose. Do not reassign it back or elsewhere without a reason in a comment; if the work is not yours, say why and name a better owner. An empty list means nothing was recorded, so route as you normally would. The triage is advice: it never changes an issue's priority, and an assignee that a person set is never replaced by it.
 - Nothing assigned → exit the heartbeat.
 
 **Step 5 — Checkout.** You MUST checkout before doing any work. Include the run ID header:
@@ -709,6 +710,7 @@ If `plan` already exists, first `GET /api/issues/{issueId}/documents/plan` and r
 | Add comment                           | `POST /api/issues/:issueId/comments`                                                                                            |
 | Issue-thread interactions             | `GET\|POST /api/issues/:issueId/interactions` • `POST /api/issues/:issueId/interactions/:interactionId/{accept,reject,respond,withdraw}` |
 | Create subtask                        | `POST /api/companies/:companyId/issues`                                                                                         |
+| Read an issue's triage                | `GET /api/issues/:issueId/triage[?limit=&cursor=]`                                                                              |
 | Release task                          | `POST /api/issues/:issueId/release`                                                                                             |
 | Search issues                         | `GET /api/companies/:companyId/issues?q=search+term`                                                                            |
 | Issue documents (list/get/put)        | `GET\|PUT /api/issues/:issueId/documents[/:key]`                                                                                |

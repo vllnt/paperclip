@@ -121,3 +121,8 @@ ui/src/pages/AgentRoutinesTab.test.tsx
 ui/src/pages/IssueDetail.test.tsx
 ui/src/pages/Routines.test.tsx
 ui/src/pages/agent-detail-navigation.test.ts
+cli/src/__tests__/issue-triage.test.ts
+packages/shared/src/issue-triage.test.ts
+server/src/modules/issue-triage/adapters/judge.test.ts
+server/src/modules/issue-triage/application/triage-issue.test.ts
+server/src/modules/issue-triage/domain/policy.test.ts

@@ -6,6 +6,7 @@ import {
 import { automationWakeSettingsSchema } from "../automation-wake.js";
 import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
 import { DUPLICATE_DETECTION_MODES } from "../duplicate-detection.js";
+import { ISSUE_TRIAGE_MODES } from "../issue-triage.js";
 import { runContextPolicySchema } from "../run-context.js";
 import { transientRetryPolicySchema } from "../transient-retry-policy.js";
 import { objectWithoutDefaults } from "./partial.js";
@@ -44,6 +45,7 @@ export const updateCompanySchema = objectWithoutDefaults(
       requireBoardApprovalForNewAgents: z.boolean().optional(),
       interactionResolverGovernance: interactionResolverGovernanceSchema.optional(),
       duplicateDetectionMode: z.enum(DUPLICATE_DETECTION_MODES).optional(),
+      issueTriageMode: z.enum(ISSUE_TRIAGE_MODES).optional(),
       automationWakeSettings: automationWakeSettingsSchema.optional(),
       routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
       runContextPolicy: runContextPolicySchema.nullable().optional(),

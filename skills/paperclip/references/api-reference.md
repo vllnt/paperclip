@@ -366,6 +366,38 @@ Security and bounds:
 - Low-trust or boundary-scoped callers that cannot read company scope receive `null` for internal wake `agentId`/`runId` and activity `agentId`/`runId`/`holdId`.
 - The subtree walk is capped to depth 8 and 100 nodes with a cycle guard. Per-node blockers, wake requests, and activity records are also capped. Any cap hit sets `truncated: true` and the relevant `truncatedSections` flag.
 
+### Issue Triage (`GET /api/issues/:issueId/triage`)
+
+Read-only. Lists what the company's issue triage recorded for an issue, newest first: a suggested priority, a short category and a suggested owner, with the model's probabilities. Query: `limit` (1-100, default 20) and `cursor` (the previous page's `nextCursor`). CLI: `paperclipai issue triage <issue>`. An empty `items` list means triage is off for the company or has not run on this issue.
+
+```json
+{
+  "items": [
+    {
+      "id": "activity-1", "createdAt": "2026-10-21T10:00:00.000Z", "version": 1,
+      "issueId": "issue-99", "companyId": "company-1",
+      "mode": "apply", "outcome": "applied", "reason": null,
+      "modelId": "typesafe-ai/jev", "modelCalls": 1, "inputHashes": ["<sha256>"],
+      "thresholds": { "ownerMinProbability": 0.8, "ownerMinMargin": 0.2 },
+      "priority": { "current": "medium", "suggested": "high", "probabilities": { "high": 0.7, "medium": 0.3 } },
+      "category": { "suggested": "bug", "probabilities": { "bug": 0.9, "feature": 0.1 } },
+      "owner": {
+        "suggestedAgentId": "agent-1", "suggestedAgentName": "Builder",
+        "probabilities": { "agent-1": 0.9, "agent-2": 0.06, "none": 0.04 },
+        "topProbability": 0.9, "margin": 0.84, "decision": "applied",
+        "appliedAgentId": "agent-1", "candidateCount": 2
+      }
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+- `outcome` is `suggested` (nothing changed), `applied` (the router set the assignee), `skipped` (a rule kept the issue's values; `reason` is `routine_origin` or `short_title`) or `degraded` (no key, daily cap, timeout or error; `reason` says which).
+- `owner.decision` names why the router did or did not assign: `applied`, `mode_suggest`, `not_todo`, `no_candidates`, `no_owner_suggested`, `no_probabilities`, `below_probability`, `below_margin`, `assignee_changed` or `not_assignable`.
+- The router only fills an empty assignee of a `todo` issue, and only when the top owner probability is at least `0.8` and beats the next by `0.2`. It never reassigns and never changes priority, so `priority.suggested` is advice only.
+- Read it before re-routing an issue. It holds no issue text.
+
 ### Execution Policy Fields On An Issue
 
 When an issue has review or approval gates, `GET /api/issues/:issueId` can also include `executionPolicy` and `executionState`:
