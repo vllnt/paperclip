@@ -352,6 +352,19 @@ describe("incremental GitHub task sync", () => {
     expect(looks).toEqual([0, 1, 3, 7, 15, 31, 61, 91, 121, 151]);
     expect(await f.h.ctx.state.get(queueKey())).toEqual({});
   });
+  it("counts a failure only when its look was due, also for the newest issue that every run lists again", async () => {
+    const f = await synced();
+    await editHere(f, 3, "Local title");
+    f.update.mockRejectedValue(new GitHubError(403));
+    const advance = skewClock();
+    for (let minute = 0; minute < 10; minute++) {
+      await f.service.sync(companyId);
+      advance(60_000);
+    }
+    // The walk listed issue 3 on each of the 10 runs; its looks were due in runs 0, 1, 3 and 7.
+    expect(f.list).toHaveBeenCalledTimes(10);
+    expect((await f.h.ctx.state.get(queueKey()) as Record<string, { attempts?: number }>)["3"]?.attempts).toBe(4);
+  });
   it("gives the issues that keep failing only a share of the run, so GitHub's changes still sync", async () => {
     const f = await fixture();
     f.remote.clear();

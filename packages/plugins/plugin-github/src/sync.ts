@@ -382,6 +382,9 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
    */
   function retry(companyId: string, queued: SyncQueue, item: { githubId: number | string; repositoryId: number; number: number }) {
     const id = String(item.githubId), taken = queued[id], attempts = (taken?.attempts ?? 0) + 1;
+    // Only a look that was due counts. The walk lists the newest issue again on every run (the overlap); its failures while the
+    // issue waits for its next look would otherwise use up the attempts in a few minutes.
+    if (taken && taken.at > Date.now()) return Promise.resolve();
     return changeQueue(companyId, queue => {
       if (queue[id] && queue[id].at !== taken?.at) return;
       if (attempts >= QUEUE_ATTEMPTS) delete queue[id];
