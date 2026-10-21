@@ -74,8 +74,10 @@ export type DeferredWakeDisposition =
   | "superseded"
   /**
    * The same, but the wake carries saved input (for example a person's
-   * comment). Leave it parked: the new assignee's admission adopts its saved
-   * comments, and the release drain cancels it once the new assignee has run.
+   * comment) and another agent now holds the issue. Leave it parked: the new
+   * assignee's admission adopts its saved comments, and the release drain
+   * resolves it once the new assignee has run. With no agent assignee
+   * (a person or nobody), nothing would resolve it, so it is superseded.
    */
   | "keptForHandoff";
 
@@ -92,8 +94,8 @@ export type DeferredWakeDispositionFacts = {
  * Decides whether an orphaned parked wake may still run. An assignee wake
  * whose agent lost the issue is superseded: the new assignee got its own
  * wake, and this one could not check the issue out. It is closed with its
- * reason instead of started, unless it carries saved input, which is left
- * parked for the handoff. Every other wake is promoted, however long it
+ * reason instead of started, unless it carries saved input and another agent
+ * holds the issue: then it is left parked for the handoff. Every other wake is promoted, however long it
  * waited: closing an old wake on an open issue could leave assigned work with
  * no run, because the stranded-issue recovery does not dispatch every such
  * issue again.
@@ -104,7 +106,7 @@ export function decideDeferredWakeDisposition(wake: DeferredWakeDispositionFacts
     ASSIGNEE_WAKE_REASONS.has(wake.wakeReason) &&
     wake.issueAssigneeAgentId !== wake.agentId
   ) {
-    return wake.carriesSavedInput ? "keptForHandoff" : "superseded";
+    return wake.carriesSavedInput && wake.issueAssigneeAgentId !== null ? "keptForHandoff" : "superseded";
   }
   return "promote";
 }

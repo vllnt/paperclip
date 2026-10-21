@@ -1399,6 +1399,46 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       expect(assigneeRunReasons).toContain("issue_assigned");
     });
 
+    it("closes a former assignee's saved-comment wake when a person or nobody holds the issue, so it never stays parked", async () => {
+      // No agent assignee means no assignment admission to adopt the comment
+      // and no release drain to hand it over: kept, it would be parked for good.
+      const companyId = await seedCompany();
+      const formerId = await seedAgent(companyId, { name: "FormerAssignee", maxConcurrentRuns: 3 });
+      const cases = [
+        { title: "Handed to a person", assigneeUserId: "board-user" },
+        { title: "Unassigned", assigneeUserId: null },
+      ];
+      const seeded = [];
+      for (const testCase of cases) {
+        const issueId = await seedIssue(companyId, { assigneeAgentId: formerId, title: testCase.title });
+        await db
+          .update(issues)
+          .set({ assigneeAgentId: null, assigneeUserId: testCase.assigneeUserId })
+          .where(eq(issues.id, issueId));
+        const [comment] = await db
+          .insert(issueComments)
+          .values({ companyId, issueId, authorUserId: "board-user", body: "Please also update the changelog." })
+          .returning();
+        const wakeId = await seedDeferredWake(companyId, formerId, issueId, {
+          ageMs: 40 * MINUTE_MS,
+          reason: "issue_commented",
+          commentIds: [comment!.id],
+          actor: { type: "user", id: "board-user" },
+        });
+        seeded.push({ issueId, wakeId });
+      }
+
+      const pass = await heartbeat.sweepDeferredWakes();
+      await heartbeat.drainActiveRunExecutions();
+
+      expect(pass).toMatchObject({ superseded: 2, keptForHandoff: 0, promoted: 0, failed: 0 });
+      for (const { issueId, wakeId } of seeded) {
+        expect(await wakeRow(wakeId)).toMatchObject({ status: "cancelled", runId: null });
+        expect(await closedActivity(issueId)).toHaveLength(1);
+        expect(await runsForIssue(issueId)).toEqual([]);
+      }
+    });
+
     it("folds an agent's duplicate parked signal wakes on one issue into the promoted wake's run", async () => {
       const companyId = await seedCompany();
       const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });

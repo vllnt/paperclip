@@ -220,6 +220,14 @@ describe("decideDeferredWakeDisposition", () => {
     expect(decideDeferredWakeDisposition(facts({ wakeReason: "issue_commented", carriesSavedInput: true }))).toBe("promote");
   });
 
+  it("supersedes a former assignee's saved-input wake when no agent holds the issue, so it is never parked for good", () => {
+    for (const wakeReason of ["issue_commented", "issue_reopened_via_comment", "issue_assigned"]) {
+      expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: null, carriesSavedInput: true }))).toBe(
+        "superseded",
+      );
+    }
+  });
+
   it("still delivers a wake that addresses a non-assignee on purpose", () => {
     for (const wakeReason of ["issue_comment_mentioned", "execution_review_requested", "approval_approved", null]) {
       expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: "agent-b" }))).toBe("promote");
