@@ -1,1 +1,0 @@
-CREATE INDEX "heartbeat_runs_restart_resume_successor_idx" ON "heartbeat_runs" USING btree ("company_id","retry_of_run_id") WHERE "heartbeat_runs"."scheduled_retry_reason" = 'planned_restart_resume';

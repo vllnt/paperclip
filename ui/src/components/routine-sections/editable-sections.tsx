@@ -56,6 +56,19 @@ const concurrencyPolicyOptions = [
   },
 ];
 
+const slotPriorityOptions = [
+  {
+    value: "normal",
+    title: "Queue order",
+    description: "Runs wait in the agent's queue by priority and age, like the agent's other work.",
+  },
+  {
+    value: "first",
+    title: "Next free slot",
+    description: "The routine's runs start as soon as a run slot frees, before the agent's other queued work, which waits meanwhile.",
+  },
+];
+
 const catchUpPolicyOptions = [
   {
     value: "skip_missed",
@@ -515,6 +528,19 @@ export function DeliverySection() {
             setEditDraft((current) => ({ ...current, catchUpPolicy }))
           }
           options={catchUpPolicyOptions}
+        />
+      </div>
+      <div className="space-y-3">
+        <p className="text-xs font-medium uppercase tracking-(--tracking-caps) text-muted-foreground">
+          Slot priority
+        </p>
+        <RadioCardGroup
+          ariaLabel="Slot priority"
+          value={editDraft.slotPriority}
+          onValueChange={(slotPriority) =>
+            setEditDraft((current) => ({ ...current, slotPriority }))
+          }
+          options={slotPriorityOptions}
         />
       </div>
       <div className="space-y-3">
