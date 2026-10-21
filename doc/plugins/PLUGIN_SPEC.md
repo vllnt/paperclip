@@ -978,7 +978,7 @@ Plugins may declare scheduled jobs in their manifest.
 Job rules:
 
 1. Each job has a stable `job_key`.
-2. The host is the scheduler of record.
+2. The host is the scheduler of record. A long-running job does not delay other due jobs: the host starts each due job on the next scheduler tick, up to its limit on concurrent jobs.
 3. The host prevents overlapping execution of the same plugin/job combination unless explicitly allowed later.
 4. Every job run is recorded in Postgres.
 5. Failed jobs are retryable.
