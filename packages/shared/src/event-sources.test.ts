@@ -4,10 +4,14 @@ import {
   DEFAULT_EVENT_GROUP_KEY_TEMPLATE,
   EVENT_GROUP_KEY_TEMPLATE_MAX_LENGTH,
   EVENT_MAX_LABELS,
+  EVENT_SOURCE_NORMALIZERS,
   EVENT_WIRE_SCHEMA_ID,
+  PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
+  PAPERCLIP_ISSUE_EVENT_MAX_LABELS,
   createEventSourceSchema,
   eventGroupKeyTemplateSchema,
   eventGroupingSchema,
+  eventLabelsSchema,
   eventMatchSchema,
   eventSeverityRank,
   gatusNormalizerConfigSchema,
@@ -15,6 +19,7 @@ import {
   listEventDeliveriesQuerySchema,
   matchesEvent,
   matchesEventGlob,
+  paperclipIssueLabelEventKey,
   renderEventGroupKey,
   sanitizeEventMultiLine,
   sanitizeEventSingleLine,
@@ -404,6 +409,7 @@ describe("eventGroupingSchema", () => {
 
   it("validates issueMode", () => {
     expect(eventGroupingSchema.safeParse({ issueMode: "group" }).success).toBe(true);
+    expect(eventGroupingSchema.safeParse({ issueMode: "event_issue" }).success).toBe(true);
     expect(eventGroupingSchema.safeParse({ issueMode: "append" }).success).toBe(false);
     expect(eventGroupingSchema.safeParse({ issueMode: { appendToIssueId: "not-a-guid" } }).success).toBe(false);
     expect(eventGroupingSchema.safeParse({ issueMode: { appendToIssueId: GUID, extra: 1 } }).success).toBe(false);
@@ -733,6 +739,36 @@ describe("createEventSourceSchema", () => {
     });
     expect(invalid.success).toBe(false);
     if (!invalid.success) expect(invalid.error.issues[0]?.path).toEqual(["normalizerConfig"]);
+  });
+});
+
+describe("the built-in Paperclip source", () => {
+  it("can never be created or switched to through the schemas", () => {
+    expect(createEventSourceSchema.safeParse({ name: "x", normalizer: PAPERCLIP_INTERNAL_EVENT_NORMALIZER }).success).toBe(false);
+    expect(updateEventSourceSchema.safeParse({ normalizer: PAPERCLIP_INTERNAL_EVENT_NORMALIZER }).success).toBe(false);
+    expect(EVENT_SOURCE_NORMALIZERS).not.toContain(PAPERCLIP_INTERNAL_EVENT_NORMALIZER);
+  });
+
+  it("builds an event label key from a task label name", () => {
+    expect(paperclipIssueLabelEventKey("Bug")).toBe("label_bug");
+    expect(paperclipIssueLabelEventKey("Needs Review!")).toBe("label_needs_review");
+    expect(paperclipIssueLabelEventKey("  --Area: UI / UX--  ")).toBe("label_area_ui_ux");
+    expect(paperclipIssueLabelEventKey("snake_case_1")).toBe("label_snake_case_1");
+    expect(paperclipIssueLabelEventKey("!!!")).toBeNull();
+    expect(paperclipIssueLabelEventKey("日本語")).toBeNull();
+  });
+
+  it("keeps every label key a valid event label key of at most 64 characters", () => {
+    const key = paperclipIssueLabelEventKey(`${"a".repeat(57)} ${"b".repeat(30)}`);
+    expect(key).not.toBeNull();
+    expect(key!.length).toBeLessThanOrEqual(64);
+    expect(key).toMatch(/^[a-z0-9_]{1,64}$/);
+    expect(key!.endsWith("_")).toBe(false);
+    expect(eventLabelsSchema.safeParse({ [key!]: "true" }).success).toBe(true);
+  });
+
+  it("leaves room for project and created_by next to the task labels", () => {
+    expect(PAPERCLIP_ISSUE_EVENT_MAX_LABELS + 2).toBeLessThanOrEqual(EVENT_MAX_LABELS);
   });
 });
 

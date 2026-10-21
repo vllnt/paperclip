@@ -10,7 +10,12 @@ import {
   routineStepTemplateTexts,
   routineStepsSchema,
 } from "./routine-steps.js";
-import { createRoutineSchema, routineRevisionSnapshotSchema, updateRoutineSchema } from "./validators/routine.js";
+import {
+  createRoutineSchema,
+  routineRevisionSnapshotSchema,
+  runRoutineSchema,
+  updateRoutineSchema,
+} from "./validators/routine.js";
 
 const AGENT_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -263,5 +268,17 @@ describe("readRoutineStepsRunPayload", () => {
     expect(readRoutineStepsRunPayload({ variables: {} })).toBeNull();
     expect(readRoutineStepsRunPayload({ [ROUTINE_STEPS_RUN_PAYLOAD_KEY]: { steps: "nope" } })).toBeNull();
     expect(readRoutineStepsRunPayload("text")).toBeNull();
+  });
+});
+
+describe("running a routine on a task", () => {
+  it("accepts a task id and still accepts a run without one", () => {
+    expect(runRoutineSchema.parse({ targetIssueId: AGENT_ID }).targetIssueId).toBe(AGENT_ID);
+    expect(runRoutineSchema.parse({}).targetIssueId).toBeUndefined();
+    expect(runRoutineSchema.parse({ targetIssueId: null }).targetIssueId).toBeNull();
+  });
+
+  it("refuses a target that is not a UUID", () => {
+    expect(runRoutineSchema.safeParse({ targetIssueId: "PAP-12" }).success).toBe(false);
   });
 });

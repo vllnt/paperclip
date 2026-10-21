@@ -3,7 +3,10 @@ import type { RoutineVariable } from "./types/routine.js";
 // Tolerate markdown-escaped underscores (`\_`) inside placeholders. WYSIWYG markdown
 // editors (e.g. MDXEditor) serialize `_` between word chars as `\_` to prevent
 // reparse-as-emphasis, so a user-typed `{{pr_url}}` is stored as `{{pr\_url}}`.
-const ROUTINE_VARIABLE_MATCHER = /\{\{\s*([A-Za-z](?:\\_|[A-Za-z0-9_])*)\s*\}\}/g;
+// The two dotted names are the only exception to the plain-name rule: they name the task a routine
+// run was started on.
+const ROUTINE_VARIABLE_MATCHER =
+  /\{\{\s*(issue\.(?:title|identifier)|[A-Za-z](?:\\_|[A-Za-z0-9_])*)\s*\}\}/g;
 
 function unescapeRoutineVariableName(raw: string): string {
   return raw.replace(/\\_/g, "_");
@@ -12,10 +15,21 @@ function unescapeRoutineVariableName(raw: string): string {
 type RoutineTemplateInput = string | null | undefined | Array<string | null | undefined>;
 
 /**
+ * Variable names that name the task a routine run was started on. They have a value only when a
+ * run starts the routine's steps on an existing task; on every other run the placeholder is left as
+ * written.
+ */
+export const ROUTINE_TASK_VARIABLE_NAMES = ["issue.title", "issue.identifier"] as const;
+
+/**
  * Built-in variable names that are automatically available in routine templates
  * without needing to be defined in the routine's variables list.
  */
-export const BUILTIN_ROUTINE_VARIABLE_NAMES = new Set(["date", "timestamp"]);
+export const BUILTIN_ROUTINE_VARIABLE_NAMES: ReadonlySet<string> = new Set([
+  "date",
+  "timestamp",
+  ...ROUTINE_TASK_VARIABLE_NAMES,
+]);
 
 export function isBuiltinRoutineVariable(name: string): boolean {
   return BUILTIN_ROUTINE_VARIABLE_NAMES.has(name);

@@ -537,7 +537,7 @@ If you are asked to install a skill for the company or an agent you MUST read:
 Routines are recurring tasks. Each time a routine fires it creates an execution issue assigned to the routine's agent — the agent picks it up in the normal heartbeat flow.
 
 - Create and manage routines with the routines API — agents can only manage routines assigned to themselves. For repeatable multi-stage work, give the routine `steps` (sub-tasks each run creates in order, with review loops and fork/join) instead of creating the sub-tasks by hand; see `references/routines.md`.
-- Add triggers per routine: `schedule` (cron), `webhook`, `api` (manual), or `event` (an external signed alert from a board-created event source; see `references/routines.md`).
+- Add triggers per routine: `schedule` (cron), `webhook`, `api` (manual), or `event` (an external signed alert from a board-created event source; see `references/routines.md`). A routine with `steps` can also start them on a task that already exists (`targetIssueId` on the manual run) or on each task a person creates (an `event` trigger on the built-in Paperclip source with `issueMode: "event_issue"`). Save and run responses carry `warnings` for steps whose agent cannot take work. See `references/routines.md`.
 - Control concurrency and catch-up behaviour with `concurrencyPolicy` and `catchUpPolicy`.
 
 If you are asked to create or manage routines you MUST read:

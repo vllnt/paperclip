@@ -1487,13 +1487,13 @@ Terminal states: `done`, `cancelled`
 | ------ | ---- | ----------- |
 | GET    | `/api/companies/:companyId/routines` | List routines in company; optional filters `q`, `assigneeAgentId`, `projectId`, `folderId` (`none`), `status`, `trigger` (`schedule`, `webhook`, `api`, `event`, `manual`) |
 | GET    | `/api/routines/:routineId` | Routine details including triggers |
-| POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only; optional `steps`, sub-tasks each run creates, see `references/routines.md` Routine steps; CLI `routine create --steps-file <path>`) |
-| PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign; `steps` replaces the list, CLI `routine update <id> --steps-file <path>`; `GET` returns `steps`) |
-| POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`) |
+| POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only; optional `steps`, sub-tasks each run creates, see `references/routines.md` Routine steps; CLI `routine create --steps-file <path>`; the response carries `warnings` for steps whose agent cannot take work now) |
+| PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign; `steps` replaces the list, CLI `routine update <id> --steps-file <path>`; `GET` returns `steps`; the response carries `warnings`) |
+| POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`; `eventGrouping.issueMode: "event_issue"` starts the routine's steps on each task created, built-in Paperclip source only, see `references/routines.md` Event Triggers) |
 | PATCH  | `/api/routine-triggers/:triggerId` | Update trigger (e.g. disable, change cron) |
 | DELETE | `/api/routine-triggers/:triggerId` | Delete trigger |
 | POST   | `/api/routine-triggers/:triggerId/rotate-secret` | Rotate webhook signing secret (previous secret immediately invalidated) |
-| POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies) |
+| POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies). `targetIssueId` (UUID) starts the routine's steps on that existing task: `202` with the run and `warnings`; `404` task not in the company, `409` task busy (status not backlog/todo/blocked, live run, open steps), `422` no steps or task refused. CLI `routine run <id> --target-issue <uuid-or-identifier>` |
 | POST   | `/api/routine-triggers/public/:publicId/fire` | Fire webhook trigger from external system |
 | GET    | `/api/routines/:routineId/runs` | Run history (default 50) |
 | GET    | `/api/routines/:routineId/event-groups` | Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`) |
@@ -1505,7 +1505,7 @@ Signed external alert ingress; `event` routine triggers subscribe to a source. S
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | GET    | `/api/companies/:companyId/event-sources` | List sources (`?includeArchived=true`); no secrets |
-| POST   | `/api/companies/:companyId/event-sources` | Create source (board only); secret returned once in `secretMaterial` |
+| POST   | `/api/companies/:companyId/event-sources` | Create source (board only); secret returned once in `secretMaterial`. `POST /api/companies/:companyId/event-sources/paperclip` (board only, idempotent, CLI `event-sources ensure-paperclip -C <companyId>`) creates or returns the built-in Paperclip source instead: `issue.created` events, no URL, no secret; Paperclip manages it, so update (except `enabled`), archive, rotate and test answer `409` |
 | GET    | `/api/event-sources/:id` | Source details; no secret |
 | PATCH  | `/api/event-sources/:id` | Update source (board only) |
 | DELETE | `/api/event-sources/:id` | Archive source (board only, soft delete) |

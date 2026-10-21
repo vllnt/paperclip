@@ -260,6 +260,8 @@ export const runRoutineSchema = z.object({
   executionWorkspaceId: z.string().guid().optional().nullable(),
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
+  /** Attach the routine's steps to this existing task instead of opening a new root task. */
+  targetIssueId: z.string().guid().optional().nullable(),
 });
 
 export type RunRoutine = z.infer<typeof runRoutineSchema>;

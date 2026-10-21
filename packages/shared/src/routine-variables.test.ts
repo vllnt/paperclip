@@ -7,6 +7,7 @@ import {
   isBuiltinRoutineVariable,
   isRoutineDateVariableName,
   isValidRoutineDateString,
+  ROUTINE_TASK_VARIABLE_NAMES,
   syncRoutineVariablesWithTemplate,
 } from "./routine-variables.js";
 
@@ -137,5 +138,34 @@ describe("routine variable helpers", () => {
     expect(
       interpolateRoutineTemplate("Report for {{date}} ({{timestamp}}) on {{repo}}", allVars),
     ).toBe(`Report for ${builtins.date} (${builtins.timestamp}) on paperclip`);
+  });
+
+  it("extracts the two task variable names and no other dotted name", () => {
+    expect(
+      extractRoutineVariableNames("Review {{issue.title}} ({{ issue.identifier }}) for {{repo}}"),
+    ).toEqual(["issue.title", "issue.identifier", "repo"]);
+    expect(extractRoutineVariableNames("{{issue.id}} {{issue.title.x}} {{foo.bar}}")).toEqual([]);
+  });
+
+  it("treats the task variables as built in, so syncing never turns them into inputs", () => {
+    expect(isBuiltinRoutineVariable("issue.title")).toBe(true);
+    expect(isBuiltinRoutineVariable("issue.identifier")).toBe(true);
+    expect(isBuiltinRoutineVariable("issue.id")).toBe(false);
+    expect(syncRoutineVariablesWithTemplate("Work on {{issue.title}} in {{repo}}", [])).toEqual([
+      { name: "repo", label: null, type: "text", defaultValue: null, required: true, options: [] },
+    ]);
+  });
+
+  it("interpolates the task variables when given and leaves them as written otherwise", () => {
+    const template = "Work on {{issue.identifier}}: {{issue.title}}";
+    expect(
+      interpolateRoutineTemplate(template, { "issue.identifier": "ENG-7", "issue.title": "Fix login" }),
+    ).toBe("Work on ENG-7: Fix login");
+    expect(interpolateRoutineTemplate(template, { repo: "paperclip" })).toBe(template);
+  });
+
+  it("does not list the task variables among the values every run gets", () => {
+    expect(Object.keys(getBuiltinRoutineVariableValues()).sort()).toEqual(["date", "timestamp"]);
+    expect([...ROUTINE_TASK_VARIABLE_NAMES]).toEqual(["issue.title", "issue.identifier"]);
   });
 });
