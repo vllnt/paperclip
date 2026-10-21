@@ -12,7 +12,8 @@ export const LINK_CARD_W = 248;
 export const LINK_HEAD_H = 36;
 export const LINK_STEP_H = 24;
 const CARD_PAD_BOTTOM = 8;
-const COLUMN_GAP = 96;
+/** Wide enough for an edge label of `EDGE_LABEL_MAX` characters between two columns. */
+export const LINK_COLUMN_GAP = 144;
 const ROW_GAP = 16;
 const MARGIN = 20;
 const UNLINKED_COLUMNS = 3;
@@ -149,7 +150,7 @@ export function layoutRoutineLinks(nodes: RoutineTimelineNode[], edges: RoutineT
     for (const node of byColumn.get(column)!) {
       const steps = stepsOf.get(node.id) ?? [];
       const h = boxHeight(node, steps.length);
-      const x = MARGIN + columnKeys.indexOf(column) * (LINK_CARD_W + COLUMN_GAP);
+      const x = MARGIN + columnKeys.indexOf(column) * (LINK_CARD_W + LINK_COLUMN_GAP);
       const box: LinkBox = {
         node,
         x,
@@ -177,7 +178,7 @@ export function layoutRoutineLinks(nodes: RoutineTimelineNode[], edges: RoutineT
     const y2 = to.y + LINK_HEAD_H / 2;
     // A link that runs back (or within one column) bows out so it does not cross its own boxes.
     const forward = x2 > x1;
-    const bend = forward ? (x2 - x1) / 2 : COLUMN_GAP / 2;
+    const bend = forward ? (x2 - x1) / 2 : LINK_COLUMN_GAP / 2;
     paths.push({
       edge,
       d: `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`,
@@ -227,7 +228,7 @@ export function layoutRoutineLinks(nodes: RoutineTimelineNode[], edges: RoutineT
     height = rowTop + Math.ceil(unlinkedNodes.length / UNLINKED_COLUMNS) * (LINK_HEAD_H + ROW_GAP) + MARGIN - ROW_GAP;
   }
 
-  const graphWidth = MARGIN * 2 + columnKeys.length * LINK_CARD_W + Math.max(0, columnKeys.length - 1) * COLUMN_GAP;
+  const graphWidth = MARGIN * 2 + columnKeys.length * LINK_CARD_W + Math.max(0, columnKeys.length - 1) * LINK_COLUMN_GAP;
   const unlinkedWidth = unlinked.length > 0 ? MARGIN * 2 + Math.min(unlinked.length, UNLINKED_COLUMNS) * (LINK_CARD_W + ROW_GAP) - ROW_GAP : 0;
   return { boxes, paths, unlinked, unlinkedTop, width: Math.max(graphWidth, unlinkedWidth, 320), height: Math.max(height, 120) };
 }

@@ -57,6 +57,8 @@ const EDGE_STYLE: Record<RoutineTimelineEdgeKind, EdgeStyle> = {
 };
 
 const DISABLED_DASH = "3 3";
+/** The gap between two columns holds this many characters of a label (see `LINK_COLUMN_GAP`). */
+const EDGE_LABEL_MAX = 20;
 
 /** The page a node opens; a step opens its routine. */
 export function nodeHref(node: RoutineTimelineNode): string | null {
@@ -145,6 +147,7 @@ function Box({ box, onOpen }: { box: LinkBox; onOpen: (node: RoutineTimelineNode
 function Curve({ path, labelOf }: { path: LinkPath; labelOf: Map<string, string> }) {
   const style = EDGE_STYLE[path.edge.kind];
   const dash = path.edge.enabled ? style.dash : DISABLED_DASH;
+  const description = describeEdge(path.edge.kind, labelOf.get(path.edge.from) ?? path.edge.from, labelOf.get(path.edge.to) ?? path.edge.to);
   return (
     <g data-testid={`routine-link-edge-${path.edge.kind}`} opacity={path.edge.enabled ? 1 : 0.55}>
       <path
@@ -155,13 +158,27 @@ function Curve({ path, labelOf }: { path: LinkPath; labelOf: Map<string, string>
         strokeDasharray={dash}
         markerEnd="url(#routine-link-arrow)"
       />
-      {path.edge.label && path.edge.kind !== "step_after" && (
-        <text x={path.labelX} y={path.labelY} textAnchor="middle" className="fill-muted-foreground text-xs">
-          {truncate(path.edge.label, 24)}
-        </text>
-      )}
-      <title>{`${describeEdge(path.edge.kind, labelOf.get(path.edge.from) ?? path.edge.from, labelOf.get(path.edge.to) ?? path.edge.to)}${path.edge.enabled ? "" : " (switched off)"}`}</title>
+      <title>{`${description}${path.edge.label ? ` (${path.edge.label})` : ""}${path.edge.enabled ? "" : " (switched off)"}`}</title>
     </g>
+  );
+}
+
+/** Drawn above the boxes with a halo of the card colour, so a label never sinks under a box or a line. */
+function EdgeLabel({ path }: { path: LinkPath }) {
+  if (!path.edge.label || path.edge.kind === "step_after") return null;
+  return (
+    <text
+      x={path.labelX}
+      y={path.labelY}
+      textAnchor="middle"
+      className="fill-muted-foreground text-xs"
+      stroke="var(--color-card)"
+      strokeWidth={4}
+      paintOrder="stroke"
+      data-testid="routine-link-edge-label"
+    >
+      {truncate(path.edge.label, EDGE_LABEL_MAX)}
+    </text>
   );
 }
 
@@ -181,6 +198,8 @@ export function RoutineLinksGraph({
   const navigate = useNavigate();
   const layout = useMemo(() => layoutRoutineLinks(nodes, edges), [nodes, edges]);
   const labelOf = useMemo(() => new Map(nodes.map((node) => [node.id, node.label])), [nodes]);
+  const linkPaths = useMemo(() => layout.paths.filter((path) => path.edge.kind !== "step_after"), [layout]);
+  const stepPaths = useMemo(() => layout.paths.filter((path) => path.edge.kind === "step_after"), [layout]);
   const open = (node: RoutineTimelineNode) => {
     const href = nodeHref(node);
     if (href) navigate(href);
@@ -218,11 +237,18 @@ export function RoutineLinksGraph({
               <path d="M0,0 L8,4 L0,8 z" fill="var(--color-muted-foreground)" />
             </marker>
           </defs>
-          {layout.paths.map((path) => (
+          {linkPaths.map((path) => (
             <Curve key={path.edge.id} path={path} labelOf={labelOf} />
           ))}
           {layout.boxes.map((box) => (
             <Box key={box.node.id} box={box} onOpen={open} />
+          ))}
+          {/* A step edge runs inside its routine's box: above the box, or the box's fill hides it. */}
+          {stepPaths.map((path) => (
+            <Curve key={path.edge.id} path={path} labelOf={labelOf} />
+          ))}
+          {linkPaths.map((path) => (
+            <EdgeLabel key={`label-${path.edge.id}`} path={path} />
           ))}
           {layout.unlinkedTop !== null && (
             <text x={20} y={layout.unlinkedTop + 18} className="fill-muted-foreground text-xs font-semibold">

@@ -222,7 +222,7 @@ function TimelineView({ data, anchorMs }: { data: RoutineTimelineResult; anchorM
             {model.runCount} run{model.runCount === 1 ? "" : "s"} · {model.fireCount} next fire{model.fireCount === 1 ? "" : "s"} ·{" "}
             {rangeLabel}
           </p>
-          <div className="flex items-center gap-1" aria-label="Timeline zoom controls">
+          <div className="flex items-center gap-1" role="group" aria-label="Timeline zoom controls">
             <Button type="button" variant="outline" size="icon-xs" onClick={() => adjustZoom(0.8)} aria-label="Zoom out" title="Zoom out">
               <Minus className="h-3 w-3" />
             </Button>

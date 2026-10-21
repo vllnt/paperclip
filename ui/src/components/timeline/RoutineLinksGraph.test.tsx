@@ -67,6 +67,26 @@ describe("RoutineLinksGraph", () => {
     }
   });
 
+  it("draws a step edge and every edge label above the boxes, so a box's fill does not hide them", () => {
+    render();
+    const graph = container.querySelector('svg[aria-label="Links between routines"]')!;
+    const triage = graph.querySelector('[aria-label="Routine Triage"]')!;
+    const follows = (earlier: Element, later: Element) => Boolean(earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(follows(triage, graph.querySelector('[data-testid="routine-link-edge-step_after"]')!)).toBe(true);
+    expect(follows(triage, graph.querySelector('[data-testid="routine-link-edge-label"]')!)).toBe(true);
+    // The links between two boxes stay under the boxes.
+    expect(follows(graph.querySelector('[data-testid="routine-link-edge-event_trigger"]')!, triage)).toBe(true);
+  });
+
+  it("cuts a long edge label to fit the gap and keeps the whole label in the tooltip", () => {
+    const longLabel = "type: issue.created, issue.updated";
+    render(nodes, [edge({ id: "e1", kind: "event_trigger", from: "event_source:s1", to: "routine:r1", label: longLabel })]);
+    const text = container.querySelector('[data-testid="routine-link-edge-label"]')!.textContent!;
+    expect(text.length).toBeLessThanOrEqual(20);
+    expect(text.endsWith("…")).toBe(true);
+    expect(container.querySelector('[data-testid="routine-link-edge-event_trigger"] title')?.textContent).toContain(longLabel);
+  });
+
   it("lists the steps inside their routine and groups routines without a link apart", () => {
     render();
     expect(container.textContent).toContain("Read");
