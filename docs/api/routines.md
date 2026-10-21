@@ -124,7 +124,7 @@ A step has these fields:
 | `title` | yes | Task title, at most 200 characters. `{{variables}}` are filled in at run time |
 | `description` | no | Task instructions in Markdown. `{{variables}}` and `skill://` mentions work |
 | `assigneeAgentId` | no | Agent that runs the step. Defaults to the run's agent: the `assigneeAgentId` of the run request, else the routine's agent. An agent can name only itself in a run of a routine with steps. Validation fails when a step has neither |
-| `after` | no | Keys of the steps this one waits for. Empty (default) means it starts with the run |
+| `after` | no | The steps this one waits for: a step key, or `{ "step": "<key>", "when": "done" \| "cancelled" }` to run on that step's outcome (see [Conditions](#conditions-on-steps)). Empty (default) means it starts with the run |
 | `priority` | no | Defaults to the routine's priority |
 | `labelIds` | no | Labels of the company |
 | `executionPolicy` | no | Review and approval stages for the step, as on any task |
@@ -132,7 +132,7 @@ A step has these fields:
 
 A `skill://<skillId>` mention in a step description gives the step's agent that company skill for the run. It applies on adapters that sync skills and on `paperclip_runner`; it is ignored on `cursor_cloud`, `openclaw_gateway`, `http` and `process`.
 
-Rules checked when you save: keys are unique, `after` points at other steps, there are no cycles, at most 25 steps, and every agent and label belongs to the company. Variables that appear only in a step are added to the routine's variables, so manual runs ask for them.
+Rules checked when you save: keys are unique, `after` points at other steps, a step names another step only once (two entries for one step with different conditions are refused), there are no cycles, at most 25 steps, and every agent and label belongs to the company. Variables that appear only in a step are added to the routine's variables, so manual runs ask for them.
 
 **What a run creates.** The run's task and its steps are created together in one savepoint of the dispatch transaction:
 
@@ -145,7 +145,32 @@ If creating the task or any step fails, none of them is kept and the run is reco
 
 The run record keeps `routineSteps: { steps, stepIssueIds }` in its trigger payload, so later edits to the routine never change a run in flight. The `routineSteps` and `targetIssueId` keys are reserved: a trigger payload you send with either key loses it (send `targetIssueId` as a field of the run request instead). To stop a run, cancel its task with the existing tree control (cancel the task and its sub-tasks): the root and every step are cancelled, and the routine is free for the next run.
 
-**A cancelled step.** A cancelled step never counts as done, so the steps that wait for it stay `blocked` and the run's task stays blocked. Nothing cascades: the blocked steps stay visible so a person can decide. Once every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled*. A stalled run no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run where another branch is still running stays live. When the run's task is next updated, a stalled run is recorded as `failed`. To clean up a stalled run, cancel its task with the tree control.
+**A cancelled step.** A cancelled step never counts as done, so the steps that wait for it with a plain `after` stay `blocked` and the run's task stays blocked. Nothing cascades without a condition: the blocked steps stay visible so a person can decide. Once every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled*. A stalled run no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run where another branch is still running stays live. When the run's task is next updated, a stalled run is recorded as `failed`. To clean up a stalled run, cancel its task with the tree control.
+
+### Conditions on steps
+
+A step can run on the outcome of another step. The outcome of a step is its final status, `done` or `cancelled`. For a step with an approval or review stage, `done` means approved, and `cancelled` means rejected or stopped by the board. A reviewer who asks for changes does not end the step.
+
+```
+PATCH /api/routines/{routineId}
+{
+  "steps": [
+    { "key": "review", "title": "Review {{target}}", "executionPolicy": { "stages": [{ "type": "approval" }] } },
+    { "key": "ship", "title": "Ship", "after": [{ "step": "review", "when": "done" }] },
+    { "key": "rework", "title": "Rework", "after": [{ "step": "review", "when": "cancelled" }] },
+    { "key": "announce", "title": "Announce", "after": ["ship", "rework"] }
+  ]
+}
+```
+
+- `{ "step": "review", "when": "done" }` waits for `review` and runs only if it is done. `"when": "cancelled"` runs only if it is cancelled. A plain key waits for the step to be done, as before.
+- A condition that does not match is a *dead* edge, and so is any edge from a skipped step. A step whose edges are all dead is cancelled with the comment `Skipped: condition not met`, and the rule repeats for the steps after it. A step with some dead and some live edges drops the dead ones and waits for the live ones. In the example above, when the review is approved `rework` is skipped and `announce` runs after `ship`; when the board cancels the review, `ship` is skipped and `announce` runs after `rework`.
+- A plain `after` on a cancelled step is not dead. The step stays `blocked`, so a cancel that no condition handles never cascades.
+- The run's task stops waiting for skipped steps, and for cancelled steps whose every outgoing `after` has a condition (the cancel is an outcome the routine handles). A cancelled step that a plain `after` waits for still holds the run.
+- A step that a person blocked is never skipped.
+- Skipped steps are ordinary cancelled tasks, so they stay visible in the run. Steps that become ready are woken once, with `issue_blockers_resolved`.
+- Paperclip applies the conditions as soon as a step ends, and a periodic check applies them again if that was missed. Both give the same result, so you never need to repeat anything.
+- Rolling back to a version of Paperclip from before conditions cannot run a routine that has them. See `doc/DATABASE.md`.
 
 **Concurrency.** For a routine with steps, an open root of an earlier run counts as live: `skip_if_active` and `coalesce_if_active` act on it until it is done or cancelled, or until the run is stalled (see above). `always_enqueue` is unchanged.
 
@@ -154,10 +179,10 @@ The run record keeps `routineSteps: { steps, stepIssueIds }` in its trigger payl
 **Limits.**
 
 - Routine environment variables and secrets apply to the run's task only. Step agents do not inherit them.
-- `after` entries are plain step keys.
+- A condition goes on an `after` entry only. There is no condition on a whole step and no way to combine conditions (all the live edges of a step must be met).
 - Steps are not supported with append issue mode (`appendToIssueId`); the API returns `422` with `Steps are not supported with append issue mode`.
 - For an event-triggered routine, the storm breaker counts alert groups, not issues, and each group can create up to 26 issues (the task plus 25 steps). Lower the source's `maxNewIssuesPerHour` if that is too many.
-- Steps are an API, CLI and UI feature of the routine. The routine UI edits key, title, instructions, agent, priority and `after`; `labelIds`, `executionPolicy` and `acceptanceCriteria` are set through the API or CLI. The UI keeps them when you edit a step.
+- Steps are an API, CLI and UI feature of the routine. The routine UI edits key, title, instructions, agent, priority, `after` and the condition on each `after` entry; `labelIds`, `executionPolicy` and `acceptanceCriteria` are set through the API or CLI. The UI keeps them when you edit a step.
 
 **Permissions.** Writing steps needs the same rights as assigning tasks. A board user needs `tasks:assign`. **An agent can only assign steps to itself**; naming another agent returns `403`. Restoring a revision that holds steps follows the same rules for an agent: the steps must be assigned to the agent, and a low-trust agent can restore only steps that already carry its containment (otherwise `403`; update the steps instead).
 
