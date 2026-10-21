@@ -8,7 +8,7 @@ export interface Repository { ownerId?: number; permissions?: Record<string, str
 export interface TaskAssociation { paperclipTask?: { id: string; identifier: string | null; status: string }; paperclipTaskError?: string }
 export interface GitHubIssue extends TaskAssociation { id: number; number: number; title: string; state: string; url: string; repository: string; updatedAt: string; assignees: string[]; body?: string; labels?: string[]; stateReason?: string | null }
 export interface Catalog { app: AppIdentity; installations: Installation[]; repositories: Repository[]; warnings: string[]; truncated: boolean }
-export interface IssuePage { issues: GitHubIssue[]; nextPage: number | null; repository: string }
+export interface IssuePage { issues: GitHubIssue[]; nextPage: number | null; repository: string; cursor?: string | null }
 export interface SetupStart { state: string; actionUrl: string; manifest: Record<string, unknown> }
 /** Why a company can or cannot use its configured App: only "connected" grants access. */
 export type ConnectionState = "connected" | "disconnected" | "not-configured" | "not-connected";
@@ -26,4 +26,5 @@ export interface AutomationRule {
   then: { agentId?: string; status?: "todo" | "backlog" | "in_review" | "blocked"; priority?: "low" | "medium" | "high" | "critical"; wake?: boolean };
 }
 export interface SyncSettings { enabled: boolean; rules: AutomationRule[] }
-export interface SyncReport { at: string; imported: number; updated: number; warnings: string[] }
+/** `checked` counts the issues a run looked at, `partial` says its time budget ended it before all its work was done. */
+export interface SyncReport { at: string; imported: number; updated: number; warnings: string[]; checked?: number; partial?: boolean; durationMs?: number }
