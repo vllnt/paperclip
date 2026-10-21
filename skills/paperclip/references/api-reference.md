@@ -1730,7 +1730,7 @@ A goal does not store its work. Tasks and routines link to a goal with `goalId`;
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
-| GET    | `/api/companies/:companyId/issues?goalId=:goalId` | Tasks whose own goal is this goal; add `status` for the open ones. A `goalId` that is not a UUID: 422 |
+| GET    | `/api/companies/:companyId/issues?goalId=:goalId` | Tasks whose own goal is this goal; add `status` for the open ones. A blank `goalId` counts as not set; one that is not a UUID: 400 |
 | GET    | `/api/companies/:companyId/routines?goalId=:goalId` | Routines whose own goal is this goal |
 | GET    | `/api/companies/:companyId/projects` | Projects; a project serves each goal in its `goalIds` |
 | GET    | `/api/companies/:companyId/goals/progress` | Done, open and total tasks per goal, including the tasks of its sub-goals |

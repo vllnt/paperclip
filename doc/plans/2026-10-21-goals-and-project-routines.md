@@ -54,7 +54,7 @@ Result: no migration in any slice. `issues.goal_id` and `routines.goal_id` have 
 ## Slice 2: goal links and goal pages (#351)
 
 - **Shared.** `goalId` on the routine list query; `goalAgentLinks`, which derives a goal's agents from its owner, open tasks and routines.
-- **Server.** `?goalId=` on the task and routine lists (a task list `goalId` that is not a UUID answers `422`). No links endpoint (see Schema decisions).
+- **Server.** `?goalId=` on the task and routine lists (a blank `goalId` counts as not set; a task list `goalId` that is not a UUID answers `400`, like the routine list). No links endpoint (see Schema decisions).
 - **UI.** Open tasks, Routines and Agents tabs on the goal page next to Sub-Goals and Projects; the Routines tab creates a routine for the goal in place. A goal picker in the routine composer, for a new routine and an edit. A Goals section on the project's Configuration tab: each goal the project serves, with the project's open tasks and routines for it and their agents, and link and unlink in place.
 - **CLI.** `goal links <id>`, `goal progress`, and `--goal-id` on `issue list`, `routine list`, `routine create` and `routine update` (`none` clears a routine's goal).
 - **OpenAPI and docs.** The `goalId` filters in the OpenAPI document, `docs/api/` and `doc/CLI.md`; a new last section, "A goal's linked work", in the skill's API reference, with its row in the runner capability inventory.

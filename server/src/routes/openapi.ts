@@ -4180,7 +4180,7 @@ registry.registerPath({
   summary: "List issues in a company",
   description:
     "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract. " +
-    "`goalId` returns the issues whose own goal is that goal; issues of its sub-goals are not included. A `goalId` that is not a UUID returns 422.",
+    "`goalId` returns the issues whose own goal is that goal; issues of its sub-goals are not included. A blank `goalId` counts as not set; one that is not a UUID returns 400.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: z
@@ -4193,8 +4193,8 @@ registry.registerPath({
   responses: {
     200: r.ok(),
     304: { description: "Not Modified" },
+    400: r.badRequest,
     401: r.unauthorized,
-    422: r.unprocessable,
   },
 });
 

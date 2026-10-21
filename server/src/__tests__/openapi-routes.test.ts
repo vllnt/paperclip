@@ -415,7 +415,7 @@ describe("openapi routes", () => {
       ["view", false],
       ["goalId", false],
     ]);
-    expect(res.body.paths["/api/companies/{companyId}/issues"].get.responses).toHaveProperty("422");
+    expect(res.body.paths["/api/companies/{companyId}/issues"].get.responses).toHaveProperty("400");
     expect(routineListParameters).toContainEqual({
       name: "status",
       in: "query",

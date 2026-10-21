@@ -117,11 +117,11 @@ describeEmbeddedPostgres("issue list routes goalId filter", () => {
 
     const res = await request(createApp(companyId)).get(`/api/companies/${companyId}/issues`).query({ goalId: "beta" });
 
-    expect(res.status).toBe(422);
+    expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: "goalId must be a UUID" });
   });
 
-  it("treats a blank goalId as not set", async () => {
+  it("treats a blank or whitespace goalId as not set", async () => {
     const companyId = await seedCompany();
     const goalId = randomUUID();
     await db.insert(goals).values({ id: goalId, companyId, title: "Ship the beta", level: "company", status: "active" });
@@ -130,9 +130,13 @@ describeEmbeddedPostgres("issue list routes goalId filter", () => {
       { id: randomUUID(), companyId, title: "No goal", status: "todo", priority: "medium", goalId: null },
     ]);
 
-    const res = await request(createApp(companyId)).get(`/api/companies/${companyId}/issues`).query({ goalId: "" });
+    const app = createApp(companyId);
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body).toHaveLength(2);
+    for (const goalId of ["", "  "]) {
+      __clearIssueListResponseCacheForTests();
+      const res = await request(app).get(`/api/companies/${companyId}/issues`).query({ goalId });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toHaveLength(2);
+    }
   });
 });
