@@ -12,7 +12,7 @@ import { resolveInstructionActor } from "./agent-instruction-authorization.js";
 import { HttpError, conflict, notFound } from "../errors.js";
 import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
-import type { Environment, EnvironmentLease } from "@paperclipai/shared";
+import { isUuidLike, type Environment, type EnvironmentLease } from "@paperclipai/shared";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { cachedAgentFileManifest, captureAgentFileCheckpoint, checkpointBaseline, checkpointSnapshot, type AgentFileManifest } from "./agent-file-checkpoints.js";
 import { logger } from "../middleware/logger.js";
@@ -29,6 +29,13 @@ function baseline(row: Copy) {
   const snapshot = parseDirectorySnapshot(row.receipt?.baseline);
   if (!snapshot || directorySnapshotSha256(snapshot) !== row.baseHash) throw new Error("Agent directory baseline is invalid");
   return snapshot;
+}
+// A copy prepared for a remote target without a stored environment has the
+// location `remote:` with no id after it. No lease binds to that copy by
+// environment, so the lookup must not run with an empty id.
+function remoteEnvironmentId(row: Copy): string | null {
+  const id = row.location.slice("remote:".length);
+  return isUuidLike(id) ? id : null;
 }
 function actor(row: Copy): AuthorizationActor {
   return { type: "agent", companyId: row.companyId, agentId: row.agentId, runId: row.runId, onBehalfOfUserId: row.responsibleUserId };
@@ -338,10 +345,12 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   }
   async function destroyedRemoteCopy(row: Copy): Promise<boolean> {
     const cleanup = row.receipt?.cleanup as { leaseId?: string; remoteCwd?: string } | undefined;
+    const environmentId = remoteEnvironmentId(row);
+    const bound = cleanup?.leaseId ? eq(environmentLeases.id, cleanup.leaseId)
+      : environmentId ? eq(environmentLeases.environmentId, environmentId) : null;
+    if (!bound) return false;
     const leases = await db.select().from(environmentLeases).where(and(
-      eq(environmentLeases.companyId, row.companyId), eq(environmentLeases.heartbeatRunId, row.runId),
-      cleanup?.leaseId ? eq(environmentLeases.id, cleanup.leaseId)
-        : eq(environmentLeases.environmentId, row.location.slice("remote:".length)),
+      eq(environmentLeases.companyId, row.companyId), eq(environmentLeases.heartbeatRunId, row.runId), bound,
     ));
     if (leases.length !== 1) return false;
     const lease = leases[0]!;
@@ -373,11 +382,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const cleanup = row.receipt?.cleanup as { leaseId?: string; remoteCwd?: string } | undefined;
     // Older preview receipts did not record the lease ID. Accept only a unique
     // lease still bound to this run and environment in that compatibility case.
-    const leases = await db.select().from(environmentLeases).where(and(
-      eq(environmentLeases.companyId, row.companyId),
-      cleanup?.leaseId ? eq(environmentLeases.id, cleanup.leaseId) : and(
-        eq(environmentLeases.environmentId, row.location.slice("remote:".length)), eq(environmentLeases.heartbeatRunId, row.runId)),
-    ));
+    const environmentId = remoteEnvironmentId(row);
+    const bound = cleanup?.leaseId ? eq(environmentLeases.id, cleanup.leaseId)
+      : environmentId ? and(eq(environmentLeases.environmentId, environmentId), eq(environmentLeases.heartbeatRunId, row.runId)) : null;
+    if (!bound) return false;
+    const leases = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, row.companyId), bound));
     if (leases.length !== 1) return false;
     const lease = leases[0]!;
     const termination = lease.metadata?.remoteExecutionTermination as { state?: string } | undefined;

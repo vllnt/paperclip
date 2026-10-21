@@ -149,6 +149,16 @@ describeEmbeddedPostgres("environmentService leases", () => {
     expect(released?.releasedAt).not.toBeNull();
   });
 
+  it.each(["", "0b3f82aa", "lease-1"])("finds no lease for the non-uuid id %j instead of failing the query", async (id) => {
+    const { companyId, environmentId, runId } = await seedEnvironment();
+    const lease = await svc.acquireLease({ companyId, environmentId, heartbeatRunId: runId, metadata: { driver: "local" } });
+
+    await expect(svc.getLeaseById(id)).resolves.toBeNull();
+    // A short prefix of a real lease id is still not that lease.
+    await expect(svc.getLeaseById(lease.id.slice(0, 8))).resolves.toBeNull();
+    await expect(svc.getLeaseById(lease.id)).resolves.toMatchObject({ id: lease.id });
+  });
+
   it("releases all active leases for a run without touching unrelated rows", async () => {
     const { companyId, agentId, environmentId, runId } = await seedEnvironment();
     const otherRunId = randomUUID();
