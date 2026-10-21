@@ -58,6 +58,8 @@ Read tools:
 - `paperclipWaitForIssueWorkspaceService`
 - `paperclipListGoals`
 - `paperclipGetGoal`
+- `paperclipListPolicies`
+- `paperclipGetPolicy`
 - `paperclipListApprovals`
 - `paperclipGetApproval`
 - `paperclipGetApprovalIssues`

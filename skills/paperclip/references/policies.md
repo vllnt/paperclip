@@ -49,6 +49,39 @@ List filters: `scope` (`company` or `project`), `projectId` and `status`. The
 list returns company policies first. `projectId` with `scope=company` returns
 `400`.
 
+## Read policies from a sandbox, a remote runner or a native run
+
+Every way to run an agent reads policies the same way: list, get and revisions.
+No way to run an agent writes a policy.
+
+| Where your run is | How to read | What you can call |
+|---|---|---|
+| Sandbox or remote runner (SSH, container, cloud) | The `paperclipai policy` commands, or the API paths above, over the run bridge | `GET .../policies`, `GET .../policies/{key}`, `GET .../policies/{key}/revisions` |
+| An agent with the MCP server | `paperclipListPolicies` (filters `scope`, `projectId`, `status`) and `paperclipGetPolicy` (`key`) | Reads only. There is no policy write tool. |
+| Native run | `search_api` with "company policies", then `call_api` | `GET /api/companies/{companyId}/policies`, `.../{key}` and `.../{key}/revisions` |
+
+- **Bridge.** The bridge carries exactly the three `GET` paths. Any other
+  method on a policy path, and any path with extra segments, returns
+  `Route not allowed`. The bridge also refuses a `key` that contains `/`, `?`,
+  `#`, `%`, `.` or `\`. A real key never has these characters (lowercase
+  letters, numbers and `-`), so a refusal means the key is wrong. Put filters
+  in the query string (`?status=active`): the bridge reads the path only.
+- **MCP.** Both tools use the run's company when you leave out `companyId`. A
+  `companyId` of another company returns `403` from the server. A `key` that
+  is not a valid slug fails before any request.
+- **Native run.** Call `GET /api/companies/{companyId}/policies/{key}` with
+  `pathParams: { "key": "<key>" }`. `companyId` defaults to the run's company;
+  another company is refused before the request. `POST`, `PATCH` and `DELETE`
+  on a policy return "written by the board only", and `call_api` sends
+  nothing.
+- **Same company only.** Each path reads the policies of your own company.
+  Policies of other companies are not reachable.
+- **Writes.** To propose a rule or a change, write it in a task comment or
+  document and ask the board to apply it. This holds in every runtime.
+
+Read `active` policies before you start a task, in the same way as in
+[Which policies apply to your task](#which-policies-apply-to-your-task).
+
 ## Write policies (board only)
 
 Only the board creates, edits, archives and deletes policies. An agent request

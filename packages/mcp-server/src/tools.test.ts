@@ -141,6 +141,7 @@ describe("paperclip MCP tools", () => {
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+      allowDuplicate: false,
     });
   });
 
@@ -427,5 +428,111 @@ describe("paperclip MCP tools", () => {
     });
 
     expect(response.content[0]?.text).toContain("must not contain '..'");
+  });
+
+  describe("company policies (read-only)", () => {
+    const companyId = "11111111-1111-1111-1111-111111111111";
+    const otherCompanyId = "99999999-9999-9999-9999-999999999999";
+
+    it("lists the policies of the agent's company with a plain GET and no run id", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        mockJsonResponse([{ key: "code-style", title: "Code style", status: "active" }]),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const response = await getTool("paperclipListPolicies").execute({});
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(String(url)).toBe(`http://localhost:3100/api/companies/${companyId}/policies`);
+      expect(init.method).toBe("GET");
+      expect(init.body).toBeUndefined();
+      expect((init.headers as Record<string, string>)["Authorization"]).toBe("Bearer token-123");
+      expect((init.headers as Record<string, string>)["X-Paperclip-Run-Id"]).toBeUndefined();
+      expect(response.content[0]?.text).toContain("Code style");
+    });
+
+    it("passes the scope, project and status filters as a query string", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([]));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await getTool("paperclipListPolicies").execute({
+        scope: "project",
+        projectId: "44444444-4444-4444-4444-444444444444",
+        status: "active",
+      });
+
+      const [url] = fetchMock.mock.calls[0] as [string];
+      expect(String(url)).toBe(
+        `http://localhost:3100/api/companies/${companyId}/policies?scope=project&projectId=44444444-4444-4444-4444-444444444444&status=active`,
+      );
+    });
+
+    it("rejects an unknown status or scope before any request", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+
+      const badStatus = await getTool("paperclipListPolicies").execute({ status: "everything" });
+      const badScope = await getTool("paperclipListPolicies").execute({ scope: "global" });
+
+      expect(badStatus.content[0]?.text).toContain("error");
+      expect(badScope.content[0]?.text).toContain("error");
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("gets one policy by key in the agent's company", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        mockJsonResponse({ key: "code-style", title: "Code style", body: "Use small commits." }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const response = await getTool("paperclipGetPolicy").execute({ key: "code-style" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(String(url)).toBe(`http://localhost:3100/api/companies/${companyId}/policies/code-style`);
+      expect(init.method).toBe("GET");
+      expect(response.content[0]?.text).toContain("Use small commits.");
+    });
+
+    it("refuses a policy key that could change the path before any request", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const tool = getTool("paperclipGetPolicy");
+
+      for (const key of ["a/b", "../goals", "..", "a?x=1", "a#x", "a%2fb", "a.b", "a\\b", "Code-Style", "-a", ""]) {
+        const response = await tool.execute({ key });
+        expect(response.content[0]?.text).toContain("error");
+      }
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("reports the server's refusal when a policy of another company is requested", async () => {
+      // A fresh Response per call: a body can be read once.
+      const fetchMock = vi.fn().mockImplementation(async () =>
+        mockJsonResponse({ error: "Agent key cannot access another company" }, 403),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+
+      const list = await getTool("paperclipListPolicies").execute({ companyId: otherCompanyId });
+      const get = await getTool("paperclipGetPolicy").execute({ companyId: otherCompanyId, key: "code-style" });
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const urls = fetchMock.mock.calls.map(([url]) => String(url));
+      expect(urls).toEqual([
+        `http://localhost:3100/api/companies/${otherCompanyId}/policies`,
+        `http://localhost:3100/api/companies/${otherCompanyId}/policies/code-style`,
+      ]);
+      expect(JSON.parse(list.content[0]?.text ?? "{}").status).toBe(403);
+      expect(JSON.parse(get.content[0]?.text ?? "{}").status).toBe(403);
+    });
+
+    it("exposes no policy write tool", () => {
+      const names = createToolDefinitions(makeClient()).map((tool) => tool.name);
+      expect(names.filter((name) => /policy|policies/i.test(name)).sort()).toEqual([
+        "paperclipGetPolicy",
+        "paperclipListPolicies",
+      ]);
+    });
   });
 });
