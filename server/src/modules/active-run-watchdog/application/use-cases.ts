@@ -74,6 +74,11 @@ export function createBuildRunOutputSilence(deps: BuildRunOutputSilenceDeps) {
 export type FoldSourceResolvedRunDeps = {
   writer: WatchdogWriter;
   processController: RunProcessController;
+  /**
+   * Runs after a fold has settled the run. The fold writes no adapter result, so the caller
+   * can record the usage that the run streamed before it ended. A failure here never undoes the fold.
+   */
+  onRunFolded?: (run: RunSnapshot) => Promise<void>;
 };
 
 export type FoldSourceResolvedRunUseCaseInput = {
@@ -96,7 +101,7 @@ export function createFoldSourceResolvedRun(deps: FoldSourceResolvedRunDeps) {
       fallbackProcessGroupId: input.run.processGroupId,
     });
 
-    return deps.writer.foldSourceResolvedRun(input.run.companyId, {
+    const outcome = await deps.writer.foldSourceResolvedRun(input.run.companyId, {
       run: input.run,
       sourceIssue: input.sourceIssue,
       evidence: input.evidence,
@@ -106,6 +111,10 @@ export function createFoldSourceResolvedRun(deps: FoldSourceResolvedRunDeps) {
       cleanup,
       now: input.now,
     });
+    if (outcome.kind === "folded") {
+      await deps.onRunFolded?.(input.run).catch(() => undefined);
+    }
+    return outcome;
   };
 }
 
