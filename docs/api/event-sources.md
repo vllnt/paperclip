@@ -33,10 +33,10 @@ sender --POST--> event source (URL, secret, normalizer, pinned labels, limits)
 | `enabled` | `true` | A disabled source answers `404`, like an unknown one |
 | `archived` | `false` | Set by `DELETE`; `PATCH {"archived": false}` restores it |
 | `publicId` | generated | 24 hex chars; part of the ingress URL |
-| `ingressUrl` | derived | `POST .../api/event-sources/public/{publicId}/events`; absolute once the instance public origin is configured (`PAPERCLIP_PUBLIC_URL`) |
+| `ingressUrl` | derived | `POST .../api/event-sources/public/{publicId}/events`; absolute once the instance public origin is configured (`PAPERCLIP_PUBLIC_URL`). `null` for the [built-in Paperclip source](#the-built-in-paperclip-source) |
 | `signingMode` | `hmac_sha256` | `hmac_sha256` or `bearer` |
 | `replayWindowSec` | `300` | 30-86400; HMAC mode only |
-| `normalizer` | `generic_v1` | `generic_v1` or `gatus` |
+| `normalizer` | `generic_v1` | `generic_v1` or `gatus`. A source can also report `paperclip_v1`: that is the built-in source, which create and update refuse |
 | `normalizerConfig` | `null` | `gatus` only: `{ "endpointMap": {...} }` |
 | `pinnedLabels` | `{}` | Forced onto every event, overwriting sender values; max 32 pairs |
 | `rateLimitPerMinute` | `600` | 1-100000, authenticated requests per source |
@@ -53,6 +53,7 @@ sender --POST--> event source (URL, secret, normalizer, pinned labels, limits)
 |-----------------|-----|-------------|
 | `GET /api/companies/{companyId}/event-sources` | board, agent | List sources; `?includeArchived=true` includes archived ones |
 | `POST /api/companies/{companyId}/event-sources` | **board only** | Create; returns the secret once |
+| `POST /api/companies/{companyId}/event-sources/paperclip` | **board only** | Create the company's [built-in Paperclip source](#the-built-in-paperclip-source), or return it if it exists |
 | `GET /api/event-sources/{id}` | board, agent | Source without secret |
 | `PATCH /api/event-sources/{id}` | **board only** | Update any field above, plus `archived` |
 | `DELETE /api/event-sources/{id}` | **board only** | Soft archive; history and trigger subscriptions stay |
@@ -89,6 +90,26 @@ Save the secret now: it is shown only on create and rotate. Rotation takes effec
 ### Rotate, update, archive
 
 `POST /api/event-sources/{id}/rotate-secret` with `{}` returns `{ "source": {...}, "secretMaterial": { "ingressUrl", "secret" } }`. `PATCH` returns the source. `DELETE` returns the archived source. Changing `normalizer` or `normalizerConfig` revalidates the pair (`422` on mismatch). Config changes are recorded in the activity log as `event_source.created`, `.updated`, `.secret_rotated` and `.archived`.
+
+### The built-in Paperclip source
+
+Paperclip can publish events about itself. Each company has at most one built-in source, created on demand:
+
+```
+POST /api/companies/{companyId}/event-sources/paperclip
+```
+
+The call takes no body and answers `200` with the source. It is safe to repeat and safe to call concurrently: it returns the same source every time and writes the `event_source.created` activity entry only when it creates it. Board access only, like creating a source. `GET /api/companies/{companyId}/event-sources` lists the source once it exists.
+
+| Field | Value |
+|-------|-------|
+| `name` | `Paperclip (built-in)` |
+| `normalizer` | `paperclip_v1` |
+| `ingressUrl`, `secretId` | `null`: nothing can post to it and it has no secret |
+
+Paperclip manages this source. You can turn it off and on with `PATCH {"enabled": ...}`. Any other `PATCH`, `DELETE`, `rotate-secret` and the dry run answer `409` with a message that Paperclip manages it, and a request to its public id answers `404`, like an unknown source. Create and update never accept `paperclip_v1`.
+
+It publishes one event type so far, `issue.created`. See [Start steps on a created task](#start-steps-on-a-created-task).
 
 ### Dry run
 
@@ -318,7 +339,7 @@ Globs support `*` only (any run of characters); everything else is literal and c
 | `repeatCommentCooldownSec` | `900` | 0-86400; minimum time between comments on a group |
 | `rewakeOnSeverityIncrease` | `true` | Comment and wake at once when severity rises above the last seen |
 | `onRecovery` | `comment_and_wake` | `comment_and_wake`, `comment_only`, or `ignore` |
-| `issueMode` | `"group"` | `"group"`, or `{ "appendToIssueId": "<uuid>" }` |
+| `issueMode` | `"group"` | `"group"`, `{ "appendToIssueId": "<uuid>" }`, or `"event_issue"` (built-in Paperclip source only; see [Start steps on a created task](#start-steps-on-a-created-task)) |
 
 Lifecycle for one group (the oldest open, visible issue of the routine with this group key):
 
@@ -337,6 +358,9 @@ Lifecycle for one group (the oldest open, visible issue of the routine with this
 - Routine has a required variable without a default: event dispatch passes no variables. Checked on trigger create, on later variable edits while an enabled event trigger exists, and on revision restore.
 - Routine is plugin-managed.
 - `appendToIssueId` rules above.
+- `issueMode: "event_issue"` on a trigger of any other source, with `fallback: true`, or on a routine with no steps. A routine update that would empty the steps while such a trigger is enabled is `422` too.
+- A routine gate script that applies to event triggers on a routine with an `event_issue` trigger, at the trigger save and at the gate save.
+- `403`: an agent that creates, enables, un-archives, restores from a revision or changes the event fields (`eventSourceId`, `eventMatch`, `eventGrouping`, `fallback`) of an `event_issue` trigger. An `event_issue` trigger starts steps on every matching task of the company, so only a board user sets it up. An agent can still disable, archive or relabel it.
 - A malformed `eventMatch`, `eventGrouping` or an unknown `groupKey` placeholder fails request validation with `400`.
 - `PATCH` with event fields on a trigger that is not of kind `event`.
 
@@ -349,6 +373,57 @@ These are re-checked at dispatch, because the routine can change after the trigg
 ### Storm breaker
 
 At most `maxNewIssuesPerHour` new alert groups are opened per source per hour; a routine that would open a new group consumes one slot, in group mode and in `appendToIssueId` mode (recoveries do not). The slot is taken under the routine lock, only once no open group exists, so concurrent repeats of one alert cost one slot; a dispatch that fails gives its slot back, so sender retries do not spend extra ones. Beyond it, new groups fold into that routine's own group `storm:<event.source>`: one "Event storm from <source>" issue per routine, receiving digest comments by the same cooldown (outcome `storm_folded`). In `appendToIssueId` mode the storm issue is a normal issue owned by the routine's agent; the standing issue is left alone. Alerts for an already open group are unaffected, and one agent's storm never lands on another agent's issue. The window is one hour from the first slot; the counter is an atomic update. A slot given back after the window rolled over is ignored.
+
+For `event_issue` triggers every started task takes one slot. When the budget is spent nothing is attached: the delivery outcome is `storm_folded` with `note: "new_issue_budget_spent"`, and the task gets its normal wake. Tasks are not folded into a storm issue.
+
+## Start steps on a created task
+
+A routine with [steps](routines.md#routine-steps) can start its steps on each task that is created, instead of opening a task of its own. The trigger is an ordinary `event` trigger on the company's [built-in Paperclip source](#the-built-in-paperclip-source):
+
+```
+POST /api/companies/{companyId}/event-sources/paperclip          -> { "id": "{sourceId}", ... }
+
+POST /api/routines/{routineId}/triggers
+{
+  "kind": "event",
+  "eventSourceId": "{sourceId}",
+  "eventMatch": { "types": ["issue.created"], "labels": { "created_by": "user", "label_bug": "true" } },
+  "eventGrouping": { "issueMode": "event_issue" },
+  "fallback": false
+}
+```
+
+**The event.** Paperclip publishes `issue.created` when a task is created through the issue-create routes:
+
+| Field | Value |
+|-------|-------|
+| `source` | `paperclip` |
+| `type` | `issue.created` |
+| `severity`, `state` | `info` |
+| `dedupeKey` | the task id |
+| `title` | empty (`""`); the event names the task only by `dedupeKey`, because every agent of the company can read deliveries and runs, also of tasks it may not read. The steps read the title from the task. |
+| `labels.project` | the project id; absent when the task has no project |
+| `labels.created_by` | `user` or `agent` |
+| `labels.label_<slug>` | `"true"` for each label on the task |
+
+`<slug>` is the label name in lowercase, with every run of characters outside `a-z`, `0-9` and `_` replaced by one `_` and the ends trimmed of `_`; the key is cut to 64 characters. A task carries at most 30 label keys (sorted by slug; the rest are dropped). `Needs Review!` becomes `label_needs_review`. `eventMatch` filters these like any label.
+
+**Recommended filter: `"created_by": "user"`.** Without it the trigger also starts steps on tasks that agents create, which is rarely what a person wants and spends the hourly budget quickly.
+
+No event is published for a hidden task, a task of origin `routine_execution`, `routine_step` or `chat_channel`, a conversation, a task below a routine run or a routine step, or a task created in a heartbeat run that works on such a task (beside the steps or at the top level). The check walks up to 50 levels; a longer parent chain counts as below a routine. A step's agent therefore cannot start another routine with the tasks it creates.
+
+**What happens.** The task is created, then the event is published before the assignee is woken:
+
+- If a trigger matches, the steps are attached to the new task in the same request. The assignee is not woken for the task; the steps without predecessors are. The `201` answer carries the task as it is afterwards.
+- A task owned by an agent becomes `blocked`; the task of a person keeps its status and only gains blocker edges. The refusals and what happens on failure are in [Start the steps on a task](routines.md#start-the-steps-on-a-task).
+- If nothing matches, or the company has no enabled `event_issue` trigger, nothing changes. In the second case Paperclip does not even create the source or a delivery row.
+- Publishing never fails the create request. If it fails, the failure is logged and recorded on the delivery, and the task gets its normal wake.
+- If the task already has open routine steps when the event is processed (a manual run on it got there first), the event's attach is refused, but the assignee is not woken: the task waits for those steps.
+- Publishing is idempotent per task: the delivery key is derived from the task id, so the same task never starts twice.
+
+**Outcome.** The delivery outcome for a routine is `issue_created` with `issueId` the task, the `runId`, and `note: "steps_attached"`. A task refused by a guard is `failed_permanent` with the guard's message (for example, a task already in progress). A spent budget is `storm_folded` (see [Storm breaker](#storm-breaker)). The run appears in the routine's run history with the task as its linked issue.
+
+**Limits.** Only a board user can set up the trigger (`403` for an agent). The trigger needs a routine with steps and `fallback: false`. A routine gate script that applies to event triggers cannot be combined with it, because the steps start in the create request and cannot wait for a gate.
 
 ## Untrusted content rendering
 
@@ -369,10 +444,13 @@ paperclipai event-sources create --company-id <id> --name <name> \
   [--normalizer-config-json <json>] [--replay-window-sec <n>] \
   [--rate-limit-per-minute <n>] [--max-new-issues-per-hour <n>] \
   [--retention-days <n>] [--payload-json <json>]
+paperclipai event-sources ensure-paperclip --company-id <id>
 paperclipai event-sources rotate <sourceId>
 paperclipai event-sources test <sourceId> (--file <payload.json> | --payload-json <json>)
 paperclipai event-sources deliveries <sourceId> [--status <s>] [--limit <n>] [--cursor <c>]
 ```
+
+`ensure-paperclip` creates the company's built-in source or returns it, and prints it (board credentials required; it has no ingress URL or secret). Create the event trigger with `paperclipai routine trigger:create <routineId> --payload-json '{...}'` and the body above.
 
 `create` and `rotate` print the ingress URL and secret once (board credentials required). `test` sends `{ "payload": ... }` to the dry-run endpoint. All commands accept the common client flags (`--api-base`, `--api-key`, `--json`, ...).
 

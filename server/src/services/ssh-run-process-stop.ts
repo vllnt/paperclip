@@ -7,6 +7,7 @@ import type { RemoteProcessTreeStopSummary } from "@paperclipai/adapter-utils/re
 import { stopSshRunProcesses, type SshConnectionConfig } from "@paperclipai/adapter-utils/ssh";
 import { logger } from "../middleware/logger.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
+import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
 // Stops what an SSH run left on its worker before the run's lease is released.
 // The local child of an SSH run is the `ssh` client: signalling it ends the
@@ -181,6 +182,26 @@ export async function stopSshLeaseRunProcesses(
     logger.warn({ err: error, runId: lease.heartbeatRunId, leaseId: lease.id }, "failed to stop SSH run processes");
     return null;
   }
+}
+
+/**
+ * True when nothing of the run is left in any environment it leased, as the
+ * stored evidence shows: each SSH lease recorded a stop that left no process,
+ * and each other remote lease holds a provider termination receipt. A run with
+ * no remote lease has nothing remote to stop. Any missing or doubtful evidence
+ * (a stop in flight, survivors, a partial stop) gives `false`.
+ */
+export async function remoteRunProcessesProvenStopped(db: Db, companyId: string, runId: string): Promise<boolean> {
+  const leases = await db
+    .select()
+    .from(environmentLeases)
+    .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId)));
+  return leases.every((lease) => {
+    if (lease.provider === "local") return true;
+    if (lease.provider !== "ssh") return hasRemoteTerminationReceipt(lease);
+    const stop = lease.metadata?.[REMOTE_PROCESS_STOP_METADATA_KEY] as { state?: unknown; outcome?: unknown } | undefined;
+    return stop !== undefined && stop.state === undefined && stop.outcome === "stopped";
+  });
 }
 
 /**

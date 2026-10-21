@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { useId, useState } from "react";
 import { AlertTriangle, Plus, Trash2 } from "lucide-react";
 import { Link } from "@/lib/router";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,7 @@ import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import {
   EVENT_ON_RECOVERY_MODES,
   EVENT_SEVERITIES,
+  isPaperclipInternalSource,
   type EventOnRecovery,
   type EventSource,
   type EventSeverity,
@@ -17,12 +18,17 @@ import {
 import {
   DEFAULT_GROUP_KEY,
   GROUP_KEY_FIELD_PLACEHOLDERS,
+  ISSUE_CREATED_CREATOR_LABEL,
+  ISSUE_CREATED_LABEL_FILTER_KEY,
   MAX_LABEL_PAIRS,
   ON_RECOVERY_LABELS,
   describeEventMatch,
   buildEventMatch,
+  eventSourcePatch,
+  hasLabelFilter,
   newLabelPair,
   severityLabel,
+  withLabelFilter,
   type EventTriggerDraft,
   type EventTriggerErrors,
   type GroupKeyCheck,
@@ -32,9 +38,18 @@ import { TagInput } from "./TagInput";
 const selectClass =
   "w-full rounded-md border border-input bg-background px-3 py-2 text-sm";
 
+/** Select value of the built-in Paperclip source before the company has one. */
+const BUILT_IN_SOURCE_OPTION = "paperclip-built-in";
+export const BUILT_IN_SOURCE_LABEL = "Paperclip (built-in): when a task is created";
+
 export type EventSourcesState = {
   sources: EventSource[];
   status: "loading" | "error" | "ready";
+  /**
+   * Creates the company's built-in Paperclip source on first use and returns it. When it is
+   * missing, the source picker hides the built-in choice.
+   */
+  ensureBuiltIn?: () => Promise<EventSource>;
 };
 
 type FieldsProps = {
@@ -65,11 +80,41 @@ export function EventMatchFields({
   eventSources,
 }: FieldsProps & { eventSources: EventSourcesState }) {
   const ids = useId();
+  const [ensuring, setEnsuring] = useState(false);
+  const [ensureError, setEnsureError] = useState("");
+  const builtIn = eventSources.sources.find(
+    (source) => isPaperclipInternalSource(source) && !source.archived,
+  );
+  const builtInOffered = Boolean(builtIn) || Boolean(eventSources.ensureBuiltIn);
   const selectable = eventSources.sources.filter(
-    (source) => !source.archived && (source.enabled || source.id === draft.sourceId),
+    (source) =>
+      !source.archived &&
+      !isPaperclipInternalSource(source) &&
+      (source.enabled || source.id === draft.sourceId),
   );
   const selected = eventSources.sources.find((source) => source.id === draft.sourceId);
+  const builtInSelected = isPaperclipInternalSource(selected);
   const selectedMissing = Boolean(draft.sourceId) && eventSources.status === "ready" && !selected;
+
+  async function chooseSource(value: string) {
+    setEnsureError("");
+    if (value !== BUILT_IN_SOURCE_OPTION) {
+      onChange(eventSourcePatch(draft, eventSources.sources.find((source) => source.id === value) ?? null));
+      return;
+    }
+    if (!eventSources.ensureBuiltIn) return;
+    setEnsuring(true);
+    try {
+      onChange(eventSourcePatch(draft, await eventSources.ensureBuiltIn()));
+    } catch (error) {
+      setEnsureError(
+        error instanceof Error ? error.message : "Couldn’t set up the built-in Paperclip source.",
+      );
+    } finally {
+      setEnsuring(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="space-y-2">
@@ -78,14 +123,20 @@ export function EventMatchFields({
           id={`${ids}-source`}
           className={selectClass}
           value={draft.sourceId}
-          disabled={disabled || eventSources.status === "loading"}
+          disabled={disabled || ensuring || eventSources.status === "loading"}
           aria-invalid={Boolean(showErrors && errors.source) || undefined}
           aria-describedby={`${ids}-source-help ${ids}-source-error`}
-          onChange={(event) => onChange({ sourceId: event.target.value })}
+          onChange={(event) => void chooseSource(event.target.value)}
         >
           <option value="">
             {eventSources.status === "loading" ? "Loading event sources…" : "Choose an event source"}
           </option>
+          {builtInOffered && (
+            <option value={builtIn?.id ?? BUILT_IN_SOURCE_OPTION}>
+              {BUILT_IN_SOURCE_LABEL}
+              {builtIn && !builtIn.enabled ? " (disabled)" : ""}
+            </option>
+          )}
           {selectable.map((source) => (
             <option key={source.id} value={source.id}>
               {source.name}
@@ -95,14 +146,21 @@ export function EventMatchFields({
           {selectedMissing && <option value={draft.sourceId}>Unavailable source</option>}
         </select>
         <p id={`${ids}-source-help`} className="text-xs text-muted-foreground">
-          The ingest endpoint that receives the events. A source can feed many routines.
+          {builtInSelected
+            ? "Paperclip publishes these events itself, so there is no URL or secret. The routine’s steps start on the task that was created."
+            : "The ingest endpoint that receives the events. A source can feed many routines."}
         </p>
         {eventSources.status === "error" && (
           <p role="alert" className="text-xs text-destructive">
             Couldn’t load event sources. Reload the page to try again.
           </p>
         )}
-        {eventSources.status === "ready" && selectable.length === 0 && (
+        {ensureError && (
+          <p role="alert" className="text-xs text-destructive">
+            {ensureError}
+          </p>
+        )}
+        {eventSources.status === "ready" && selectable.length === 0 && !builtInOffered && (
           <p className="text-sm text-muted-foreground">
             No event sources yet.{" "}
             <Link className="underline underline-offset-2" to="/company/settings/event-sources">
@@ -119,57 +177,69 @@ export function EventMatchFields({
         <p className="-mt-2 text-xs text-muted-foreground">
           Every field you fill in must match. Leave a field empty to match anything.
         </p>
-        <div className="space-y-2">
-          <Label htmlFor={`${ids}-emitters`}>Emitters</Label>
-          <TagInput
-            id={`${ids}-emitters`}
-            values={draft.sources}
-            onChange={(sources) => onChange({ sources })}
-            placeholder="gatus, upkeep"
-            ariaDescribedBy={`${ids}-emitters-help ${ids}-emitters-error`}
-            invalid={Boolean(errors.sources)}
-            disabled={disabled}
-          />
-          <p id={`${ids}-emitters-help`} className="text-xs text-muted-foreground">
-            The <code>source</code> name the sender puts in each event. Press Enter or comma to add one.
-          </p>
-          <FieldError id={`${ids}-emitters-error`} message={errors.sources} />
-        </div>
+        {!builtInSelected && (
+          <div className="space-y-2">
+            <Label htmlFor={`${ids}-emitters`}>Emitters</Label>
+            <TagInput
+              id={`${ids}-emitters`}
+              values={draft.sources}
+              onChange={(sources) => onChange({ sources })}
+              placeholder="gatus, upkeep"
+              ariaDescribedBy={`${ids}-emitters-help ${ids}-emitters-error`}
+              invalid={Boolean(errors.sources)}
+              disabled={disabled}
+            />
+            <p id={`${ids}-emitters-help`} className="text-xs text-muted-foreground">
+              The <code>source</code> name the sender puts in each event. Press Enter or comma to add one.
+            </p>
+            <FieldError id={`${ids}-emitters-error`} message={errors.sources} />
+          </div>
+        )}
         <div className="space-y-2">
           <Label htmlFor={`${ids}-types`}>Event types</Label>
           <TagInput
             id={`${ids}-types`}
             values={draft.types}
             onChange={(types) => onChange({ types })}
-            placeholder="disk.*, host.down"
+            placeholder={builtInSelected ? "issue.created" : "disk.*, host.down"}
             ariaDescribedBy={`${ids}-types-help ${ids}-types-error`}
             invalid={Boolean(errors.types)}
             disabled={disabled}
           />
           <p id={`${ids}-types-help`} className="text-xs text-muted-foreground">
-            Use <code>*</code> as a wildcard, for example <code>disk.*</code>.
+            {builtInSelected ? (
+              <>
+                <code>issue.created</code> is the only type Paperclip publishes so far.
+              </>
+            ) : (
+              <>
+                Use <code>*</code> as a wildcard, for example <code>disk.*</code>.
+              </>
+            )}
           </p>
           <FieldError id={`${ids}-types-error`} message={errors.types} />
         </div>
-        <div className="space-y-2">
-          <Label htmlFor={`${ids}-severity`}>Minimum severity</Label>
-          <select
-            id={`${ids}-severity`}
-            className={selectClass}
-            value={draft.minSeverity}
-            disabled={disabled}
-            onChange={(event) =>
-              onChange({ minSeverity: event.target.value as EventTriggerDraft["minSeverity"] })
-            }
-          >
-            <option value="any">Any severity</option>
-            {EVENT_SEVERITIES.map((severity: EventSeverity) => (
-              <option key={severity} value={severity}>
-                {severityLabel(severity)} and above
-              </option>
-            ))}
-          </select>
-        </div>
+        {!builtInSelected && (
+          <div className="space-y-2">
+            <Label htmlFor={`${ids}-severity`}>Minimum severity</Label>
+            <select
+              id={`${ids}-severity`}
+              className={selectClass}
+              value={draft.minSeverity}
+              disabled={disabled}
+              onChange={(event) =>
+                onChange({ minSeverity: event.target.value as EventTriggerDraft["minSeverity"] })
+              }
+            >
+              <option value="any">Any severity</option>
+              {EVENT_SEVERITIES.map((severity: EventSeverity) => (
+                <option key={severity} value={severity}>
+                  {severityLabel(severity)} and above
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <LabelPairsEditor
           idPrefix={ids}
           draft={draft}
@@ -177,27 +247,89 @@ export function EventMatchFields({
           error={errors.labels}
           disabled={disabled}
         />
+        {builtInSelected && <TaskFilterHints draft={draft} onChange={onChange} disabled={disabled} />}
       </fieldset>
 
-      <div className="flex items-start gap-3 rounded-md border border-border p-4">
-        <ToggleSwitch
-          id={`${ids}-fallback`}
-          checked={draft.fallback}
-          disabled={disabled}
-          onCheckedChange={(fallback) => onChange({ fallback })}
-          aria-labelledby={`${ids}-fallback-label`}
-          aria-describedby={`${ids}-fallback-help`}
-        />
-        <div className="space-y-1">
-          <p id={`${ids}-fallback-label`} className="text-sm font-medium">
-            Fallback trigger
-          </p>
-          <p id={`${ids}-fallback-help`} className="text-xs text-muted-foreground">
-            Fires only when no other routine on this source took the event, so an alert never goes
-            unrouted. The filters above still apply.
-          </p>
+      {!builtInSelected && (
+        <div className="flex items-start gap-3 rounded-md border border-border p-4">
+          <ToggleSwitch
+            id={`${ids}-fallback`}
+            checked={draft.fallback}
+            disabled={disabled}
+            onCheckedChange={(fallback) => onChange({ fallback })}
+            aria-labelledby={`${ids}-fallback-label`}
+            aria-describedby={`${ids}-fallback-help`}
+          />
+          <div className="space-y-1">
+            <p id={`${ids}-fallback-label`} className="text-sm font-medium">
+              Fallback trigger
+            </p>
+            <p id={`${ids}-fallback-help`} className="text-xs text-muted-foreground">
+              Fires only when no other routine on this source took the event, so an alert never goes
+              unrouted. The filters above still apply.
+            </p>
+          </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+/** Which labels a created task carries as event labels, with one-click starters. */
+function TaskFilterHints({
+  draft,
+  onChange,
+  disabled,
+}: {
+  draft: EventTriggerDraft;
+  onChange: (patch: Partial<EventTriggerDraft>) => void;
+  disabled?: boolean;
+}) {
+  const filteredByCreator = hasLabelFilter(draft, ISSUE_CREATED_CREATOR_LABEL);
+  const full = draft.labels.length >= MAX_LABEL_PAIRS;
+  return (
+    <div aria-label="Task filters" role="group" className="space-y-2 rounded-md bg-muted/40 p-3">
+      <p className="text-xs text-muted-foreground">
+        A created task carries these labels: <code>created_by</code> (<code>user</code> or{" "}
+        <code>agent</code>), <code>project</code> (the project ID, when it has one) and one{" "}
+        <code>label_&lt;name&gt;</code> = <code>true</code> for each task label. The name is
+        lowercased, and every other character becomes <code>_</code>.
+      </p>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={disabled || (!filteredByCreator && full)}
+          onClick={() =>
+            onChange({ labels: withLabelFilter(draft.labels, ISSUE_CREATED_CREATOR_LABEL, ["user"]) })
+          }
+        >
+          Only tasks created by a person
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={disabled || full}
+          onClick={() =>
+            onChange({ labels: [...draft.labels, newLabelPair(ISSUE_CREATED_LABEL_FILTER_KEY, ["true"])] })
+          }
+        >
+          Add a task label filter
+        </Button>
       </div>
+      {!filteredByCreator && (
+        <p role="status" className="flex items-start gap-1.5 text-xs text-muted-foreground">
+          <AlertTriangle
+            className="mt-0.5 h-3.5 w-3.5 shrink-0 text-(--status-agent-paused)"
+            aria-hidden="true"
+          />
+          <span>
+            Without a <code>created_by</code> filter, tasks that agents create start this routine too.
+          </span>
+        </p>
+      )}
     </div>
   );
 }
@@ -288,6 +420,7 @@ export function EventGroupingFields({
   disabled,
 }: FieldsProps & { groupKey: GroupKeyCheck }) {
   const ids = useId();
+  if (draft.issueMode === "event_issue") return <EventIssueModeNotice />;
   const groupKeyError = showErrors || draft.groupKey !== DEFAULT_GROUP_KEY ? errors.groupKey : undefined;
   return (
     <div className="space-y-6">
@@ -452,6 +585,41 @@ export function EventGroupingFields({
   );
 }
 
+/**
+ * The issue mode of the built-in Paperclip source. It is fixed, so it is shown as the single
+ * selected choice, and the group settings that only apply to alert groups are left out.
+ */
+function EventIssueModeNotice() {
+  return (
+    <div className="space-y-3">
+      <p className="text-sm font-medium">Issues</p>
+      <RadioCardGroup
+        ariaLabel="Issue handling"
+        value="event_issue"
+        disabled
+        onValueChange={() => undefined}
+        options={[
+          {
+            value: "event_issue",
+            title: "Attach the steps to the created task",
+            description:
+              "The routine’s steps become subtasks of the task that was created. Fixed for the built-in Paperclip source.",
+          },
+        ]}
+      />
+      <ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">
+        <li>A task assigned to an agent becomes blocked until the steps finish. It is not woken first.</li>
+        <li>A task assigned to a person keeps its status and only gets links to the steps that block it.</li>
+        <li>
+          A task that is already in progress, or already has open steps, is refused and the delivery
+          shows why. Tasks the routine itself creates never start it again.
+        </li>
+        <li>Routines with a gate script cannot use this mode.</li>
+      </ul>
+    </div>
+  );
+}
+
 /** Plain-language recap shown on the last step, before the trigger is added. */
 export function EventTriggerSummary({
   draft,
@@ -461,22 +629,30 @@ export function EventTriggerSummary({
   sourceName?: string;
 }) {
   const cooldown = Number(draft.cooldownMinutes);
+  const eventIssue = draft.issueMode === "event_issue";
+  const rows = eventIssue
+    ? [
+        ["Source", sourceName ?? "Not chosen"],
+        ["Listens for", describeEventMatch(buildEventMatch(draft))],
+        ["Starts", "The routine’s steps, as subtasks of the created task"],
+      ]
+    : [
+        ["Source", sourceName ?? "Not chosen"],
+        ["Listens for", describeEventMatch(buildEventMatch(draft), draft.fallback)],
+        ["Groups by", draft.groupKey.trim() || "—"],
+        [
+          "Repeats",
+          Number.isFinite(cooldown) && cooldown > 0
+            ? `One comment every ${cooldown} min at most`
+            : "A comment on every repeat",
+        ],
+        ["Recovery", ON_RECOVERY_LABELS[draft.onRecovery]],
+      ];
   return (
     <section aria-label="Trigger summary" className="space-y-2 rounded-md bg-muted/40 p-4">
       <h2 className="text-sm font-medium">What this trigger will do</h2>
       <dl className="space-y-1.5 text-sm">
-        {[
-          ["Source", sourceName ?? "Not chosen"],
-          ["Listens for", describeEventMatch(buildEventMatch(draft), draft.fallback)],
-          ["Groups by", draft.groupKey.trim() || "—"],
-          [
-            "Repeats",
-            Number.isFinite(cooldown) && cooldown > 0
-              ? `One comment every ${cooldown} min at most`
-              : "A comment on every repeat",
-          ],
-          ["Recovery", ON_RECOVERY_LABELS[draft.onRecovery]],
-        ].map(([term, detail]) => (
+        {rows.map(([term, detail]) => (
           <div key={term} className="flex flex-col gap-0.5 sm:flex-row sm:gap-4">
             <dt className="shrink-0 text-muted-foreground sm:w-28">{term}</dt>
             <dd className={cn("min-w-0 break-words", term === "Groups by" && "font-mono text-xs")}>{detail}</dd>
@@ -484,8 +660,9 @@ export function EventTriggerSummary({
         ))}
       </dl>
       <p className="text-xs text-muted-foreground">
-        A new alert group opens an issue assigned to this routine’s agent. Later events for the same
-        group are added to it.
+        {eventIssue
+          ? "Each matching task gets this routine’s steps once. No separate issue is opened."
+          : "A new alert group opens an issue assigned to this routine’s agent. Later events for the same group are added to it."}
       </p>
     </section>
   );

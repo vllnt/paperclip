@@ -332,6 +332,68 @@ describe("rotating, disabling and archiving", () => {
   });
 });
 
+describe("the built-in Paperclip source", () => {
+  const builtIn = makeSource({
+    id: "src-builtin",
+    name: "Paperclip (built-in)",
+    normalizer: "paperclip_v1",
+    ingressUrl: null,
+    secretId: null,
+    publicId: "paperclip",
+  });
+
+  function buttonLabels(): string[] {
+    return [...document.body.querySelectorAll("button")].map((item) => item.textContent?.trim() ?? "");
+  }
+
+  it("lists as managed: no ingest URL or secret actions, only the on/off switch", async () => {
+    api.list.mockResolvedValue([builtIn]);
+    await renderPage();
+
+    expect(pageText()).toContain("Paperclip (built-in)");
+    expect(pageText()).toContain("Managed by Paperclip");
+    expect(pageText()).toContain("there is no ingest URL or secret");
+    expect(pageText()).not.toContain("Ingest URL");
+    expect(buttonLabels()).toContain("Disable");
+    for (const label of ["Edit", "Rotate secret", "Archive"]) expect(buttonLabels()).not.toContain(label);
+  });
+
+  it("switches off with the same one-click update as any other source", async () => {
+    api.list.mockResolvedValue([builtIn]);
+    api.update.mockResolvedValue({ ...builtIn, enabled: false });
+    await renderPage();
+    await click(findButton("Disable"));
+    expect(api.update).toHaveBeenCalledWith("src-builtin", { enabled: false });
+  });
+
+  it("shows a detail page with no test panel, and keeps ordinary sources next to it intact", async () => {
+    searchParamsState.current = new URLSearchParams("source=src-builtin");
+    api.list.mockResolvedValue([builtIn, makeSource()]);
+    await renderPage();
+
+    expect(pageText()).toContain("There is nothing to test here");
+    expect(pageText()).toContain("None. Paperclip publishes these events itself.");
+    expect(pageText()).not.toContain("Rate limit");
+    expect(pageText()).not.toContain("Replay window");
+    expect(buttonLabels()).not.toContain("Run dry run");
+    expect(api.deliveries).toHaveBeenCalledWith("src-builtin", expect.anything());
+  });
+
+  it("keeps the ingest URL and every action for an external source", async () => {
+    api.list.mockResolvedValue([builtIn, makeSource()]);
+    await renderPage();
+    expect(pageText()).toContain(INGRESS_URL);
+    expect(buttonLabels()).toEqual(expect.arrayContaining(["Edit", "Rotate secret", "Archive"]));
+  });
+
+  it("still offers the dry run on the detail page of an external source", async () => {
+    searchParamsState.current = new URLSearchParams("source=src-1");
+    api.list.mockResolvedValue([builtIn, makeSource()]);
+    await renderPage();
+    expect(buttonLabels()).toContain("Run dry run");
+  });
+});
+
 describe("source detail: test send and deliveries", () => {
   // PR144 service.dryRun returns one result per routine, with all matching trigger IDs.
   const dryRun: EventTestResult = {
