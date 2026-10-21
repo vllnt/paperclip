@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import {
   agents,
   companies,
+  companyMemberships,
   heartbeatRuns,
   issues,
   projects,
@@ -14,6 +15,9 @@ import { eventSourceService, type IngestResult } from "../../services/event-sour
 import { routineService } from "../../services/routines.ts";
 
 type TestDb = ReturnType<typeof createDb>;
+
+/** The board user who saves the fixture's event sources and triggers; a member of its company. */
+export const FIXTURE_BOARD_USER_ID = "board-user";
 
 export interface WakeupRecord {
   agentId: string;
@@ -63,6 +67,13 @@ export async function seedEventFixture(
     issuePrefix,
     defaultResponsibleUserId,
     requireBoardApprovalForNewAgents: false,
+  });
+  await db.insert(companyMemberships).values({
+    companyId,
+    principalType: "user",
+    principalId: FIXTURE_BOARD_USER_ID,
+    status: "active",
+    membershipRole: "operator",
   });
   const projectId = randomUUID();
   await db.insert(projects).values({ id: projectId, companyId, name: "Alerts", status: "in_progress" });
@@ -163,7 +174,7 @@ export async function seedEventFixture(
         eventGrouping: trigger.grouping ? ({ ...trigger.grouping } as EventGrouping) : undefined,
         fallback: trigger.fallback ?? false,
       } as never,
-      {},
+      { userId: FIXTURE_BOARD_USER_ID },
     );
     return created.trigger;
   }

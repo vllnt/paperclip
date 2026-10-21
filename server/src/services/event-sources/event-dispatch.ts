@@ -134,6 +134,18 @@ export interface EventDispatchDeps {
   /** Whether the routine has a gate script that applies to event triggers. */
   gateApplies?(routine: RoutineRow): boolean;
   /**
+   * Refuses, before an existing task is touched, when `authorUserId` (the author of the trigger) could
+   * not assign the routine's steps under the task: the `tasks:assign` decision per step agent, as a
+   * manual run asks it for its caller. Throws a classified error; a trigger without an author is
+   * refused. Reads on `executor`, the attach savepoint.
+   */
+  assertStepsAssignable(
+    routine: RoutineRow,
+    task: { id: string; companyId: string; projectId: string | null },
+    authorUserId: string | null,
+    executor: Db,
+  ): Promise<void>;
+  /**
    * Refuses, before an existing task is touched, when the agent of a step that would start now
    * could not be woken (budget hard-stop, paused agent). Reads on `executor`, the attach savepoint.
    */
@@ -607,6 +619,7 @@ export function createEventRoutineDispatcher(deps: EventDispatchDeps) {
             defaultAssigneeAgentId: prepared.assigneeAgentId,
             variables: prepared.variables,
             assertCanStart: async (task, executor) => {
+              await deps.assertStepsAssignable(routine, task, currentTrigger.createdByUserId, executor);
               await deps.assertStepsCanStart?.(routine, task, executor);
             },
           });

@@ -223,8 +223,9 @@ Both use the same rules. The task is locked, then checked, and then the steps ar
 | Answer | When |
 |--------|------|
 | `404` | The task is not in the routine's company, or is hidden |
-| `409` | The task is not in `backlog`, `todo` or `blocked`; it has a checkout, an execution lock or a queued or running heartbeat run; or it already has open routine steps |
+| `409` | The task is not in `backlog`, `todo` or `blocked`; it has a checkout, an execution lock or a queued or running heartbeat run; or it already has open routine steps; or (manual run only) the routine changed while the run was starting |
 | `422` | The routine has no steps; the task is a routine run, a routine step or a conversation; or its sub-tasks plus the steps would pass 25 |
+| `403` | The caller may not assign a step's agent under the task: the task or its project blocks the assignment, or the caller lacks `tasks:assign`. A manual run asks this for the caller. An event trigger asks it for the board user who created the trigger, at the time of the event: a trigger without an author, or whose author has left the company or lost the right, fails the delivery with `failed_permanent` and the task stays as it was. |
 
 What happens to the task:
 
@@ -235,7 +236,7 @@ What happens to the task:
 
 The steps are sub-tasks of the task, so they take its project and execution workspace like any sub-task. When the task has an execution workspace, every step of its project works in it, also two steps that run at the same time. When it has none, the steps hand their workspaces on as on any run. This is deliberate: the steps check or finish the task's own work.
 
-Two starts on one task (an event and a manual run, say) take turns on the task's row lock, so the task ends up with one tree of steps. A second run on a task whose first run's steps are still open is refused with `409`; after those steps close, the routine can run on the task again. To retry a manual run safely, send an `idempotencyKey`: the same key returns the same run. A key that was already used for a run on another task, or for a run without a task, answers `409`.
+A manual run checks the caller's permissions twice: first before it opens its transaction, so a caller who may not see the task learns nothing about it, and again under the task and routine locks, on the task and the routine as locked. A change that a board user makes between the two (the task moves to another project, the task or the agent of a step starts blocking assignments, the steps go to other agents) is refused with `403`, or with `409` when the routine was edited at all in that time: send the same request again. Two starts on one task (an event and a manual run, say) take turns on the task's row lock, so the task ends up with one tree of steps. A second run on a task whose first run's steps are still open is refused with `409`; after those steps close, the routine can run on the task again. To retry a manual run safely, send an `idempotencyKey`: the same key returns the same run. A key that was already used for a run on another task, or for a run without a task, answers `409`.
 
 In the text of a step on such a run, `{{issue.title}}` and `{{issue.identifier}}` are the task's title and identifier. On any other run they are left as written.
 
