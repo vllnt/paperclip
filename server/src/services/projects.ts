@@ -953,10 +953,19 @@ export function projectService(db: Db) {
      */
     remove: (id: string) =>
       db.transaction(async (tx) => {
+        // Lock the project first: a policy cannot then be created in it or moved into it meanwhile.
+        const locked = await tx
+          .select({ id: projects.id })
+          .from(projects)
+          .where(eq(projects.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!locked) return null;
         const projectPolicies = await tx
           .select({ key: companyPolicies.key, documentId: companyPolicies.documentId })
           .from(companyPolicies)
-          .where(eq(companyPolicies.projectId, id));
+          .where(eq(companyPolicies.projectId, id))
+          .for("update");
         const row = await tx
           .delete(projects)
           .where(eq(projects.id, id))

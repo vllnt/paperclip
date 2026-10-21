@@ -253,9 +253,15 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
   const keyValid = /^[a-z0-9][a-z0-9-]*$/.test(key.trim());
   const canSave = title.trim().length > 0 && (!isNew || keyValid) && !save.isPending;
   const mutationError = save.error ?? restore.error ?? remove.error;
+  // A write in flight closes the dialog when it succeeds, so the dialog stays open until then.
+  const busy = save.isPending || restore.isPending || remove.isPending;
+  const requestOpenChange = (next: boolean) => {
+    if (!next && busy) return;
+    onOpenChange(next);
+  };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={requestOpenChange}>
       <DialogContent className="gap-0 p-0 sm:max-w-2xl">
         <div className="flex flex-col gap-1 border-b border-border px-4 py-3">
           <DialogTitle className="text-base">{isNew ? "New policy" : "Edit policy"}</DialogTitle>
@@ -490,7 +496,7 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
 
         <div className="flex items-center justify-between gap-2 border-t border-border px-4 py-2.5">
           <div className="flex items-center gap-2">
-            <Button type="button" variant="ghost" size="sm" onClick={() => onOpenChange(false)}>
+            <Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => requestOpenChange(false)}>
               Cancel
             </Button>
             {policy?.status === "archived" ? (

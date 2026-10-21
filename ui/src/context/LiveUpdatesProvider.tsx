@@ -1540,6 +1540,10 @@ function invalidateActivityQueries(
     if (sourceIssueId) queryClient.invalidateQueries({ queryKey: queryKeys.issues.activity(sourceIssueId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.projects.all(companyId) });
     if (entityId) queryClient.invalidateQueries({ queryKey: queryKeys.projects.detail(entityId) });
+    // A deleted project takes its policies with it.
+    if (readString(payload.action) === "project.deleted") {
+      queryClient.invalidateQueries({ queryKey: queryKeys.policies.all(companyId) });
+    }
     return;
   }
 

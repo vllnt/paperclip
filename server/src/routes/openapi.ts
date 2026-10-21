@@ -5567,7 +5567,7 @@ registry.registerPath({
   summary: "List company policies",
   description:
     `${COMPANY_POLICY_GUIDANCE} Company policies come first. Filter with \`scope\` (company or project), \`projectId\` and ` +
-    "`status` (draft, active or archived). Only active policies apply to agents.",
+    "`status` (draft, active or archived). `scope=company` with `projectId` returns 400. Only active policies apply to agents.",
   request: { params: z.object({ companyId: z.string() }), query: listCompanyPoliciesQuerySchema },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
