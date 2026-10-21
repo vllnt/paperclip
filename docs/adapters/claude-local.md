@@ -133,6 +133,8 @@ The adapter persists Claude Code session IDs between heartbeats. On the next wak
 
 Session resume is cwd-aware: if the agent's working directory changed since the last run, a fresh session starts instead.
 
+A fresh session also starts when the agent instructions or skills changed. Each run reads its own copy of the instructions, so the adapter compares their contents, not the path of the copy. On an SSH target, each run works in its own directory under the target's workspace. An SSH session resumes when the host workspace, host, port, user and remote workspace match the saved session. A sandbox session resumes only in the same lease. A resumed session still remembers the paths of its first run, so its prompt names this run's instructions directory on a local target, and this run's workspace on a remote target.
+
 If resume fails with an unknown session error, the adapter automatically retries with a fresh session.
 
 ### Poisoned `previous_message_id` (recovery)
@@ -160,6 +162,8 @@ On-call checklist if you see this in production:
 ## Skills Injection
 
 The adapter creates a temporary directory with symlinks to Paperclip skills and passes it via `--add-dir`. This makes skills discoverable without polluting the agent's working directory.
+
+These directories (one per set of instructions and skills, with the run's copy of the instructions) live in the company's Claude prompt cache in the instance directory. Each run marks the directory it uses. At most once an hour per company, a run removes the directories that no run has used for 7 days, without following the skill links inside them. A failed cleanup is retried later and never fails the run.
 
 ## Remote credential ownership
 

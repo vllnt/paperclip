@@ -26,10 +26,11 @@ import {
   type RoutineStepWarning,
   type RoutineStepsRunPayload,
 } from "@paperclipai/shared";
-import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
+import { HttpError, conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { evaluateAgentInvokability } from "./agent-invokability.js";
+import { authorizationDeniedDetails, type AuthorizationActor, type authorizationService } from "./authorization.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { issueExecutionWorkspaceModeForPersistedWorkspace } from "./execution-workspace-policy.js";
 import {
@@ -220,6 +221,35 @@ export function routineStartingStepAgentIds(steps: RoutineStep[], defaultAssigne
   return [...new Set(ids)];
 }
 
+/**
+ * Asks, for each agent the steps go to, the `tasks:assign` decision under the task: the task or its
+ * project can block an assignment for any actor, so a person who could not assign the steps there
+ * cannot have them attached either. Manual runs ask it for the caller and event dispatch for the
+ * author of the trigger.
+ * @param input.defaultAssigneeAgentId The agent a step without `assigneeAgentId` runs as.
+ * @throws HttpError 403 on the first assignment that is denied.
+ */
+export async function assertActorMayAssignSteps(input: {
+  authorization: Pick<ReturnType<typeof authorizationService>, "decide">;
+  actor: AuthorizationActor;
+  task: { id: string; companyId: string; projectId: string | null };
+  steps: RoutineStep[];
+  defaultAssigneeAgentId: string | null;
+}): Promise<void> {
+  const { authorization, actor, task } = input;
+  const assigneeAgentIds = new Set(input.steps.map((step) => step.assigneeAgentId ?? input.defaultAssigneeAgentId));
+  for (const assigneeAgentId of assigneeAgentIds) {
+    const scope = { projectId: task.projectId, parentIssueId: task.id, assigneeAgentId, assigneeUserId: null };
+    const decision = await authorization.decide({
+      actor,
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: task.companyId, issueId: null, ...scope },
+      scope,
+    });
+    if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+}
+
 /** What the steps hang under: the root issue of a routine run. */
 export interface RoutineRunRoot {
   id: string;
@@ -400,6 +430,13 @@ export interface AttachRoutineStepsToIssueInput {
   /** Values for `{{variable}}` placeholders; `issue.title` and `issue.identifier` come from the task. */
   variables: Record<string, unknown>;
   /**
+   * The caller's permission check on the task. It runs first under the locks, on the task row as
+   * locked and before any guard that tells the state of the task, so a change that landed after the
+   * caller's own read cannot slip through; throw to refuse. It reads on `executor`, the savepoint the
+   * attach runs in.
+   */
+  authorize?: (issue: RoutineStepTargetIssue, executor: Db) => Promise<void>;
+  /**
    * Runs once the guards pass and before anything is created; throw to refuse the task. It reads on
    * `executor`, the savepoint the attach runs in.
    */
@@ -431,7 +468,8 @@ async function hasLiveHeartbeatRun(executor: Db, companyId: string, issueId: str
  * The company's issue counter row and then the task row are locked first, in the order issue creation
  * takes them, so two attaches on one task (an event and a manual run, say) take turns and the second
  * sees the first one's steps. Under that lock a task is refused when it is
- * hidden or in another company (404), belongs to a routine run or a conversation (422), is not in
+ * hidden or in another company (404), when the caller's `authorize` check refuses it, when it belongs
+ * to a routine run or a conversation (422), is not in
  * backlog, todo or blocked (409), has a run in progress (409), already has routine steps in
  * progress (409), or would end up with more subtasks than a helper may create (422). A task an agent
  * owns is then set to `blocked`, so that agent does not start on it while the steps run; a task no
@@ -443,7 +481,7 @@ async function hasLiveHeartbeatRun(executor: Db, companyId: string, issueId: str
 export async function attachRoutineStepsToIssue(
   input: AttachRoutineStepsToIssueInput,
 ): Promise<{ root: RoutineStepTargetIssue; attached: AttachedRoutineSteps }> {
-  const { tx, companyId, issueId, run, routine, steps, assertCanStart } = input;
+  const { tx, companyId, issueId, run, routine, steps, authorize, assertCanStart } = input;
   const rootPublications: ActivityPublication[] = [];
   const created = await createRoutineRunIssues({
     tx,
@@ -473,6 +511,7 @@ export async function attachRoutineStepsToIssue(
         .for("update")
         .then((rows) => rows[0] ?? null);
       if (!locked || locked.hiddenAt) throw notFound("Task not found");
+      await authorize?.(locked, savepointDb);
       if (
         (locked.originKind && UNATTACHABLE_TASK_ORIGIN_KINDS.includes(locked.originKind)) ||
         locked.conversationAgentId

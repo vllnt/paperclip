@@ -2,9 +2,13 @@ import { and, asc, count, eq, gte, inArray, isNull, lt, lte, notExists, notInArr
 import { alias, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { agentWakeupRequests, agents, companies, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { SELF_REBLOCK_WAKE_PARKED_PAYLOAD_KEY } from "../domain/self-reblock-wake.js";
-import { DEFERRED_WAKE_SWEEP_BATCH_LIMIT, type OrphanedDeferredWake } from "../domain/deferred-wake-sweep.js";
+import {
+  DEFERRED_WAKE_SWEEP_BATCH_LIMIT,
+  type OrphanedDeferredWake,
+} from "../domain/deferred-wake-sweep.js";
 
 const DEFERRED_WAKE_STATUS = "deferred_issue_execution";
+const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const PROMOTED_WAKE_REASON = "issue_execution_promoted";
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 /** A closed task is not revived by an old parked wake. */
@@ -30,7 +34,43 @@ export type OrphanedDeferredWakeRow = OrphanedDeferredWake & {
   observedUpdatedAt: Date;
   /** The issue's project, which scopes a project budget hard stop. */
   projectId: string | null;
+  /** The issue's current assignee, which decides whether an assignee wake is superseded. */
+  issueAssigneeAgentId: string | null;
+  /** The reason the wake was requested for: the parked context's `wakeReason`, else the row's reason. */
+  wakeReason: string | null;
+  /** The wake delivers saved input, so it is never superseded or folded; see `carriesSavedInput`. */
+  carriesSavedInput: boolean;
 };
+
+/** The wake's reason: the parked context's `wakeReason`, else the row's reason. */
+const parkedWakeReason = (wake: { payload: AnyPgColumn; reason: AnyPgColumn }) =>
+  sql<string | null>`coalesce(${wake.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ->> 'wakeReason', ${wake.reason})`;
+
+/**
+ * A wake that delivers saved input, which nothing else would deliver again:
+ * - anything a person requested (a decision, an answer, a comment, a manual wake);
+ * - an approval decision (`approvalId`) or an interaction answer or request
+ *   (`interactionId`, `mutation: "interaction"`), whoever sent it;
+ * - a decision's continuation (`decisionId`), which carries the chosen
+ *   outcome to the agent that proposed the decision;
+ * - a comment (`commentId` or a non-empty parked `wakeCommentIds`);
+ * - a message held for execution recovery (`executionWait`);
+ * - a completed child (`issue_children_completed`), whose payload names the
+ *   child and its summary.
+ * Such a wake is never folded into another run, and never closed as superseded.
+ */
+const carriesSavedInput = (wake: { payload: AnyPgColumn; reason: AnyPgColumn; requestedByActorType: AnyPgColumn }) =>
+  sql<boolean>`(
+  coalesce(${wake.requestedByActorType} = 'user', false)
+  or ${wake.payload} ->> 'approvalId' is not null
+  or ${wake.payload} ->> 'decisionId' is not null
+  or ${wake.payload} ->> 'interactionId' is not null
+  or coalesce(${wake.payload} ->> 'mutation' = 'interaction', false)
+  or ${wake.payload} -> 'executionWait' is not null
+  or ${wake.payload} ->> 'commentId' is not null
+  or coalesce(jsonb_array_length(case jsonb_typeof(${wake.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text -> 'wakeCommentIds') when 'array' then ${wake.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text -> 'wakeCommentIds' end), 0) > 0
+  or coalesce(${parkedWakeReason(wake)} = 'issue_children_completed', false)
+)`;
 
 /** `payload.issueId` as a uuid, or null when it is not one, so the join can use the issue primary key. */
 const wakeIssueId = sql`(case when ${agentWakeupRequests.payload} ->> 'issueId' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' then (${agentWakeupRequests.payload} ->> 'issueId')::uuid end)`;
@@ -78,6 +118,9 @@ export async function listOrphanedDeferredWakes(
       issueId: issues.id,
       issuePriority: issues.priority,
       projectId: issues.projectId,
+      issueAssigneeAgentId: issues.assigneeAgentId,
+      wakeReason: parkedWakeReason(agentWakeupRequests),
+      carriesSavedInput: carriesSavedInput(agentWakeupRequests),
     })
     .from(agentWakeupRequests)
     .innerJoin(
@@ -272,6 +315,102 @@ export async function claimDeferredWakeExamination(
     )
     .returning({ id: agentWakeupRequests.id });
   return claimed.length > 0;
+}
+
+/**
+ * Closes one superseded parked wake, which the sweep will not run, with the
+ * existing terminal status `cancelled` and its reason. Run it inside a
+ * transaction: it takes the issue row lock first (`FOR UPDATE`), the lock
+ * admission holds while it consumes a receipt, so a close and a promotion of
+ * the same wake cannot interleave. Under the lock it is a no-op when:
+ * - another writer moved or touched the wake since the caller read it (a
+ *   promotion, a merged wake, another pass's claim), judged by the observed
+ *   `updated_at` as in `claimDeferredWakeExamination`;
+ * - the wake's agent holds the issue again.
+ *
+ * @returns Whether this call closed the wake.
+ */
+export async function closeDeferredWake(
+  db: Db,
+  input: {
+    companyId: string;
+    wakeId: string;
+    issueId: string;
+    observedUpdatedAt: Date;
+    /** The wake's agent: the close holds only while it does not hold the issue. */
+    supersededAgentId: string;
+    error: string;
+    now: Date;
+  },
+): Promise<boolean> {
+  const [issue] = await db
+    .select({ assigneeAgentId: issues.assigneeAgentId })
+    .from(issues)
+    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+    .for("update");
+  if (!issue || issue.assigneeAgentId === input.supersededAgentId) return false;
+  const closed = await db
+    .update(agentWakeupRequests)
+    .set({ status: "cancelled", error: input.error, finishedAt: input.now, updatedAt: input.now })
+    .where(
+      and(
+        eq(agentWakeupRequests.id, input.wakeId),
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+        sql`date_trunc('milliseconds', ${agentWakeupRequests.updatedAt}) = ${input.observedUpdatedAt.toISOString()}::timestamptz`,
+      ),
+    )
+    .returning({ id: agentWakeupRequests.id });
+  return closed.length > 0;
+}
+
+/**
+ * Folds an agent's other parked signal wakes on one issue into the run a
+ * promoted wake just queued, as admission folds parked comment wakes: status
+ * `coalesced`, linked to that run. Only wakes that carry nothing but their
+ * reason qualify: one of `reasons`, no saved input (see `carriesSavedInput`),
+ * no wake merged into it while it was parked (`coalesced_count` 0, because an
+ * earlier merged wake may have carried input), not owned by another recovery,
+ * and requested no later than `requestedAtLte`,
+ * the moment the promotion started, so a wake parked behind the new run after
+ * it started is left for that run's release. Wakes with saved input keep their
+ * own delivery.
+ *
+ * @returns The folded wakes.
+ */
+export async function coalesceParkedSignalWakesIntoRun(
+  db: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    runId: string;
+    reasons: readonly string[];
+    requestedAtLte: Date;
+    now: Date;
+  },
+): Promise<Array<{ id: string }>> {
+  if (input.reasons.length === 0) return [];
+  return db
+    .update(agentWakeupRequests)
+    .set({ status: "coalesced", runId: input.runId, finishedAt: input.now, updatedAt: input.now })
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${input.issueId}`,
+        lte(agentWakeupRequests.requestedAt, input.requestedAtLte),
+        eq(agentWakeupRequests.coalescedCount, 0),
+        notOwnedByOtherRecovery(agentWakeupRequests),
+        sql`not ${carriesSavedInput(agentWakeupRequests)}`,
+        sql`${parkedWakeReason(agentWakeupRequests)} in (${sql.join(
+          input.reasons.map((reason) => sql`${reason}`),
+          sql`, `,
+        )})`,
+      ),
+    )
+    .returning({ id: agentWakeupRequests.id });
 }
 
 export type DeferredWakeParkedBreakdown = {

@@ -495,6 +495,21 @@
       ]
     },
     {
+      "id": "skill:skills/paperclip/SKILL.md:policies:746",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/SKILL.md:746",
+      "title": "Policies",
+      "expectedSemantics": "Skill guidance headed “Policies”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/SKILL.md:746"
+      ]
+    },
+    {
       "id": "skill:skills/paperclip/references/api-reference.md:paperclip-api-reference:1",
       "sourceKind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/api-reference.md:1",
@@ -1590,6 +1605,21 @@
       ]
     },
     {
+      "id": "skill:skills/paperclip/references/api-reference.md:policies:1714",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md:1714",
+      "title": "Policies",
+      "expectedSemantics": "Skill guidance headed “Policies”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/references/api-reference.md:1714"
+      ]
+    },
+    {
       "id": "skill:skills/paperclip/references/artifacts.md:generated-artifacts-and-work-products:1",
       "sourceKind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/artifacts.md:1",
@@ -2427,6 +2457,36 @@
       ],
       "evidenceIds": [
         "skill:skills/paperclip/references/routines.md:287"
+      ]
+    },
+    {
+      "id": "skill:skills/paperclip/references/routines.md:slot-priority:387",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/routines.md:387",
+      "title": "Slot Priority",
+      "expectedSemantics": "Skill guidance headed “Slot Priority”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/references/routines.md:387"
+      ]
+    },
+    {
+      "id": "skill:skills/paperclip/references/routines.md:a-project-s-routines:402",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/routines.md:402",
+      "title": "A project's routines",
+      "expectedSemantics": "Skill guidance headed “A project's routines”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/references/routines.md:402"
       ]
     },
     {

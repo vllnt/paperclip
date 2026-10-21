@@ -317,9 +317,13 @@ run slot. The run log gets one `lifecycle` event (`warn`, payload
 `{ errorCode: "context_window_exceeded" }`) that says why. An assigned task
 becomes `blocked` with the usual recovery notice, so a person decides the next
 step, for example a fresh session. The run failure cause is `context_overflow`.
-The task session is kept: a different wake that was already queued for the same
-task, or a goal resumed at server start, still resumes that session and can fail
-the same way until a person resets the session.
+The run's task session is cleared, unless another run has saved that row
+since, because resuming it would overflow again. So the next wake on the task
+starts a fresh session, and so does the next tick of a routine whose issues
+share one session. A wake that starts on the same task before the clear (one
+that was deferred behind the run, for example), or a goal resumed at server
+start that carries its own session, can still fail the same way until a person
+resets the session.
 
 Provider identity diagnostics remain in the local run log. They record the notification method, expected and received thread/turn identifiers, and the classification (root, verified descendant, stale, unrelated informational, or invalid authoritative). They omit the original provider payload and credentials. Repeated informational notices are bounded.
 
@@ -338,8 +342,9 @@ then queues a retry with the reason `planned_restart_resume`. That retry is due
 at once and carries `resumeFromRunId`, so it resumes the session of the
 interrupted run. A run that asked for a fresh session resumes only a session it
 created itself; without one, the retry starts fresh. The retry spends no
-failure retry, and a run whose failure budget is spent gets none. At most three
-such retries follow each other; then the ordinary bounded retry applies. The
+failure retry, and a run whose failure budget is spent gets none. The
+interrupted run and its resume count as one run toward `maxDailyRuns`. At most
+three such retries follow each other; then the ordinary bounded retry applies. The
 server queues it only when stored lease evidence shows that the remote
 processes of the run stopped. If it cannot show this, the interrupted run
 records a lifecycle event with the payload `{ "reason": "remote_stop_unproven" }`

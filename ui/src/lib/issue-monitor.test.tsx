@@ -131,6 +131,28 @@ describe("deriveMonitorState", () => {
     ).toBe("retrying");
   });
 
+  it("names the pull request a wait targets after the service", () => {
+    const derived = deriveMonitorState(
+      {
+        executionPolicy: {
+          monitor: {
+            nextCheckAt: "2026-07-17T22:12:00.000Z",
+            serviceName: "GitHub pull request",
+            pullRequestUrl: "https://github.com/acme/app/pull/7",
+          },
+        },
+      },
+      now,
+    );
+    expect(derived.serviceName).toBe("GitHub pull request acme/app#7");
+    expect(
+      deriveMonitorState(
+        { executionPolicy: { monitor: { nextCheckAt: "2026-07-17T22:12:00.000Z", pullRequestUrl: "https://example.test/x" } } },
+        now,
+      ).serviceName,
+    ).toBeNull();
+  });
+
   it("derives due-now and overdue at the grace boundary", () => {
     const issue = (nextCheckAt: string) => ({
       executionState: { monitor: { status: "scheduled" as const, nextCheckAt, attemptCount: 1 } },

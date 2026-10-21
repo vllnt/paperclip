@@ -767,6 +767,12 @@ type PaperclipWakeExecutionWorkspace = {
   branchName: string | null;
 };
 
+// Set when a session kept across a routine's ticks resumes on a new tick's
+// issue. previousIssue is the issue the session last worked on, when known.
+type PaperclipWakeRoutineSession = {
+  previousIssue: { id: string; identifier: string | null; title: string | null } | null;
+};
+
 type PaperclipWakeToolResult = {
   actionRequestId: string;
   toolName: string;
@@ -836,6 +842,7 @@ type PaperclipWakePayload = {
   checkboxSelection: PaperclipWakeCheckboxSelection | null;
   questionResponse: PaperclipWakeQuestionResponse | null;
   executionWorkspace: PaperclipWakeExecutionWorkspace | null;
+  routineSession: PaperclipWakeRoutineSession | null;
   agentMessage: PaperclipWakeAgentMessage | null;
   annotationDeltas: PaperclipWakeAnnotationDelta[];
   childIssueSummaries: PaperclipWakeChildIssueSummary[];
@@ -1645,6 +1652,38 @@ function normalizePaperclipWakeExecutionWorkspace(
   return { branchName };
 }
 
+function normalizePaperclipWakeRoutineSession(
+  value: unknown,
+): PaperclipWakeRoutineSession | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const previous = parseObject(parseObject(value).previousIssue);
+  const id = asString(previous.id, "").trim();
+  return {
+    previousIssue: id
+      ? {
+          id,
+          identifier: oneLineText(previous.identifier, 100),
+          title: oneLineText(previous.title, ROUTINE_SESSION_TITLE_MAX_CHARS),
+        }
+      : null,
+  };
+}
+
+const ROUTINE_SESSION_TITLE_MAX_CHARS = 300;
+
+// Flatten text that goes inside one prompt sentence: control characters
+// (newlines included) become spaces, and the length is capped.
+function oneLineText(text: unknown, max: number): string | null {
+  return asString(text, "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max) || null;
+}
+
+// "RTN-2 `Weekly report`": the reference, then the title in an inline-code
+// span so a title cannot end the sentence it sits in.
+function routineSessionIssueLabel(reference: string, title: string | null | undefined): string {
+  const flatTitle = oneLineText(title, ROUTINE_SESSION_TITLE_MAX_CHARS);
+  return flatTitle ? `${reference} ${markdownInlineCode(flatTitle)}` : reference;
+}
+
 // Wrap a value in a Markdown inline-code span whose backtick fence is longer
 // than any backtick run inside the value, so the value cannot close the span.
 function markdownInlineCode(value: string): string {
@@ -1826,6 +1865,7 @@ export function normalizePaperclipWakePayload(
   const executionWorkspace = normalizePaperclipWakeExecutionWorkspace(
     payload.executionWorkspace,
   );
+  const routineSession = normalizePaperclipWakeRoutineSession(payload.routineSession);
   const agentMessage = normalizePaperclipWakeAgentMessage(payload.agentMessage);
   const issue = normalizePaperclipWakeIssue(payload.issue);
   const skillTest =
@@ -1909,6 +1949,7 @@ export function normalizePaperclipWakePayload(
     checkboxSelection,
     questionResponse,
     executionWorkspace,
+    routineSession,
     agentMessage,
     childIssueSummaries,
     childIssueSummaryTruncated: asBoolean(
@@ -2539,12 +2580,35 @@ function renderPaperclipWakePromptBody(
           "",
         ]
       : [];
+  const previousRoutineIssue = normalized.routineSession?.previousIssue ?? null;
+  const routineIssueLabel = routineSessionIssueLabel(
+    normalized.issue?.identifier ?? normalized.issue?.id ?? "the issue below",
+    normalized.issue?.title,
+  );
+  const previousRoutineIssueLabel = previousRoutineIssue
+    ? routineSessionIssueLabel(
+        previousRoutineIssue.identifier ?? previousRoutineIssue.id,
+        previousRoutineIssue.title,
+      )
+    : "another run of this routine";
+  const routineSessionLines = resumedSession && normalized.routineSession
+    ? [
+        // The routine dispatch assigns each new run's issue; any other wake
+        // (a comment, for example) can be on an older run's issue.
+        normalized.reason === "issue_assigned"
+          ? `This wake is for a NEW issue, ${routineIssueLabel}, created by a new run of the same routine.`
+          : `This wake is for ${routineIssueLabel}, an issue of the same routine. It is not the issue you worked on last in this session.`,
+        `Earlier in this session you worked on ${previousRoutineIssueLabel}${previousRoutineIssue ? ", another run of this routine" : ""}. That is a separate issue: do not continue, update, comment on, or close it from this wake.`,
+        "Treat other runs only as background. Work on the issue below.",
+      ]
+    : [];
   const lines = resumedSession
     ? [
         "## Paperclip Resume Delta",
         "",
         "You are resuming an existing Paperclip session.",
         "This heartbeat is scoped to the issue below. Do not switch to another issue until you have handled this wake.",
+        ...routineSessionLines,
         "Focus on the new wake delta below and continue the current task without restating the full heartbeat boilerplate.",
         ...(externalChatContract
           ? ["Use the supplied task and wake context before considering tools."]

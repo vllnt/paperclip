@@ -26,6 +26,7 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { PageTabBar } from "../components/PageTabBar";
 import { ProjectWorkspacesContent } from "../components/ProjectWorkspacesContent";
 import { ProjectRoutinesSection } from "../components/ProjectRoutinesSection";
+import { ProjectPoliciesSection } from "../components/ProjectPoliciesSection";
 import { SummarySlotCard } from "../components/SummarySlotCard";
 import { MembershipAction } from "../components/MembershipAction";
 import { StarToggle } from "../components/StarToggle";
@@ -903,12 +904,20 @@ export function ProjectDetail() {
           <ProjectProperties
             project={project}
             routines={
-              <ProjectRoutinesSection
-                key={project.id}
-                companyId={project.companyId}
-                projectId={project.id}
-                canCreate={!project.archivedAt}
-              />
+              <div className="flex flex-col gap-8">
+                <ProjectRoutinesSection
+                  key={project.id}
+                  companyId={project.companyId}
+                  projectId={project.id}
+                  canCreate={!project.archivedAt}
+                />
+                <ProjectPoliciesSection
+                  key={`policies-${project.id}`}
+                  companyId={project.companyId}
+                  projectId={project.id}
+                  canCreate={!project.archivedAt}
+                />
+              </div>
             }
             onUpdate={(data) => updateProject.mutate(data)}
             onFieldUpdate={updateProjectField}

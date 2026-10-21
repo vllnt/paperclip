@@ -66,6 +66,7 @@ function wakeCandidate(overrides: Partial<DeferredWakeCandidate> = {}): Deferred
     triggerDetail: null,
     requestedByActorType: "user",
     requestedByActorId: "actor-1",
+    requestedAt: new Date("2026-01-01T00:00:00.000Z"),
     payload: {},
     queuedCommentIds: [],
     preservesIndependentContinuation: false,
@@ -384,6 +385,19 @@ describe("releaseIssueExecution", () => {
     expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
     expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({
       source: "assignment", deferredAgent: expect.objectContaining({ id: AGENT.id }),
+    }));
+  });
+
+  it("stamps the promoted run with the wake's request time, so its queue wait counts the time it was parked", async () => {
+    const requestedAt = new Date("2026-01-01T08:00:00.000Z");
+    const queue = [wakeCandidate({ requestedAt, deferredContextSeed: { issueId: ISSUE.id, wakeReason: "issue_commented" } })];
+    const transaction = createFakeTransaction({ findNextDeferredWake: vi.fn(async () => queue.shift() ?? null) });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, ISSUE), recovery: createFakeRecovery(),
+    });
+    expect((await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() })).outcome.kind).toBe("promoted");
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledWith(expect.objectContaining({
+      contextSnapshot: expect.objectContaining({ parkedWakeRequestedAt: requestedAt.toISOString() }),
     }));
   });
 

@@ -3,7 +3,7 @@
 Routines are recurring tasks. Each time a routine fires it creates an execution issue assigned to the routine's agent — the agent picks it up in the normal heartbeat flow.
 
 A routine has:
-- One assigned agent and one project
+- One assigned agent, and at most one project (see [A project's routines](#a-projects-routines))
 - One or more triggers (`schedule`, `webhook`, `api`, or `event`)
 - A concurrency policy (what to do when a previous run is still active)
 - A catch-up policy (what to do with missed scheduled runs)
@@ -49,7 +49,7 @@ POST /api/companies/{companyId}/routines
 | `title` | yes | Max 200 chars |
 | `description` | no | Human-readable description of the routine |
 | `assigneeAgentId` | yes | Agents: must be themselves |
-| `projectId` | yes | |
+| `projectId` | no | The project the routine belongs to; a run's task opens in it. See [A project's routines](#a-projects-routines) |
 | `goalId` | no | Inherited by run issues |
 | `parentIssueId` | no | Run issues become children of this issue |
 | `priority` | no | `critical` `high` `medium` (default) `low` |
@@ -378,6 +378,34 @@ POST /api/routines/{routineId}/triggers
 - While such a trigger is enabled, you cannot change the routine's steps, its variables or its agent, also not through a revision restore (`403`). Ask the board, or disable the trigger first.
 - `event_issue` is valid only on the built-in source, with `fallback: false`, for a routine that has steps (`422` otherwise). A routine gate script that applies to event triggers cannot be combined with it (`422`).
 - No event for hidden tasks, routine run or step tasks, chat or conversation tasks, tasks below a routine run or step task, or tasks created while you work on a routine run or step task (anywhere, also at the top level), so steps cannot start a loop.
-- Effect: the steps are attached to the new task in the create request, before its assignee is woken. The assignee is not woken for the task; the steps without predecessors are. An agent-owned task becomes `blocked` until the steps finish. A refused task (for example one already in progress) records `failed_permanent` on the delivery and the task gets its normal wake, unless it already has open routine steps from another run: then the assignee stays asleep. When the source's `maxNewIssuesPerHour` is spent the delivery is `storm_folded` (note `new_issue_budget_spent`), nothing is attached, and the task gets its normal wake.
+- Effect: the steps are attached to the new task in the create request, before its assignee is woken. The assignee is not woken for the task; the steps without predecessors are. An agent-owned task becomes `blocked` until the steps finish. A refused task (for example one already in progress, or one whose task or project blocks assigning a step's agent to the board user who created the trigger) records `failed_permanent` on the delivery and the task gets its normal wake, unless it already has open routine steps from another run: then the assignee stays asleep. When the source's `maxNewIssuesPerHour` is spent the delivery is `storm_folded` (note `new_issue_budget_spent`), nothing is attached, and the task gets its normal wake.
 
-**Manual run on a task.** For a routine with `steps`, add `"targetIssueId": "<taskId>"` (a UUID) to put the steps under that existing task instead of opening a new one. The answer is `202` with the run (`linkedIssueId` is the task) and `warnings`. You need to manage the routine (agents: your own routines) and be allowed to update the task (`403` otherwise). You also need the right to assign each step's agent under the task, which the task or its project can block (`403`), and as an agent you can name only yourself as `assigneeAgentId` (`403` otherwise). A second run on a task whose first run's steps are still open is refused with `409`; once those steps are closed you can run it on the task again. Do not send `triggerId`, `projectId`, `projectWorkspaceId` or execution workspace fields with it (`422`). Reusing an `idempotencyKey` from a run on another task, or from a run without a task, answers `409`, and so does the reverse. A step that starts at once needs an agent that can be woken (`409` otherwise). Other errors are `404`, `409` and `422` as described under "Steps on a task that exists". CLI: `paperclipai routine run <routineId> --target-issue <uuid-or-identifier>`.
+**Manual run on a task.** For a routine with `steps`, add `"targetIssueId": "<taskId>"` (a UUID) to put the steps under that existing task instead of opening a new one. The answer is `202` with the run (`linkedIssueId` is the task) and `warnings`. You need to manage the routine (agents: your own routines) and be allowed to update the task (`403` otherwise). You also need the right to assign each step's agent under the task, which the task or its project can block (`403`), and as an agent you can name only yourself as `assigneeAgentId` (`403` otherwise). A second run on a task whose first run's steps are still open is refused with `409`; once those steps are closed you can run it on the task again. Do not send `triggerId`, `projectId`, `projectWorkspaceId` or execution workspace fields with it (`422`). Reusing an `idempotencyKey` from a run on another task, or from a run without a task, answers `409`, and so does the reverse. A step that starts at once needs an agent that can be woken (`409` otherwise). The permission checks run again under the task and routine locks, so a board change that lands while the run starts is refused (`403`); an edit of the routine in that time answers `409` "The routine changed while the run was starting": send the same request again. Other errors are `404`, `409` and `422` as described under "Steps on a task that exists". CLI: `paperclipai routine run <routineId> --target-issue <uuid-or-identifier>`.
+
+---
+
+## Slot Priority
+
+`slotPriority` controls where the routine's runs wait when its agent already has as many runs as it can start at once. Set it on create or update (`"slotPriority": "first"`). It defaults to `normal`.
+
+| Value | Behaviour |
+|-------|-----------|
+| `normal` **(default)** | Runs wait in the agent's queue by issue priority and age, like its other work |
+| `first` | Runs on the routine's run task and step sub-tasks start at the agent's next free slot, before its other queued runs. Runs whose issue has unresolved blockers still go last |
+
+Use `first` for a scheduled routine that must not wait behind a long queue, such as an hourly health check. Changing it does not create a revision, and restoring a revision leaves it as it is.
+
+- **Only the board sets `first`.** It reorders the queue of every agent that serves the routine's runs, so a board user with `tasks:assign` must set it. As an agent you get `403` when you set `first` on a routine that is not already `first`, even on your own routine: ask the board. You can still set it back to `normal`. While your routine is `first`, adding triggers or starting more runs pushes the other queued work of every agent it serves further back, so ask the board before you make it run more often.
+- **Your other runs can wait.** Aging (one priority level per 30 minutes waited) works within each group only. While a `first` routine keeps runs queued, the agent's other runs wait, however long they have waited.
+- **Which issues.** It applies to the issues the routine files under its own id (origin `routine_execution` or `routine_step`). A plugin-managed routine that files its runs under the plugin's own origin, or another origin id, keeps the usual order.
+
+## A project's routines
+
+A routine belongs to at most one project (`projectId`). To work with one project's routines:
+
+- List them with `GET /api/companies/{companyId}/routines?projectId={projectId}`, or `paperclipai routine list --project-id <id>`.
+- Create one in the project with `projectId` in the create body, or `paperclipai routine create --project-id <id> --payload-json '{...}'`.
+- Move one to another project with `PATCH /api/routines/{routineId}` and `projectId`, or `paperclipai routine update <routineId> --project-id <id>`. Send `null`, or `--project-id none`, to take it out of any project.
+- Pause, run and edit it as any other routine.
+
+The board does the same on the project's Configuration tab.

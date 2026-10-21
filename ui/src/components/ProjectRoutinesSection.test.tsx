@@ -13,6 +13,7 @@ import { ProjectRoutinesSection } from "./ProjectRoutinesSection";
 const routinesListMock = vi.hoisted(() => vi.fn());
 const routinesUpdateMock = vi.hoisted(() => vi.fn());
 const pushToastMock = vi.hoisted(() => vi.fn());
+const composerRenderMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/router", () => ({
   Link: ({ to, children, ...props }: AnchorHTMLAttributes<HTMLAnchorElement> & { to: string; children: ReactNode }) => (
@@ -30,6 +31,26 @@ vi.mock("../api/projects", () => ({
 }));
 vi.mock("../context/ToastContext", () => ({ useToastActions: () => ({ pushToast: pushToastMock }) }));
 vi.mock("./RoutineRunVariablesDialog", () => ({ RoutineRunVariablesDialog: () => null }));
+vi.mock("./RoutineComposerDialog", () => ({
+  RoutineComposerDialog: (props: ComposerProps) => {
+    composerRenderMock(props);
+    if (!props.open) return null;
+    return (
+      <div data-testid={props.routine ? "routine-editor" : "routine-composer"}>
+        {props.routine?.title ?? props.initialDraft?.projectId}
+        <button type="button" onClick={() => props.onOpenChange(false)}>Close dialog</button>
+      </div>
+    );
+  },
+}));
+
+interface ComposerProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  routine?: RoutineListItem | null;
+  initialDraft?: { projectId?: string };
+  afterCreate?: string;
+}
 
 async function act(callback: () => void | Promise<void>) {
   let result: void | Promise<void> = undefined;
@@ -71,6 +92,7 @@ describe("ProjectRoutinesSection", () => {
     routinesListMock.mockReset();
     routinesUpdateMock.mockReset();
     pushToastMock.mockReset();
+    composerRenderMock.mockReset();
   });
 
   afterEach(async () => {
@@ -109,7 +131,8 @@ describe("ProjectRoutinesSection", () => {
     expect(container.textContent).toContain("Builder");
     expect(container.querySelector('a[href="/routines/routine-1/overview"]')).not.toBeNull();
     expect(container.textContent).not.toContain("Old sync");
-    expect(container.querySelector('a[href="/routines?new=1&projectId=project-1"]')).not.toBeNull();
+    expect(button("New routine")).toBeTruthy();
+    expect(container.querySelector('[aria-label="Edit Nightly triage"]')).not.toBeNull();
 
     await act(() => button("Show archived (1)")!.click());
 
@@ -117,24 +140,59 @@ describe("ProjectRoutinesSection", () => {
     expect(button("Hide archived")).toBeTruthy();
   });
 
-  it("shows an empty state with a New routine link that preselects the project", async () => {
+  it("shows an empty state whose New routine opens the composer in place with the project chosen", async () => {
     routinesListMock.mockResolvedValue([]);
 
     await renderSection();
 
     expect(container.textContent).toContain("No routines in this project yet.");
-    const links = container.querySelectorAll('a[href="/routines?new=1&projectId=project-1"]');
-    expect(links).toHaveLength(1);
-    expect(links[0].textContent).toContain("New routine");
+    expect(container.querySelector('a[href^="/routines?new=1"]')).toBeNull();
+    expect(container.querySelector('[data-testid="routine-composer"]')).toBeNull();
+
+    await act(() => button("New routine")!.click());
+
+    expect(container.querySelector('[data-testid="routine-composer"]')?.textContent).toContain("project-1");
+    const props = composerRenderMock.mock.calls
+      .map(([call]) => call as ComposerProps)
+      .filter((call) => call.open && !call.routine)
+      .at(-1);
+    expect(props?.initialDraft).toEqual({ projectId: "project-1" });
+    expect(props?.afterCreate).toBe("stay");
+
+    await act(() => button("Close dialog")!.click());
+    expect(container.querySelector('[data-testid="routine-composer"]')).toBeNull();
   });
 
-  it("offers no New routine link for an archived project", async () => {
+  it("offers no New routine for an archived project", async () => {
     routinesListMock.mockResolvedValue([]);
 
     await renderSection(false);
 
     expect(container.textContent).toContain("No routines in this project yet.");
-    expect(container.querySelector('a[href^="/routines?new=1"]')).toBeNull();
+    expect(button("New routine")).toBeUndefined();
+  });
+
+  it("edits a routine in place from its row", async () => {
+    routinesListMock.mockResolvedValue([
+      routine({ id: "routine-1", title: "Nightly triage" }),
+      routine({ id: "routine-2", title: "Weekly sweep" }),
+    ]);
+
+    await renderSection();
+    await act(() => container.querySelector<HTMLButtonElement>('[aria-label="Edit Nightly triage"]')!.click());
+
+    expect(container.querySelector('[data-testid="routine-editor"]')?.textContent).toContain("Nightly triage");
+    expect(container.querySelector('[data-testid="routine-composer"]')).toBeNull();
+
+    await act(() => button("Close dialog")!.click());
+    expect(container.querySelector('[data-testid="routine-editor"]')).toBeNull();
+    // The closed editor keeps its routine, so the dialog content does not change while it animates out.
+    const last = composerRenderMock.mock.calls
+      .map(([call]) => call as ComposerProps)
+      .filter((call) => call.routine !== undefined)
+      .at(-1);
+    expect(last?.open).toBe(false);
+    expect(last?.routine?.id).toBe("routine-1");
   });
 
   it("pauses a routine from its row and refreshes the project's list", async () => {
