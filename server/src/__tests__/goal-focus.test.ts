@@ -294,11 +294,13 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
       const foreignProgress = await request(app(member(mine.id))).get(`/api/companies/${theirs.id}/goals/progress`);
       const agentId = await seedAgent(mine.id);
       const foreignForAgent = await request(app(agentActor(mine.id, agentId))).get(`/api/companies/${theirs.id}/goals/focus`);
+      const foreignProgressForAgent = await request(app(agentActor(mine.id, agentId))).get(`/api/companies/${theirs.id}/goals/progress`);
 
       expect(own.body.goals).toEqual([]);
       expect(foreign.status).toBe(403);
       expect(foreignProgress.status).toBe(403);
       expect(foreignForAgent.status).toBe(403);
+      expect(foreignProgressForAgent.status).toBe(403);
     });
   });
 
@@ -676,6 +678,22 @@ describeEmbeddedPostgres("goal horizons, milestones and company focus", () => {
         expect(res.body.goal.title.isWellFormed()).toBe(true);
         expect(endsBetweenGraphemes(title, res.body.goal.title)).toBe(true);
       }
+    });
+
+    it("lets an agent read its own company's focus and each goal's task progress with its key", async () => {
+      const company = await seedCompany();
+      const agentId = await seedAgent(company.id);
+      const focusGoal = await seedGoal(company.id, { title: "Land PRs", horizon: "short" });
+      await seedIssue(company, { assigneeAgentId: agentId, goalId: focusGoal.id });
+      const asAgent = request(app(agentActor(company.id, agentId)));
+
+      const focus = await asAgent.get(`/api/companies/${company.id}/goals/focus`);
+      const progress = await asAgent.get(`/api/companies/${company.id}/goals/progress`);
+
+      expect(focus.status).toBe(200);
+      expect(focus.body.goals.map((goal: { id: string }) => goal.id)).toEqual([focusGoal.id]);
+      expect(progress.status).toBe(200);
+      expect(progress.body[focusGoal.id]).toMatchObject({ total: 1, open: 1, done: 0 });
     });
 
     it("gives an agent goal text cut from the goal and issue APIs its tools call, and the board the stored text", async () => {

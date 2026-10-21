@@ -7,6 +7,7 @@ import {
   type ResolvedTransientRetryPolicy,
 } from "@paperclipai/shared";
 import { issueIdEqualsText } from "./issue-id-match.js";
+import { capGoalTextForAgents } from "./goal-focus.js";
 import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
 import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
@@ -224,6 +225,7 @@ import {
   documentAnnotationThreads,
   documentRevisions,
   environmentLeases,
+  goals,
   issueDocuments,
   executionWorkspaces,
   heartbeatRunEvents,
@@ -8354,6 +8356,7 @@ export async function buildPaperclipWakePayload(input: {
     priority: string;
     workMode: string;
     projectId?: string | null;
+    goalId?: string | null;
     executionPolicy?: unknown;
   } | null;
   exposeLowTrustRaw?: boolean;
@@ -8385,6 +8388,7 @@ export async function buildPaperclipWakePayload(input: {
             status: issues.status,
             priority: issues.priority,
             workMode: issues.workMode,
+            goalId: issues.goalId,
           })
           .from(issues)
           .where(
@@ -8392,6 +8396,15 @@ export async function buildPaperclipWakePayload(input: {
           )
           .then((rows) => rows[0] ?? null)
       : null);
+  // The task's own goal, cut like every goal text an agent reads. A chat wake shows no goal.
+  const issueGoalId = conversationMode ? null : issueSummary?.goalId ?? null;
+  const issueGoal = issueGoalId
+    ? await input.db
+        .select({ id: goals.id, title: goals.title })
+        .from(goals)
+        .where(and(eq(goals.id, issueGoalId), eq(goals.companyId, input.companyId)))
+        .then((rows) => (rows[0] ? capGoalTextForAgents(rows[0]) : null))
+    : null;
   if (
     commentIds.length === 0 &&
     Object.keys(executionStage).length === 0 &&
@@ -8812,6 +8825,7 @@ export async function buildPaperclipWakePayload(input: {
           status: issueSummary.status,
           priority: issueSummary.priority,
           workMode: issueSummary.workMode,
+          ...(issueGoal ? { goal: issueGoal } : {}),
         }
       : null,
     agentMessage: agentMessageText
@@ -11587,6 +11601,7 @@ export function heartbeatService(
         reviewPolicy: issues.reviewPolicy,
         priority: issues.priority,
         projectId: issues.projectId,
+        goalId: issues.goalId,
         projectWorkspaceId: issues.projectWorkspaceId,
         executionWorkspaceId: issues.executionWorkspaceId,
         executionWorkspacePreference: issues.executionWorkspacePreference,
@@ -24408,6 +24423,7 @@ export function heartbeatService(
             reviewPolicy: issueContext.reviewPolicy,
             description: issueContext.description,
             projectId: issueContext.projectId,
+            goalId: issueContext.goalId,
             projectWorkspaceId: issueContext.projectWorkspaceId,
             executionWorkspaceId: issueContext.executionWorkspaceId,
             executionWorkspacePreference:
@@ -24485,6 +24501,7 @@ export function heartbeatService(
               priority: issueRef.priority,
               workMode: issueRef.workMode,
               projectId: issueRef.projectId,
+              goalId: issueRef.goalId,
               executionPolicy: issueContext?.executionPolicy ?? null,
             }
           : null,
