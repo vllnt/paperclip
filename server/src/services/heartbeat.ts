@@ -22073,7 +22073,7 @@ export function heartbeatService(
    * or touched it first, or a superseded wake's agent holds the issue again.
    */
   async function closeSupersededParkedWake(wake: OrphanedDeferredWakeRow) {
-    const error = "Superseded: the issue is now assigned to another agent. This wake will not run.";
+    const error = "Superseded: the issue is no longer assigned to this agent. This wake will not run.";
     const publications: ActivityPublication[] = [];
     const closed = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;

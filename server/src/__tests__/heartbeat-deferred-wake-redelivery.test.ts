@@ -1351,7 +1351,7 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       expect(pass).toMatchObject({ superseded: 1, failed: 0 });
       const stale = await wakeRow(staleWakeId);
       expect(stale).toMatchObject({ status: "cancelled", runId: null });
-      expect(stale.error).toMatch(/^Superseded: the issue is now assigned to another agent/);
+      expect(stale.error).toMatch(/^Superseded: the issue is no longer assigned to this agent/);
       // Single assignee: the former assignee never runs the issue and does not take it back.
       expect((await runsForIssue(reassignedIssueId)).filter((run) => run.agentId === formerId)).toEqual([]);
       const [reassigned] = await db.select().from(issues).where(eq(issues.id, reassignedIssueId));
@@ -1433,7 +1433,9 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
 
       expect(pass).toMatchObject({ superseded: 2, keptForHandoff: 0, promoted: 0, failed: 0 });
       for (const { issueId, wakeId } of seeded) {
-        expect(await wakeRow(wakeId)).toMatchObject({ status: "cancelled", runId: null });
+        const closed = await wakeRow(wakeId);
+        expect(closed).toMatchObject({ status: "cancelled", runId: null });
+        expect(closed.error).toMatch(/^Superseded: the issue is no longer assigned to this agent/);
         expect(await closedActivity(issueId)).toHaveLength(1);
         expect(await runsForIssue(issueId)).toEqual([]);
       }
