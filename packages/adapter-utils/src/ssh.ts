@@ -10,10 +10,8 @@ import { createPaperclipTempDir, removePaperclipTempDir, type PaperclipTempPrefi
 import {
   createUnrelatedHistoryGraftCommit,
   commitTreeWithSyncIdentity,
-  describeGitFailure,
   readSanitizedOriginRemoteUrl,
   retryTransientGitBundleTransfer,
-  runLocalGitIndexWrite,
   SSH_SIGNAL_TERMINATION_MESSAGE_PREFIX,
 } from "./git-workspace-sync.js";
 import type { ChildProcess } from "node:child_process";
@@ -174,7 +172,7 @@ export interface SshEnvLabFixtureState {
   sshdLogPath: string;
 }
 
-export interface LocalGitWorkspaceSnapshot {
+interface LocalGitWorkspaceSnapshot {
   headCommit: string;
   branchName: string | null;
   deletedPaths: string[];
@@ -1169,19 +1167,18 @@ async function exportGitWorkspaceFromSsh(input: {
   }
 }
 
-/** How `integrateImportedGitHead` moved a ref: the index and the run log need both ends. */
-interface GitHeadMove {
-  ref: string;
-  from: string;
-  to: string;
-  how: "fast-forward" | "merge" | "graft";
+// Any git failure answers false, so the caller keeps integrating as before.
+async function localHistoryContains(localDir: string, commit: string): Promise<boolean> {
+  return await runLocalGit(localDir, ["merge-base", "--is-ancestor", commit, "HEAD"], {
+    timeout: 10_000,
+    maxBuffer: 16 * 1024,
+  }).then(() => true, () => false);
 }
 
-/** Moves the local branch to hold `importedHead`. Resolves with the move, or null when the history already holds it. */
 async function integrateImportedGitHead(input: {
   localDir: string;
   importedHead: string;
-}): Promise<GitHeadMove | null> {
+}): Promise<void> {
   const isConcurrentRefUpdateError = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     return message.includes("cannot lock ref") && message.includes("expected");
@@ -1189,10 +1186,10 @@ async function integrateImportedGitHead(input: {
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const snapshot = await readLocalGitWorkspaceSnapshot(input.localDir);
-    if (!snapshot) return null;
+    if (!snapshot) return;
 
     const currentHead = snapshot.headCommit;
-    if (!currentHead || currentHead === input.importedHead) return null;
+    if (!currentHead || currentHead === input.importedHead) return;
 
     const headRef = snapshot.branchName ? `refs/heads/${snapshot.branchName}` : "HEAD";
     // `git merge-base` exits 1 when the commits share no ancestor — the only
@@ -1210,7 +1207,7 @@ async function integrateImportedGitHead(input: {
     const mergeBaseHead = mergeBase?.stdout.trim() ?? "";
 
     if (mergeBaseHead === input.importedHead) {
-      return null;
+      return;
     }
 
     if (mergeBaseHead === currentHead) {
@@ -1219,7 +1216,7 @@ async function integrateImportedGitHead(input: {
           timeout: 10_000,
           maxBuffer: 16 * 1024,
         });
-        return { ref: headRef, from: currentHead, to: input.importedHead, how: "fast-forward" };
+        return;
       } catch (error) {
         if (isConcurrentRefUpdateError(error) && attempt < 4) continue;
         throw error;
@@ -1241,7 +1238,7 @@ async function integrateImportedGitHead(input: {
           timeout: 10_000,
           maxBuffer: 16 * 1024,
         });
-        return { ref: headRef, from: currentHead, to: graftCommit, how: "graft" };
+        return;
       } catch (error) {
         if (isConcurrentRefUpdateError(error) && attempt < 4) continue;
         throw error;
@@ -1286,7 +1283,7 @@ async function integrateImportedGitHead(input: {
         timeout: 10_000,
         maxBuffer: 16 * 1024,
       });
-      return { ref: headRef, from: currentHead, to: mergeCommit.stdout.trim(), how: "merge" };
+      return;
     } catch (error) {
       if (isConcurrentRefUpdateError(error) && attempt < 4) continue;
       throw error;
@@ -1294,89 +1291,6 @@ async function integrateImportedGitHead(input: {
   }
 
   throw new Error(`Failed to integrate concurrent SSH git history for ${input.importedHead.slice(0, 12)} after multiple retries.`);
-}
-
-/**
- * Brings the index entries of the paths that `move` changed to their version
- * in the new HEAD, in one git command, so the index moves whole or not at all.
- * Every other entry stays as it is: a change staged by hand on another path
- * stays staged, the staged part of a partly staged file included. It runs
- * after the merge's preflight and before its first write. When the index
- * cannot follow (another git process kept it locked past the retries), the ref
- * goes back with a compare-and-swap: no file was written yet, so HEAD, index
- * and files still agree and the next restore integrates again.
- */
-async function moveLocalGitIndexWithHead(localDir: string, move: GitHeadMove): Promise<{ paths: number; lockWaitMs: number }> {
-  const listDir = await createPaperclipTempDir("paperclip-ssh-sync-back-");
-  try {
-    const changed = (await runLocalGit(localDir, ["diff", "--name-only", "-z", "--no-renames", move.from, move.to, "--"], {
-      timeout: 60_000,
-      maxBuffer: 16 * 1024 * 1024,
-    })).stdout;
-    const paths = changed.split("\0").filter(Boolean).length;
-    if (paths === 0) return { paths, lockWaitMs: 0 };
-    const listFile = path.join(listDir, "index-paths");
-    await fs.writeFile(listFile, changed);
-    const { lockWaitMs } = await runLocalGitIndexWrite(localDir, [
-      "--literal-pathspecs", "reset", "--quiet", move.to, `--pathspec-from-file=${listFile}`, "--pathspec-file-nul",
-    ]);
-    return { paths, lockWaitMs };
-  } catch (error) {
-    const reason = `Failed to move the local git index to ${move.to.slice(0, 12)}: ${describeGitFailure(error)}`;
-    await runLocalGit(localDir, ["update-ref", move.ref, move.from, move.to], {
-      timeout: 10_000,
-      maxBuffer: 16 * 1024,
-    }).catch((undoError: unknown) => {
-      throw new Error(`${reason}\nMoving ${move.ref} back to ${move.from.slice(0, 12)} failed too: ${describeGitFailure(undoError)}`);
-    });
-    throw new Error(`${reason}\n${move.ref} is back at ${move.from.slice(0, 12)}.`);
-  } finally {
-    await removePaperclipTempDir(listDir).catch(() => undefined);
-  }
-}
-
-/**
- * `integrateImportedGitHead` moves the ref, and the file merge then writes
- * whatever the run's copy held on the paths it changed. A path the merge wrote
- * whose file equals the run's commit but differs from the integrated HEAD is a
- * stale copy of history Git has already merged, not an edit: it follows HEAD,
- * and a tracked file the merge removed for that reason comes back. A file the
- * run edited after its last commit differs from the run's commit and stays as
- * it is, so a true both-sides conflict still resolves as "the run's dirty file
- * wins". A path the merge did not write is the host's and is never touched.
- * Symlinks and other non-regular files are left alone.
- */
-async function realignTrackedFilesWithHead(input: {
-  localDir: string;
-  importedHead: string;
-  written: ReadonlySet<string>;
-}): Promise<{ paths: number; lockWaitMs: number }> {
-  if (input.written.size === 0) return { paths: 0, lockWaitMs: 0 };
-  const driftedFrom = async (commit: string): Promise<string[]> =>
-    (await runLocalGit(input.localDir, ["diff", "--name-only", "-z", "--no-renames", commit, "--"], {
-      timeout: 60_000,
-      maxBuffer: 16 * 1024 * 1024,
-    })).stdout.split("\0").filter(Boolean);
-  const differsFromRunCommit = new Set(await driftedFrom(input.importedHead));
-  const stale: string[] = [];
-  for (const relative of await driftedFrom("HEAD")) {
-    if (!input.written.has(relative) || differsFromRunCommit.has(relative)) continue;
-    const kind = await fs.lstat(path.join(input.localDir, relative)).then(
-      (stat) => (stat.isFile() ? "file" : "other"),
-      (error: NodeJS.ErrnoException) => (error.code === "ENOENT" ? "absent" : "other"),
-    );
-    if (kind !== "other") stale.push(relative);
-  }
-  let lockWaitMs = 0;
-  for (let offset = 0; offset < stale.length; offset += 200) {
-    const batch = stale.slice(offset, offset + 200);
-    try {
-      lockWaitMs += (await runLocalGitIndexWrite(input.localDir, ["--literal-pathspecs", "checkout", "HEAD", "--", ...batch])).lockWaitMs;
-    } catch (error) {
-      throw new Error(`Failed to bring ${batch.length} restored file(s) back in line with HEAD: ${describeGitFailure(error)}`);
-    }
-  }
-  return { paths: stale.length, lockWaitMs };
 }
 
 async function clearRemoteDirectory(input: {
@@ -2100,32 +2014,6 @@ export async function syncDirectoryFromSsh(input: {
   }
 }
 
-/**
- * What `prepareWorkspaceForSshExecution` will send, decided without sending
- * anything. The caller snapshots the host between planning and sending, so the
- * sync-back baseline never records a change that lands on the host while the
- * copy is being seeded.
- */
-export interface SshWorkspaceSeedPlan {
-  gitBacked: boolean;
-  /** The host's HEAD and deleted paths, read once for both the seed and the baseline. */
-  gitSnapshot: LocalGitWorkspaceSnapshot | null;
-  /** Dependency directory names the host does not track: the seed and the baseline both leave them out. */
-  untrackedDependencyDirNames: string[];
-}
-
-export async function planWorkspaceSeed(input: {
-  localDir: string;
-  workspaceFileMode?: "all";
-}): Promise<SshWorkspaceSeedPlan> {
-  const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
-  return {
-    gitBacked: gitSnapshot !== null,
-    gitSnapshot,
-    untrackedDependencyDirNames: gitSnapshot ? await untrackedSshSyncBackDependencyDirNames(input.localDir) : [],
-  };
-}
-
 export async function prepareWorkspaceForSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
@@ -2133,12 +2021,9 @@ export async function prepareWorkspaceForSshExecution(input: {
   onProgress?: RuntimeProgressSink;
   workspaceFileMode?: "all";
   workspaceExclude?: string[];
-  /** A plan the caller already made with `planWorkspaceSeed`; made here when absent. */
-  plan?: SshWorkspaceSeedPlan;
 }): Promise<{ gitBacked: boolean }> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
-  const plan = input.plan ?? await planWorkspaceSeed(input);
-  const gitSnapshot = plan.gitSnapshot;
+  const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
 
   if (gitSnapshot) {
     await importGitWorkspaceToSsh({
@@ -2158,7 +2043,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       exclude: [
         ".git",
         ".paperclip-runtime",
-        ...sshSyncBackDependencyExcludes(plan.untrackedDependencyDirNames),
+        ...sshSyncBackDependencyExcludes(await untrackedSshSyncBackDependencyDirNames(input.localDir)),
       ],
       onProgress: input.onProgress,
       progressLabel: "workspace",
@@ -2187,25 +2072,12 @@ export async function prepareWorkspaceForSshExecution(input: {
   return { gitBacked: false };
 }
 
-/** A run-log line for one restore step: what it did and how long it took. */
-function describeRestoreStep(name: string, ms: number, detail: string, lockWaitMs: number): string {
-  const seconds = (value: number) => `${(value / 1000).toFixed(1)}s`;
-  const waited = lockWaitMs > 0 ? `, ${seconds(lockWaitMs)} of it waiting for the git index lock` : "";
-  return `[paperclip] Restore ${name}: ${detail} (${seconds(ms)}${waited}).\n`;
-}
-
 export async function restoreWorkspaceFromSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
   remoteDir?: string;
   baselineSnapshot?: DirectorySnapshot;
   restoreGitHistory?: boolean;
-  /**
-   * The local HEAD the copy was seeded from. A run whose HEAD is still this
-   * commit made no commit, so the restore writes its file edits only and leaves
-   * the local HEAD, index and branches as the host left them.
-   */
-  seedHead?: string | null;
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
@@ -2225,11 +2097,12 @@ export async function restoreWorkspaceFromSshExecution(input: {
           onProgress: input.onProgress,
         })
         : null;
-      // A run still on the seed made no commit: there is nothing to integrate
-      // or realign, and whatever the host did with its HEAD, index and branches
-      // during the run (a commit, a `revert -n`, a switch, an amend, a
-      // `reset --soft`) is the host's own.
-      const runHead = importedHead && importedHead !== input.seedHead ? importedHead : null;
+      // A head the local history already contains integrates as a no-op, so a
+      // run without new commits needs no hook and an unchanged tree can skip
+      // the merge lock.
+      const headToIntegrate = importedHead && !(await localHistoryContains(input.localDir, importedHead))
+        ? importedHead
+        : null;
       // `stagingDir` is fresh and empty, so extract into it directly rather
       // than through a second staging copy.
       await extractDirectoryFromSsh({
@@ -2240,48 +2113,19 @@ export async function restoreWorkspaceFromSshExecution(input: {
         onProgress: input.onProgress,
         progressLabel: "workspace",
       });
-      // One run-log line per step. A line that cannot be written never fails the restore.
-      const reportStep = async (name: string, ms: number, detail: string, lockWaitMs = 0) => {
-        await Promise.resolve(input.onProgress?.(describeRestoreStep(name, ms, detail, lockWaitMs))).catch(() => undefined);
-      };
       await mergeDirectoryWithBaseline({
         baseline: input.baselineSnapshot,
         sourceDir: stagingDir,
         targetDir: input.localDir,
         onLockWaitProgress: input.onProgress,
-        onStep: async (step) => {
-          if (step.name === "snapshot") {
-            await reportStep("snapshot", step.ms, `${step.paths} entries in the run's copy`);
-            if (importedHead && !runHead) await reportStep("integrate", 0, "skipped, the run made no commit");
-          } else {
-            await reportStep("copy", step.ms, `${step.paths} path(s) written`);
-          }
-        },
         // Git history advances via integrateImportedGitHead; the working tree
         // still comes from the remote file snapshot so dirty remote edits win.
-        // Both run after the preflight, so a merge that refuses moves nothing.
-        // A head the local history already holds integrates as a no-op; a run
-        // that moved its copy to such a commit still needs the realign below.
-        afterPreflight: runHead
+        beforeApply: headToIntegrate
           ? async () => {
-            let startedAt = Date.now();
-            const move = await integrateImportedGitHead({ localDir: input.localDir, importedHead: runHead });
-            const integrateMs = Date.now() - startedAt;
-            startedAt = Date.now();
-            const index = move ? await moveLocalGitIndexWithHead(input.localDir, move) : null;
-            await reportStep("integrate", integrateMs, move
-              ? `${move.how} to ${move.to.slice(0, 12)}`
-              : `the local history already holds ${runHead.slice(0, 12)}`);
-            if (index) {
-              await reportStep("index", Date.now() - startedAt, `${index.paths} path(s) follow the new HEAD`, index.lockWaitMs);
-            }
-          }
-          : undefined,
-        afterApply: runHead
-          ? async (written) => {
-            const startedAt = Date.now();
-            const realigned = await realignTrackedFilesWithHead({ localDir: input.localDir, importedHead: runHead, written });
-            await reportStep("realign", Date.now() - startedAt, `${realigned.paths} file(s) follow HEAD`, realigned.lockWaitMs);
+            await integrateImportedGitHead({
+              localDir: input.localDir,
+              importedHead: headToIntegrate,
+            });
           }
           : undefined,
       });
