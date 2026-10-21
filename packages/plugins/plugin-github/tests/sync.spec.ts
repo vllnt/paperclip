@@ -437,6 +437,11 @@ describe("incremental GitHub task sync", () => {
     await f.h.ctx.state.set(queueKey(), { "2000": { repositoryId: 99, number: 1, at: Date.now() } });
     await f.service.sync(companyId);
     expect(Object.keys(await f.h.ctx.state.get(queueKey()) as object)).toEqual(["2000"]);
+    // A retry is due 30 minutes after its sixth failure; its age counts from the failure. 2001 failed 61 minutes ago, 2002 10 minutes ago.
+    await f.h.ctx.state.set(queueKey(), { "2001": { repositoryId: 99, number: 2, at: Date.now() - 31 * 60_000, attempts: 6 },
+      "2002": { repositoryId: 99, number: 3, at: Date.now() + 20 * 60_000, attempts: 6 } });
+    await f.service.sync(companyId);
+    expect(Object.keys(await f.h.ctx.state.get(queueKey()) as object)).toEqual(["2002"]);
     await f.h.ctx.state.set(queueKey(), {});
     await editHere(f, 2, "Local title");
     await f.service.sync(companyId);

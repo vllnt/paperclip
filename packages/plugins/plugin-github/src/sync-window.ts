@@ -32,6 +32,11 @@ export const QUEUE_RETRY_MS = 60_000;
 export const QUEUE_RETRY_MAX_MS = 1_800_000;
 /** An ask for an issue whose repository is neither linked nor tracked is dropped once it is this old: one catalog read that missed a repository keeps its asks. */
 export const QUEUE_ORPHAN_MS = 3_600_000;
+
+/** How long an issue waits for its next look after its `attempts`-th failure in a row. */
+export function retryDelay(attempts: number): number {
+  return Math.min(QUEUE_RETRY_MS * 2 ** (attempts - 1), QUEUE_RETRY_MAX_MS);
+}
 /** An issue in a repository that no project links is only fetched one by one: at most this many per run, none more often than this. */
 export const TRACKED_PER_RUN = 10;
 export const TRACKED_RECHECK_MS = 300_000;
