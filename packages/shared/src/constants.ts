@@ -535,6 +535,9 @@ export const PROVIDER_QUOTA_MONITOR_SERVICE_NAME = "AI provider quota";
 // Server-owned monitor scheduled after Paperclip stopped a lingering background
 // task at the end of a successful run.
 export const BACKGROUND_TASK_RECHECK_MONITOR_SERVICE_NAME = "Background task re-check";
+// An agent's wait on one GitHub pull request (`issue wait --pull-request`); the
+// monitor's pullRequestUrl holds the pull request URL.
+export const PULL_REQUEST_WAIT_MONITOR_SERVICE_NAME = "GitHub pull request";
 
 export const ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES = [
   "wake_owner",
@@ -579,6 +582,23 @@ export type GoalKind = (typeof GOAL_KINDS)[number];
 /** When a goal matters: short term goals are the company's current focus. */
 export const GOAL_HORIZONS = ["short", "medium", "long"] as const;
 export type GoalHorizon = (typeof GOAL_HORIZONS)[number];
+
+/**
+ * A company policy is a written rule or guardrail. Only active policies apply to agents.
+ * Archived keeps the key reserved, so a `policy://<key>` reference never points at another policy.
+ */
+export const COMPANY_POLICY_STATUSES = ["draft", "active", "archived"] as const;
+export type CompanyPolicyStatus = (typeof COMPANY_POLICY_STATUSES)[number];
+
+/** Which policies a list returns: company-wide ones, project ones, or both. */
+export const COMPANY_POLICY_SCOPES = ["company", "project"] as const;
+export type CompanyPolicyScope = (typeof COMPANY_POLICY_SCOPES)[number];
+
+export const COMPANY_POLICY_KEY_MAX_LENGTH = 64;
+export const COMPANY_POLICY_TITLE_MAX_LENGTH = 200;
+export const COMPANY_POLICY_SUMMARY_MAX_LENGTH = 280;
+export const COMPANY_POLICY_BODY_MAX_LENGTH = 100_000;
+export const COMPANY_POLICY_CHANGE_SUMMARY_MAX_LENGTH = 500;
 
 /** Shown to agents beside the company focus so every run applies it the same way. */
 export const COMPANY_FOCUS_GUIDANCE =
@@ -659,6 +679,14 @@ export type RoutineConcurrencyPolicy = (typeof ROUTINE_CONCURRENCY_POLICIES)[num
 
 export const ROUTINE_CATCH_UP_POLICIES = ["skip_missed", "enqueue_missed_with_cap"] as const;
 export type RoutineCatchUpPolicy = (typeof ROUTINE_CATCH_UP_POLICIES)[number];
+
+/**
+ * Where a routine's queued runs stand when their agent claims its next run.
+ * `normal` keeps the agent's queue order; `first` offers the routine's runs
+ * before the agent's other queued runs, so they take the next free slot.
+ */
+export const ROUTINE_SLOT_PRIORITIES = ["normal", "first"] as const;
+export type RoutineSlotPriority = (typeof ROUTINE_SLOT_PRIORITIES)[number];
 
 export const ROUTINE_ACTIVITY_GATE_POLICIES = ["always", "require_external_activity"] as const;
 export type RoutineActivityGatePolicy = (typeof ROUTINE_ACTIVITY_GATE_POLICIES)[number];
@@ -1557,6 +1585,7 @@ export const PLUGIN_RESERVED_COMPANY_ROUTE_SEGMENTS = [
   "projects",
   "issues",
   "goals",
+  "policies",
   "approvals",
   "costs",
   "activity",

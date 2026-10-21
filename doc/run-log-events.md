@@ -342,8 +342,9 @@ then queues a retry with the reason `planned_restart_resume`. That retry is due
 at once and carries `resumeFromRunId`, so it resumes the session of the
 interrupted run. A run that asked for a fresh session resumes only a session it
 created itself; without one, the retry starts fresh. The retry spends no
-failure retry, and a run whose failure budget is spent gets none. At most three
-such retries follow each other; then the ordinary bounded retry applies. The
+failure retry, and a run whose failure budget is spent gets none. The
+interrupted run and its resume count as one run toward `maxDailyRuns`. At most
+three such retries follow each other; then the ordinary bounded retry applies. The
 server queues it only when stored lease evidence shows that the remote
 processes of the run stopped. If it cannot show this, the interrupted run
 records a lifecycle event with the payload `{ "reason": "remote_stop_unproven" }`

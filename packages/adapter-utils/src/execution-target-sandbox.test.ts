@@ -3,7 +3,7 @@ import http2 from "node:http2";
 import net from "node:net";
 import { duplexPair, type Duplex } from "node:stream";
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -2380,6 +2380,178 @@ describe("sandbox adapter execution targets", () => {
     } finally {
       await bridge?.stop();
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
+  /**
+   * Write one request entry straight into a running queue_v1 bridge's request
+   * queue, the way any process in the sandbox workspace can, and wait for the
+   * host worker's response entry.
+   */
+  async function relayRawBridgeQueueEntry(
+    runtimeRootDir: string,
+    entry: { id: string; method: string; path: string; query: string; headers: Record<string, string>; body: string },
+  ): Promise<{ status: number }> {
+    const queueDir = path.join(runtimeRootDir, "paperclip-bridge", "queue");
+    const requestPath = path.join(queueDir, "requests", `${entry.id}.json`);
+    await writeFile(`${requestPath}.tmp`, JSON.stringify({ ...entry, createdAt: new Date().toISOString() }), "utf8");
+    await rename(`${requestPath}.tmp`, requestPath);
+    const responsePath = path.join(queueDir, "responses", `${entry.id}.json`);
+    const deadline = Date.now() + 4_000;
+    while (Date.now() < deadline) {
+      const raw = await readFile(responsePath, "utf8").catch(() => null);
+      if (raw !== null) {
+        try {
+          return JSON.parse(raw) as { status: number };
+        } catch {
+          // The worker is still writing the response entry.
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`Timed out waiting for the bridge response to ${entry.id}.`);
+  }
+
+  async function startQueueBridgeForHeaderTest(runId: string, hostApiUrl: string) {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-execution-target-bridge-headers-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    const runtimeRootDir = path.join(remoteCwd, ".paperclip-runtime", "codex");
+    await mkdir(runtimeRootDir, { recursive: true });
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId,
+      target: {
+        kind: "remote",
+        transport: "sandbox",
+        providerKey: "e2b",
+        environmentId: "env-1",
+        leaseId: "lease-1",
+        remoteCwd,
+        runner: createLocalSandboxRunner(),
+        timeoutMs: 30_000,
+      },
+      runtimeRootDir,
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl,
+    });
+    expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+    return { bridge: bridge!, runtimeRootDir };
+  }
+
+  it("forwards only allowlisted headers from a raw queue_v1 entry to the host API", async () => {
+    const received: Array<Record<string, string | string[] | undefined>> = [];
+    const apiServer = createServer((req, res) => {
+      received.push({ ...req.headers });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      apiServer.once("error", reject);
+      apiServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = apiServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Expected the bridge test API server to listen on a TCP port.");
+    }
+    const { bridge, runtimeRootDir } = await startQueueBridgeForHeaderTest(
+      "run-bridge-raw-headers",
+      `http://127.0.0.1:${address.port}`,
+    );
+    try {
+      const response = await relayRawBridgeQueueEntry(runtimeRootDir, {
+        id: "raw-headers",
+        method: "GET",
+        path: "/api/agents/me",
+        query: "",
+        headers: {
+          accept: "application/json",
+          cookie: "session=board-session",
+          "x-forwarded-for": "203.0.113.7",
+          "x-paperclip-cloud-tenant-token": "tenant-token",
+        },
+        body: "",
+      });
+
+      expect(response.status).toBe(200);
+      expect(received).toHaveLength(1);
+      expect(received[0]).toMatchObject({
+        accept: "application/json",
+        authorization: "Bearer real-run-jwt",
+        "x-paperclip-run-id": "run-bridge-raw-headers",
+      });
+      expect(received[0]?.cookie).toBeUndefined();
+      expect(received[0]?.["x-forwarded-for"]).toBeUndefined();
+      expect(received[0]?.["x-paperclip-cloud-tenant-token"]).toBeUndefined();
+    } finally {
+      await bridge.stop();
+      await new Promise<void>((resolve) => apiServer.close(() => resolve()));
+    }
+  });
+
+  it("hands fetch only the allowlisted headers and the canonical path for a queue_v1 forward", async () => {
+    const hostApiUrl = "http://127.0.0.1:9";
+    const { bridge, runtimeRootDir } = await startQueueBridgeForHeaderTest("run-bridge-fetch-headers", hostApiUrl);
+    const realFetch = globalThis.fetch;
+    const forwarded: Array<{ url: string; headers: Record<string, string> }> = [];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.startsWith(`${hostApiUrl}/`)) return realFetch(input, init);
+      forwarded.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()) });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    try {
+      const response = await relayRawBridgeQueueEntry(runtimeRootDir, {
+        id: "fetch-headers",
+        method: "POST",
+        path: "/api/issues/issue-1/comments",
+        query: "?draft=false",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          "if-match": '"rev-1"',
+          "if-none-match": '"rev-0"',
+          "x-paperclip-github-capability": "run-scoped-capability",
+          authorization: "Bearer sandbox-supplied",
+          "x-paperclip-run-id": "run-other",
+          cookie: "session=board-session",
+          "x-forwarded-for": "203.0.113.7",
+          "x-paperclip-cloud-tenant-token": "tenant-token",
+          host: "api.internal",
+        },
+        body: JSON.stringify({ body: "hello" }),
+      });
+
+      expect(response.status).toBe(201);
+      expect(forwarded).toEqual([{
+        url: `${hostApiUrl}/api/issues/issue-1/comments?draft=false`,
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          "if-match": '"rev-1"',
+          "if-none-match": '"rev-0"',
+          "x-paperclip-github-capability": "run-scoped-capability",
+          authorization: "Bearer real-run-jwt",
+          "x-paperclip-run-id": "run-bridge-fetch-headers",
+        },
+      }]);
+
+      const rejected = await relayRawBridgeQueueEntry(runtimeRootDir, {
+        id: "fetch-backslash-path",
+        method: "GET",
+        path: "/api/routines/r1\\..\\..\\secrets",
+        query: "",
+        headers: { accept: "application/json" },
+        body: "",
+      });
+      expect(rejected.status).toBe(400);
+      expect(forwarded).toHaveLength(1);
+    } finally {
+      fetchSpy.mockRestore();
+      await bridge.stop();
     }
   });
 

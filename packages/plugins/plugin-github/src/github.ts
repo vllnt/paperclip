@@ -320,11 +320,21 @@ export class GitHubClient {
     result.repositories = [...new Map(result.repositories.map(r => [r.id, r])).values()].sort((a,b) => a.fullName.localeCompare(b.fullName));
     return result;
   }
-  async issues(id: string, pem: string, repository: Repository, page: number, state: "open" | "closed" | "all"): Promise<IssuePage> {
+  /**
+   * One page of a repository's issues by update time. `since` keeps only issues updated at or after it (GitHub filters; the
+   * listing then holds the changes, not the repository's history). Pull requests share the listing and are dropped, but
+   * `cursor` still covers them: it is the newest update time on the page, so a walk can move past a page of pull requests.
+   */
+  async issues(id: string, pem: string, repository: Repository, page: number, state: "open" | "closed" | "all",
+    options: { since?: string; direction?: "asc" | "desc"; perPage?: number } = {}): Promise<IssuePage> {
     const token = await this.token(id, pem, repository.installationId, repository.id);
-    const { data, next } = await this.request<any[]>(`/repos/${repository.fullName}/issues?state=${state}&sort=updated&direction=desc&per_page=50&page=${page}`, token);
+    const query = new URLSearchParams({ state, sort: "updated", direction: options.direction ?? "desc", per_page: String(options.perPage ?? 50), page: String(page),
+      ...(options.since ? { since: options.since } : {}) });
+    const { data, next } = await this.request<any[]>(`/repos/${repository.fullName}/issues?${query}`, token);
     const issues = data.filter(row => !row.pull_request).map(row => this.issue(row, repository));
-    return { issues, repository: repository.fullName, nextPage: next ? page + 1 : null };
+    const cursor = data.reduce<string | null>((newest, row) => typeof row.updated_at === "string" && Number.isFinite(Date.parse(row.updated_at))
+      && (newest === null || Date.parse(row.updated_at) > Date.parse(newest)) ? row.updated_at : newest, null);
+    return { issues, repository: repository.fullName, nextPage: next ? page + 1 : null, cursor };
   }
   issue(row: any, repository: Repository): GitHubIssue {
     if (!Number.isSafeInteger(row.id) || row.id < 1 || !Number.isSafeInteger(row.number) || row.number < 1 || row.pull_request) throw new Error("GitHub returned an invalid issue.");

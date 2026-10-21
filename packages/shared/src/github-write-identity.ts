@@ -241,7 +241,7 @@ export type GitHubSignDecision = { signature: string; keyFingerprint: string } |
 export const GITHUB_WRITE_IDENTITY_STATE = { namespace: "identity", stateKey: "write-identity" } as const;
 
 export const MAX_GITHUB_WRITE_IDENTITY_OVERRIDES = 50;
-export const MAX_GITHUB_ALLOWED_REPOSITORIES = 100;
+export const MAX_GITHUB_ALLOWED_REPOSITORIES = 250;
 
 const POLICY_FIELDS = [
   "default", "overrides", "missingUserConnection", "userSource", "enabled", "allowedRepositories", "installationRepositories",

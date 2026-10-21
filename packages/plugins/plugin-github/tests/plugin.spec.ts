@@ -162,6 +162,24 @@ describe("GitHub transport and access", () => {
     expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({ repository_ids: [22], permissions: { metadata: "read", issues: "read" } });
     expect(result.issues).toHaveLength(1); expect(result.issues[0].assignees).toEqual(["me"]); expect(result.nextPage).toBe(2);
   });
+  it("asks for the changes since a time, oldest first, with a token of the same scope, and reports the newest update time", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(json({ token: "short-lived" })).mockResolvedValueOnce(json([
+      { id: 1, number: 1, title: "Issue", state: "open", updated_at: "2026-10-04T12:00:05Z", assignees: [] },
+      { id: 2, number: 2, title: "PR", pull_request: {}, updated_at: "2026-10-04T12:00:09Z" }
+    ]));
+    const result = await new GitHubClient(fetcher).issues("12", pem, repository, 1, "all", { since: "2026-10-04T12:00:00Z", direction: "asc", perPage: 100 });
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({ repository_ids: [22], permissions: { metadata: "read", issues: "read" } });
+    expect(Object.fromEntries(new URL(fetcher.mock.calls[1][0]).searchParams)).toEqual({ state: "all", sort: "updated", direction: "asc", per_page: "100", page: "1", since: "2026-10-04T12:00:00Z" });
+    expect(result.issues.map(item => item.number)).toEqual([1]);
+    expect(result.cursor).toBe("2026-10-04T12:00:09Z");
+    expect(result.nextPage).toBeNull();
+  });
+  it("lists newest first, 50 to a page, and without `since` when no option is given", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(json({ token: "short-lived" })).mockResolvedValueOnce(json([]));
+    const result = await new GitHubClient(fetcher).issues("12", pem, repository, 2, "open");
+    expect(Object.fromEntries(new URL(fetcher.mock.calls[1][0]).searchParams)).toEqual({ state: "open", sort: "updated", direction: "desc", per_page: "50", page: "2" });
+    expect(result.cursor).toBeNull();
+  });
   it("validates repository URLs instead of trusting mutable workspace names", () => {
     expect(repoName("https://github.com/acme/repo.git")).toBe("acme/repo");
     for (const url of ["https://evil.example/acme/repo", "https://github.com/acme/repo/issues", "https://token@github.com/acme/repo", "https://github.com/acme/repo?token=secret"]) expect(repoName(url)).toBeNull();

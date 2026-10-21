@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import {
   activityLog,
   agents,
+  costEvents,
   agentWakeupRequests,
   companies,
   createDb,
@@ -727,4 +728,131 @@ describeEmbeddedPostgres("provider capacity retries", () => {
     const released = (await companyRuns(companyId)).filter((run) => waiting.some((held) => held.id === run.id));
     expect(released.map((run) => run.status)).toEqual(Array.from({ length: 99 }, () => "succeeded"));
   }, 600_000);
+
+  /** Next 00:00Z after `at`: where the daily cap window that holds `at` ends. */
+  function utcMidnightAfter(at: Date) {
+    return new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate() + 1));
+  }
+
+  /** An in_progress issue's run, queued with its wake, as the claim finds it. */
+  async function insertQueuedIssueRun(
+    companyId: string, agentId: string, issueId: string, retry?: { retryOfRunId: string; reason: string },
+  ) {
+    const runId = randomUUID(), wakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId, companyId, agentId, source: "automation", triggerDetail: "system",
+      reason: retry?.reason ?? "issue_assigned", payload: { issueId }, status: "queued",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, invocationSource: "automation", triggerDetail: "system",
+      status: "queued", wakeupRequestId, contextSnapshot: { issueId, taskId: issueId },
+      ...(retry ? { retryOfRunId: retry.retryOfRunId, scheduledRetryReason: retry.reason, scheduledRetryAttempt: 1 } : {}),
+    });
+    await db.update(agentWakeupRequests).set({ runId }).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    await db.update(issues).set({ status: "in_progress", executionRunId: runId }).where(eq(issues.id, issueId));
+    return runId;
+  }
+
+  async function insertStartedRun(
+    companyId: string, agentId: string, issueId: string | null,
+    values: Partial<typeof heartbeatRuns.$inferInsert> = {},
+  ) {
+    const id = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id, companyId, agentId, invocationSource: "automation", triggerDetail: "system", status: "succeeded",
+      startedAt: new Date(), finishedAt: new Date(), contextSnapshot: issueId ? { issueId, taskId: issueId } : {},
+      ...values,
+    });
+    return id;
+  }
+
+  async function runsTodayOf(companyId: string, agentId: string) {
+    const stats = await heartbeat.runStats(companyId, { since: new Date(Date.now() - 60 * MINUTE_MS), until: new Date(Date.now() + MINUTE_MS) });
+    return stats.agents.find((agent) => agent.agentId === agentId)?.runsToday;
+  }
+
+  it("charges a run that a restart cut short and its resume once toward maxDailyRuns", async () => {
+    const { companyId, agentId, issueId } = await seed({ maxDailyRuns: 2 });
+    const cutRunId = await insertStartedRun(companyId, agentId, issueId, {
+      status: "interrupted", errorCode: "server_shutdown_interrupted",
+    });
+    await insertStartedRun(companyId, agentId, issueId, {
+      retryOfRunId: cutRunId, scheduledRetryReason: "planned_restart_resume", scheduledRetryAttempt: 1,
+    });
+
+    expect(await runsTodayOf(companyId, agentId)).toBe(1);
+    // One run of two is spent, so the cap admits the next wake.
+    expect(await heartbeat.wakeup(agentId, {
+      source: "on_demand", triggerDetail: "manual", reason: "manual_check", payload: {}, requestedByActorType: "system",
+    })).not.toBeNull();
+  });
+
+  it("runs the resume of a run that a restart cut short on the agent's last daily run", async () => {
+    const { companyId, agentId, issueId } = await seed({ maxDailyRuns: 1 });
+    const cutRunId = await insertStartedRun(companyId, agentId, issueId, {
+      status: "interrupted", errorCode: "server_shutdown_interrupted",
+    });
+    const resumeRunId = await insertQueuedIssueRun(companyId, agentId, issueId, {
+      retryOfRunId: cutRunId, reason: "planned_restart_resume",
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+
+    // The resume takes over the cut run's charge instead of needing a second one.
+    expect(await heartbeat.getRun(resumeRunId)).toMatchObject({ status: "succeeded" });
+    expect(executedRunIds).toEqual([resumeRunId]);
+    expect(await runsTodayOf(companyId, agentId)).toBe(1);
+  });
+
+  /** An agent at its daily cap: one run started today, or a day's cost spent. */
+  const CAPS = {
+    "heartbeat.daily_run_limit": { config: { maxDailyRuns: 1 }, spend: async (companyId: string, agentId: string) => {
+      await insertStartedRun(companyId, agentId, null);
+    } },
+    "heartbeat.daily_cost_limit": { config: { maxDailyCostCents: 100 }, spend: async (companyId: string, agentId: string) => {
+      await db.insert(costEvents).values({
+        companyId, agentId, provider: "openai", model: "gpt-test", costCents: 100, occurredAt: new Date(),
+      });
+    } },
+  } as const;
+
+  /** Seeds an agent at the cap and lets the claim cancel its queued issue run. */
+  async function capCancelledIssueRun(errorCode: keyof typeof CAPS) {
+    const { companyId, agentId, issueId } = await seed(CAPS[errorCode].config);
+    await CAPS[errorCode].spend(companyId, agentId);
+    const runId = await insertQueuedIssueRun(companyId, agentId, issueId);
+    await heartbeat.resumeQueuedRuns();
+    const cancelled = await heartbeat.getRun(runId);
+    expect(cancelled).toMatchObject({ status: "cancelled", errorCode });
+    return { companyId, issueId, cancelled: cancelled! };
+  }
+
+  it.each(Object.keys(CAPS) as Array<keyof typeof CAPS>)(
+    "retries an issue run that %s cancelled once the cap window resets",
+    async (errorCode) => {
+      const { companyId, issueId, cancelled } = await capCancelledIssueRun(errorCode);
+
+      // The stranded-issue sweep queues the bounded retry, due when the cap resets.
+      await heartbeat.reconcileStrandedAssignedIssues();
+      const retry = await pendingRetry(companyId);
+      expect(retry).toMatchObject({ retryOfRunId: cancelled.id, scheduledRetryAttempt: 1 });
+      expect(retry!.scheduledRetryAt!.toISOString()).toBe(utcMidnightAfter(cancelled.finishedAt!).toISOString());
+
+      // A later sweep sees the pending retry as the issue's live path.
+      await heartbeat.reconcileStrandedAssignedIssues();
+      expect((await companyRuns(companyId)).filter((run) => run.status === "scheduled_retry")).toHaveLength(1);
+      const [issue] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+      expect(issue?.status).toBe("in_progress");
+      expect(executedRunIds).toEqual([]);
+    },
+  );
+
+  it("retries a cap-cancelled run on the ordinary schedule once its cap window has reset", async () => {
+    const { cancelled } = await capCancelledIssueRun("heartbeat.daily_run_limit");
+    const nextDay = new Date(utcMidnightAfter(cancelled.finishedAt!).getTime() + 60 * MINUTE_MS);
+
+    const retry = await heartbeat.scheduleBoundedRetry(cancelled.id, { now: nextDay });
+    expect(retry).toMatchObject({ outcome: "scheduled", dueAt: new Date(nextDay.getTime() + 30_000) });
+  });
 });

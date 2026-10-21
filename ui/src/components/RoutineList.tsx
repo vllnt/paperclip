@@ -1,7 +1,7 @@
 import type { AgentAppearance } from "@paperclipai/shared";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import type { ReactNode } from "react";
-import { MoreHorizontal, Play } from "lucide-react";
+import { MoreHorizontal, Pencil, Play } from "lucide-react";
 import { Link } from "@/lib/router";
 import { Button } from "@/components/ui/button";
 import {
@@ -74,6 +74,7 @@ export function RoutineListRow<TRoutine extends RoutineListRowItem>({
   onRunNow,
   onToggleEnabled,
   onToggleArchived,
+  onEdit,
 }: {
   routine: TRoutine;
   projectById: Map<string, RoutineListProjectSummary>;
@@ -97,6 +98,8 @@ export function RoutineListRow<TRoutine extends RoutineListRowItem>({
   onRunNow: (routine: TRoutine) => void;
   onToggleEnabled: (routine: TRoutine, enabled: boolean) => void;
   onToggleArchived?: (routine: TRoutine) => void;
+  /** Edits the routine in place: adds an Edit button, and the menu links `href` as the full editor. */
+  onEdit?: (routine: TRoutine) => void;
 }) {
   const enabled = routine.status === "active";
   const isArchived = routine.status === "archived";
@@ -177,6 +180,13 @@ export function RoutineListRow<TRoutine extends RoutineListRowItem>({
           </Button>
         ) : null}
 
+        {onEdit ? (
+          <Button variant="outline" size="sm" onClick={() => onEdit(routine)} aria-label={`Edit ${routine.title}`}>
+            <Pencil className="h-3.5 w-3.5" />
+            Edit
+          </Button>
+        ) : null}
+
         <div className="flex items-center gap-3">
           <ToggleSwitch
             size="lg"
@@ -198,7 +208,7 @@ export function RoutineListRow<TRoutine extends RoutineListRowItem>({
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
             <DropdownMenuItem asChild>
-              <Link to={href}>{configureLabel}</Link>
+              <Link to={href}>{onEdit ? "Open full editor" : configureLabel}</Link>
             </DropdownMenuItem>
             <DropdownMenuItem
               disabled={runDisabled}

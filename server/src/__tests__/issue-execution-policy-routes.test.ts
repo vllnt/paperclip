@@ -1285,6 +1285,52 @@ describe("issue execution policy routes", () => {
       );
     });
 
+    it("stores a canonical pull request target with the wait and echoes it", async () => {
+      useIssue(waitingIssue({ status: "in_review" }));
+
+      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+        .post(`/api/issues/${issueId}/wait`)
+        .send({ in: "10m", reason: "Review on the fix", pullRequest: "https://github.com/acme/app/pull/7/files" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.pullRequest).toBe("https://github.com/acme/app/pull/7");
+      const [, patch] = mockIssueService.update.mock.calls[0] as unknown as [string, Record<string, any>];
+      expect(patch.executionPolicy.monitor).toMatchObject({
+        serviceName: "GitHub pull request",
+        externalRef: null,
+        pullRequestUrl: "https://github.com/acme/app/pull/7",
+        scheduledBy: "assignee",
+      });
+    });
+
+    it("keeps a wait without a pull request target exactly as before", async () => {
+      useIssue(waitingIssue());
+
+      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+        .post(`/api/issues/${issueId}/wait`)
+        .send({ in: "10m", reason: "Deploy" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.pullRequest).toBeNull();
+      const [, patch] = mockIssueService.update.mock.calls[0] as unknown as [string, Record<string, any>];
+      expect(patch.executionPolicy.monitor).toMatchObject({ serviceName: null, externalRef: null, pullRequestUrl: null });
+    });
+
+    it.each([
+      ["https://github.example.com/acme/app/pull/7"],
+      ["https://github.com/acme/../pull/7"],
+      ["acme/app#7"],
+    ])("rejects the pull request target %s", async (pullRequest) => {
+      useIssue(waitingIssue());
+
+      const res = await request(await waitApp(agentActor(assigneeAgentId)))
+        .post(`/api/issues/${issueId}/wait`)
+        .send({ in: "10m", reason: "CI", pullRequest });
+
+      expect(res.status).toBe(400);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     it("refuses an agent waiting on an issue assigned to someone else", async () => {
       useIssue(waitingIssue());
 

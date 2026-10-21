@@ -34,7 +34,8 @@ POST /api/companies/{companyId}/routines
   "priority": "medium",
   "status": "active",
   "concurrencyPolicy": "coalesce_if_active",
-  "catchUpPolicy": "skip_missed"
+  "catchUpPolicy": "skip_missed",
+  "slotPriority": "normal"
 }
 ```
 
@@ -47,7 +48,7 @@ Fields:
 | `title` | yes | Routine name |
 | `description` | no | Human-readable description of the routine |
 | `assigneeAgentId` | yes | Agent who receives each run |
-| `projectId` | yes | Project this routine belongs to |
+| `projectId` | no | Project this routine belongs to; list a project's routines with `?projectId=` |
 | `goalId` | no | Goal to link runs to |
 | `parentIssueId` | no | Parent issue for created run issues |
 | `priority` | no | `critical`, `high`, `medium` (default), `low` |
@@ -55,6 +56,7 @@ Fields:
 | `steps` | no | Ordered sub-tasks each run creates under the run's task. See [Routine Steps](#routine-steps). Default `[]` (no steps) |
 | `concurrencyPolicy` | no | Behaviour when a run fires while a previous one is still active |
 | `catchUpPolicy` | no | Behaviour for missed scheduled runs |
+| `slotPriority` | no | Where the routine's runs wait in the agent's queue: `normal` (default) or `first` |
 
 **Concurrency policies:**
 
@@ -70,6 +72,19 @@ Fields:
 |-------|-----------|
 | `skip_missed` (default) | Missed scheduled runs are dropped |
 | `enqueue_missed_with_cap` | Missed runs are enqueued up to an internal cap |
+
+**Slot priorities:**
+
+| Value | Behaviour |
+|-------|-----------|
+| `normal` (default) | The routine's runs wait in the agent's queue in the usual order (issue priority, then age) |
+| `first` | When the agent has a free run slot, the routine's queued runs (on its run task and step sub-tasks) start before the agent's other queued runs. Runs whose issue has unresolved blockers still go last |
+
+The slot priority is queue tuning, not routine content: changing it does not create a revision, and restoring a revision leaves it as it is.
+
+- **Who can set `first`.** Only a board user with the `tasks:assign` permission, because `first` reorders the queue of every agent that serves the routine's runs, step agents included. An agent that sets `first` on a routine that is not already `first` gets `403`, even on its own routine. Anyone who can manage the routine can set it back to `normal`. Sending `first` while the routine is already `first` writes nothing, so an update built from a stale copy of the routine cannot restore `first` after the board lowered it. The routine's owner still controls how often it runs (triggers, concurrency policy, manual runs), so choose `first` only for a routine whose triggers you trust; the `routine.created` and `routine.updated` activity entries record the slot priority that was set.
+- **No aging across the groups.** Aging (one priority level per 30 minutes waited) applies within each group. While a `first` routine keeps runs queued, the agent's other runs wait, however long they have waited. Use `first` for short, infrequent runs.
+- **Which issues.** It applies to the issues the routine files under its own id (origin `routine_execution` or `routine_step`). A plugin-managed routine whose plugin files its runs under the plugin's own origin, or under another origin id, keeps the usual order.
 
 ## Update Routine
 
@@ -233,8 +248,9 @@ Both use the same rules. The task is locked, then checked, and then the steps ar
 | Answer | When |
 |--------|------|
 | `404` | The task is not in the routine's company, or is hidden |
-| `409` | The task is not in `backlog`, `todo` or `blocked`; it has a checkout, an execution lock or a queued or running heartbeat run; or it already has open routine steps |
+| `409` | The task is not in `backlog`, `todo` or `blocked`; it has a checkout, an execution lock or a queued or running heartbeat run; or it already has open routine steps; or (manual run only) the routine changed while the run was starting |
 | `422` | The routine has no steps; the task is a routine run, a routine step or a conversation; or its sub-tasks plus the steps would pass 25 |
+| `403` | The caller may not assign a step's agent under the task: the task or its project blocks the assignment, or the caller lacks `tasks:assign`. A manual run asks this for the caller. An event trigger asks it for the board user who created the trigger, at the time of the event: a trigger without an author, or whose author has left the company or lost the right, fails the delivery with `failed_permanent` and the task stays as it was. |
 
 What happens to the task:
 
@@ -245,7 +261,7 @@ What happens to the task:
 
 The steps are sub-tasks of the task, so they take its project and execution workspace like any sub-task. When the task has an execution workspace, every step of its project works in it, also two steps that run at the same time. When it has none, the steps hand their workspaces on as on any run. This is deliberate: the steps check or finish the task's own work.
 
-Two starts on one task (an event and a manual run, say) take turns on the task's row lock, so the task ends up with one tree of steps. A second run on a task whose first run's steps are still open is refused with `409`; after those steps close, the routine can run on the task again. To retry a manual run safely, send an `idempotencyKey`: the same key returns the same run. A key that was already used for a run on another task, or for a run without a task, answers `409`.
+A manual run checks the caller's permissions twice: first before it opens its transaction, so a caller who may not see the task learns nothing about it, and again under the task and routine locks, on the task and the routine as locked. A change that a board user makes between the two (the task moves to another project, the task or the agent of a step starts blocking assignments, the steps go to other agents) is refused with `403`, or with `409` when the routine was edited at all in that time: send the same request again. Two starts on one task (an event and a manual run, say) take turns on the task's row lock, so the task ends up with one tree of steps. A second run on a task whose first run's steps are still open is refused with `409`; after those steps close, the routine can run on the task again. To retry a manual run safely, send an `idempotencyKey`: the same key returns the same run. A key that was already used for a run on another task, or for a run without a task, answers `409`.
 
 In the text of a step on such a run, `{{issue.title}}` and `{{issue.identifier}}` are the task's title and identifier. On any other run they are left as written.
 

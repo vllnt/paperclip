@@ -28,8 +28,7 @@ import {
   routineService,
 } from "../services/index.js";
 import { agentTrustService } from "../services/agent-trust.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
-import { routineStepWarnings } from "../services/routine-steps.js";
+import { assertActorMayAssignSteps, routineStepWarnings } from "../services/routine-steps.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, notFound, unauthorized, unsupportedMediaType } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -121,6 +120,21 @@ export function routineRoutes(
     if (assigneeAgentId !== req.actor.agentId) {
       throw forbidden("Agents can only manage routines assigned to themselves");
     }
+  }
+
+  /**
+   * Slot priority `first` puts a routine's runs ahead of the other queued work of every agent that
+   * serves them, step agents included, so only a board user with `tasks:assign` may set it.
+   * Anyone who manages the routine may set it back to `normal`. An update that resends `first`
+   * while the routine already reads `first` writes nothing, so a stale copy of the routine cannot
+   * restore `first` after the board lowered it in the meantime.
+   * @throws HttpError 403 for an agent, or for a board user without `tasks:assign`.
+   */
+  async function assertCanSetFirstSlotPriority(req: Request, companyId: string) {
+    if (req.actor.type === "agent") {
+      throw forbidden("Only the board can set a routine's slot priority to first");
+    }
+    await assertBoardCanAssignTasks(req, companyId);
   }
 
   /**
@@ -221,8 +235,9 @@ export function routineRoutes(
       assigneeUserId: string | null;
       status: string;
     },
+    decider: Pick<ReturnType<typeof accessService>, "decide"> = access,
   ) {
-    return access.decide({
+    return decider.decide({
       actor: req.actor,
       action,
       resource: {
@@ -273,33 +288,33 @@ export function routineRoutes(
    * decision on the task, and the `tasks:assign` decision under the task for each agent the steps go to.
    * Board users with company access may change every task, but the task or its project can still block
    * an assignment for them, so the `tasks:assign` decision applies to every actor.
+   *
+   * The route asks it twice. The first ask, on the rows it just read, refuses a caller early, before any
+   * guard of the attach can tell that caller the state of a task it may not see. The second ask is the
+   * one that counts: the attach calls it under the task and routine locks, with the locked rows and a
+   * `decider` on its own transaction, so a board change after the first ask cannot get past it.
    * @throws HttpError 404 when the task is missing, hidden or in another company; 403 when an agent may
    * not change it, or the actor may not assign the steps under it.
    */
   async function assertCanStartStepsOnTask(
     req: Request,
     routine: { companyId: string; assigneeAgentId: string | null; steps?: RoutineStep[] | null },
-    taskId: string,
+    task: (Parameters<typeof decideOnTask>[2] & { hiddenAt: Date | null }) | null,
     runAssigneeAgentId: string | null,
+    decider: Pick<ReturnType<typeof accessService>, "decide"> = access,
   ) {
-    const task = await issues.getById(taskId);
     if (!task || task.companyId !== routine.companyId || task.hiddenAt) throw notFound("Task not found");
     if (req.actor.type === "agent") {
-      const decision = await decideOnTask(req, "issue:mutate", task);
+      const decision = await decideOnTask(req, "issue:mutate", task, decider);
       if (!decision.allowed) throw forbidden("This agent may not change the task", { issueId: task.id });
     }
-    const defaultAgentId = runAssigneeAgentId ?? routine.assigneeAgentId;
-    const stepAgentIds = new Set((routine.steps ?? []).map((step) => step.assigneeAgentId ?? defaultAgentId));
-    for (const assigneeAgentId of stepAgentIds) {
-      const scope = { projectId: task.projectId, parentIssueId: task.id, assigneeAgentId, assigneeUserId: null };
-      const assign = await access.decide({
-        actor: req.actor,
-        action: "tasks:assign",
-        resource: { type: "issue", companyId: task.companyId, issueId: null, ...scope },
-        scope,
-      });
-      if (!assign.allowed) throw forbidden(assign.explanation, authorizationDeniedDetails(assign));
-    }
+    await assertActorMayAssignSteps({
+      authorization: decider,
+      actor: req.actor,
+      task,
+      steps: routine.steps ?? [],
+      defaultAssigneeAgentId: runAssigneeAgentId ?? routine.assigneeAgentId,
+    });
   }
 
   async function logRoutineRevisionCreated(req: Request, input: {
@@ -343,6 +358,7 @@ export function routineRoutes(
     const companyId = req.params.companyId as string;
     await assertBoardCanAssignTasks(req, companyId);
     assertCanManageCompanyRoutine(req, companyId, req.body.assigneeAgentId);
+    if (req.body.slotPriority === "first") await assertCanSetFirstSlotPriority(req, companyId);
     await assertCanAssignRoutineSteps(req, companyId, req.body.steps);
     const steps = await containAgentSteps(req, companyId, req.body.projectId ?? null, req.body.steps);
     const created = await svc.create(companyId, steps ? { ...req.body, steps } : req.body, {
@@ -361,7 +377,7 @@ export function routineRoutes(
       action: "routine.created",
       entityType: "routine",
       entityId: created.id,
-      details: { title: created.title, assigneeAgentId: created.assigneeAgentId },
+      details: { title: created.title, assigneeAgentId: created.assigneeAgentId, slotPriority: created.slotPriority },
     });
     const telemetryClient = getTelemetryClient();
     if (telemetryClient) {
@@ -566,6 +582,9 @@ export function routineRoutes(
     if (statusWillActivate) {
       await assertBoardCanAssignTasks(req, routine.companyId);
     }
+    if (req.body.slotPriority === "first" && routine.slotPriority !== "first") {
+      await assertCanSetFirstSlotPriority(req, routine.companyId);
+    }
     if (
       req.actor.type === "agent" &&
       req.body.assigneeAgentId !== undefined &&
@@ -574,7 +593,10 @@ export function routineRoutes(
       throw forbidden("Agents can only assign routines to themselves");
     }
     const stepsWillChange = req.body.steps !== undefined && !isDeepStrictEqual(req.body.steps, routine.steps);
-    let patch = req.body;
+    let patch =
+      req.body.slotPriority === "first" && routine.slotPriority === "first"
+        ? { ...req.body, slotPriority: undefined }
+        : req.body;
     if (stepsWillChange) {
       await assertCanAssignRoutineSteps(req, routine.companyId, req.body.steps);
       const steps = await containAgentSteps(
@@ -583,7 +605,7 @@ export function routineRoutes(
         req.body.projectId === undefined ? routine.projectId : req.body.projectId,
         req.body.steps,
       );
-      if (steps) patch = { ...req.body, steps };
+      if (steps) patch = { ...patch, steps };
     }
     const updated = await svc.update(routine.id, patch, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
@@ -601,7 +623,10 @@ export function routineRoutes(
       action: "routine.updated",
       entityType: "routine",
       entityId: routine.id,
-      details: { title: updated?.title ?? routine.title },
+      details: {
+        title: updated?.title ?? routine.title,
+        ...(updated && updated.slotPriority !== routine.slotPriority ? { slotPriority: updated.slotPriority } : {}),
+      },
     });
     if (updated && updated.latestRevisionId !== routine.latestRevisionId) {
       await remapRoutineDescriptionAnnotations(req, routine.id);
@@ -845,11 +870,21 @@ export function routineRoutes(
       throw forbidden("Agents can only assign routine steps to themselves");
     }
     const targetIssueId: string | null = req.body.targetIssueId ?? null;
-    if (targetIssueId) await assertCanStartStepsOnTask(req, routine, targetIssueId, assigneeOverride);
-    const run = await svc.runRoutine(routine.id, req.body, {
+    if (targetIssueId) {
+      await assertCanStartStepsOnTask(req, routine, await issues.getById(targetIssueId), assigneeOverride);
+    }
+    const runner = {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
-    });
+    };
+    // The checks above read the task and the routine before the attach locks them, and a board change
+    // can land in between. The service asks again under the locks, on the rows it locked.
+    const run = targetIssueId
+      ? await svc.runRoutine(routine.id, req.body, runner, {
+          authorizeOnTask: ({ routine: locked, task, executor }) =>
+            assertCanStartStepsOnTask(req, locked, task, assigneeOverride, accessService(executor)),
+        })
+      : await svc.runRoutine(routine.id, req.body, runner);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: routine.companyId,
