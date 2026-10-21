@@ -18,8 +18,8 @@ export const SYNC_PAGE_SIZE = 100;
 /** Tasks that need a second look (edited here, or failed last time). Beyond this, the full pass finds the rest. */
 export const QUEUE_LIMIT = 500;
 /**
- * A run looks at no more of them than this per repository, and at none once this share of the company's run is used, so they
- * never take the time that GitHub's changes need.
+ * A run looks at no more of them than this per repository, and at none once the looks of all its repositories together have
+ * used this share of the company's run, so they never take the time that GitHub's changes need.
  */
 export const QUEUE_PER_REPOSITORY = 20;
 export const QUEUE_SHARE = 0.3;

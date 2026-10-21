@@ -389,6 +389,29 @@ describe("incremental GitHub task sync", () => {
     await f.service.sync(companyId);
     expect([...read()].filter(number => first.has(number))).toEqual([]);
   });
+  it("pushes an edit of a later repository in the same run, although an earlier repository's walk took a long time", async () => {
+    const f = await fixture();
+    // Repository "org/alpha" sorts first, and its walk takes 40 s once both repositories have had their first full pass.
+    const alpha = { ...repo, id: 21, name: "alpha", fullName: "org/alpha", url: "https://github.com/org/alpha" };
+    f.catalog.mockResolvedValue({ app: { id: "12", slug: "app", name: "App" }, installations: [], repositories: [alpha, repo], warnings: [], truncated: false });
+    f.h.seed({ projectWorkspaces: [{ id: "w3", companyId, projectId: "p2", repoUrl: alpha.url }] as any });
+    f.remote.clear();
+    for (const number of [1, 2, 3]) f.remote.set(number, edited(number, number));
+    const advance = skewClock(), listing = f.list.getMockImplementation()!;
+    let slow = false;
+    f.list.mockImplementation(async (...args) => {
+      if (args[2].id !== alpha.id) return listing(...args);
+      if (slow) advance(40_000);
+      return { issues: [], nextPage: null, repository: alpha.fullName, cursor: null };
+    });
+    await f.service.sync(companyId);
+    const task = (await f.native()).find(item => item.originId === "1")!;
+    await f.h.ctx.issues.update(task.id, { title: "Local title" }, companyId);
+    await f.h.emit("issue.updated", { id: task.id }, { companyId, actorType: "user", entityId: task.id });
+    slow = true;
+    expect(await f.service.sync(companyId)).toMatchObject({ partial: false });
+    expect(f.remote.get(1)?.title).toBe("Local title");
+  });
   it("drops the asks for issues of a repository that is no longer linked, so a full queue takes new edits again", async () => {
     const f = await synced();
     await f.h.ctx.state.set(queueKey(), Object.fromEntries(Array.from({ length: QUEUE_LIMIT }, (_, index) => [String(1000 + index), { repositoryId: 99, number: index + 1, at: 0 }])));

@@ -20,7 +20,8 @@ type Pending = { issueId: string; repositoryId: number; phase: "ready" | "postin
 type SyncQueue = Record<string, { repositoryId: number; number: number; at: number; attempts?: number }>;
 type Tracked = Record<string, { repositoryId: number; number: number; checkedAt?: string }>;
 interface RunScope { auth: { id: string; pem: string }; config: SyncSettings; report: SyncReport; deadline: number; resyncAt: string | undefined;
-  queued: SyncQueue; /** The queue lane takes no issue after this. */ queueDeadline: number; connected(): Promise<boolean> }
+  queued: SyncQueue; /** The time (ms) the queue lanes of all repositories may still use in this run; only a lane's own time counts. */ queueLeft: number;
+  connected(): Promise<boolean> }
 type Credentials = (companyId: string) => Promise<{ id: string; pem: string }>;
 export interface GitHubWebhookPayload {
   action?: string;
@@ -447,20 +448,24 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     async function asked(): Promise<"done" | "budget"> {
       const now = Date.now();
       const mine = Object.entries(scope.queued).filter(([, item]) => item.repositoryId === repo.id && item.at <= now).sort(([, a], [, b]) => a.at - b.at).slice(0, QUEUE_PER_REPOSITORY);
-      for (const [githubId, item] of mine) {
-        if (Date.now() >= deadline) return "budget";
-        if (Date.now() >= scope.queueDeadline) break;
-        try {
-          const remote = await github.getIssue(auth.id, auth.pem, repo, item.number);
-          await recover([remote]);
-          await reconcileOne(remote);
-        } catch (error) {
-          // A deleted or moved issue has nothing left to sync.
-          if (error instanceof GitHubError && (error.status === 404 || error.status === 410)) await settle(companyId, scope.queued, githubId);
-          else { warn(error, `${repo.fullName} #${item.number}`); await retry(companyId, scope.queued, { githubId, repositoryId: repo.id, number: item.number }); }
+      // The lanes share their part of the run by the time they use, so a slow walk of an earlier repository leaves this lane its part.
+      const left = scope.queueLeft;
+      try {
+        for (const [githubId, item] of mine) {
+          if (Date.now() >= deadline) return "budget";
+          if (Date.now() - now >= left) break;
+          try {
+            const remote = await github.getIssue(auth.id, auth.pem, repo, item.number);
+            await recover([remote]);
+            await reconcileOne(remote);
+          } catch (error) {
+            // A deleted or moved issue has nothing left to sync.
+            if (error instanceof GitHubError && (error.status === 404 || error.status === 410)) await settle(companyId, scope.queued, githubId);
+            else { warn(error, `${repo.fullName} #${item.number}`); await retry(companyId, scope.queued, { githubId, repositoryId: repo.id, number: item.number }); }
+          }
         }
-      }
-      return "done";
+        return "done";
+      } finally { scope.queueLeft = left - (Date.now() - now); }
     }
     // Publications that no listing showed a receipt for: a "ready" one is posted now; a "posting" one waits for its receipt,
     // which only a finished walk (`walked`) can rule out.
@@ -542,7 +547,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       report.warnings.push(...data.warnings);
       const auth = await credentials(companyId);
       const scope: RunScope = { auth, config, report, deadline, connected, queued: await queueFor(companyId), resyncAt: validTime(await ctx.state.get(key(companyId, "resync"))),
-        queueDeadline: startedAt + QUEUE_SHARE * (deadline - startedAt) };
+        queueLeft: QUEUE_SHARE * (deadline - startedAt) };
       const works: Array<Awaited<ReturnType<typeof repoWork>>> = [];
       const stop = () => { report.warnings.push(DISCONNECTED_DURING_SYNC); return report; };
       for (const repo of data.repositories) {
