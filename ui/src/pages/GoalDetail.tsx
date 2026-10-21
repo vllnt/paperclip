@@ -4,6 +4,9 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { goalsApi } from "../api/goals";
 import { projectsApi } from "../api/projects";
 import { assetsApi } from "../api/assets";
+import { issuesApi } from "../api/issues";
+import { routinesApi } from "../api/routines";
+import { agentsApi } from "../api/agents";
 import { usePanel } from "../context/PanelContext";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
@@ -16,11 +19,25 @@ import { StatusBadge } from "../components/StatusBadge";
 import { InlineEditor } from "../components/InlineEditor";
 import { EntityRow } from "../components/EntityRow";
 import { PageSkeleton } from "../components/PageSkeleton";
-import { cn, projectUrl } from "../lib/utils";
+import { routineDetailHref } from "../components/RoutineContextualSidebar";
+import { agentUrl, cn, issueUrl, projectUrl } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Plus, SlidersHorizontal } from "lucide-react";
-import { GOAL_TEXT_MAX_LENGTH, type Goal, type Project } from "@paperclipai/shared";
+import {
+  GOAL_TEXT_MAX_LENGTH,
+  OPEN_ISSUE_STATUSES,
+  goalAgentLinks,
+  type Goal,
+  type GoalAgentReason,
+  type Project,
+} from "@paperclipai/shared";
+
+const goalAgentReasonLabels: Record<GoalAgentReason, string> = {
+  owner: "Owner",
+  task: "Open tasks",
+  routine: "Routines",
+};
 
 interface GoalPropertiesToggleButtonProps {
   panelVisible: boolean;
@@ -79,6 +96,26 @@ export function GoalDetail() {
     enabled: !!resolvedCompanyId
   });
 
+  // Linked work reads the goal's own tasks and routines; sub-goals keep theirs on their own page.
+  const linkedWorkEnabled = !!resolvedCompanyId && !!goalId;
+  const { data: openTasks } = useQuery({
+    queryKey: queryKeys.issues.listOpenByGoal(resolvedCompanyId!, goalId!),
+    queryFn: () => issuesApi.listAll(resolvedCompanyId!, { goalId: goalId!, status: OPEN_ISSUE_STATUSES.join(",") }),
+    enabled: linkedWorkEnabled
+  });
+
+  const { data: goalRoutines } = useQuery({
+    queryKey: queryKeys.routines.list(resolvedCompanyId!, { goalId }),
+    queryFn: () => routinesApi.list(resolvedCompanyId!, { goalId }),
+    enabled: linkedWorkEnabled
+  });
+
+  const { data: agents } = useQuery({
+    queryKey: queryKeys.agents.list(resolvedCompanyId!),
+    queryFn: () => agentsApi.list(resolvedCompanyId!),
+    enabled: !!resolvedCompanyId
+  });
+
   useEffect(() => {
     if (!goal?.companyId || goal.companyId === selectedCompanyId) return;
     setSelectedCompanyId(goal.companyId, { source: "route_sync" });
@@ -119,6 +156,12 @@ export function GoalDetail() {
     if (p.goalIds.includes(goalId)) return true;
     if (p.goals.some((goalRef) => goalRef.id === goalId)) return true;
     return p.goalId === goalId;
+  });
+  const agentById = new Map((agents ?? []).map((agent) => [agent.id, agent]));
+  const linkedAgents = goalAgentLinks({
+    ownerAgentId: goal?.ownerAgentId ?? null,
+    tasks: openTasks ?? [],
+    routines: goalRoutines ?? [],
   });
 
   useEffect(() => {
@@ -190,6 +233,15 @@ export function GoalDetail() {
           <TabsTrigger value="projects">
             Projects ({linkedProjects.length})
           </TabsTrigger>
+          <TabsTrigger value="tasks">
+            Open tasks ({openTasks?.length ?? 0})
+          </TabsTrigger>
+          <TabsTrigger value="routines">
+            Routines ({goalRoutines?.length ?? 0})
+          </TabsTrigger>
+          <TabsTrigger value="agents">
+            Agents ({linkedAgents.length})
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="children" className="mt-4 space-y-3">
@@ -224,6 +276,67 @@ export function GoalDetail() {
                   trailing={<StatusBadge status={project.status} />}
                 />
               ))}
+            </div>
+          )}
+        </TabsContent>
+
+        <TabsContent value="tasks" className="mt-4">
+          {(openTasks ?? []).length === 0 ? (
+            <p className="text-sm text-muted-foreground">No open tasks for this goal.</p>
+          ) : (
+            <div className="border border-border">
+              {(openTasks ?? []).map((task) => (
+                <EntityRow
+                  key={task.id}
+                  identifier={task.identifier ?? undefined}
+                  title={task.title}
+                  subtitle={task.assigneeAgentId ? agentById.get(task.assigneeAgentId)?.name : undefined}
+                  to={issueUrl(task)}
+                  trailing={<StatusBadge status={task.status} />}
+                />
+              ))}
+            </div>
+          )}
+        </TabsContent>
+
+        <TabsContent value="routines" className="mt-4">
+          {(goalRoutines ?? []).length === 0 ? (
+            <p className="text-sm text-muted-foreground">No routines for this goal.</p>
+          ) : (
+            <div className="border border-border">
+              {(goalRoutines ?? []).map((routine) => (
+                <EntityRow
+                  key={routine.id}
+                  title={routine.title}
+                  subtitle={routine.assigneeAgentId ? agentById.get(routine.assigneeAgentId)?.name : undefined}
+                  to={routineDetailHref(routine.id)}
+                  trailing={<StatusBadge status={routine.status} />}
+                />
+              ))}
+            </div>
+          )}
+        </TabsContent>
+
+        <TabsContent value="agents" className="mt-4 space-y-3">
+          <p className="text-sm text-muted-foreground">
+            The goal's owner, and the agents of its open tasks and routines.
+          </p>
+          {linkedAgents.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No agents work on this goal yet.</p>
+          ) : (
+            <div className="border border-border">
+              {linkedAgents.map((link) => {
+                const agent = agentById.get(link.agentId);
+                return (
+                  <EntityRow
+                    key={link.agentId}
+                    title={agent?.name ?? link.agentId}
+                    subtitle={link.reasons.map((reason) => goalAgentReasonLabels[reason]).join(" · ")}
+                    to={agent ? agentUrl(agent) : undefined}
+                    trailing={agent ? <StatusBadge status={agent.status} /> : undefined}
+                  />
+                );
+              })}
             </div>
           )}
         </TabsContent>

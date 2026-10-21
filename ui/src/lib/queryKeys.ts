@@ -330,6 +330,9 @@ export const queryKeys = {
     labels: (companyId: string) => ["issues", companyId, "labels"] as const,
     listByProject: (companyId: string, projectId: string) =>
       ["issues", companyId, "project", projectId] as const,
+    /** The open tasks whose own goal is this one. */
+    listOpenByGoal: (companyId: string, goalId: string) =>
+      ["issues", companyId, "goal", goalId, "open"] as const,
     listPluginOperationsByProject: (
       companyId: string,
       projectId: string,
@@ -441,7 +444,7 @@ export const queryKeys = {
       ["issues", "file-resources", issueId, "availability", refKeys] as const,
   },
   routines: {
-    list: (companyId: string, filters?: { projectId?: string | null; q?: string | null; assigneeAgentId?: string | null; folderId?: string | null; status?: string | null; trigger?: string | null }) => {
+    list: (companyId: string, filters?: { projectId?: string | null; q?: string | null; assigneeAgentId?: string | null; folderId?: string | null; status?: string | null; trigger?: string | null; goalId?: string | null }) => {
       const { projectId, ...rest } = filters ?? {};
       const narrowing = Object.fromEntries(Object.entries(rest).filter(([, value]) => value));
       return Object.keys(narrowing).length > 0
