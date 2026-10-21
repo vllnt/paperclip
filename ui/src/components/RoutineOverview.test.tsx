@@ -172,6 +172,53 @@ describe("RoutineOverview", () => {
     });
   });
 
+  it("names enabled event triggers instead of reporting manual runs only", () => {
+    const eventTrigger = {
+      ...routine.triggers[0]!,
+      kind: "event",
+      label: "issue created",
+      cronExpression: null,
+      timezone: null,
+      nextRunAt: null,
+    };
+    expect(summarizeRoutineSchedule([eventTrigger])).toEqual({
+      label: "1 active event trigger", detail: "Runs on matching events", nextRunAt: null,
+    });
+    expect(summarizeRoutineSchedule([eventTrigger, { ...eventTrigger, id: "trigger-2" }])).toMatchObject({
+      label: "2 active event triggers",
+    });
+    expect(summarizeRoutineSchedule([{ ...eventTrigger, enabled: false }])).toEqual({
+      label: "No active schedule", detail: "Manual runs only", nextRunAt: null,
+    });
+    expect(summarizeRoutineSchedule([eventTrigger, { ...eventTrigger, id: "trigger-3", kind: "webhook" }])).toEqual({
+      label: "2 active triggers", detail: "Runs on incoming requests and matching events", nextRunAt: null,
+    });
+  });
+
+  it("keeps manual runs only when the routine has no trigger", () => {
+    expect(summarizeRoutineSchedule([])).toEqual({
+      label: "No active schedule", detail: "Manual runs only", nextRunAt: null,
+    });
+  });
+
+  it("shows an event-only routine as waiting for events on the overview", () => {
+    const eventRoutine = {
+      ...routine,
+      triggers: [{ ...routine.triggers[0]!, kind: "event", cronExpression: null, timezone: null, nextRunAt: null }],
+    } as RoutineDetail;
+    flushSync(() => root.render(
+      <RoutineDetailContext.Provider value={{ ...contextFixture(), routine: eventRoutine }}>
+        <RoutineOverview />
+      </RoutineDetailContext.Provider>,
+    ));
+
+    expect(container.textContent).toContain("1 active event trigger");
+    expect(container.textContent).toContain("Runs on matching events");
+    expect(container.textContent).toContain("On matching event");
+    expect(container.textContent).not.toContain("Manual runs only");
+    expect(container.textContent).not.toContain("Add or enable a schedule");
+  });
+
   it("adapts compact run tasks to the canonical task presentation", () => {
     const issue = routineRunIssue(run.linkedIssue!, run, "company-1", "project-1");
     expect(issue).toMatchObject({
