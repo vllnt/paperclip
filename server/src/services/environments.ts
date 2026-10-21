@@ -20,6 +20,7 @@ import {
   ENVIRONMENT_LEASE_POLICIES,
   ENVIRONMENT_LEASE_STATUSES,
   ENVIRONMENT_STATUSES,
+  isUuidLike,
   type CompanyEnvironmentLeaseListItem,
   type CreateEnvironment,
   type Environment,
@@ -902,6 +903,9 @@ export function environmentService(db: Db) {
     },
 
     getLeaseById: async (id: string): Promise<EnvironmentLease | null> => {
+      // A short id from the CLI or a log, or an empty id, is no lease. Skip the
+      // query: the uuid-typed column rejects it with a database error.
+      if (!isUuidLike(id)) return null;
       const row = await db
         .select()
         .from(environmentLeases)

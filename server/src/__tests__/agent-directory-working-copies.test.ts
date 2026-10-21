@@ -863,6 +863,40 @@ describe("persistent agent directories", () => {
     } finally { shell.mockRestore(); }
   });
 
+  // A remote target without a stored environment gives the location "remote:"
+  // and a receipt that names no lease. The lease lookup has no id to use then.
+  async function remoteWithoutEnvironment(stopped: boolean) {
+    const { copy } = await unavailableRemote({ state: "destroyed" });
+    await db.update(agentInstructionWorkingCopies).set({ location: "remote:", processStoppedAt: stopped ? new Date() : null,
+      receipt: { ...copy.receipt, cleanup: { remoteCwd: "/fixture/cleanup-task" } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+    return (await copies.get(companyId, copy.runId))!;
+  }
+  const noLeaseQuery = () => vi.fn(() => { throw new Error('invalid input syntax for type uuid: ""'); });
+
+  it("looks up no lease to recover an unavailable copy whose remote target had no stored environment", async () => {
+    const copy = await remoteWithoutEnvironment(false);
+    const select = noLeaseQuery();
+    const patch = vi.fn(async () => { throw new Error("no destruction is proven, so the copy must not change"); });
+    await expect(agentDirectoryWorkingCopyService({ select } as unknown as typeof db, copies.get, patch).recoverUnavailable(copy)).resolves.toBeUndefined();
+    expect(select).not.toHaveBeenCalled();
+    expect(patch).not.toHaveBeenCalled();
+    expect(await copies.get(companyId, copy.runId)).toEqual(copy);
+  });
+
+  it("looks up no lease to release a stopped copy whose remote target had no stored environment, and keeps its cleanup pending", async () => {
+    const copy = await remoteWithoutEnvironment(true);
+    const select = noLeaseQuery();
+    const patch = async (row: typeof copy, values: Partial<typeof agentInstructionWorkingCopies.$inferInsert>) => {
+      const [updated] = await db.update(agentInstructionWorkingCopies).set(values).where(eq(agentInstructionWorkingCopies.runId, row.runId)).returning();
+      return updated!;
+    };
+    await agentDirectoryWorkingCopyService({ select } as unknown as typeof db, copies.get, patch).release(copy);
+    expect(select).not.toHaveBeenCalled();
+    const kept = (await copies.get(companyId, copy.runId))!;
+    expect(kept).toMatchObject({ state: "unavailable", receipt: { cleanupPending: true } });
+    expect(kept.nextAttemptAt).toBeInstanceOf(Date);
+  });
+
   it.each([false, true])("preserves uncollected local edits and their unavailable receipt even after local stop proof (%s)", async stopped => {
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, "unsaved-local.txt"), "recoverable local edit");
