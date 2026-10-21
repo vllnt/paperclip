@@ -126,7 +126,9 @@ export function routineRoutes(
   /**
    * Slot priority `first` puts a routine's runs ahead of the other queued work of every agent that
    * serves them, step agents included, so only a board user with `tasks:assign` may set it.
-   * Anyone who manages the routine may set it back to `normal`.
+   * Anyone who manages the routine may set it back to `normal`. An update that resends `first`
+   * while the routine already reads `first` writes nothing, so a stale copy of the routine cannot
+   * restore `first` after the board lowered it in the meantime.
    * @throws HttpError 403 for an agent, or for a board user without `tasks:assign`.
    */
   async function assertCanSetFirstSlotPriority(req: Request, companyId: string) {
@@ -591,7 +593,10 @@ export function routineRoutes(
       throw forbidden("Agents can only assign routines to themselves");
     }
     const stepsWillChange = req.body.steps !== undefined && !isDeepStrictEqual(req.body.steps, routine.steps);
-    let patch = req.body;
+    let patch =
+      req.body.slotPriority === "first" && routine.slotPriority === "first"
+        ? { ...req.body, slotPriority: undefined }
+        : req.body;
     if (stepsWillChange) {
       await assertCanAssignRoutineSteps(req, routine.companyId, req.body.steps);
       const steps = await containAgentSteps(
@@ -600,7 +605,7 @@ export function routineRoutes(
         req.body.projectId === undefined ? routine.projectId : req.body.projectId,
         req.body.steps,
       );
-      if (steps) patch = { ...req.body, steps };
+      if (steps) patch = { ...patch, steps };
     }
     const updated = await svc.update(routine.id, patch, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
@@ -618,7 +623,10 @@ export function routineRoutes(
       action: "routine.updated",
       entityType: "routine",
       entityId: routine.id,
-      details: { title: updated?.title ?? routine.title },
+      details: {
+        title: updated?.title ?? routine.title,
+        ...(updated && updated.slotPriority !== routine.slotPriority ? { slotPriority: updated.slotPriority } : {}),
+      },
     });
     if (updated && updated.latestRevisionId !== routine.latestRevisionId) {
       await remapRoutineDescriptionAnnotations(req, routine.id);

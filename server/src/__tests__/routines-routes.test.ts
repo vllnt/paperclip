@@ -745,6 +745,38 @@ describe("routine routes", () => {
       expect(mockRoutineService.update).toHaveBeenCalledTimes(2);
     });
 
+    it("records the new slot priority in the routine.updated activity entry", async () => {
+      mockAccessService.canUser.mockResolvedValue(true);
+      mockRoutineService.get.mockResolvedValue({ ...routine, slotPriority: "normal" });
+      mockRoutineService.update.mockResolvedValue({ ...routine, slotPriority: "first" });
+      const app = await createApp(board);
+
+      const res = await request(app).patch(`/api/routines/${routineId}`).send({ slotPriority: "first" });
+
+      expect(res.status).toBe(200);
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "routine.updated",
+        actorId: "board-user",
+        details: { title: routine.title, slotPriority: "first" },
+      }));
+    });
+
+    it("writes nothing for a resent first, so a stale copy cannot undo the board lowering it meanwhile", async () => {
+      mockRoutineService.get.mockResolvedValue({ ...routine, slotPriority: "first" });
+      const app = await createApp({ type: "agent", agentId, companyId });
+
+      const res = await request(app)
+        .patch(`/api/routines/${routineId}`)
+        .send({ title: "Renamed", slotPriority: "first" });
+
+      expect(res.status).toBe(200);
+      expect(mockRoutineService.update).toHaveBeenCalledWith(
+        routineId,
+        expect.objectContaining({ title: "Renamed", slotPriority: undefined }),
+        expect.anything(),
+      );
+    });
+
     it("requires tasks:assign permission for a board user to set first", async () => {
       const app = await createApp(board);
 

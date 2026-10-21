@@ -3758,7 +3758,12 @@ export function routineService(
         if (patch.slotPriority !== undefined && patch.slotPriority !== locked.slotPriority) {
           await txDb
             .update(routines)
-            .set({ slotPriority: patch.slotPriority, updatedAt: new Date() })
+            .set({
+              slotPriority: patch.slotPriority,
+              updatedByAgentId: actor.agentId ?? null,
+              updatedByUserId: actor.userId ?? null,
+              updatedAt: new Date(),
+            })
             .where(eq(routines.id, id));
           locked.slotPriority = patch.slotPriority;
         }

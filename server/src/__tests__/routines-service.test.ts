@@ -503,17 +503,17 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   });
 
   it("defaults the slot priority to normal and persists a slot-priority-only update without a new revision", async () => {
-    const { routine, svc } = await seedFixture();
+    const { agentId, routine, svc } = await seedFixture();
     expect(routine.slotPriority).toBe("normal");
 
     const updated = await svc.update(
       routine.id,
       { slotPriority: "first", baseRevisionId: routine.latestRevisionId },
-      {},
+      { agentId },
     );
     expect(updated?.slotPriority).toBe("first");
     expect(updated?.latestRevisionId).toBe(routine.latestRevisionId);
-    expect((await svc.get(routine.id))?.slotPriority).toBe("first");
+    expect(await svc.get(routine.id)).toMatchObject({ slotPriority: "first", updatedByAgentId: agentId });
 
     // A content edit in the same call keeps the new slot priority and versions only the content.
     const edited = await svc.update(routine.id, { title: "Renamed", slotPriority: "normal" }, {});
