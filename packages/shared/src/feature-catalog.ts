@@ -200,6 +200,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  enableDatabases: {
+    title: "Databases",
+    description:
+      "Enable company and project databases: typed tables whose rows board users, agents and routines create, with the gated API and CLI.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableExternalObjects: {
     title: "External Objects",
     description:

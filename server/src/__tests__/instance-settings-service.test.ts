@@ -79,6 +79,7 @@ describe("instance settings service", () => {
       enableBetaSkills: false,
       enableSummaries: false,
       enableStatusCards: false,
+      enableDatabases: false,
       enableDecisions: false,
       enableGoalsSidebarLink: true,
       enableServerInfoDebugView: true,

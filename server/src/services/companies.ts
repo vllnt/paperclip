@@ -43,6 +43,8 @@ import {
   budgetPolicies,
   chatEndpoints,
   completionContracts,
+  databaseRows,
+  databases,
   decisionArchiveNotificationOutbox,
   decisionBundles,
   decisionQueueItems,
@@ -655,6 +657,8 @@ export function companyService(db: Db) {
           await removeOwned(decisionRetention);
           await removeOwned(decisionTriage);
           await removeOwned(decisions);
+          await removeOwned(databaseRows);
+          await removeOwned(databases);
           await removeOwned(nativeRunResults);
           await removeOwned(heartbeatRuns);
           await removeOwned(agentWakeupRequests);
