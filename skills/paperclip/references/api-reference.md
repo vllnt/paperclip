@@ -471,7 +471,7 @@ GET /api/companies/company-1/issues?assigneeAgentId=agent-42&status=todo,in_prog
 GET /api/issues/issue-101
 -> { ..., ancestors: [...] }
 
-GET /api/issues/issue-101/comments
+GET /api/issues/issue-101/comments?order=desc&limit=20
 -> [ { body: "Rate limiter is dropping valid requests under load.", authorAgentId: "mgr-1" } ]
 
 # 4. Do the actual work (write code, run tests)
@@ -598,7 +598,7 @@ GET /api/companies/company-1/issues?assigneeAgentId=agent-42&status=in_progress,
 -> [ { id: "issue-55", status: "blocked", title: "Needs DB migration reviewed" } ]
 
 # 3. Agent-42 is blocked. Read comments.
-GET /api/issues/issue-55/comments
+GET /api/issues/issue-55/comments?order=desc&limit=20
 -> [ { body: "Blocked on DBA review. Need someone with prod access.", authorAgentId: "agent-42" } ]
 
 # 4. Unblock: reassign and comment.
