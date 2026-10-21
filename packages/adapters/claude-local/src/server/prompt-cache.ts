@@ -44,6 +44,47 @@ function resolveManagedClaudePromptCacheRoot(
   );
 }
 
+/** A bundle that no run has prepared for this long is removed. No run lasts this long. */
+const PROMPT_BUNDLE_MAX_IDLE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Each prompt cache is pruned at most this often. */
+const PROMPT_BUNDLE_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+const PROMPT_BUNDLE_DIR_NAME = /^[0-9a-f]{64}$/;
+const lastPromptBundlePruneAt = new Map<string, number>();
+let promptBundleDirLock: Promise<unknown> = Promise.resolve();
+
+/** Runs `work` alone among this process's bundle marks and bundle removals. */
+function withPromptBundleDirLock<T>(work: () => Promise<T>): Promise<T> {
+  const result = promptBundleDirLock.then(work);
+  promptBundleDirLock = result.catch(() => undefined);
+  return result;
+}
+
+/**
+ * Removes the bundles in `cacheRoot` that no run has prepared for 7 days. Each
+ * run marks its bundle by its modified time, so the bundle a run uses is never
+ * idle. It removes only a directory named like a bundle key, never `keep`, and
+ * never a symlink; the removal does not follow the skill links inside a bundle.
+ * Each check and removal holds the lock that a run's mark holds, so a bundle
+ * that a run marks during the prune is kept.
+ *
+ * @param cacheRoot The prompt cache of one company.
+ * @param keep The bundle key of the calling run.
+ * @param now The time to measure idleness from (epoch ms).
+ */
+export async function pruneIdleClaudePromptBundles(cacheRoot: string, keep: string, now = Date.now()): Promise<void> {
+  const entries = await fs.readdir(cacheRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === keep || !PROMPT_BUNDLE_DIR_NAME.test(entry.name)) continue;
+    const bundleDir = path.join(cacheRoot, entry.name);
+    await withPromptBundleDirLock(async () => {
+      const stat = await fs.lstat(bundleDir);
+      if (stat.isDirectory() && now - stat.mtimeMs > PROMPT_BUNDLE_MAX_IDLE_MS) {
+        await fs.rm(bundleDir, { recursive: true, force: true });
+      }
+    }).catch(() => undefined);
+  }
+}
+
 interface HashSink {
   update(data: string | Buffer): void;
 }
@@ -176,9 +217,24 @@ export async function prepareClaudePromptBundle(input: {
     instructionsContents,
     resumeInstructionsContents,
   });
-  const rootDir = path.join(resolveManagedClaudePromptCacheRoot(process.env, companyId), bundleKey);
+  const cacheRoot = resolveManagedClaudePromptCacheRoot(process.env, companyId);
+  const rootDir = path.join(cacheRoot, bundleKey);
   const skillsHome = path.join(rootDir, ".claude", "skills");
-  await fs.mkdir(skillsHome, { recursive: true });
+  // Mark the bundle as used, so a prune keeps it while this run reads it. A
+  // prune that removed it just before is followed by a fresh copy below. A
+  // failed mark does not fail the run.
+  await withPromptBundleDirLock(async () => {
+    await fs.mkdir(skillsHome, { recursive: true });
+    const markedAt = new Date();
+    await fs.utimes(rootDir, markedAt, markedAt).catch(() => undefined);
+  });
+  const lastPruneAt = lastPromptBundlePruneAt.get(cacheRoot) ?? 0;
+  if (Date.now() - lastPruneAt >= PROMPT_BUNDLE_PRUNE_INTERVAL_MS) {
+    lastPromptBundlePruneAt.set(cacheRoot, Date.now());
+    // Never awaited and never thrown: a failed prune does not delay or fail
+    // the run, and the next prune retries.
+    void pruneIdleClaudePromptBundles(cacheRoot, bundleKey).catch(() => undefined);
+  }
 
   for (const entry of skills) {
     const target = path.join(skillsHome, entry.runtimeName);
