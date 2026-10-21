@@ -721,7 +721,7 @@ A wait without `--pull-request` behaves exactly as before: it always wakes the a
   - a server-owned monitor (provider quota, background-task re-check)
   - the last attempt that a re-arm allows
   - any wake that is not a scheduled monitor wake, including every comment wake
-- **Fail open.** Paperclip reads GitHub with the company's own credential: the managed GitHub connection, else a `GITHUB_TOKEN`/`GH_TOKEN`/`PAPERCLIP_GITHUB_TOKEN` company secret. It never uses the server-environment token, and it sends the credential only to `https://api.github.com`. Any of the following means the agent wakes as before, and Paperclip logs the reason with the company and issue ids:
+- **Fail open.** No run exists yet when Paperclip reads GitHub, so it uses the credential that a run of the assignee on this issue would get for a read, as the runtime-tools credential route answers it (see [GitHub connections](connections/GITHUB.md#identity-resolution)): the managed GitHub identity that the issue continues under, else a `GITHUB_TOKEN`/`GH_TOKEN`/`PAPERCLIP_GITHUB_TOKEN` company secret. The company's GitHub write-identity policy and trust rules apply: a low-trust issue, or a company with the write-identity kill switch on, has no credential, and an App-user company gets its read token from the GitHub plugin. Paperclip never uses the server-environment token, and it sends the credential only to `https://api.github.com`. Any of the following means the agent wakes as before, and Paperclip logs the reason with the company and issue ids:
   - there is no credential, or it cannot be resolved
   - GitHub answers with an error, or with a rate limit (a 429, or a 403 with no requests left or with `retry-after`)
   - fewer than 100 requests remain in the rate limit

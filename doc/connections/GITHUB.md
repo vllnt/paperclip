@@ -44,6 +44,15 @@ and webhook binding uses the same order:
 4. Legacy `GH_TOKEN`/`GITHUB_TOKEN` only when no managed GitHub connection is
    configured for the company.
 
+The server also reads GitHub when no run exists yet: the unchanged pull request
+check for a wait (`issue wait --pull-request`) and the GitHub panel of an issue.
+These reads use the order above for a read by the issue's assignee, as the
+runtime-tools credential route answers it. The responsible user is the one that
+the issue continues under (its continuation identity). Standing delegations do
+not count, and a company-default identity names nobody to act as. A low-trust
+issue, the write-identity kill switch, and an App-user policy apply as they do
+for a run.
+
 An unavailable or ambiguous managed identity fails visibly. It never falls
 through to another person, an organization credential, or a legacy token.
 Agent grants are company-scoped, have exactly one `subjectAgentId`, cannot be
