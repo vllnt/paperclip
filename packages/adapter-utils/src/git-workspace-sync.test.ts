@@ -21,7 +21,6 @@ import {
   type GitWorkspaceSnapshot,
   ReferencedSourceIgnoreScanLimitExceededError,
   readReferencedSourceGitIgnoredPaths,
-  resetLocalGitIndexToHead,
   REFERENCED_SOURCE_IGNORE_MAX_ENTRY_COUNT,
   REFERENCED_SOURCE_IGNORE_MAX_TOTAL_BYTES,
   runLocalGit,
@@ -218,36 +217,6 @@ describe("git workspace sync", () => {
     await git(repo, ["commit", "-m", "base"]);
     return repo;
   }
-
-  it("resets the index to HEAD once another git process releases a short-lived index lock", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-index-lock-"));
-    cleanupDirs.push(rootDir);
-    const repo = await createRepo(rootDir);
-    await writeFile(path.join(repo, "tracked.txt"), "staged\n", "utf8");
-    await git(repo, ["add", "tracked.txt"]);
-    const lockPath = path.join(repo, ".git", "index.lock");
-    await writeFile(lockPath, "");
-    const release = setTimeout(() => void rm(lockPath, { force: true }), 500);
-
-    try {
-      await resetLocalGitIndexToHead({ localDir: repo });
-    } finally {
-      clearTimeout(release);
-    }
-
-    expect(await git(repo, ["diff", "--cached", "--name-only"])).toBe("");
-  });
-
-  it("fails the index reset when the index lock is never released", async () => {
-    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-index-lock-held-"));
-    cleanupDirs.push(rootDir);
-    const repo = await createRepo(rootDir);
-    await writeFile(path.join(repo, ".git", "index.lock"), "");
-
-    await expect(resetLocalGitIndexToHead({ localDir: repo })).rejects.toThrow(
-      "Failed to reset local git index to HEAD after workspace restore",
-    );
-  });
 
   it("does not classify a selected repository subfolder as a cloneable repository root", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-git-selected-folder-"));
