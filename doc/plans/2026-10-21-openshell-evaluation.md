@@ -153,8 +153,8 @@ boundary, and the agent is frozen if the supervisor link drops
   [O5 L55-64]. The global policy *replaces* sandbox policies; it does not limit
   them. While it is active, OpenShell also blocks sandbox policy changes and
   proposal approvals, and drops provider-contributed rules [O5 L82-88]. So a
-  per-run policy needs a gateway with no global policy. Providers add rules on top ("effective policy")
-  [O5 L69-74]. The default allows no network. It grants the working
+  per-run policy needs a gateway with no global policy. Providers add rules on
+  top ("effective policy") [O5 L69-74]. The default allows no network. It grants the working
   directory, `/tmp` and `/dev/null` read-write and a few system paths
   read-only [O17 L26-47].
 - **Versioning and apply:** every change is a gateway revision. The sandbox
@@ -322,8 +322,14 @@ Full paths for the diagram:
       bypass is on by default unless network access is off or a sandbox is
       set explicitly
       (`packages/adapters/codex-local/src/server/codex-args.ts:62-70`;
-      `packages/adapters/codex-local/src/index.ts:12`). The native runner gives
-      Codex a workspace-only permission profile by default
+      `packages/adapters/codex-local/src/index.ts:12`). A run without network
+      access turns the bypass off, and heartbeat removes network access for
+      every preset other than standard (`server/src/services/heartbeat.ts:26331-26335`;
+      `execution-target.ts:1910`;
+      `packages/adapters/codex-local/src/server/execute.ts:1237`). Codex then
+      runs its tool commands with network off (`codex-args.ts:69`). That is
+      all or nothing, not filtering. The native runner gives Codex a
+      workspace-only permission profile by default
       (`packages/paperclip-runner/src/drivers/codex/codex-security-config.ts:225-246`).
 - **Inside provider sandboxes, enforcement is thin:**
   - Paperclip relies on the provider to isolate the sandbox from the host, and
@@ -332,9 +338,11 @@ Full paths for the diagram:
   - For general internet access, "Paperclip does not enforce this policy
     inside the sandbox" (`SANDBOX-REQUIREMENTS.md:70-71`).
   - In a sandbox target, the native runner switches Codex to a profile that
-    can write the whole sandbox root
+    can write the whole sandbox root, and starts Codex with
+    `--dangerously-bypass-approvals-and-sandbox`
     (`server/src/services/native-runtime/native-session-executor.ts:12374-12376`;
-    `codex-security-config.ts:225-227, 236-239`).
+    `codex-security-config.ts:225-227, 236-239, 261-263`). So Codex's own
+    sandbox is off there on purpose.
   - Two providers filter egress:
     - the Kubernetes provider writes a deny-all plus allowlist egress
       NetworkPolicy
@@ -444,7 +452,7 @@ on `origin/main`.)
 | Guardrail | Today | With OpenShell |
 |---|---|---|
 | "Only talk to approved hosts", "no data exfiltration" | guidance; allowlists exist only in `bwrap` (local Linux claude/codex runs), the Kubernetes provider (exact host names only in `cilium` mode) and the Modal provider (CIDRs or block-all) | **Enforced:** egress allowlist per binary and its child processes, deny by default |
-| "Only use approved package registries" | guidance, with the same two exceptions | **Enforced:** egress allowlist |
+| "Only use approved package registries" | guidance, with the same exceptions | **Enforced:** egress allowlist |
 | "Read-only access to service X" | guidance | **Enforced:** REST `access: read-only` with `enforce` |
 | "Never call production or metadata endpoints" | guidance | **Enforced:** deny rules; metadata is never an allowed destination [O6 L141-146] |
 | "Stay inside the workspace; don't read home or secret files" | guidance; `bwrap` `filesystemScope: "workspace"` for local Linux claude/codex runs (`local-process-sandbox.ts:353-358`), and Codex's own sandbox when it is on (section 2.1) | **Enforced in every OpenShell sandbox:** `filesystem_policy` (Landlock), with `hard_requirement` |
@@ -802,7 +810,11 @@ Each opted-in worker host would need:
     the Modal provider's CIDR allowlist or block-all (IP literals only), and
     the `bwrap` proxy allowlist (local Linux claude/codex runs);
   - `fs.*` compiles to `bwrap` `filesystemScope: "workspace"` on local Linux
-    runs, and to Codex's own workspace sandbox for Codex runs;
+    runs, and to Codex's own workspace sandbox where Paperclip leaves it on
+    (codex-local with its bypass off, or the native runner outside provider
+    sandboxes);
+  - a "no egress" control can also turn off network for Codex's tool commands
+    (section 2.1);
   - method and path rules, `egress.deny` on paths, `credential.bind` and
     `mode: audit` have no target and stay guidance.
 
