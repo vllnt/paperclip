@@ -201,6 +201,14 @@ describe("deriveRunUsageRecord", () => {
     expect(record).toMatchObject({ usageQuality: "derived", usageBasis: "session_delta" });
   });
 
+  it("marks usage that the server read back from the run log as derived", () => {
+    const record = deriveRunUsageRecord(makeInput({
+      run: makeRun({ usageJson: { ...CLAUDE_USAGE, usageSource: "run_log", partial: true } }),
+    }));
+
+    expect(record).toMatchObject({ usageQuality: "derived", usageBasis: null });
+  });
+
   describe("Codex", () => {
     it("treats codex_local usage as measured per-run counts, even when a resume reuses the session id", () => {
       const resumed = deriveRunUsageRecord(makeInput({

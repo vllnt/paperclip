@@ -1,4 +1,5 @@
 import type { Db } from "@paperclipai/db";
+import type { RunSnapshot } from "./application/types.js";
 import { createPostgresWatchdogAdapter } from "./adapters/postgres.js";
 import { createProcessAdapter } from "./adapters/process.js";
 import {
@@ -12,6 +13,8 @@ export type ActiveRunWatchdogConfig = {
   suspicionThresholdMs: number;
   criticalThresholdMs: number;
   continueRearmMs: number;
+  /** Called after a source-resolved fold settled a run. See {@link FoldSourceResolvedRunDeps}. */
+  onRunFolded?: (run: RunSnapshot) => Promise<void>;
 };
 
 /**
@@ -26,6 +29,7 @@ export function createActiveRunWatchdog(db: Db, config: ActiveRunWatchdogConfig)
   const foldSourceResolvedRun = createFoldSourceResolvedRun({
     writer: postgresAdapter,
     processController,
+    onRunFolded: config.onRunFolded,
   });
 
   return {
@@ -51,6 +55,7 @@ export type ActiveRunWatchdog = ReturnType<typeof createActiveRunWatchdog>;
 
 export type {
   RunOutputSilenceSummary,
+  RunSnapshot,
   ScanSilentActiveRunsResult,
   WatchdogDecisionActor,
   WatchdogDecisionRecord,
