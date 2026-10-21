@@ -13960,6 +13960,10 @@ export function issueRoutes(
               resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
+              flushFinalUsage:
+                actor.actorType === "agent" &&
+                actor.agentId === runToStopForReassignment.agentId &&
+                actor.runId === runToStopForReassignment.id,
             },
           );
           if (!cancelled || cancelled.status !== "cancelled") {
