@@ -228,7 +228,7 @@ export function GoalDetail() {
       </div>
 
       <Tabs defaultValue="children">
-        <TabsList>
+        <TabsList className="max-w-full justify-start overflow-x-auto">
           <TabsTrigger value="children">
             Sub-Goals ({childGoals.length})
           </TabsTrigger>
