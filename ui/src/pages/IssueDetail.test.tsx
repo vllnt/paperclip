@@ -1665,6 +1665,64 @@ describe("IssueDetail", () => {
     ).toBe(false);
   });
 
+  it.each([true, false])(
+    "keeps the More task actions menu reachable at a mobile width (streamlined: %s)",
+    async (streamlined) => {
+      mockSidebarState.isMobile = true;
+      mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+        enableIssuePlanDecompositions: false,
+        enableExperimentalFileViewer: false,
+        enableExternalObjects: false,
+        enableStreamlinedUi: streamlined,
+      });
+      mockIssuesApi.get.mockResolvedValue(createIssue());
+
+      await act(async () => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <IssueDetail />
+          </QueryClientProvider>,
+        );
+      });
+      await flushReact();
+      await flushReact();
+
+      const moreButton = container.querySelector<HTMLButtonElement>(
+        'button[aria-label="More task actions"]',
+      );
+      expect(moreButton).not.toBeNull();
+      // jsdom loads no stylesheet, so read the Tailwind classes: a bare
+      // `hidden` (or `max-md:hidden`) on the button or any ancestor hides it
+      // below the md breakpoint, where `md:flex` only restores it from 768 px.
+      for (
+        let node: Element | null = moreButton;
+        node && node !== container;
+        node = node.parentElement
+      ) {
+        const classes = (node.getAttribute("class") ?? "").split(/\s+/);
+        expect(classes).not.toContain("hidden");
+        expect(classes).not.toContain("max-md:hidden");
+      }
+
+      const menuLabels = Array.from(
+        document.body.querySelectorAll<HTMLButtonElement>("button"),
+      ).map((button) => button.textContent?.trim());
+      expect(menuLabels).toContain("Run routine on this task");
+      expect(menuLabels).toContain("Hide this task");
+
+      const runRoutine = Array.from(
+        document.body.querySelectorAll<HTMLButtonElement>("button"),
+      ).find(
+        (button) => button.textContent?.trim() === "Run routine on this task",
+      );
+      await act(async () => runRoutine!.click());
+      expect(
+        document.body.querySelector('[data-slot="dialog-content"]')
+          ?.textContent,
+      ).toContain("Run routine on this task");
+    },
+  );
+
   it.each([false, true])(
     "preserves explicit upload receipt IDs through the page mutation (reassign=%s)",
     async (reassign) => {

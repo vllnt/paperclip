@@ -7095,7 +7095,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       )}
     >
       {streamlinedTaskDetailEnabled ? (
-        <div className="flex min-w-0 items-start gap-2 md:items-center md:pr-8">
+        <div className="flex min-w-0 items-start gap-2 pr-8 md:items-center">
           <div className="hidden md:block">{issueStatusControl}</div>
           <div
             data-slot="task-detail-title"
@@ -7301,59 +7301,67 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           </div>
         )}
 
-        <div className="hidden md:flex items-center md:ml-auto shrink-0">
-          {!streamlinedTaskDetailEnabled && canArchiveFromInbox && (
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={() => {
-                if (!archivePending && issue?.id)
-                  archiveFromInbox.mutate(issue.id);
-              }}
-              disabled={archivePending}
-              title="Archive from inbox"
-              aria-label="Archive from inbox"
-            >
-              <Archive className="h-4 w-4" />
-            </Button>
+        <div
+          className={cn(
+            "flex items-center shrink-0 md:ml-auto",
+            (streamlinedTaskDetailEnabled || (isMobile && isFromInbox)) &&
+              "ml-auto",
           )}
-          {fileViewerEnabled ? (
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={() => setFileViewerPromptOpen(true)}
-              title="Open file... (g f)"
-              aria-label="Open file in this issue"
-            >
-              <FileCode2 className="h-4 w-4" />
-            </Button>
-          ) : null}
-          {!streamlinedTaskDetailEnabled ? (
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={copyIssueToClipboard}
-              title="Copy task as markdown"
-            >
-              {copied ? (
-                <Check className="h-4 w-4 text-green-500" />
-              ) : (
-                <Copy className="h-4 w-4" />
-              )}
-            </Button>
-          ) : null}
-          {!streamlinedTaskDetailEnabled &&
-          !taskChatShellEnabled &&
-          (!panelVisible || suppressPanelUntilPlan) ? (
-            <TooltipProvider>
-              <SidePanelToggleButton
-                open={false}
-                onToggle={openTaskSidePanel}
-                shortcut="]"
-                className="shrink-0"
-              />
-            </TooltipProvider>
-          ) : null}
+        >
+          <div className="hidden md:flex items-center">
+            {!streamlinedTaskDetailEnabled && canArchiveFromInbox && (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={() => {
+                  if (!archivePending && issue?.id)
+                    archiveFromInbox.mutate(issue.id);
+                }}
+                disabled={archivePending}
+                title="Archive from inbox"
+                aria-label="Archive from inbox"
+              >
+                <Archive className="h-4 w-4" />
+              </Button>
+            )}
+            {fileViewerEnabled ? (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={() => setFileViewerPromptOpen(true)}
+                title="Open file... (g f)"
+                aria-label="Open file in this issue"
+              >
+                <FileCode2 className="h-4 w-4" />
+              </Button>
+            ) : null}
+            {!streamlinedTaskDetailEnabled ? (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={copyIssueToClipboard}
+                title="Copy task as markdown"
+              >
+                {copied ? (
+                  <Check className="h-4 w-4 text-green-500" />
+                ) : (
+                  <Copy className="h-4 w-4" />
+                )}
+              </Button>
+            ) : null}
+            {!streamlinedTaskDetailEnabled &&
+            !taskChatShellEnabled &&
+            (!panelVisible || suppressPanelUntilPlan) ? (
+              <TooltipProvider>
+                <SidePanelToggleButton
+                  open={false}
+                  onToggle={openTaskSidePanel}
+                  shortcut="]"
+                  className="shrink-0"
+                />
+              </TooltipProvider>
+            ) : null}
+          </div>
           <div
             data-slot="task-title-actions"
             className={cn(
