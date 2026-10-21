@@ -549,6 +549,15 @@ describe("sandbox callback bridge", () => {
       { fileId: "req-query-number", id: "req-query-number", method: "GET", path: "/api/agents/me", query: 5 },
       { fileId: "req-query-missing", id: "req-query-missing", method: "GET", path: "/api/agents/me" },
       { fileId: "req-query-array", id: "req-query-array", method: "GET", path: "/api/agents/me", query: ["?a=b"] },
+      { fileId: "req-created-at-number", id: "req-created-at-number", method: "GET", path: "/api/agents/me", query: "", createdAt: 5 },
+      {
+        fileId: "req-created-at-missing",
+        id: "req-created-at-missing",
+        method: "GET",
+        path: "/api/agents/me",
+        query: "",
+        createdAt: undefined,
+      },
       { fileId: "req-headers-null", id: "req-headers-null", method: "GET", path: "/api/agents/me", query: "", headers: null },
       { fileId: "req-headers-array", id: "req-headers-array", method: "GET", path: "/api/agents/me", query: "", headers: [] },
       {
@@ -580,6 +589,19 @@ describe("sandbox callback bridge", () => {
       { id: "enc-plain", path: "/api/routines/r1/runs", query: "?limit=5", ok: true },
       { id: "enc-encoded-utf8", path: "/api/routines/%C3%A9", query: "?x=%C3%A9", ok: true },
       { id: "enc-encoded-space", path: "/api/routines/a%20b", query: "?x=a%20b", ok: true },
+      { id: "enc-query-encoded-slash", path: "/api/routines/r1", query: "?q=a%2Fb", ok: true },
+      {
+        id: "enc-query-encoded-url",
+        path: "/api/routines/r1",
+        query: "?q=https%3A%2F%2Fgithub.com%2Fvllnt%2Fpaperclip%2Fpull%2F374",
+        ok: true,
+      },
+      { id: "enc-query-raw-url", path: "/api/routines/r1", query: "?url=https://x", ok: true },
+      { id: "enc-query-network-path", path: "/api/routines/r1", query: "?next=//x", ok: true },
+      { id: "enc-path-encoded-slash", path: "/api/routines/r1%2Fruns", query: "?x=1", ok: false },
+      { id: "enc-path-url", path: "/api/routines/https://x", query: "?x=1", ok: false },
+      { id: "enc-path-backslash", path: "/api/routines/r1\\runs", query: "?x=1", ok: false },
+      { id: "enc-query-nul", path: "/api/routines/r1", query: "?x=%00", ok: false },
       { id: "enc-raw-utf8-path", path: "/api/routines/\u00e9", query: "", ok: false },
       { id: "enc-raw-utf8-query", path: "/api/routines/r1", query: "?x=\u00e9", ok: false },
       { id: "enc-encoded-dot", path: "/api/routines/r%2e1", query: "", ok: false },
@@ -624,6 +646,15 @@ describe("sandbox callback bridge", () => {
       expect(
         buildBridgeForwardUrl("https://api.example.test/", { path: "/api/issues/abc", query: "foo=bar" }).toString(),
       ).toBe("https://api.example.test/api/issues/abc?foo=bar");
+    });
+
+    it("test_a_query_that_holds_a_url_or_an_encoded_slash_keeps_the_host_api_origin", () => {
+      for (const query of ["?q=a%2Fb", "?url=https://evil.example/x", "?next=//evil.example/x"]) {
+        const url = buildBridgeForwardUrl("http://127.0.0.1:4000", { path: "/api/issues", query });
+        expect(url.origin, query).toBe("http://127.0.0.1:4000");
+        expect(url.pathname, query).toBe("/api/issues");
+        expect(url.search, query).toBe(query);
+      }
     });
 
     it("test_a_forward_url_off_the_host_api_origin_is_refused", () => {
@@ -864,6 +895,7 @@ describe("sandbox callback bridge", () => {
         query: "",
         headers: {},
         body: "",
+        createdAt: new Date().toISOString(),
       }),
       "utf8",
     );
@@ -980,7 +1012,15 @@ describe("sandbox callback bridge", () => {
             // Return one request on the first poll, then nothing.
             listJsonFiles: async () => (served ? [] : ["000000000001.json"]),
             readTextFile: async () =>
-              JSON.stringify({ id: "req-1", method: "GET", path: "/", query: "", headers: {}, body: "" }),
+              JSON.stringify({
+                id: "req-1",
+                method: "GET",
+                path: "/",
+                query: "",
+                headers: {},
+                body: "",
+                createdAt: new Date().toISOString(),
+              }),
             writeTextFile: async () => {},
             rename: async () => {},
             remove: async () => {},
@@ -1037,7 +1077,15 @@ describe("sandbox callback bridge", () => {
         makeDirs: async () => {},
         listJsonFiles: async () => (served ? [] : ["000000000001.json"]),
         readTextFile: async () =>
-          JSON.stringify({ id: "req-1", method: "GET", path: "/", query: "", headers: {}, body: "" }),
+          JSON.stringify({
+                id: "req-1",
+                method: "GET",
+                path: "/",
+                query: "",
+                headers: {},
+                body: "",
+                createdAt: new Date().toISOString(),
+              }),
         writeTextFile: async () => {},
         rename: async () => {},
         remove: async () => {},
@@ -1088,7 +1136,15 @@ describe("sandbox callback bridge", () => {
             makeDirs: async () => {},
             listJsonFiles: async () => (served ? [] : ["000000000001.json"]),
             readTextFile: async () =>
-              JSON.stringify({ id: "req-1", method: "GET", path: "/", query: "", headers: {}, body: "" }),
+              JSON.stringify({
+                id: "req-1",
+                method: "GET",
+                path: "/",
+                query: "",
+                headers: {},
+                body: "",
+                createdAt: new Date().toISOString(),
+              }),
             writeTextFile: async () => {},
             rename: async () => {},
             remove: async () => {},

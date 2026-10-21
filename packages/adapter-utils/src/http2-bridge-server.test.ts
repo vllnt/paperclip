@@ -1804,6 +1804,36 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
       });
     });
 
+    it("test_the_pathname_only_rules_accept_an_encoded_slash_or_a_url_in_the_query", () => {
+      const accepted: Array<[string, string]> = [
+        ["/api/companies/c1/issues?q=vllnt%2Fpaperclip", "?q=vllnt%2Fpaperclip"],
+        [
+          "/api/companies/c1/issues?q=https%3A%2F%2Fgithub.com%2Fvllnt%2Fpaperclip%2Fpull%2F374",
+          "?q=https%3A%2F%2Fgithub.com%2Fvllnt%2Fpaperclip%2Fpull%2F374",
+        ],
+        ["/api/issues?redirect=https://example.com/x", "?redirect=https://example.com/x"],
+        ["/api/issues?next=//example.com/x", "?next=//example.com/x"],
+        ["/api/issues?x=a\\b", "?x=a\\b"],
+      ];
+      for (const [rawTarget, query] of accepted) {
+        expect(parseCanonicalBridgeRequestPath({ ":path": rawTarget }), rawTarget).toEqual({
+          ok: true,
+          value: { pathname: rawTarget.slice(0, rawTarget.indexOf("?")), query },
+        });
+      }
+      const rejected: Array<[string, CanonicalBridgeRequestPathRejection]> = [
+        ["/api%2fissues?q=1", "encoded_slash"],
+        ["/api/issues%2Fabc?q=1", "encoded_slash"],
+        ["/api\\issues?q=1", "backslash"],
+        ["/api/https://example.com?q=1", "non_origin_form"],
+        ["/api/issues?x=%00", "nul_byte"],
+        ["/api/issues?x=a b", "control_or_space_byte"],
+      ];
+      for (const [rawTarget, reason] of rejected) {
+        expect(parseCanonicalBridgeRequestPath({ ":path": rawTarget }), rawTarget).toEqual({ ok: false, reason });
+      }
+    });
+
     it("rejects a duplicate pseudo-header", () => {
       expect(
         parseCanonicalBridgeRequestPath({ ":path": ["/api/agents/me", "/api/agents/other"] } as never),

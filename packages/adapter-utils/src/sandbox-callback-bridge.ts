@@ -628,10 +628,12 @@ function hasControlOrSpaceByte(value: string): boolean {
  * value.
  *
  * The parser rejects a target that is missing or empty, is not origin-form,
- * or carries an encoded slash, a backslash, a NUL byte, a control or space
- * byte, a dot segment (checked before URL normalization would silently remove
- * it, and after percent-decoding each segment, so an encoded dot segment
- * cannot slip through) or a percent-encoded dot in the pathname.
+ * or carries a NUL byte or a control or space byte anywhere, or an encoded
+ * slash, a backslash, a `://`, a dot segment (checked before URL normalization
+ * would silently remove it, and after percent-decoding each segment, so an
+ * encoded dot segment cannot slip through) or a percent-encoded dot in the
+ * pathname. The pathname-only rules leave the query alone: a query value may
+ * hold an encoded slash or a URL.
  *
  * It also rejects a target that `URL` would change. The gateway on the sandbox
  * side sends the pathname and query its own `URL` parser produced, so a
@@ -645,13 +647,21 @@ export function parseCanonicalBridgeRequestTarget(rawPath: unknown): CanonicalBr
   }
   // Origin-form only: a single leading "/", never "//" (network-path form) and
   // never an absolute-form URI ("scheme://...").
-  if (!rawPath.startsWith("/") || rawPath.startsWith("//") || rawPath.includes("://")) {
+  if (!rawPath.startsWith("/") || rawPath.startsWith("//")) {
     return { ok: false, reason: "non_origin_form" };
   }
-  if (/%2f/i.test(rawPath)) {
+  // The slash, backslash and "://" rules guard the route match, which reads the
+  // pathname only. A query value carries them legitimately (`?q=a%2Fb`,
+  // `?url=https://x`), so they run on the pathname, never on the query.
+  const queryIndex = rawPath.indexOf("?");
+  const rawPathname = queryIndex === -1 ? rawPath : rawPath.slice(0, queryIndex);
+  if (rawPathname.includes("://")) {
+    return { ok: false, reason: "non_origin_form" };
+  }
+  if (/%2f/i.test(rawPathname)) {
     return { ok: false, reason: "encoded_slash" };
   }
-  if (rawPath.includes("\\")) {
+  if (rawPathname.includes("\\")) {
     return { ok: false, reason: "backslash" };
   }
   if (rawPath.includes("\0") || /%00/i.test(rawPath)) {
@@ -662,8 +672,6 @@ export function parseCanonicalBridgeRequestTarget(rawPath: unknown): CanonicalBr
   if (hasControlOrSpaceByte(rawPath)) {
     return { ok: false, reason: "control_or_space_byte" };
   }
-  const queryIndex = rawPath.indexOf("?");
-  const rawPathname = queryIndex === -1 ? rawPath : rawPath.slice(0, queryIndex);
   for (const segment of rawPathname.split("/")) {
     let decoded: string;
     try {
@@ -743,7 +751,8 @@ function isSandboxCallbackBridgeRequest(value: unknown): value is SandboxCallbac
     typeof entry.id !== "string" ||
     typeof entry.method !== "string" ||
     typeof entry.path !== "string" ||
-    typeof entry.query !== "string"
+    typeof entry.query !== "string" ||
+    typeof entry.createdAt !== "string"
   ) {
     return false;
   }
