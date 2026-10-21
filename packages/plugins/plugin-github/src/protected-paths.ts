@@ -7,17 +7,17 @@
  *
  * The protected list comes from the base branch only (never the PR head): a
  * minimum list hard-coded here, plus `protectedPaths` of `paperclip/tiers.yaml`
- * read at the base commit.
+ * read at the base commit, plus the paths of the instance admin's
+ * `protectedPathPolicy` rules for the repository (plugin config, read at merge time).
+ *
+ * By default every protected path refuses an agent merge. A `protectedPathPolicy` rule
+ * can instead `require` approvals from named reviewer lenses at the exact head commit.
  */
 
 /** The CODEOWNERS paths decide who may approve a change: no opt-in ever releases them. */
 export const CODEOWNERS_PATHS: readonly string[] = ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"];
 /** Protected in every repository. */
 export const MINIMUM_PROTECTED_PATHS: readonly string[] = [".github/**", ...CODEOWNERS_PATHS];
-/** Also protected in a company's control repository (and in any repository with a `paperclip/tiers.yaml`). */
-export const CONTROL_PROTECTED_PATHS: readonly string[] = ["paperclip/**", "scripts/**", "ROADMAP.md", "data/company/strategy/**"];
-/** Control repositories (lowercase `owner/name`): the full minimum list applies even without a tiers file. */
-export const CONTROL_REPOSITORIES: readonly string[] = ["anthm-fr/anthm-fr"];
 export const TIERS_FILE = "paperclip/tiers.yaml";
 export const SKILLS_LOCK_FILE = "paperclip/skills.lock";
 const SKILL_PATH = /^plugins\/anthm\/skills\/[A-Za-z0-9._-]+$/;
@@ -87,10 +87,12 @@ export function matchesProtectedPath(pattern: string, path: string): boolean {
   return false;
 }
 
-/** The protected patterns of a repository, from the minimum list and its base branch's tiers file (null when it has none). */
-export function protectedPatterns(repository: string, tiers: string[] | null): string[] {
-  const control = isControlRepository(repository, tiers);
-  return [...new Set([...MINIMUM_PROTECTED_PATHS, ...(control ? CONTROL_PROTECTED_PATHS : []), ...(tiers ?? [])])];
+/**
+ * The protected patterns of a repository: the minimum list, its base branch's tiers file (null when it has none) and the
+ * paths of the admin's policy rules for it (a `refuse` rule is how an admin protects a path that the other two do not name).
+ */
+export function protectedPatterns(tiers: string[] | null, policy: RepositoryPathPolicy | null = null): string[] {
+  return [...new Set([...MINIMUM_PROTECTED_PATHS, ...policyPaths(policy), ...(tiers ?? [])])];
 }
 
 export interface ChangedFile { filename: string; previousFilename?: string | null }
@@ -99,11 +101,6 @@ export interface ChangedFile { filename: string; previousFilename?: string | nul
 export function protectedFiles(files: readonly ChangedFile[], patterns: readonly string[]): string[] {
   const touched = files.flatMap(file => [file.filename, ...(file.previousFilename ? [file.previousFilename] : [])]);
   return [...new Set(touched.filter(path => patterns.some(pattern => matchesProtectedPath(pattern, path))))].sort();
-}
-
-/** Whether a repository is a control repository: the full list applies, and no opt-in can release a control path or a tiers path. */
-export function isControlRepository(repository: string, tiers: string[] | null): boolean {
-  return tiers !== null || CONTROL_REPOSITORIES.includes(repository.toLowerCase());
 }
 
 /**
@@ -129,6 +126,7 @@ function patternProblem(pattern: unknown): string | null {
  * Reads the `agentMergeablePaths` config. An entry that is not valid is dropped whole (it releases nothing), and so is a
  * repository listed twice: a doubt never releases a path. Whatever the config holds, a CODEOWNERS path is never released
  * (see `releasedByOptIn`); an `allow` entry that names one, or reaches outside `.github/`, makes its entry invalid.
+ * (`protectedPathPolicy` is the way to let reviewed merges through CODEOWNERS, control and tiers paths.)
  */
 export function parseAgentMergeablePaths(value: unknown): { rules: AgentMergeableRule[]; problems: string[] } {
   if (value === undefined || value === null) return { rules: [], problems: [] };
@@ -169,29 +167,196 @@ export function isCodeownersPath(path: string): boolean {
 }
 
 /**
- * Whether the opt-in releases one protected file: `allow` covers it, no `exclude` does, and it is not a CODEOWNERS, control
- * or tiers path. Those last three win over any config, so no change of the config can release them. A path that is not in
- * its normal form (a `.`, `..` or empty segment, as in `.github/../scripts/x`) is never released: it could match `allow`
- * by its first segments and name a control path.
+ * Whether the opt-in releases one protected file: `allow` covers it, no `exclude` does, and it is not a CODEOWNERS path, a
+ * path of the repository's `protectedPathPolicy` rules or a tiers path. Those last three win over any config, so no change
+ * of this config can release them. A path that is not in its normal form (a `.`, `..` or empty segment, as in
+ * `.github/../scripts/x`) is never released: it could match `allow` by its first segments and name a control path.
  */
-export function releasedByOptIn(rule: AgentMergeableRule, path: string, tiers: string[] | null): boolean {
+export function releasedByOptIn(rule: AgentMergeableRule, path: string, tiers: string[] | null, policy: RepositoryPathPolicy | null = null): boolean {
   if (path.split("/").some(segment => segment === "" || segment === "." || segment === "..")) return false;
   if (!rule.allow.some(pattern => matchesProtectedPath(pattern, path))) return false;
   if (rule.exclude.some(pattern => matchesProtectedPath(pattern, path))) return false;
   if (isCodeownersPath(path)) return false;
-  return ![...CONTROL_PROTECTED_PATHS, ...(tiers ?? [])].some(pattern => matchesProtectedPath(pattern, path));
+  return ![...policyPaths(policy), ...(tiers ?? [])].some(pattern => matchesProtectedPath(pattern, path));
 }
 
 /**
  * Splits the protected files of a pull request into those the opt-in releases and those it does not. Nothing is released
- * without a rule for the repository, nor for a repository with a tiers file. A control repository without one can opt in,
- * but its control paths stay refused (see `releasedByOptIn`). One unreleased file keeps the refusal for the whole pull request.
+ * without a rule for the repository, nor for a repository with a tiers file. The paths of the repository's policy rules stay
+ * refused or reviewed (see `releasedByOptIn`). One unreleased file keeps the refusal for the whole pull request.
  */
-export function splitReleased(touched: readonly string[], rule: AgentMergeableRule | null, tiers: string[] | null): { released: string[]; kept: string[] } {
+export function splitReleased(touched: readonly string[], rule: AgentMergeableRule | null, tiers: string[] | null, policy: RepositoryPathPolicy | null = null): { released: string[]; kept: string[] } {
   // `!== null`, not a truthiness test: a tiers value that is not exactly null (even `undefined`) releases nothing.
   if (!rule || tiers !== null) return { released: [], kept: [...touched] };
-  const released = touched.filter(path => releasedByOptIn(rule, path, tiers));
+  const released = touched.filter(path => releasedByOptIn(rule, path, tiers, policy));
   return { released, kept: touched.filter(path => !released.includes(path)) };
+}
+
+/**
+ * A reviewer lens an instance admin defines for one repository: a name (the scope a reviewer writes in a verdict), optional
+ * other spellings of it, and the Paperclip agents whose verdicts count for it. Only these agents can approve the lens.
+ */
+export interface LensDefinition { name: string; aliases: string[]; agents: string[] }
+
+/**
+ * What a protected path needs before an agent may merge a pull request that touches it. `refuse` is the default for every
+ * protected path. `require` lets the merge go ahead when every named lens has an approval at the exact head commit.
+ */
+export type PathRuleAction =
+  | { action: "refuse" }
+  | {
+    action: "require";
+    /** Lens names (each defined in the entry's `lenses`). */
+    lenses: string[];
+    /** Whether an `--admin` merge may go ahead for the paths of this rule (the admin merge checks of the plugin still apply). */
+    allowAdmin: boolean;
+    /** Whether the rule also governs CODEOWNERS paths. Without it, a CODEOWNERS file the rule's paths cover stays refused. */
+    codeowners: boolean;
+  };
+export type PathRule = { paths: string[] } & PathRuleAction;
+
+/** The admin's protected-path policy for one repository (the `protectedPathPolicy` plugin config). Never read from a pull request. */
+export interface RepositoryPathPolicy { repository: string; rules: PathRule[]; lenses: LensDefinition[] }
+
+/** Every path pattern the policy's rules name: they are protected whatever the minimum list and the tiers file say. */
+export function policyPaths(policy: RepositoryPathPolicy | null): string[] {
+  return policy ? policy.rules.flatMap(rule => rule.paths) : [];
+}
+
+const MAX_POLICY_REPOSITORIES = 50, MAX_POLICY_RULES = 50, MAX_RULE_PATHS = 50, MAX_RULE_LENSES = 10, MAX_LENSES = 10, MAX_LENS_ALIASES = 5, MAX_LENS_AGENTS = 20;
+const LENS_TEXT = /^[A-Za-z0-9][A-Za-z0-9 &._-]{0,39}$/;
+const AGENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** How a lens is compared: case, outer and repeated spaces do not matter. */
+export const lensKey = (text: string): string => text.trim().replace(/\s+/g, " ").toLowerCase();
+
+export interface PolicyProblem {
+  /** The repository (lowercase) the problem belongs to, or null when it cannot be told. */
+  repository: string | null;
+  message: string;
+}
+
+function onlyKeys(record: Record<string, unknown>, allowed: readonly string[]): string | null {
+  const extra = Object.keys(record).find(key => !allowed.includes(key));
+  return extra === undefined ? null : `unknown key ${extra}`;
+}
+
+function parseLens(value: unknown): LensDefinition | string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "a lens must be an object";
+  const record = value as Record<string, unknown>;
+  const extra = onlyKeys(record, ["name", "aliases", "agents"]);
+  if (extra) return `a lens has ${extra}`;
+  if (typeof record.name !== "string" || !LENS_TEXT.test(record.name)) return "a lens name must be 1 to 40 letters, digits, spaces and & . _ -";
+  const aliases = record.aliases ?? [];
+  if (!Array.isArray(aliases) || aliases.length > MAX_LENS_ALIASES || aliases.some(alias => typeof alias !== "string" || !LENS_TEXT.test(alias))) return `lens ${record.name}: aliases must list at most ${MAX_LENS_ALIASES} names`;
+  const agents = record.agents;
+  if (!Array.isArray(agents) || !agents.length || agents.length > MAX_LENS_AGENTS || agents.some(agent => typeof agent !== "string" || !AGENT_ID.test(agent))) return `lens ${record.name}: agents must list 1 to ${MAX_LENS_AGENTS} agent IDs`;
+  return { name: record.name, aliases: aliases as string[], agents: [...new Set((agents as string[]).map(agent => agent.toLowerCase()))] };
+}
+
+function parseRule(value: unknown): PathRule | string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "a rule must be an object";
+  const record = value as Record<string, unknown>;
+  const extra = onlyKeys(record, ["paths", "action", "lenses", "allowAdmin", "codeowners"]);
+  if (extra) return `a rule has ${extra}`;
+  const paths = record.paths;
+  if (!Array.isArray(paths) || !paths.length || paths.length > MAX_RULE_PATHS) return `a rule's paths must list 1 to ${MAX_RULE_PATHS} paths`;
+  for (const path of paths) { const problem = patternProblem(path); if (problem) return problem; }
+  if (record.action === undefined || record.action === "refuse") {
+    if (record.lenses !== undefined || record.allowAdmin !== undefined || record.codeowners !== undefined) return "a refuse rule takes no lenses, allowAdmin or codeowners";
+    return { paths: paths as string[], action: "refuse" };
+  }
+  if (record.action !== "require") return "a rule's action must be refuse or require";
+  const lenses = record.lenses;
+  if (!Array.isArray(lenses) || !lenses.length || lenses.length > MAX_RULE_LENSES || lenses.some(lens => typeof lens !== "string" || !LENS_TEXT.test(lens))) return `a require rule must name 1 to ${MAX_RULE_LENSES} lenses`;
+  for (const flag of ["allowAdmin", "codeowners"] as const) if (record[flag] !== undefined && typeof record[flag] !== "boolean") return `${flag} must be true or false`;
+  return { paths: paths as string[], action: "require", lenses: lenses as string[], allowAdmin: record.allowAdmin === true, codeowners: record.codeowners === true };
+}
+
+/**
+ * Reads the `protectedPathPolicy` config: per repository, ordered rules (the first rule that covers a path decides) and the
+ * reviewer lenses the rules may require. Nothing in a rule can widen what an agent may merge unless it names lenses that
+ * the admin defined with the agents that may approve them. The reader is strict: an entry that is not valid, or a repository
+ * listed twice, comes back in `problems` and has no policy. The merge guard then refuses every merge in that repository
+ * (a policy it cannot read must not turn into an unprotected path).
+ */
+export function parseProtectedPathPolicy(value: unknown): { policies: RepositoryPathPolicy[]; problems: PolicyProblem[] } {
+  if (value === undefined || value === null) return { policies: [], problems: [] };
+  const problems: PolicyProblem[] = [];
+  if (!Array.isArray(value)) return { policies: [], problems: [{ repository: null, message: "protectedPathPolicy must be a list" }] };
+  if (value.length > MAX_POLICY_REPOSITORIES) return { policies: [], problems: [{ repository: null, message: `protectedPathPolicy lists more than ${MAX_POLICY_REPOSITORIES} repositories` }] };
+  const seen = new Map<string, RepositoryPathPolicy | null>();
+  value.forEach((entry, index) => {
+    const at = `protectedPathPolicy[${index}]`;
+    let repository: string | null = null;
+    const fail = (message: string) => { problems.push({ repository, message: `${at}: ${message}` }); };
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return fail("must be an object");
+    const record = entry as Record<string, unknown>;
+    if (typeof record.repository === "string" && REPOSITORY_NAME.test(record.repository)) repository = record.repository.toLowerCase();
+    const extra = onlyKeys(record, ["repository", "rules", "lenses"]);
+    if (extra) return fail(extra);
+    if (repository === null) return fail("repository must be owner/name");
+    const rules = record.rules;
+    if (!Array.isArray(rules) || !rules.length || rules.length > MAX_POLICY_RULES) return fail(`rules must list 1 to ${MAX_POLICY_RULES} rules`);
+    const parsedRules: PathRule[] = [];
+    for (const rule of rules) { const parsed = parseRule(rule); if (typeof parsed === "string") return fail(parsed); parsedRules.push(parsed); }
+    const lenses = record.lenses ?? [];
+    if (!Array.isArray(lenses) || lenses.length > MAX_LENSES) return fail(`lenses must list at most ${MAX_LENSES} lenses`);
+    const parsedLenses: LensDefinition[] = [];
+    const names = new Set<string>();
+    for (const lens of lenses) {
+      const parsed = parseLens(lens);
+      if (typeof parsed === "string") return fail(parsed);
+      // A name or alias two lenses share would let one lens's verdict count for the other.
+      for (const key of new Set([parsed.name, ...parsed.aliases].map(lensKey))) {
+        if (names.has(key)) return fail(`the lens name ${key} is used more than once`);
+        names.add(key);
+      }
+      parsedLenses.push(parsed);
+    }
+    const defined = new Set(parsedLenses.map(lens => lensKey(lens.name)));
+    for (const rule of parsedRules) {
+      if (rule.action !== "require") continue;
+      const unknown = rule.lenses.find(lens => !defined.has(lensKey(lens)));
+      if (unknown !== undefined) return fail(`a rule requires the lens ${unknown}, which this repository does not define`);
+    }
+    // A repository listed twice is ambiguous: neither entry counts, and the guard refuses the repository.
+    if (seen.has(repository)) { problems.push({ repository, message: `${at}: ${repository} is listed more than once` }); seen.set(repository, null); return; }
+    seen.set(repository, { repository, rules: parsedRules, lenses: parsedLenses });
+  });
+  return { policies: [...seen.values()].filter((policy): policy is RepositoryPathPolicy => policy !== null), problems };
+}
+
+export interface GovernedFile { path: string; ruleIndex: number }
+
+/**
+ * Sorts the protected files that are still refused after the `agentMergeablePaths` release: those a `require` rule governs
+ * (with the rule), and those that stay refused (no rule covers them, a `refuse` rule does, or the path is not in its
+ * normal form). The first rule that covers a path decides, so an earlier `refuse` rule keeps a path out of a later `require`
+ * rule. A CODEOWNERS file is governed only by a rule with `codeowners: true`; the other rules skip it.
+ */
+export function classifyKeptFiles(kept: readonly string[], policy: RepositoryPathPolicy | null): { refused: string[]; governed: GovernedFile[] } {
+  const refused: string[] = [], governed: GovernedFile[] = [];
+  for (const path of kept) {
+    const normal = !path.split("/").some(segment => segment === "" || segment === "." || segment === "..");
+    const codeowners = isCodeownersPath(path);
+    const index = !normal || !policy ? -1 : policy.rules.findIndex(rule => rule.paths.some(pattern => matchesProtectedPath(pattern, path)) && (!codeowners || (rule.action === "require" && rule.codeowners) || rule.action === "refuse"));
+    const rule = index >= 0 ? policy!.rules[index]! : null;
+    if (rule && rule.action === "require") governed.push({ path, ruleIndex: index });
+    else refused.push(path);
+  }
+  return { refused, governed };
+}
+
+/** What the governed files of a pull request ask for: the lenses (each once, in the order the rules name them), and the rules used. */
+export function requirementsOf(governed: readonly GovernedFile[], policy: RepositoryPathPolicy): { lenses: string[]; rules: Array<{ index: number; paths: string[]; lenses: string[]; allowAdmin: boolean; files: string[] }>; withoutAdmin: number[] } {
+  const rules = [...new Set(governed.map(entry => entry.ruleIndex))].sort((a, b) => a - b).map(index => {
+    const rule = policy.rules[index]!;
+    if (rule.action !== "require") throw new Error("a governed file belongs to a require rule");
+    return { index, paths: rule.paths, lenses: rule.lenses, allowAdmin: rule.allowAdmin, files: governed.filter(entry => entry.ruleIndex === index).map(entry => entry.path) };
+  });
+  const lenses: string[] = [];
+  for (const rule of rules) for (const lens of rule.lenses) if (!lenses.some(known => lensKey(known) === lensKey(lens))) lenses.push(lens);
+  return { lenses, rules, withoutAdmin: rules.filter(rule => !rule.allowAdmin).map(rule => rule.index) };
 }
 
 /**

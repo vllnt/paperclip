@@ -10,7 +10,6 @@ import manifest from "../src/manifest.js";
 import { register } from "../src/worker.js";
 import { GitHubClient, GitHubError, assertReadOnlyInstallationToken } from "../src/github.js";
 import { WriteThrottle } from "../src/write-identity.js";
-import { CONTROL_REPOSITORIES } from "../src/protected-paths.js";
 import { parseSshSigningKey } from "../src/ssh-signature.js";
 import { RepositoryManager } from "../src/management-repository.js";
 import { CLOCK_SKEW_ALERT_SECONDS, PAUSE_ALERT_AFTER_MS, WRITE_ALERT_ORIGIN, createWriteAlerts } from "../src/write-alerts.js";
@@ -26,6 +25,10 @@ const actors = (company: string) => ({
 const allBot = { commit: "bot", push: "bot", pullRequest: "bot", comment: "bot" };
 
 afterEach(() => { vi.useRealTimers(); });
+
+/** The paths a company usually keeps as its control paths, as an admin's `protectedPathPolicy` for one repository. */
+const CONTROL_PATHS = ["paperclip/**", "scripts/**", "ROADMAP.md", "data/company/strategy/**"];
+const controlPolicy = (repository: string) => [{ repository, rules: [{ paths: CONTROL_PATHS, action: "refuse" }] }];
 
 describe("GitHub write identity: run user (VLL-477)", () => {
   const { admin, member, agent, server } = actors("vllnt");
@@ -1910,7 +1913,7 @@ describe("P4b protected-path merge guard (round 4)", () => {
     f.write(repository, { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: head, ...extra });
   const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   async function controlRepo() {
-    const f = await appFixture();
+    const f = await appFixture({ config: { protectedPathPolicy: controlPolicy("anthm-fr/anthm-fr") } });
     await f.authorize();
     f.github.contents[`anthm-fr/anthm-fr/paperclip/tiers.yaml@${base}`] = tiersFile(["paperclip/**", "plugins/anthm/skills/anthm-base/**", "data/company/monetisation/**/*goals*", "data/products/*/knowledge/wiki-history/**"]);
     return f;
@@ -2065,7 +2068,7 @@ describe("security review round 5 (attack regressions)", () => {
   });
 
   it("m3: a duplicate key in skills.lock cannot hide a change", async () => {
-    const f = await appFixture();
+    const f = await appFixture({ config: { protectedPathPolicy: controlPolicy("anthm-fr/anthm-fr") } });
     await f.authorize();
     const entry = (owner: string) => `{"skillPath":"plugins/anthm/skills/assistant","snapshotHash":"${"1".repeat(64)}","paperclipSkillId":null,"owner":"${owner}"}`;
     f.github.contents[`anthm-fr/anthm-fr/paperclip/skills.lock@${base}`] = `{"version":1,"skills":[${entry("ab9aff55")}]}`;
@@ -2088,7 +2091,7 @@ describe("security review round 5 (attack regressions)", () => {
   });
 
   it("m5: a file, symlink or submodule named like a protected directory is protected too", async () => {
-    const f = await appFixture();
+    const f = await appFixture({ config: { protectedPathPolicy: controlPolicy("anthm-fr/anthm-fr") } });
     await f.authorize();
     for (const filename of ["paperclip", ".github", "scripts"]) {
       f.github.prFiles = [{ filename }];
@@ -2825,15 +2828,15 @@ describe("per-agent grants of editWorkflows and workflowDispatch", () => {
 
 describe("agentMergeablePaths: an instance admin releases some protected paths for agent merges", () => {
   const head = "a".repeat(40), base = "c".repeat(40);
-  // Synthetic repositories for these tests (the fixture is extended below to answer for them). The control repository is the
-  // code's own list's first entry, which the fixture answers as it is.
-  const OWNER = "example-org", ORDINARY = `${OWNER}/app`, OTHER = `${OWNER}/other`, CONTROL = CONTROL_REPOSITORIES[0]!;
+  // Synthetic repositories for these tests (the fixture is extended below to answer for them). The control repository is one
+  // whose admin lists control paths in `protectedPathPolicy`.
+  const OWNER = "example-org", ORDINARY = `${OWNER}/app`, OTHER = `${OWNER}/other`, CONTROL = `${OWNER}/control`;
   const optIn = (extra: Record<string, unknown> = {}, repository = ORDINARY) => [{ repository, allow: [".github/**"], exclude: [".github/workflows/release.yml"], ...extra }];
   const merge = (f: Awaited<ReturnType<typeof appFixture>>, repository = ORDINARY, extra: Record<string, unknown> = {}) =>
     f.write(repository, { action: "pullRequest", privileged: [], merge: true, pullRequest: 7, expectedHeadSha: head, ...extra });
   const tiersFile = (paths: string[]) => `version: 1\nprotectedPaths:\n${paths.map(path => `  - ${path}`).join("\n")}\n`;
   /** The synthetic repositories as the plugin's catalog lists them: the fixture's one installation, owner example-org. */
-  const synthetic = [ORDINARY, OTHER].map((fullName, index) => ({ id: 900 + index, name: fullName.split("/")[1]!, fullName, url: `https://github.com/${fullName}`, installationId: 101, owner: OWNER, ownerId: 1, private: true, permissions }));
+  const synthetic = [ORDINARY, OTHER, CONTROL].map((fullName, index) => ({ id: 900 + index, name: fullName.split("/")[1]!, fullName, url: `https://github.com/${fullName}`, installationId: 101, owner: OWNER, ownerId: 1, private: true, permissions }));
   /** Extends the fixture's fake GitHub, catalog and installation so that they answer for the synthetic repositories as for their own. */
   function addSyntheticRepositories(f: Awaited<ReturnType<typeof appFixture>>) {
     const catalog = vi.mocked(f.client.catalog), readCatalog = catalog.getMockImplementation()!;
@@ -2862,8 +2865,9 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
       throw new Error(`Unexpected GitHub request ${path}`);
     });
   }
-  async function fixture(agentMergeablePaths?: unknown) {
-    const f = await appFixture(agentMergeablePaths === undefined ? {} : { config: { agentMergeablePaths } });
+  async function fixture(agentMergeablePaths?: unknown, protectedPathPolicy?: unknown) {
+    const config = { ...(agentMergeablePaths === undefined ? {} : { agentMergeablePaths }), ...(protectedPathPolicy === undefined ? {} : { protectedPathPolicy }) };
+    const f = await appFixture(Object.keys(config).length ? { config } : {});
     addSyntheticRepositories(f);
     await f.authorize();
     // The user's installation, the write allowlist and the installation fence of the stored policy now also name the synthetic repositories.
@@ -2983,7 +2987,7 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
   });
 
   it("lets a control repository without a tiers file opt in to .github/**, and keeps its control paths and CODEOWNERS refused", async () => {
-    const f = await fixture(optIn({}, CONTROL));
+    const f = await fixture(optIn({}, CONTROL), controlPolicy(CONTROL));
     f.github.prFiles = [{ filename: "src/ok.ts" }, { filename: ".github/workflows/ci.yml" }];
     expect(await merge(f, CONTROL)).toMatchObject({
       credential: { login: "agent-owner" },
@@ -3003,13 +3007,13 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
   it("keeps a control repository refused without its own explicit opt-in, and when its base branch has a tiers file", async () => {
     // No entry, or an entry for another repository: nothing is released.
     for (const config of [undefined, optIn({}, ORDINARY)]) {
-      const f = await fixture(config);
+      const f = await fixture(config, controlPolicy(CONTROL));
       f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
       expect(await merge(f, CONTROL), JSON.stringify(config)).toMatchObject(refused([".github/workflows/ci.yml"]));
     }
     // A tiers file refuses the opt-in, and a tiers file with no opt-in refuses as before.
     for (const config of [optIn({}, CONTROL), undefined]) {
-      const f = await fixture(config);
+      const f = await fixture(config, controlPolicy(CONTROL));
       f.github.contents[`${CONTROL}/paperclip/tiers.yaml@${base}`] = tiersFile(["paperclip/**"]);
       f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
       expect(await merge(f, CONTROL), JSON.stringify(config)).toMatchObject(refused([".github/workflows/ci.yml"]));
@@ -3104,6 +3108,274 @@ describe("agentMergeablePaths: an instance admin releases some protected paths f
     const decision = await merge(f);
     expect(decision.evidence.protectedPaths.releasedProtectedFiles).toHaveLength(100);
     expect(decision.evidence.protectedPaths).toMatchObject({ releasedProtectedFilesCount: 150, releasedBy: "config:agentMergeablePaths" });
+  });
+
+  describe("protectedPathPolicy: a rule can require reviewers' approvals at the exact head", () => {
+    const SECURITY = "11111111-1111-4111-8111-111111111111", DX = "22222222-2222-4222-8222-222222222222", MERGER = "33333333-3333-4333-8333-333333333333", STRANGER = "44444444-4444-4444-8444-444444444444";
+    const RUN = "55555555-5555-4555-8555-555555555555";
+    const stale = "b".repeat(40);
+    const lenses = [{ name: "security", aliases: ["Security"], agents: [SECURITY, MERGER] }, { name: "dx", aliases: ["Agents & DX"], agents: [DX] }];
+    const defaultRules = () => [
+      { paths: ["paperclip/**"], action: "refuse" },
+      { paths: ["scripts/**", ".github/**"], action: "require", lenses: ["security", "dx"], allowAdmin: true },
+      { paths: ["CODEOWNERS", ".github/CODEOWNERS"], action: "require", lenses: ["security"], codeowners: true },
+    ];
+    const policyFor = (rules: unknown[] = defaultRules(), repository = ORDINARY) => [{ repository, lenses, rules }];
+    /** The merge as the host reports it: the merging agent and its run come from the run's own token, never from the command. */
+    const mergeAs = (f: Awaited<ReturnType<typeof appFixture>>, extra: Record<string, unknown> = {}, repository = ORDINARY) => merge(f, repository, { agentId: MERGER, runId: RUN, ...extra });
+    let counter = 0;
+    /** The merging agent's issue at its gate stage, and the comments reviewers wrote on it. */
+    function gate(f: Awaited<ReturnType<typeof appFixture>>, comments: Array<{ body: string; by: string | null; deleted?: boolean }>, issue: Record<string, unknown> = {}) {
+      const id = `issue-gate-${counter += 1}`;
+      f.h.seed({
+        issues: [{ id, companyId: "anthm", identifier: `W-${counter}`, title: "Gate", status: "in_review", assigneeAgentId: MERGER, ...issue }] as any,
+        issueComments: comments.map((comment, index) => ({
+          id: `comment-${counter}-${index}`, companyId: "anthm", issueId: id, authorType: "agent", authorAgentId: comment.by, authorUserId: null, body: comment.body, presentation: null, metadata: null,
+          createdAt: new Date(Date.parse("2026-10-08T07:00:00Z") + index * 60_000), updatedAt: new Date(), ...(comment.deleted ? { deletedAt: new Date() } : {}),
+        })) as any,
+      });
+      return id;
+    }
+    const approve = (lens: string, by: string, sha = head) => ({ body: `VERDICT ${lens} APPROVE ${sha}\nChecked: the diff`, by });
+    const merged = (decision: any) => decision.evidence?.protectedPaths;
+    const allowedRecords = (f: Awaited<ReturnType<typeof appFixture>>) => f.h.activity.filter(entry => entry.message === "github.protected_path_merge_allowed");
+
+    it("refuses by default: with no policy a protected path needs a person, however many reviewers approved, and nothing else is protected", async () => {
+      const f = await fixture();
+      gate(f, [approve("security", SECURITY), approve("dx", DX)]);
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      const decision = await mergeAs(f);
+      expect(decision).toMatchObject(refused([".github/workflows/ci.yml"]));
+      expect(decision).not.toHaveProperty("credential");
+      expect(allowedRecords(f)).toEqual([]);
+      // No control list is built into the plugin: the paths of the old list are ordinary paths until a policy names them.
+      f.github.prFiles = [{ filename: "scripts/build.sh" }, { filename: "paperclip/gates.yaml" }, { filename: "ROADMAP.md" }, { filename: "data/company/strategy/plan.md" }];
+      expect(await mergeAs(f)).toHaveProperty("credential");
+    });
+
+    it("merges when every required lens is approved at the exact head, and records the rule and the approvals it used", async () => {
+      const f = await fixture(undefined, policyFor());
+      const issueId = gate(f, [approve("security", SECURITY), approve("Agents & DX", DX)]);
+      f.github.prFiles = [{ filename: "src/ok.ts" }, { filename: "scripts/build.sh" }, { filename: ".github/workflows/ci.yml" }];
+      const decision = await mergeAs(f);
+      expect(decision).toMatchObject({ credential: { login: "agent-owner" } });
+      expect(merged(decision)).toMatchObject({
+        pullRequest: 7, headSha: head, baseSha: base, files: 3,
+        requiredBy: [{ index: 1, paths: ["scripts/**", ".github/**"], lenses: ["security", "dx"], allowAdmin: true, files: [".github/workflows/ci.yml", "scripts/build.sh"] }],
+        approvals: [{ lens: "security", decision: "APPROVE", agentId: SECURITY, issueId }, { lens: "dx", decision: "APPROVE", agentId: DX, issueId }],
+      });
+      expect(allowedRecords(f)).toEqual([expect.objectContaining({ entityType: "agent", entityId: MERGER, metadata: expect.objectContaining({
+        repository: ORDINARY, pullRequest: 7, headSha: head, admin: false, agentId: MERGER, runId: RUN,
+        requiredBy: [expect.objectContaining({ index: 1 })], approvals: [expect.objectContaining({ lens: "security" }), expect.objectContaining({ lens: "dx" })],
+      }) })]);
+      // A merge that needs nothing from reviewers records none.
+      f.github.prFiles = [{ filename: "src/ok.ts" }];
+      expect(merged(await mergeAs(f))).not.toHaveProperty("approvals");
+      expect(allowedRecords(f)).toHaveLength(1);
+    });
+
+    it("refuses and names the missing lens when one of the required approvals is absent", async () => {
+      const f = await fixture(undefined, policyFor());
+      gate(f, [approve("security", SECURITY)]);
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      const decision = await mergeAs(f);
+      expect(decision).toMatchObject({ unavailable: expect.stringMatching(/protected paths \(scripts\/build\.sh\); merging it needs an approval at its head aaaaaaaaaaaa from: dx \(no approval at this head\)\. A reviewer records it as the first line of a comment.*VERDICT <lens> APPROVE <full head sha>/) });
+      expect(decision.unavailable).not.toMatch(/security \(/);
+      expect(decision).not.toHaveProperty("credential");
+      expect(decision.evidence).toMatchObject({ protectedFiles: ["scripts/build.sh"], requiredBy: [{ index: 1 }], lenses: [{ lens: "security", outcome: "approved" }, { lens: "dx", outcome: "missing" }] });
+      // No comment at all names every lens.
+      const none = await fixture(undefined, policyFor());
+      none.github.prFiles = [{ filename: "scripts/build.sh" }];
+      expect((await mergeAs(none)).unavailable).toMatch(/from: security \(no approval at this head\), dx \(no approval at this head\)/);
+      expect(allowedRecords(f)).toEqual([]);
+    });
+
+    it("counts approvals at the exact head only: a verdict for an older commit, a short SHA and a verdict that is not the first line count for nothing", async () => {
+      const f = await fixture(undefined, policyFor());
+      gate(f, [approve("security", SECURITY, stale), approve("dx", DX, stale), { body: `VERDICT security APPROVE ${head.slice(0, 12)}`, by: SECURITY }, { body: `Approved.\nVERDICT security APPROVE ${head}`, by: SECURITY }, { body: `VERDICT dx APPROVE ${head} and more`, by: DX }]);
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      expect((await mergeAs(f)).unavailable).toMatch(/from: security \(no approval at this head\), dx \(no approval at this head\)/);
+    });
+
+    it("refuses when the head moves: approvals follow the commit, and a push while the approvals are read refuses", async () => {
+      const f = await fixture(undefined, policyFor());
+      gate(f, [approve("security", SECURITY), approve("dx", DX)]);
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      expect(await mergeAs(f)).toHaveProperty("credential");
+      // The caller expected the reviewed commit, and a push moved the pull request on.
+      f.github.pr = { ...f.github.pr, head: { sha: stale } };
+      expect(await mergeAs(f)).toMatchObject({ unavailable: expect.stringContaining("not the expected") });
+      // The pull request is at the new commit and the caller expects it: the approvals of the old commit are stale.
+      expect(await mergeAs(f, { expectedHeadSha: stale })).toMatchObject({ unavailable: expect.stringMatching(/needs an approval at its head bbbbbbbbbbbb from: security \(no approval at this head\), dx \(no approval at this head\)/) });
+      // A push while the plugin reads the approvals: the approvals do not belong to the commit it checked.
+      f.github.pr = { ...f.github.pr, head: { sha: head } };
+      const original = f.h.ctx.issues.listComments.bind(f.h.ctx.issues);
+      vi.spyOn(f.h.ctx.issues, "listComments").mockImplementation(async (...args) => {
+        const comments = await original(...args);
+        f.github.pr = { ...f.github.pr, head: { sha: stale } };
+        return comments;
+      });
+      expect(await mergeAs(f)).toMatchObject({ unavailable: expect.stringContaining("changed while Paperclip checked it") });
+    });
+
+    it("lets a BLOCK at the head keep a lens from being approved, and a later approval by the same reviewer replace it", async () => {
+      const f = await fixture(undefined, policyFor());
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      gate(f, [approve("security", SECURITY), { body: `VERDICT security BLOCK ${head}\n[blocker] x`, by: SECURITY }, approve("dx", DX)]);
+      expect((await mergeAs(f)).unavailable).toMatch(/from: security \(blocked at this head\)/);
+      const again = await fixture(undefined, policyFor());
+      again.github.prFiles = [{ filename: "scripts/build.sh" }];
+      gate(again, [{ body: `VERDICT security BLOCK ${head}`, by: SECURITY }, approve("security", SECURITY), approve("dx", DX)]);
+      expect(await mergeAs(again)).toHaveProperty("credential");
+    });
+
+    it("counts only the agents the config names for a lens: not other agents, not a missing author, not a deleted comment, not the merging agent's own verdict", async () => {
+      const f = await fixture(undefined, policyFor());
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      gate(f, [
+        approve("security", STRANGER), approve("dx", SECURITY), approve("security", SECURITY.toUpperCase().replace(/^1/, "9")),
+        { body: `VERDICT security APPROVE ${head}`, by: null }, { ...approve("dx", DX), deleted: true },
+        // The merging agent is named for security in this config, and still never approves its own merge.
+        approve("security", MERGER), approve("dx", MERGER),
+      ]);
+      expect((await mergeAs(f)).unavailable).toMatch(/from: security \(no approval at this head\), dx \(no approval at this head\)/);
+    });
+
+    it("reads verdicts only from the open issues assigned to the merging agent, and refuses a merge the host cannot attribute to an agent", async () => {
+      const f = await fixture(undefined, policyFor());
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      // The reviewers wrote on an issue of another agent, or on a closed one.
+      gate(f, [approve("security", SECURITY), approve("dx", DX)], { assigneeAgentId: STRANGER });
+      gate(f, [approve("security", SECURITY), approve("dx", DX)], { status: "done" });
+      gate(f, [approve("security", SECURITY), approve("dx", DX)], { companyId: "another-company" });
+      expect((await mergeAs(f)).unavailable).toMatch(/from: security \(no approval at this head\), dx \(no approval at this head\)/);
+      // The right issue exists, but the merge names no agent.
+      gate(f, [approve("security", SECURITY), approve("dx", DX)]);
+      expect((await merge(f, ORDINARY)).unavailable).toMatch(/from: security \(no approval at this head\), dx \(no approval at this head\)/);
+      expect(await mergeAs(f)).toHaveProperty("credential");
+      // Work in progress counts too: the gate may hold the issue in either status.
+      const g = await fixture(undefined, policyFor());
+      g.github.prFiles = [{ filename: "scripts/build.sh" }];
+      gate(g, [approve("security", SECURITY), approve("dx", DX)], { status: "in_progress" });
+      expect(await mergeAs(g)).toHaveProperty("credential");
+    });
+
+    it("keeps a refuse rule refused whatever the approvals, and a path no rule covers refused", async () => {
+      const f = await fixture(undefined, policyFor());
+      gate(f, [approve("security", SECURITY), approve("dx", DX)]);
+      f.github.prFiles = [{ filename: "paperclip/gates.yaml" }];
+      f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${base}`] = tiersFile(["paperclip/**", "docs/private/**"]);
+      expect(await mergeAs(f)).toMatchObject(refused(["paperclip/gates.yaml"]));
+      // A path only the tiers file protects has no rule: refused next to a reviewed path, which keeps the refusal for the whole pull request.
+      f.github.prFiles = [{ filename: "scripts/build.sh" }, { filename: "docs/private/plan.md" }];
+      expect(await mergeAs(f)).toMatchObject({ ...refused(["docs/private/plan.md"]), evidence: { protectedFiles: ["docs/private/plan.md"] } });
+      // A tiers path can be governed by a rule too, and then needs the lenses.
+      f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${base}`] = tiersFile(["scripts/**"]);
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      expect(await mergeAs(f)).toHaveProperty("credential");
+    });
+
+    it("refuses a CODEOWNERS file unless a rule names it and sets codeowners, and then needs that rule's lenses", async () => {
+      const broad = policyFor([{ paths: [".github/**", "CODEOWNERS"], action: "require", lenses: ["security"], allowAdmin: true }]);
+      const f = await fixture(undefined, broad);
+      gate(f, [approve("security", SECURITY), approve("dx", DX)]);
+      for (const filename of [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]) {
+        f.github.prFiles = [{ filename }];
+        expect(await mergeAs(f), filename).toMatchObject(refused([filename]));
+        f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }, { filename }];
+        expect(await mergeAs(f), `${filename} with a workflow`).toMatchObject({ ...refused([filename]), evidence: { protectedFiles: [filename] } });
+      }
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await mergeAs(f)).toHaveProperty("credential");
+      // With the flag on a rule that names the file, the rule governs it.
+      const explicit = await fixture(undefined, policyFor());
+      f.github.prFiles = [{ filename: ".github/CODEOWNERS" }];
+      gate(explicit, [approve("security", SECURITY)]);
+      explicit.github.prFiles = [{ filename: ".github/CODEOWNERS" }];
+      expect(merged(await mergeAs(explicit))).toMatchObject({ requiredBy: [{ index: 2, lenses: ["security"], allowAdmin: false }] });
+      // A rename out of CODEOWNERS counts both names.
+      explicit.github.prFiles = [{ filename: "src/owners.txt", previous_filename: ".github/CODEOWNERS", status: "renamed" }];
+      expect(merged(await mergeAs(explicit))).toMatchObject({ requiredBy: [{ index: 2, files: [".github/CODEOWNERS"] }] });
+      const lacking = await fixture(undefined, policyFor());
+      gate(lacking, []);
+      lacking.github.prFiles = [{ filename: ".github/CODEOWNERS" }];
+      expect((await mergeAs(lacking)).unavailable).toMatch(/from: security \(no approval at this head\)/);
+    });
+
+    it("allows an --admin merge only where the rule allows it, and the plugin's own admin checks still apply", async () => {
+      const f = await fixture(undefined, policyFor());
+      gate(f, [approve("security", SECURITY), approve("dx", DX)]);
+      // allowAdmin on the rule: the merge goes on to the admin checks and succeeds, and the record says it was an admin merge.
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      expect(await mergeAs(f, { privileged: ["adminMerge"] })).toMatchObject({ credential: { login: "agent-owner" }, evidence: { protectedPaths: { requiredBy: [{ index: 1 }] }, adminMerge: { requiredChecks: expect.any(Array) } } });
+      expect(allowedRecords(f).at(-1)).toMatchObject({ metadata: { admin: true } });
+      // The rule for CODEOWNERS does not allow it, even when the lens approved.
+      f.github.prFiles = [{ filename: "scripts/build.sh" }, { filename: ".github/CODEOWNERS" }];
+      const refusedAdmin = await mergeAs(f, { privileged: ["adminMerge"] });
+      expect(refusedAdmin).toMatchObject({ unavailable: expect.stringMatching(/does not allow an --admin merge \(rule 3 of example-org\/app\); merge it without --admin once security, dx approved the head/) });
+      expect(refusedAdmin).not.toHaveProperty("credential");
+      expect(await mergeAs(f)).toHaveProperty("credential");
+      // Admin merges are still refused where the branch protection lets administrators through, whatever the reviewers said.
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      f.github.protection = { enabled: true, required_status_checks: { enforcement_level: "non_admins", contexts: [], checks: [] } };
+      expect(await mergeAs(f, { privileged: ["adminMerge"] })).toMatchObject({ unavailable: expect.stringContaining("lets administrators bypass") });
+    });
+
+    it("lets the first rule that covers a path decide, and a policy rule win over an agentMergeablePaths release", async () => {
+      const f = await fixture(optIn({ exclude: [] }), policyFor([
+        { paths: [".github/workflows/deploy.yml"], action: "require", lenses: ["security"] },
+        { paths: [".github/workflows/**"], action: "refuse" },
+      ]));
+      gate(f, [approve("security", SECURITY)]);
+      // Released by agentMergeablePaths, no policy rule covers it.
+      f.github.prFiles = [{ filename: ".github/dependabot.yml" }];
+      expect(merged(await mergeAs(f))).toMatchObject({ releasedBy: "config:agentMergeablePaths" });
+      expect(merged(await mergeAs(f))).not.toHaveProperty("approvals");
+      // The policy covers it first, so the release does not apply and the lens is needed.
+      f.github.prFiles = [{ filename: ".github/workflows/deploy.yml" }];
+      expect(merged(await mergeAs(f))).toMatchObject({ requiredBy: [{ index: 0, lenses: ["security"] }], approvals: [{ lens: "security" }] });
+      expect(merged(await mergeAs(f))).not.toHaveProperty("releasedProtectedFiles");
+      // The earlier require rule does not reach the other workflows: the refuse rule after it does.
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await mergeAs(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    });
+
+    it("fails closed on a policy it cannot read: every merge in its repository is refused, the others go on, and a list that is not a list stops them all", async () => {
+      for (const bad of [
+        policyFor([{ paths: ["scripts/**"], action: "allow" }]),
+        policyFor([{ paths: ["scripts/**"], action: "require", lenses: ["performance"] }]),
+        [...policyFor(), ...policyFor()],
+        [{ ...policyFor()[0], extra: true }],
+      ]) {
+        const f = await fixture(undefined, bad);
+        f.github.prFiles = [{ filename: "src/ok.ts" }];
+        const decision = await mergeAs(f);
+        expect(decision, JSON.stringify(bad)).toMatchObject({ unavailable: expect.stringMatching(/The protectedPathPolicy plugin setting is not valid for example-org\/app \(.*\), so Paperclip cannot tell what a merge there needs; it refuses merges there until an instance administrator fixes the setting/) });
+        expect(decision).not.toHaveProperty("credential");
+        expect(await mergeAs(f, {}, OTHER)).toHaveProperty("credential");
+      }
+      for (const bad of ["yes", { repository: ORDINARY }, [null]]) {
+        const f = await fixture(undefined, bad);
+        f.github.prFiles = [{ filename: "src/ok.ts" }];
+        expect(await mergeAs(f, {}, OTHER), JSON.stringify(bad)).toMatchObject({ unavailable: expect.stringContaining("The protectedPathPolicy plugin setting is not valid (") });
+      }
+    });
+
+    it("reads the policy on every merge from the plugin config only, so a change by the instance admin applies at once in both directions", async () => {
+      const f = await fixture(undefined, policyFor());
+      gate(f, [approve("security", SECURITY), approve("dx", DX)]);
+      f.github.prFiles = [{ filename: "scripts/build.sh" }];
+      expect(await mergeAs(f)).toHaveProperty("credential");
+      // The head's own files cannot grant anything.
+      f.github.contents[`${ORDINARY}/.github/protected-path-policy.json`] = JSON.stringify(policyFor());
+      f.github.contents[`${ORDINARY}/paperclip/tiers.yaml@${head}`] = "protectedPathPolicy: all\n";
+      expect(await mergeAs(f)).toHaveProperty("credential");
+      // The admin removes the policy: the same pull request is no longer protected at all (nothing built in), and a workflow change is refused again.
+      const stored = await f.h.ctx.config.get("anthm");
+      vi.mocked(f.h.ctx.config.get).mockImplementation(async company => company === "anthm" ? { ...stored, protectedPathPolicy: undefined } : {});
+      f.github.prFiles = [{ filename: ".github/workflows/ci.yml" }];
+      expect(await mergeAs(f)).toMatchObject(refused([".github/workflows/ci.yml"]));
+    });
   });
 });
 
@@ -3569,12 +3841,13 @@ describe("host and GitHub calls of one write-identity decision", () => {
       push: { warm: { ...write, github: 0 } },
       merge: {
         // The pull request (before and after the file list), the base branch's tiers file, one page of changed files.
-        warm: { ...write, github: 4 },
+        // The plugin config is read once more: the admin's protected-path policy and opt-in.
+        warm: { ...write, "config.get": 2, github: 4 },
         // Also the App connection, its key and allowed owners, the signing key secret, the catalog and a new read token.
-        cold: { "state.get": 7, "config.get": 2, "secrets.resolve": 2, github: 6 },
+        cold: { "state.get": 7, "config.get": 3, "secrets.resolve": 2, github: 6 },
       },
       // A merge, plus the pull request again, the base branch, its rules, and the head's check runs and statuses.
-      adminMerge: { warm: { ...write, github: 9 } },
+      adminMerge: { warm: { ...write, "config.get": 2, github: 9 } },
     };
     const measured: Record<string, Record<string, unknown>> = {};
     for (const [name, decide] of [["push", push], ["merge", merge], ["adminMerge", adminMerge]] as const) {
