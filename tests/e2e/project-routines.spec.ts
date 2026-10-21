@@ -126,7 +126,13 @@ for (const viewport of [
     await expect(section.getByText("Edited elsewhere")).toBeVisible();
 
     await section.getByRole("button", { name: "Edit Edited elsewhere" }).click();
-    await expect(page.getByRole("dialog").getByRole("textbox", { name: "Routine title" })).toHaveValue("Edited elsewhere");
+    const reopened = page.getByRole("dialog");
+    await expect(reopened.getByRole("textbox", { name: "Routine title" })).toHaveValue("Edited elsewhere");
+    await expect(reopened.getByRole("alert")).toHaveCount(0);
+
+    await reopened.getByRole("textbox", { name: "Routine title" }).fill("Edited after the conflict");
+    await reopened.getByRole("button", { name: "Save changes" }).click();
+    await expect(section.getByText("Edited after the conflict")).toBeVisible();
 
     // The failed save logs its 409 response; nothing else may.
     expect(errors.filter((line) => !line.includes("409"))).toEqual([]);

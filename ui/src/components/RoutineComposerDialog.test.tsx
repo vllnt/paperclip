@@ -16,6 +16,10 @@ const updateMock = vi.hoisted(() => vi.fn());
 const navigateMock = vi.hoisted(() => vi.fn());
 const pushToastMock = vi.hoisted(() => vi.fn());
 const foldersListMock = vi.hoisted(() => vi.fn(async () => ({ folders: [] })));
+const activeAgents = [{ id: "agent-1", name: "Builder", role: "engineer", status: "active" }];
+const activeProjects = [{ id: "project-1", name: "Project Alpha", color: null, archivedAt: null }];
+const agentsListMock = vi.hoisted(() => vi.fn());
+const projectsListMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/router", () => ({
   Link: ({ to, children, ...props }: AnchorHTMLAttributes<HTMLAnchorElement> & { to: string; children: ReactNode }) => (
@@ -24,19 +28,17 @@ vi.mock("@/lib/router", () => ({
   useNavigate: () => navigateMock,
 }));
 vi.mock("../api/routines", () => ({ routinesApi: { create: createMock, update: updateMock } }));
-vi.mock("../api/agents", () => ({
-  agentsApi: { list: vi.fn(async () => [{ id: "agent-1", name: "Builder", role: "engineer", status: "active" }]) },
-}));
-vi.mock("../api/projects", () => ({
-  projectsApi: { list: vi.fn(async () => [{ id: "project-1", name: "Project Alpha", color: null }]) },
-}));
+vi.mock("../api/agents", () => ({ agentsApi: { list: agentsListMock } }));
+vi.mock("../api/projects", () => ({ projectsApi: { list: projectsListMock } }));
 vi.mock("../api/folders", () => ({ foldersApi: { list: foldersListMock } }));
 vi.mock("../api/access", () => ({ accessApi: { listUserDirectory: vi.fn(async () => ({ users: [] })) } }));
 vi.mock("../context/ToastContext", () => ({ useToastActions: () => ({ pushToast: pushToastMock }) }));
 vi.mock("./MarkdownEditor", () => ({ MarkdownEditor: () => <div data-testid="markdown-editor" /> }));
 vi.mock("./InlineEntitySelector", () => ({
-  InlineEntitySelector: (props: { value?: string; placeholder?: string }) => (
-    <button type="button" data-selector={props.placeholder}>{props.value || props.placeholder}</button>
+  InlineEntitySelector: (props: { value?: string; placeholder?: string; options?: { label: string }[] }) => (
+    <button type="button" data-selector={props.placeholder} data-labels={props.options?.map((option) => option.label).join("|")}>
+      {props.value || props.placeholder}
+    </button>
   ),
 }));
 
@@ -88,7 +90,7 @@ describe("routineEditPatch", () => {
     expect(routineEditPatch(routine, { ...routineComposerDraftFrom(routine), description: "Sort new tasks" })).toBeNull();
   });
 
-  it("sends only the changed fields with the revision the edit started from, never the variables", () => {
+  it("sends only the changed fields with the revision the edit started from, never the variable settings", () => {
     const routine = savedRoutine();
     const draft = { ...routineComposerDraftFrom(routine), title: "Morning triage", projectId: "", variables: [] };
 
@@ -123,6 +125,8 @@ describe("RoutineComposerDialog", () => {
     navigateMock.mockReset();
     pushToastMock.mockReset();
     foldersListMock.mockClear();
+    agentsListMock.mockReset().mockResolvedValue(activeAgents);
+    projectsListMock.mockReset().mockResolvedValue(activeProjects);
     onOpenChange.mockReset();
   });
 
@@ -135,8 +139,23 @@ describe("RoutineComposerDialog", () => {
 
   async function render(element: ReactNode) {
     root = createRoot(container);
+    await rerender(element);
+  }
+
+  async function rerender(element: ReactNode) {
     await act(() => root!.render(<QueryClientProvider client={queryClient}>{element}</QueryClientProvider>));
     await flush();
+  }
+
+  const projectListKey = ["routines", "company-1", "project-1"];
+
+  function seedProjectList() {
+    queryClient.setQueryData(projectListKey, []);
+    expect(queryClient.getQueryState(projectListKey)?.isInvalidated).toBe(false);
+  }
+
+  function projectListInvalidated() {
+    return queryClient.getQueryState(projectListKey)?.isInvalidated;
   }
 
   function dialog() {
@@ -167,11 +186,13 @@ describe("RoutineComposerDialog", () => {
     expect(dialog()?.textContent).toContain("New routine");
     expect(dialog()?.querySelector('[data-selector="Project"]')?.textContent).toBe("project-1");
     expect(dialogButton("Create routine")?.disabled).toBe(true);
+    seedProjectList();
 
     await act(() => typeInto(titleInput(), "Weekly sweep"));
     await act(() => dialogButton("Create routine")!.click());
     await flush();
 
+    expect(projectListInvalidated()).toBe(true);
     expect(createMock).toHaveBeenCalledWith("company-1", expect.objectContaining({
       title: "Weekly sweep",
       projectId: "project-1",
@@ -212,9 +233,12 @@ describe("RoutineComposerDialog", () => {
 
     await act(() => typeInto(titleInput(), "Morning triage"));
     expect(dialogButton("Save changes")?.disabled).toBe(false);
+    seedProjectList();
     await act(() => dialogButton("Save changes")!.click());
     await flush();
 
+    expect(projectListInvalidated()).toBe(true);
+    expect(titleInput().value).toBe("Morning triage");
     expect(updateMock).toHaveBeenCalledWith("routine-1", { title: "Morning triage", baseRevisionId: "revision-3" });
     expect(createMock).not.toHaveBeenCalled();
     expect(onOpenChange).toHaveBeenCalledWith(false);
@@ -227,12 +251,77 @@ describe("RoutineComposerDialog", () => {
 
     await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} routine={savedRoutine()} />);
     await act(() => typeInto(titleInput(), "Morning triage"));
+    seedProjectList();
     await act(() => dialogButton("Save changes")!.click());
     await flush();
 
     expect(dialog()?.querySelector('[role="alert"]')?.textContent).toContain("Someone else saved this routine");
+    expect(projectListInvalidated()).toBe(true);
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
     expect(pushToastMock).not.toHaveBeenCalled();
+  });
+
+  it("drops the last save error once closed, so a reopened routine starts clean", async () => {
+    updateMock.mockRejectedValue(new ApiError("Routine was updated by someone else", 409, {}));
+    const routine = savedRoutine();
+
+    await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} routine={routine} />);
+    await act(() => typeInto(titleInput(), "Morning triage"));
+    await act(() => dialogButton("Save changes")!.click());
+    await flush();
+    expect(dialog()?.querySelector('[role="alert"]')).not.toBeNull();
+
+    await rerender(<RoutineComposerDialog companyId="company-1" open={false} onOpenChange={onOpenChange} routine={routine} />);
+    await rerender(
+      <RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} routine={savedRoutine({ id: "routine-2", title: "Weekly report" })} />,
+    );
+
+    expect(titleInput().value).toBe("Weekly report");
+    expect(dialog()?.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("keeps an unsaved new routine across a reopen and drops unsaved edits to a saved one", async () => {
+    await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} initialDraft={{ projectId: "project-1" }} />);
+    await act(() => typeInto(titleInput(), "Weekly sweep"));
+    await rerender(<RoutineComposerDialog companyId="company-1" open={false} onOpenChange={onOpenChange} initialDraft={{ projectId: "project-1" }} />);
+    await rerender(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} initialDraft={{ projectId: "project-2" }} />);
+
+    expect(titleInput().value).toBe("Weekly sweep");
+    expect(dialog()?.querySelector('[data-selector="Project"]')?.textContent).toBe("project-2");
+
+    await act(() => root!.unmount());
+    root = null;
+    const routine = savedRoutine();
+    await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} routine={routine} />);
+    await act(() => typeInto(titleInput(), "Morning triage"));
+    await rerender(<RoutineComposerDialog companyId="company-1" open={false} onOpenChange={onOpenChange} routine={routine} />);
+    await rerender(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} routine={routine} />);
+
+    expect(titleInput().value).toBe("Nightly triage");
+  });
+
+  it("lists a saved routine's terminated agent and archived project only while editing it", async () => {
+    agentsListMock.mockResolvedValue([...activeAgents, { id: "agent-old", name: "Retired", role: "engineer", status: "terminated" }]);
+    projectsListMock.mockResolvedValue([...activeProjects, { id: "project-old", name: "Old project", color: null, archivedAt: "2026-01-01T00:00:00.000Z" }]);
+
+    await render(
+      <RoutineComposerDialog
+        companyId="company-1"
+        open
+        onOpenChange={onOpenChange}
+        routine={savedRoutine({ assigneeAgentId: "agent-old", projectId: "project-old" })}
+      />,
+    );
+
+    expect(dialog()?.querySelector('[data-selector="Responsible"]')?.getAttribute("data-labels")).toBe("Builder|Retired (terminated)");
+    expect(dialog()?.querySelector('[data-selector="Project"]')?.getAttribute("data-labels")).toBe("Project Alpha|Old project (archived)");
+
+    await act(() => root!.unmount());
+    root = null;
+    await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} />);
+
+    expect(dialog()?.querySelector('[data-selector="Responsible"]')?.getAttribute("data-labels")).toBe("Builder");
+    expect(dialog()?.querySelector('[data-selector="Project"]')?.getAttribute("data-labels")).toBe("Project Alpha");
   });
 
   it("fetches nothing while closed and loads its lists once opened", async () => {

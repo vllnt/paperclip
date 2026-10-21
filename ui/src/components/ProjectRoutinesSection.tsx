@@ -64,7 +64,7 @@ export function ProjectRoutinesSection({ companyId, projectId, canCreate = true 
 
   const invalidateRoutine = (routineId: string) =>
     Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["routines", companyId] }),
+      queryClient.invalidateQueries({ queryKey: queryKeys.routines.all(companyId) }),
       queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(routineId) }),
     ]);
 

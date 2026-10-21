@@ -67,7 +67,11 @@ const emptyRoutineDraft: RoutineComposerDraft = {
   variables: [],
 };
 
-/** Fields the edit mode can change; variables, triggers, steps and secrets stay in the full editor. */
+/**
+ * Fields the edit mode sends; triggers, steps, secrets and variable settings stay in the full editor.
+ * The server still derives the variable list from the title and instructions, so removing a
+ * `{{name}}` from the text removes that variable, as it does in the full editor.
+ */
 const editableRoutineFields = [
   "title",
   "description",
@@ -215,11 +219,12 @@ export function RoutineComposerDialog({
       return routinesApi.update(routine.id, editPatch ?? {});
     },
     onSuccess: async (saved) => {
-      setDraft(emptyRoutineDraft);
+      // An edit keeps its draft so the closing dialog does not blank out; the next open seeds it again.
+      if (!routine) setDraft(emptyRoutineDraft);
       onOpenChange(false);
       setAdvancedOpen(false);
       await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.routines.list(companyId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.routines.all(companyId) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(saved.id) }),
       ]);
       if (routine) {
@@ -242,33 +247,41 @@ export function RoutineComposerDialog({
     onError: (error) => {
       // A 409 means someone saved a newer revision: refresh so reopening the dialog edits that one.
       if (error instanceof ApiError && error.status === 409) {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.routines.list(companyId) });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.routines.all(companyId) });
       }
     },
   });
+  const resetSave = saveRoutine.reset;
+  // The dialog stays mounted between opens, so a closed dialog drops its last save error.
+  useEffect(() => {
+    if (!open) resetSave();
+  }, [open, resetSave]);
 
   const recentAssigneeIds = useMemo(() => getRecentAssigneeIds(), [open]);
   const recentProjectIds = useMemo(() => getRecentProjectIds(), [open]);
+  // An edited routine keeps showing its saved agent and project even when terminated or archived.
+  const savedAssigneeId = routine?.assigneeAgentId ?? null;
+  const savedProjectId = routine?.projectId ?? null;
   const assigneeOptions = useMemo<InlineEntityOption[]>(
     () =>
       sortAgentsByRecency(
-        (agents ?? []).filter((agent) => agent.status !== "terminated"),
+        (agents ?? []).filter((agent) => agent.status !== "terminated" || agent.id === savedAssigneeId),
         recentAssigneeIds,
       ).map((agent) => ({
         id: agent.id,
-        label: agent.name,
+        label: agent.status === "terminated" ? `${agent.name} (terminated)` : agent.name,
         searchText: `${agent.name} ${agent.role} ${agent.title ?? ""}`,
       })),
-    [agents, recentAssigneeIds],
+    [agents, recentAssigneeIds, savedAssigneeId],
   );
   const projectOptions = useMemo<InlineEntityOption[]>(
     () =>
-      (projects ?? []).filter((project) => !project.archivedAt).map((project) => ({
+      (projects ?? []).filter((project) => !project.archivedAt || project.id === savedProjectId).map((project) => ({
         id: project.id,
-        label: project.name,
+        label: project.archivedAt ? `${project.name} (archived)` : project.name,
         searchText: project.description ?? "",
       })),
-    [projects],
+    [projects, savedProjectId],
   );
   const agentById = useMemo(() => new Map((agents ?? []).map((agent) => [agent.id, agent])), [agents]);
   const projectById = useMemo(() => new Map((projects ?? []).map((project) => [project.id, project])), [projects]);

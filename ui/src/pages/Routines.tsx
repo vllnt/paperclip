@@ -42,7 +42,6 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { auditSectionHref } from "./audit/audit-navigation";
-import { routineDetailHref } from "../components/RoutineContextualSidebar";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
 import { useNewRoutineLink } from "../hooks/useNewRoutineLink";
 import { useStreamlinedUiEnabled } from "../hooks/useStreamlinedUiEnabled";

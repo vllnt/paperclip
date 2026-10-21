@@ -73,12 +73,25 @@ describe("routine --project-id on create and update", () => {
     expect(lastRequest().body).toEqual({ projectId: null });
   });
 
-  it("refuses a project in both the payload and the flag", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-
-    await expect(
-      run(["routine", "update", ROUTINE_ID, "--payload-json", `{"projectId":"${PROJECT_ID}"}`, "--project-id", "none"]),
-    ).rejects.toThrow();
+  async function refusal(args: string[]): Promise<string> {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation((code) => {
+      throw new Error(`exit ${code}`);
+    });
+    await expect(run(args)).rejects.toThrow("exit 1");
     expect(fetchMock).not.toHaveBeenCalled();
+    return errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
+  }
+
+  it("refuses a project in both the payload and the flag", async () => {
+    const message = await refusal([
+      "routine", "update", ROUTINE_ID, "--payload-json", `{"projectId":"${PROJECT_ID}"}`, "--project-id", "none",
+    ]);
+    expect(message).toContain("Pass projectId either in --payload-json or with --project-id, not both.");
+  });
+
+  it("refuses the flag with a payload that is not a JSON object", async () => {
+    const message = await refusal(["routine", "update", ROUTINE_ID, "--payload-json", "[]", "--project-id", PROJECT_ID]);
+    expect(message).toContain("--payload-json must be a JSON object when --project-id is used.");
   });
 });
