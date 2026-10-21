@@ -59,7 +59,10 @@ describe("goal links and goal filters", () => {
     vi.spyOn(console, "log").mockImplementation((line: unknown) => {
       logged.push(String(line));
     });
-    fetchMock = vi.fn().mockImplementation((url: string) => json(responses[new URL(url).pathname] ?? []));
+    fetchMock = vi.fn().mockImplementation((url: string) => {
+      const parsed = new URL(url);
+      return json(parsed.searchParams.has("afterId") ? [] : responses[parsed.pathname] ?? []);
+    });
     vi.stubGlobal("fetch", fetchMock);
   });
 
@@ -72,7 +75,7 @@ describe("goal links and goal filters", () => {
     return fetchMock.mock.calls.map((call) => String(call[0]));
   }
 
-  it("composes a goal's projects, open tasks, routines and agents from the list APIs", async () => {
+  it("composes a goal's projects, open tasks, routines that are not archived, and agents from the list APIs", async () => {
     await run(["goal", "links", GOAL_ID, "--json"]);
 
     expect(requested()).toEqual(expect.arrayContaining([
@@ -87,7 +90,6 @@ describe("goal links and goal filters", () => {
       tasks: [{ id: "issue-1", identifier: "PAP-1", title: "Write the docs", status: "todo", assigneeAgentId: "agent-writer" }],
       routines: [
         { id: "routine-1", title: "Nightly build", status: "active", assigneeAgentId: "agent-builder", projectId: "project-1" },
-        { id: "routine-2", title: "Old report", status: "archived", assigneeAgentId: "agent-retired", projectId: null },
       ],
       agents: [
         { agentId: "agent-owner", reasons: ["owner"], name: "Owner" },
@@ -97,20 +99,24 @@ describe("goal links and goal filters", () => {
     });
   });
 
-  it("reads every page of a goal's open tasks", async () => {
-    const firstPage = Array.from({ length: 500 }, (_, index) => ({ id: `issue-${String(index).padStart(3, "0")}`, status: "todo", assigneeAgentId: null }));
-    const secondPage = [{ id: "issue-500", status: "todo", assigneeAgentId: "agent-late" }];
+  it("reads every page of a goal's open tasks, past a page that access filtering made short", async () => {
+    const pages: Record<string, unknown[]> = {
+      "": Array.from({ length: 500 }, (_, index) => ({ id: `issue-${String(index).padStart(3, "0")}`, status: "todo", assigneeAgentId: null })),
+      "issue-499": [{ id: "issue-500", status: "todo", assigneeAgentId: null }],
+      "issue-500": [{ id: "issue-900", status: "todo", assigneeAgentId: "agent-late" }],
+    };
     fetchMock.mockImplementation((url: string) => {
       const parsed = new URL(url);
-      if (parsed.pathname.endsWith("/issues")) return json(parsed.searchParams.get("afterId") === "issue-499" ? secondPage : firstPage);
+      if (parsed.pathname.endsWith("/issues")) return json(pages[parsed.searchParams.get("afterId") ?? ""] ?? []);
       return json(responses[parsed.pathname] ?? []);
     });
 
     await run(["goal", "links", GOAL_ID, "--json"]);
 
     const links = JSON.parse(logged.join("\n"));
-    expect(links.tasks).toHaveLength(501);
+    expect(links.tasks).toHaveLength(502);
     expect(links.agents.map((agent: { agentId: string }) => agent.agentId)).toContain("agent-late");
+    expect(requested().filter((url) => new URL(url).pathname.endsWith("/issues"))).toHaveLength(4);
   });
 
   it("prints each goal's progress", async () => {

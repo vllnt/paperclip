@@ -309,14 +309,16 @@ async function listOpenGoalTasks(api: PaperclipApiClient, companyId: string, goa
     const page = (await api.get<Issue[]>(`${apiPath`/api/companies/${companyId}/issues`}?${params}`)) ?? [];
     tasks.push(...page);
     const last = page.at(-1);
-    if (page.length < TASK_PAGE_SIZE || !last) return tasks;
+    // The server can drop rows the caller may not see after it applies the page limit, so a short
+    // page is not the last one; only an empty page is.
+    if (!last) return tasks;
     afterId = last.id;
   }
 }
 
 /**
  * Reads the work linked to a goal from the list APIs, so the caller sees only what its own access
- * allows: projects that link the goal, open tasks and routines whose own goal it is, and the agents
+ * allows: projects that link the goal, open tasks and routines (not archived) whose own goal it is, and the agents
  * that `goalAgentLinks` derives from them.
  * @param api The API client.
  * @param goalId The goal.
@@ -334,7 +336,7 @@ export async function readGoalLinks(api: PaperclipApiClient, goalId: string): Pr
     api.get<Agent[]>(apiPath`/api/companies/${companyId}/agents`),
   ]);
   const agentNames = new Map((agents ?? []).map((agent) => [agent.id, agent.name]));
-  const goalRoutines = routines ?? [];
+  const goalRoutines = (routines ?? []).filter((routine) => routine.status !== "archived");
   return {
     goal,
     progress: progress?.[goalId] ?? null,

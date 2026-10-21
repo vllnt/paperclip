@@ -529,7 +529,7 @@ npx paperclipai goal progress --company-id <company-id>
 npx paperclipai goal links <goal-id>
 ```
 
-`goal progress` shows each goal's done, open and total tasks, including the tasks of the goals below it. `goal links` shows the work linked to one goal: the projects that serve it, its open tasks, its routines and its agents (the owner, the assignees of its open tasks, and the default agents of its routines that are not archived). Sub-goals keep their own work.
+`goal progress` shows each goal's done, open and total tasks, including the tasks of the goals below it. `goal links` shows the work linked to one goal: the projects that serve it, its open tasks, its routines that are not archived, and its agents (the owner, the assignees of its open tasks, and the default agents of its routines that are not archived). Sub-goals keep their own work.
 
 ## Policy Commands
 
