@@ -43,7 +43,24 @@ function applyObservabilityHeaders(headers: Headers) {
   }
 }
 
+/**
+ * Ids and other route values reach request paths from the address bar. The
+ * browser resolves dot segments before it sends the request, so a value of
+ * `..` would leave the endpoint the caller named and hit another one with the
+ * user's session. Refuse such paths here, for every caller.
+ */
+function assertApiRequestPath(path: string): void {
+  const pathname = path.split(/[?#]/, 1)[0] ?? "";
+  const escapesEndpoint =
+    !path.startsWith("/")
+    || path.startsWith("//")
+    || pathname.includes("\\")
+    || pathname.split("/").some((segment) => /^(?:\.|%2e){1,2}$/i.test(segment));
+  if (escapesEndpoint) throw new ApiError("Invalid API request path", 400, null);
+}
+
 export async function requestResponse(path: string, init?: RequestInit): Promise<Response> {
+  assertApiRequestPath(path);
   const headers = new Headers(init?.headers ?? undefined);
   const body = init?.body;
   if (!(body instanceof FormData) && !headers.has("Content-Type")) {

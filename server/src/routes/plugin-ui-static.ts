@@ -369,7 +369,8 @@ export function pluginUiStaticRoutes(db: Db, options: PluginUiStaticRouteOptions
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 10_000);
             try {
-              const upstream = await fetch(targetUrl.href, { signal: controller.signal });
+              // A redirect would leave the loopback host validated above.
+              const upstream = await fetch(targetUrl.href, { signal: controller.signal, redirect: "error" });
               if (!upstream.ok) {
                 res.status(upstream.status).json({
                   error: `Dev server returned ${upstream.status}`,

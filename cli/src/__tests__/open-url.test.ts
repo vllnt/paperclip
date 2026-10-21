@@ -47,6 +47,33 @@ describe("openUrl", () => {
     await expect(openUrl("https://example.com")).resolves.toBe(false);
   });
 
+  it("refuses a URL that is not http or https without spawning anything", async () => {
+    for (const url of ["file:///etc/passwd", "javascript:alert(1)", "-a Calculator", "not a url", ""]) {
+      await expect(openUrl(url)).resolves.toBe(false);
+    }
+    expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it("opens on Windows without a shell, passing the URL as one literal argument", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: "win32" });
+    try {
+      mocks.spawn.mockImplementation(() => {
+        const child = fakeChild();
+        queueMicrotask(() => child.emit("spawn"));
+        return child;
+      });
+
+      await expect(openUrl("https://example.com/approve?a=1&calc.exe|x")).resolves.toBe(true);
+
+      const [command, args] = mocks.spawn.mock.calls[0] as [string, string[]];
+      expect(command).not.toMatch(/^cmd(\.exe)?$/i);
+      expect(args).toEqual(["url.dll,FileProtocolHandler", "https://example.com/approve?a=1&calc.exe|x"]);
+    } finally {
+      if (platform) Object.defineProperty(process, "platform", platform);
+    }
+  });
+
   it("resolves false when spawn throws synchronously", async () => {
     mocks.spawn.mockImplementation(() => {
       throw new Error("synchronous spawn failure");

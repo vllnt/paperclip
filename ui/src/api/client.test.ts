@@ -199,3 +199,30 @@ describe("per-caller abort semantics", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("API request paths", () => {
+  it.each([
+    "/issues/../admin/instance",
+    "/issues/%2e%2E/admin",
+    "/issues/./x",
+    "/issues/..",
+    "//other.example/issues",
+    "/issues\\..\\admin",
+    "issues/1",
+  ])("refuses a path that can leave its endpoint without sending anything: %s", async (path) => {
+    await expect(api.get(path)).rejects.toMatchObject({ name: "ApiError", status: 400 });
+    await expect(api.post(path, {})).rejects.toMatchObject({ name: "ApiError", status: 400 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("sends paths whose segments only look like dots", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ ok: true }));
+
+    await api.get("/issues/a..b/files/..%2Fx?next=../y");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/issues/a..b/files/..%2Fx?next=../y",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+});

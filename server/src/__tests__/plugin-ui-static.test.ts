@@ -158,7 +158,27 @@ describe("plugin UI static route", () => {
     expect(mockRegistry.getConfig).toHaveBeenCalledWith(pluginId, companyA);
     expect(fetchMock).toHaveBeenCalledWith(
       "http://localhost:5173/index.js",
-      expect.objectContaining({ signal: expect.any(Object) }),
+      expect.objectContaining({ signal: expect.any(Object), redirect: "error" }),
     );
+  });
+
+  it("does not proxy a devUiUrl that targets a non-loopback host", async () => {
+    process.env.NODE_ENV = "development";
+    readyPlugin(createPluginPackage());
+    mockRegistry.getConfig.mockResolvedValue({
+      configJson: {
+        devUiUrl: "http://169.254.169.254/",
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue(new Response("secret", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const app = await createApp(boardActor([companyA]));
+
+    const res = await request(app)
+      .get(`/_plugins/${pluginId}/ui/index.js`)
+      .query({ companyId: companyA });
+
+    expect(res.status).toBe(400);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
