@@ -414,7 +414,7 @@ The Tasks toolbar polls local sync status every 30 seconds while idle, every 5 s
 
 ### Sync now queues a request
 
-Sync runs only in the scheduled `github-sync` job. The host starts the job every minute, skips a start while the previous run is still going, and the job syncs every connected company on each run. A run takes as long as the companies have issues to check, so the next run starts within about a minute after the previous one ends. A sync started anywhere else (an event handler, an action) would run in a worker call that the host closes when the call ends, and the host would then refuse its later calls.
+Sync runs only in the scheduled `github-sync` job. The host starts the job every minute, skips a start while the previous run is still going, and the job syncs every connected company on each run. A run is bounded (see [What a sync run reads](#what-a-sync-run-reads)), so the next run starts within about a minute after the previous one ends. A sync started anywhere else (an event handler, an action) would run in a worker call that the host closes when the call ends, and the host would then refuse its later calls.
 
 **Sync now** (`sync-now`, `sync.trigger`, the **Sync now** buttons in the toolbar, the task panels and **Retry sync**, and `paperclipai plugin action vllnt.paperclip-github sync-now -C <companyId>`) therefore queues a request and answers at once:
 
@@ -432,6 +432,19 @@ The web UI shows a queued request as **GitHub sync queued**, then **Syncing GitH
 If the host denies a call during a run, the run stops at once instead of retrying, writes no report and no more links, and the job logs the failure.
 
 Background synchronization still reads GitHub issue changes directly. A sync writes a link only when it changed.
+
+### What a sync run reads
+
+The host gives one run of the job 300 seconds, for every company together. A run therefore reads what changed, not every issue:
+
+- **Recent changes.** For each linked repository the run lists issues oldest change first, with GitHub's `since` parameter set to the newest update time it finished last time (one second earlier, so a tie is not lost). It asks again from the newest time on the page instead of turning to the next page, because an issue that changes during the walk would otherwise make the walk skip its neighbour. A run with nothing new costs one listing request per repository, and reads no single issue.
+- **Edits made here.** An edit to a linked task in Paperclip does not change anything on GitHub, so the listing cannot show it. The plugin notes the task from the `issue.updated` event and checks that issue on the next run (one request for the issue, then the write). A task that failed to sync, or that has a conflict to resolve, is checked again on each run in the same way. At most 500 issues wait this way, 100 per repository per run.
+- **Full pass.** Every 6 hours, and after the sync settings are saved (so a new rule reaches every issue), the run walks the whole repository the same way. This also catches a change that neither an event nor the listing showed. A repository gets its first full pass when it is first synced.
+- **Time budget.** A company's run ends at the first check after 120 seconds, and the job starts no company after 200 seconds. The place of each walk is saved after every page, so the next run goes on from there, and a large repository finishes its first pass over several runs. The company that was skipped goes first on the next run. The report of a run that ended at its budget has `partial: true`.
+
+The report also has `checked` (issues compared with their task) and `durationMs`, and the run logs both. Issues in a repository that no project links are read one by one: at most 10 per run, none more often than every 5 minutes.
+
+Every listing and issue read in these walks uses the same repository-scoped read token as before; only the write-back to GitHub uses a write token.
 
 ## Event routing
 

@@ -4,6 +4,8 @@ import { GitHubClient, GitHubError } from "./github.js";
 import { boardScope } from "./setup.js";
 import type { PluginWriteRequest } from "./write-identity.js";
 import { nativeGitHubReady } from "./native-github.js";
+import { JOB_BUDGET_MS, HEAD_MARGIN_MS, QUEUE_LIMIT, QUEUE_PER_REPOSITORY, RUN_BUDGET_MS, SYNC_PAGE_SIZE, TRACKED_PER_RUN, TRACKED_RECHECK_MS,
+  currentSweep, newestUpdate, resumeFrom, validTime, walkUpdated, type RepoCursor, type WalkEnd } from "./sync-window.js";
 import { PLUGIN_ID, type AutomationRule, type ConnectionState, type GitHubIssue, type Repository, type SyncReport, type SyncSettings, type TaskRepository, type TaskRepositories } from "./contracts.js";
 
 const ORIGIN = `plugin:${PLUGIN_ID}:issue` as const;
@@ -11,6 +13,11 @@ const defaults: SyncSettings = { enabled: true, rules: [] };
 type Snapshot = { title: string; body: string; state: string };
 type Link = { issueId: string; githubId: number; number: number; repositoryId: number; base: Snapshot; ruleMatch?: string; conflicts?: string[]; wakePending?: string; projectless?: boolean };
 type Pending = { issueId: string; repositoryId: number; phase: "ready" | "posting"; title: string; body: string };
+/** GitHub issues that need a look although GitHub did not report a change: edited here, or failed last time. Keyed by GitHub issue ID. */
+type SyncQueue = Record<string, { repositoryId: number; number: number; at: number }>;
+type Tracked = Record<string, { repositoryId: number; number: number; checkedAt?: string }>;
+interface RunScope { auth: { id: string; pem: string }; config: SyncSettings; report: SyncReport; deadline: number; resyncAt: string | undefined;
+  queued: SyncQueue; connected(): Promise<boolean> }
 type Credentials = (companyId: string) => Promise<{ id: string; pem: string }>;
 export interface GitHubWebhookPayload {
   action?: string;
@@ -123,12 +130,29 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
   // company -> when the oldest request that no run has taken yet was made (milliseconds)
   const requested = new Map<string, number>();
   function requestSync(companyId: string) { if (!requested.has(companyId)) requested.set(companyId, Date.now()); }
-  function exclusive<T>(companyId: string, operation: () => Promise<T>): Promise<T> {
-    const pending = (queues.get(companyId) ?? Promise.resolve()).catch(() => {}).then(operation);
-    queues.set(companyId, pending);
-    void pending.finally(() => { if (queues.get(companyId) === pending) queues.delete(companyId); }).catch(() => {});
+  function chain<T>(lanes: Map<string, Promise<unknown>>, companyId: string, operation: () => Promise<T>): Promise<T> {
+    const pending = (lanes.get(companyId) ?? Promise.resolve()).catch(() => {}).then(operation);
+    lanes.set(companyId, pending);
+    void pending.finally(() => { if (lanes.get(companyId) === pending) lanes.delete(companyId); }).catch(() => {});
     return pending;
   }
+  const exclusive = <T>(companyId: string, operation: () => Promise<T>) => chain(queues, companyId, operation);
+  // The queue has its own lane: an event handler that records an edit must not wait for a run that is in progress.
+  const queueLanes = new Map<string, Promise<unknown>>();
+  const queueFor = async (companyId: string) => (await ctx.state.get(key(companyId, "queue")) as SyncQueue | null) ?? {};
+  function changeQueue(companyId: string, change: (queue: SyncQueue) => void) {
+    return chain(queueLanes, companyId, async () => {
+      const queue = await queueFor(companyId), before = JSON.stringify(queue);
+      change(queue);
+      if (JSON.stringify(queue) !== before) await ctx.state.set(key(companyId, "queue"), queue);
+    });
+  }
+  /** Asks for a second look at one GitHub issue on the next run. The newest ask wins; the oldest ask goes first. */
+  const enqueue = (companyId: string, item: { githubId: number; repositoryId: number; number: number }) => changeQueue(companyId, queue => {
+    if (queue[String(item.githubId)] || Object.keys(queue).length < QUEUE_LIMIT) queue[String(item.githubId)] = { repositoryId: item.repositoryId, number: item.number, at: Date.now() };
+  });
+  // The last time a run started for a company, so that a job that ends at its budget starts with the companies it skipped.
+  const lastStart = new Map<string, number>();
   async function settings(companyId: string) { return (await ctx.state.get(key(companyId, "settings")) as SyncSettings | null) ?? defaults; }
   const loadLink = async (companyId: string, id: number) => await ctx.state.get(key(companyId, `link:${id}`)) as Link | null;
   const saveLink = (companyId: string, link: Link) => ctx.state.set(key(companyId, `link:${link.githubId}`), link);
@@ -337,12 +361,148 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     const all = await pendingFor(companyId); delete all[native.id]; await ctx.state.set(key(companyId, "pending"), all);
     return remote;
   }
-  async function run(companyId: string): Promise<SyncReport | null> {
+  const cursorKey = (companyId: string, repositoryId: number) => key(companyId, `cursor:${repositoryId}`);
+  async function loadCursor(companyId: string, repositoryId: number): Promise<RepoCursor> {
+    const saved = await ctx.state.get(cursorKey(companyId, repositoryId)) as Partial<RepoCursor> | null;
+    const startedAt = validTime(saved?.sweep?.startedAt), since = validTime(saved?.sweep?.since);
+    const sweptAt = validTime(saved?.sweptAt);
+    // The first full pass is also the first recent-changes walk, so a repository has no `head` until its first pass ends.
+    const head = validTime(saved?.head) ?? (startedAt === undefined && sweptAt !== undefined ? new Date(Date.parse(sweptAt) - HEAD_MARGIN_MS).toISOString() : undefined);
+    return { head, sweptAt, sweep: startedAt === undefined ? undefined : { startedAt, since } };
+  }
+  /** Drops the ask for a second look at an issue, unless a newer ask came in while the run was working on it. */
+  function settle(companyId: string, queued: SyncQueue, githubId: number | string) {
+    const asked = queued[String(githubId)];
+    return asked ? changeQueue(companyId, queue => { if (queue[String(githubId)]?.at === asked.at) delete queue[String(githubId)]; }) : Promise.resolve();
+  }
+  /**
+   * One repository's part of a run, in the order that keeps GitHub's news first: the issues that were asked for again, then what
+   * GitHub changed since the last run (`recent`), then, with the time that is left, the periodic full pass (`sweep`).
+   */
+  async function repoWork(companyId: string, repo: TaskRepository, scope: RunScope) {
+    const { auth, config, report, deadline } = scope;
+    const projectIds = repo.projects.map(p => p.id);
+    const cursor = await loadCursor(companyId, repo.id);
+    const saveCursor = () => ctx.state.set(cursorKey(companyId, repo.id), cursor);
+    const seen = new Set<string>(), recovered = new Set<string>(), unresolved = new Set<string>();
+    const pending = Object.values(await pendingFor(companyId)).filter(item => item.repositoryId === repo.id);
+    const warn = (error: unknown, subject: string) => {
+      if (isScopeLoss(error)) throw error;
+      report.warnings.push(`${subject}: ${errorText(error)}`);
+    };
+    // A publication whose receipt shows up in a listing is attached before that issue is looked at, so it never becomes a second task.
+    async function recover(listed: GitHubIssue[]) {
+      for (const item of pending) {
+        if (recovered.has(item.issueId) || unresolved.has(item.issueId) || !listed.some(issue => issue.body?.includes(marker(companyId, item.issueId)))) continue;
+        try { await publishPending(companyId, item, repo, auth, listed); recovered.add(item.issueId); }
+        catch (error) { warn(error, repo.fullName); unresolved.add(item.issueId); }
+      }
+    }
+    async function reconcileOne(remote: GitHubIssue) {
+      const stamp = `${remote.id}@${remote.updatedAt}`;
+      if (seen.has(stamp)) return;
+      seen.add(stamp);
+      // A partially attached publication is never imported as a second task.
+      if ([...unresolved].some(id => remote.body?.includes(marker(companyId, id)))) return;
+      report.checked = (report.checked ?? 0) + 1;
+      try { await reconcile(companyId, repo, remote, projectIds, auth, config, report); await settle(companyId, scope.queued, remote.id); }
+      catch (error) {
+        warn(error, `${repo.fullName} #${remote.number}`);
+        await enqueue(companyId, { githubId: remote.id, repositoryId: repo.id, number: remote.number });
+      }
+    }
+    const walk = (from: string | undefined, commit: (since: string) => Promise<void>) => walkUpdated<GitHubIssue>({ from, deadline, commit,
+      async fetchPage(since, page) {
+        if (!await scope.connected()) return null;
+        const result = await github.issues(auth.id, auth.pem, repo, page, "all", { direction: "asc", perPage: SYNC_PAGE_SIZE, ...(since ? { since: resumeFrom(since) } : {}) });
+        if (result.nextPage !== null && (result.nextPage <= page || result.nextPage > 10000)) throw new Error("GitHub returned an invalid issue page.");
+        return { items: result.issues, nextPage: result.nextPage, cursor: result.cursor ?? newestUpdate(result.issues) };
+      },
+      async visit(listed) {
+        await recover(listed);
+        for (const remote of listed) {
+          if (Date.now() >= deadline) return false;
+          await reconcileOne(remote);
+        }
+        return true;
+      } });
+    async function asked(): Promise<"done" | "budget"> {
+      const mine = Object.entries(scope.queued).filter(([, item]) => item.repositoryId === repo.id).sort(([, a], [, b]) => a.at - b.at).slice(0, QUEUE_PER_REPOSITORY);
+      for (const [githubId, item] of mine) {
+        if (Date.now() >= deadline) return "budget";
+        try {
+          const remote = await github.getIssue(auth.id, auth.pem, repo, item.number);
+          await recover([remote]);
+          await reconcileOne(remote);
+        } catch (error) {
+          // A deleted or moved issue has nothing left to sync.
+          if (error instanceof GitHubError && (error.status === 404 || error.status === 410)) await settle(companyId, scope.queued, githubId);
+          else warn(error, `${repo.fullName} #${item.number}`);
+        }
+      }
+      return "done";
+    }
+    // Publications that no listing showed a receipt for: a "ready" one is posted now; a "posting" one waits for its receipt.
+    async function publishRest() {
+      for (const item of pending) {
+        if (recovered.has(item.issueId) || unresolved.has(item.issueId)) continue;
+        try { await reconcileOne(await publishPending(companyId, item, repo, auth, [])); recovered.add(item.issueId); }
+        catch (error) { warn(error, repo.fullName); unresolved.add(item.issueId); }
+      }
+    }
+    return {
+      async recent(): Promise<WalkEnd> {
+        if (await asked() === "budget") return "budget";
+        if (cursor.head === undefined) return "done";
+        const end = await walk(cursor.head, async since => { cursor.head = since; await saveCursor(); });
+        if (end === "done") await publishRest();
+        return end;
+      },
+      async sweep(): Promise<WalkEnd> {
+        const current = currentSweep(cursor, scope.resyncAt, Date.now());
+        if (!current) return "done";
+        if (current !== cursor.sweep) { cursor.sweep = current; await saveCursor(); }
+        const end = await walk(current.since, async since => { current.since = since; await saveCursor(); });
+        if (end === "done") {
+          cursor.sweptAt = current.startedAt; delete cursor.sweep;
+          cursor.head ??= current.since ?? new Date(Date.parse(current.startedAt) - HEAD_MARGIN_MS).toISOString();
+          await saveCursor();
+        }
+        return end;
+      },
+    };
+  }
+  /** Issues of repositories that no project links are fetched one by one, a few per run, and at once when edited here. */
+  async function syncTracked(companyId: string, linked: Repository[], scope: RunScope): Promise<"done" | "stopped"> {
+    const tracked = (await ctx.state.get(key(companyId, "standalone")) as Tracked | null) ?? {};
+    const now = Date.now(), checked = (item: Tracked[string]) => Date.parse(validTime(item.checkedAt) ?? "") || 0;
+    const due = Object.entries(tracked).filter(([githubId, item]) => !linked.some(repo => repo.id === item.repositoryId)
+      && (scope.queued[githubId] || now - checked(item) >= TRACKED_RECHECK_MS)).sort(([, a], [, b]) => checked(a) - checked(b)).slice(0, TRACKED_PER_RUN);
+    let end: "done" | "stopped" = "done";
+    for (const [githubId, item] of due) {
+      if (Date.now() >= scope.deadline) break;
+      if (!await scope.connected()) { end = "stopped"; break; }
+      try {
+        const repo = await sources.repository(companyId, item.repositoryId);
+        if (!repo) throw new Error("Repository access is unavailable.");
+        const remote = await github.getIssue(scope.auth.id, scope.auth.pem, repo, item.number);
+        if (String(remote.id) !== githubId) throw new Error("Issue moved. Open it in its destination repository to reconnect.");
+        scope.report.checked = (scope.report.checked ?? 0) + 1;
+        await reconcile(companyId, repo, remote, repo.projects.map(p => p.id), scope.auth, scope.config, scope.report);
+        await settle(companyId, scope.queued, githubId);
+      } catch (error) { if (isScopeLoss(error)) throw error; scope.report.warnings.push(`GitHub issue #${item.number}: ${errorText(error)}`); }
+      item.checkedAt = new Date().toISOString();
+    }
+    if (due.length) await ctx.state.set(key(companyId, "standalone"), tracked);
+    return end;
+  }
+  async function run(companyId: string, deadline: number): Promise<SyncReport | null> {
     // Only a connected company syncs; disconnecting also stops an in-flight run
     // before its next repository.
     const connected = async () => await companies.state(companyId) === "connected";
     if (!await connected()) return null;
-    const report: SyncReport = { at: new Date().toISOString(), imported: 0, updated: 0, warnings: [] };
+    const startedAt = Date.now();
+    const report: SyncReport = { at: new Date(startedAt).toISOString(), imported: 0, updated: 0, warnings: [], checked: 0, partial: false };
     // When the host denies a call because the run's invocation scope is gone, the run stops: every call after it would be denied
     // too (one failed call per remaining issue, and a report that cannot be written). The error goes to the caller; the next
     // scheduled run starts over.
@@ -353,56 +513,49 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       const data = await sources.repositories(companyId);
       report.warnings.push(...data.warnings);
       const auth = await credentials(companyId);
+      const scope: RunScope = { auth, config, report, deadline, connected, queued: await queueFor(companyId), resyncAt: validTime(await ctx.state.get(key(companyId, "resync"))) };
+      const works: Array<Awaited<ReturnType<typeof repoWork>>> = [];
+      const stop = () => { report.warnings.push(DISCONNECTED_DURING_SYNC); return report; };
       for (const repo of data.repositories) {
-        if (!await connected()) { report.warnings.push(DISCONNECTED_DURING_SYNC); return report; }
+        if (Date.now() >= deadline) { report.partial = true; break; }
+        if (!await connected()) return stop();
         try {
-          const remoteIssues: GitHubIssue[] = [];
-          for (let page: number | null = 1; page !== null;) {
-            const result = await github.issues(auth.id, auth.pem, repo, page, "all");
-            remoteIssues.push(...result.issues);
-            if (result.nextPage !== null && (result.nextPage <= page || result.nextPage > 10000)) throw new Error("GitHub returned an invalid issue page.");
-            page = result.nextPage;
-          }
-          const pending = Object.values(await pendingFor(companyId)).filter(item => item.repositoryId === repo.id);
-          const unresolved = new Set<string>();
-          for (const item of pending) {
-            try {
-              const remote = await publishPending(companyId, item, repo, auth, remoteIssues);
-              if (!remoteIssues.some(issue => issue.id === remote.id)) remoteIssues.push(remote);
-            } catch (error) { if (isScopeLoss(error)) throw error; unresolved.add(item.issueId); report.warnings.push(`${repo.fullName}: ${errorText(error)}`); }
-          }
-          for (const remote of new Map(remoteIssues.map(issue => [issue.id, issue])).values()) {
-            // A partially attached publication is never imported as a second task.
-            if ([...unresolved].some(id => remote.body?.includes(marker(companyId, id)))) continue;
-            try { await reconcile(companyId, repo, remote, repo.projects.map(p => p.id), auth, config, report); }
-            catch (error) { if (isScopeLoss(error)) throw error; report.warnings.push(`${repo.fullName} #${remote.number}: ${errorText(error)}`); }
-          }
+          const work = await repoWork(companyId, repo, scope);
+          works.push(work);
+          const end = await work.recent();
+          if (end === "stopped") return stop();
+          if (end === "budget") report.partial = true;
         } catch (error) { if (isScopeLoss(error)) throw error; report.warnings.push(`${repo.fullName}: ${errorText(error)}`); }
       }
-      const tracked = (await ctx.state.get(key(companyId, "standalone")) as Record<string, { repositoryId: number; number: number }> | null) ?? {};
-      for (const [githubId, item] of Object.entries(tracked)) {
-        if (data.repositories.some(repo => repo.id === item.repositoryId)) continue;
-        if (!await connected()) { report.warnings.push(DISCONNECTED_DURING_SYNC); return report; }
+      if (await syncTracked(companyId, data.repositories, scope) === "stopped") return stop();
+      // The full pass gets what the news left of the budget.
+      for (const work of works) {
+        if (Date.now() >= deadline) { report.partial = true; break; }
         try {
-          const repo = await sources.repository(companyId, item.repositoryId);
-          if (!repo) throw new Error("Repository access is unavailable.");
-          const remote = await github.getIssue(auth.id, auth.pem, repo, item.number);
-          if (String(remote.id) !== githubId) throw new Error("Issue moved. Open it in its destination repository to reconnect.");
-          await reconcile(companyId, repo, remote, repo.projects.map(p => p.id), auth, config, report);
-        } catch (error) { if (isScopeLoss(error)) throw error; report.warnings.push(`GitHub issue #${item.number}: ${errorText(error)}`); }
+          const end = await work.sweep();
+          if (end === "stopped") return stop();
+          if (end === "budget") report.partial = true;
+        } catch (error) { if (isScopeLoss(error)) throw error; report.warnings.push(errorText(error)); }
       }
     } catch (error) {
       if (isScopeLoss(error)) { scopeLost = true; throw error; }
       report.warnings.push(errorText(error));
     }
-    finally { if (!scopeLost) { if (report.updated) invalidate(companyId); await ctx.state.set(key(companyId, "report"), report); } }
+    finally {
+      if (!scopeLost) {
+        report.durationMs = Date.now() - startedAt;
+        if (report.updated) invalidate(companyId);
+        await ctx.state.set(key(companyId, "report"), report);
+        ctx.logger.info("GitHub sync run", { companyId, durationMs: report.durationMs, checked: report.checked, imported: report.imported, updated: report.updated, partial: report.partial, warnings: report.warnings.length });
+      }
+    }
     return report;
   }
   /** Runs one sync now; only the scheduled job calls this (tests too). Anything else uses requestSync or queueSync. */
-  function sync(companyId: string) {
+  function sync(companyId: string, jobDeadline = Infinity) {
     const existing = running.get(companyId); if (existing) return existing;
     // The run takes the requests made so far; one that arrives while it runs stays for the next run.
-    const promise = exclusive(companyId, () => { requested.delete(companyId); return run(companyId); });
+    const promise = exclusive(companyId, () => { requested.delete(companyId); lastStart.set(companyId, Date.now()); return run(companyId, Math.min(Date.now() + RUN_BUDGET_MS, jobDeadline)); });
     running.set(companyId, promise);
     void promise.finally(() => { if (running.get(companyId) === promise) running.delete(companyId); }).catch(() => {});
     return promise;
@@ -412,8 +565,12 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     // ctx.companies.list() is a forbidden wildcard call from this context.
     // Iterate the companies connected in persisted state, so a worker restart
     // without a config replay keeps syncing.
-    for (const companyId of await companies.connected()) {
-      try { await sync(companyId); }
+    // A job that ends at its budget starts, next time, with the companies it did not reach.
+    const deadline = Date.now() + JOB_BUDGET_MS;
+    const connected = (await companies.connected()).sort((a, b) => (lastStart.get(a) ?? 0) - (lastStart.get(b) ?? 0));
+    for (const companyId of connected) {
+      if (Date.now() >= deadline) { ctx.logger.warn("GitHub scheduled sync reached the job time budget; the other companies go first next run", { companyId }); break; }
+      try { await sync(companyId, deadline); }
       catch (error) {
         ctx.logger.error("GitHub scheduled sync failed", { companyId, error: errorText(error) });
         // The host no longer admits this worker's calls, so the rest of the job would only be denied. The next run starts over.
@@ -423,8 +580,18 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       catch (error) { ctx.logger.error("GitHub write identity check failed", { companyId, error: errorText(error) }); }
     }
   });
-  // Events (issue and project changes) do not ask for a sync: the job syncs every connected company on every run, so an event
-  // could not make one happen sooner, and a sync that an event handler started would lose its scope (see requestSync).
+  // Events do not ask for a sync: the job syncs every connected company on every run, so an event could not make one happen
+  // sooner, and a sync that an event handler started would lose its scope (see requestSync). An event only notes that a linked
+  // task changed here: a run looks at GitHub's changes, so without this note an edit made here would wait for the full pass.
+  ctx.events.on("issue.updated", async event => {
+    if (event.actorType === "plugin" || !event.entityId) return;
+    try {
+      const native = await ctx.issues.get(event.entityId, event.companyId);
+      if (native?.originKind !== ORIGIN || !native.originId) return;
+      const link = await loadLink(event.companyId, Number(native.originId));
+      if (link?.issueId === native.id) await enqueue(event.companyId, link);
+    } catch (error) { ctx.logger.warn("GitHub sync could not note an edited task", { companyId: event.companyId, error: errorText(error) }); }
+  });
   /**
    * The answer to "Sync now": the request is queued for the scheduled job, which takes it on its next run (after the run in
    * progress, if there is one). It says when the request was queued and when a sync last finished, so that no surface
@@ -470,6 +637,8 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     }
     await exclusive(companyId, async () => {
       await ctx.state.set(key(companyId, "settings"), value);
+      // New rules apply to every issue, not only to the ones GitHub changes next: the next run starts a full pass.
+      await ctx.state.set(key(companyId, "resync"), new Date().toISOString());
       await ctx.activity.log({ companyId, message: "GitHub sync and automation settings updated", metadata: { enabled: value.enabled, ruleCount: value.rules.length } });
     });
     requestSync(companyId);
