@@ -11,6 +11,7 @@ import {
   createUnrelatedHistoryGraftCommit,
   commitTreeWithSyncIdentity,
   readSanitizedOriginRemoteUrl,
+  resetLocalGitIndexToHead,
   retryTransientGitBundleTransfer,
   SSH_SIGNAL_TERMINATION_MESSAGE_PREFIX,
 } from "./git-workspace-sync.js";
@@ -172,7 +173,7 @@ export interface SshEnvLabFixtureState {
   sshdLogPath: string;
 }
 
-interface LocalGitWorkspaceSnapshot {
+export interface LocalGitWorkspaceSnapshot {
   headCommit: string;
   branchName: string | null;
   deletedPaths: string[];
@@ -1293,6 +1294,37 @@ async function integrateImportedGitHead(input: {
   throw new Error(`Failed to integrate concurrent SSH git history for ${input.importedHead.slice(0, 12)} after multiple retries.`);
 }
 
+/**
+ * `integrateImportedGitHead` moves the ref only, and the file merge then writes
+ * whatever the run's copy held. A tracked file that equals the blob the run
+ * committed but differs from the integrated HEAD is a stale copy of history Git
+ * has already merged, not a dirty edit: it follows HEAD. A file the run edited
+ * after its last commit differs from the run's committed blob and stays as it
+ * is, so a true both-sides conflict still resolves as "the run's dirty file
+ * wins". Symlinks and other non-regular files are left alone. Call it with the
+ * index already reset to HEAD.
+ */
+async function realignTrackedFilesWithHead(input: { localDir: string; importedHead: string }): Promise<void> {
+  const driftedFrom = async (commit: string): Promise<string[]> =>
+    (await runLocalGit(input.localDir, ["diff", "--name-only", "-z", "--no-renames", commit, "--"], {
+      timeout: 60_000,
+      maxBuffer: 16 * 1024 * 1024,
+    })).stdout.split("\0").filter(Boolean);
+  const differsFromRunCommit = new Set(await driftedFrom(input.importedHead));
+  const stale: string[] = [];
+  for (const relative of await driftedFrom("HEAD")) {
+    if (differsFromRunCommit.has(relative)) continue;
+    const stat = await fs.lstat(path.join(input.localDir, relative)).catch(() => null);
+    if (stat?.isFile()) stale.push(relative);
+  }
+  for (let offset = 0; offset < stale.length; offset += 200) {
+    await runLocalGit(input.localDir, ["--literal-pathspecs", "checkout", "HEAD", "--", ...stale.slice(offset, offset + 200)], {
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+    });
+  }
+}
+
 async function clearRemoteDirectory(input: {
   spec: SshConnectionConfig;
   remoteDir: string;
@@ -2014,6 +2046,32 @@ export async function syncDirectoryFromSsh(input: {
   }
 }
 
+/**
+ * What `prepareWorkspaceForSshExecution` will send, decided without sending
+ * anything. The caller snapshots the host between planning and sending, so the
+ * sync-back baseline never records a change that lands on the host while the
+ * copy is being seeded.
+ */
+export interface SshWorkspaceSeedPlan {
+  gitBacked: boolean;
+  /** The host's HEAD and deleted paths, read once for both the seed and the baseline. */
+  gitSnapshot: LocalGitWorkspaceSnapshot | null;
+  /** Dependency directory names the host does not track: the seed and the baseline both leave them out. */
+  untrackedDependencyDirNames: string[];
+}
+
+export async function planWorkspaceSeed(input: {
+  localDir: string;
+  workspaceFileMode?: "all";
+}): Promise<SshWorkspaceSeedPlan> {
+  const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
+  return {
+    gitBacked: gitSnapshot !== null,
+    gitSnapshot,
+    untrackedDependencyDirNames: gitSnapshot ? await untrackedSshSyncBackDependencyDirNames(input.localDir) : [],
+  };
+}
+
 export async function prepareWorkspaceForSshExecution(input: {
   spec: SshRemoteExecutionSpec;
   localDir: string;
@@ -2021,9 +2079,12 @@ export async function prepareWorkspaceForSshExecution(input: {
   onProgress?: RuntimeProgressSink;
   workspaceFileMode?: "all";
   workspaceExclude?: string[];
+  /** A plan the caller already made with `planWorkspaceSeed`; made here when absent. */
+  plan?: SshWorkspaceSeedPlan;
 }): Promise<{ gitBacked: boolean }> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
-  const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
+  const plan = input.plan ?? await planWorkspaceSeed(input);
+  const gitSnapshot = plan.gitSnapshot;
 
   if (gitSnapshot) {
     await importGitWorkspaceToSsh({
@@ -2043,7 +2104,7 @@ export async function prepareWorkspaceForSshExecution(input: {
       exclude: [
         ".git",
         ".paperclip-runtime",
-        ...sshSyncBackDependencyExcludes(await untrackedSshSyncBackDependencyDirNames(input.localDir)),
+        ...sshSyncBackDependencyExcludes(plan.untrackedDependencyDirNames),
       ],
       onProgress: input.onProgress,
       progressLabel: "workspace",
@@ -2126,6 +2187,14 @@ export async function restoreWorkspaceFromSshExecution(input: {
               localDir: input.localDir,
               importedHead: headToIntegrate,
             });
+          }
+          : undefined,
+        // The ref moved without the index or the tree. Reset the index to the
+        // integrated HEAD, or a plain `git commit` would delete the run's files.
+        afterApply: headToIntegrate
+          ? async () => {
+            await resetLocalGitIndexToHead({ localDir: input.localDir });
+            await realignTrackedFilesWithHead({ localDir: input.localDir, importedHead: headToIntegrate });
           }
           : undefined,
       });

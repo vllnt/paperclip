@@ -7,6 +7,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const execFileAsync = promisify(execFile);
 
+/** Commits what is staged (or nothing) so the repository has a HEAD, which is what makes a workspace Git-backed. */
+async function commitStaged(root: string): Promise<void> {
+  await execFileAsync("git", [
+    "-C", root, "-c", "user.name=Paperclip Test", "-c", "user.email=test@paperclip.dev", "-c", "commit.gpgsign=false",
+    "commit", "-q", "--allow-empty", "-m", "seed",
+  ]);
+}
+
 const {
   prepareWorkspaceForSshExecution,
   restoreWorkspaceFromSshExecution,
@@ -34,6 +42,7 @@ import { prepareRemoteManagedRuntime, sshRunDirectory } from "./remote-managed-r
 import { sshSyncBackDependencyExcludes } from "./ssh.js";
 import { resolveReferencedSourceIgnore } from "./sandbox-managed-runtime.js";
 import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
+import { captureDirectorySnapshot, type DirectorySnapshot } from "./workspace-restore-merge.js";
 
 describe("remote managed runtime", () => {
   const cleanupDirs: string[] = [];
@@ -85,7 +94,10 @@ describe("remote managed runtime", () => {
       await mkdir(path.dirname(path.join(root, file)), { recursive: true });
       await writeFile(path.join(root, file), file);
     }
-    if (gitBacked) await execFileAsync("git", ["init", "-q", root]);
+    if (gitBacked) {
+      await execFileAsync("git", ["init", "-q", root]);
+      await commitStaged(root);
+    }
     prepareWorkspaceForSshExecution.mockResolvedValueOnce({ gitBacked });
 
     const prepared = await prepareRemoteManagedRuntime({
@@ -106,7 +118,42 @@ describe("remote managed runtime", () => {
     // Build output and vendored code may be tracked, so they still sync back.
     const baselineFiles = [...baselineSnapshot.entries.keys()].filter((entry) => files.includes(entry)).sort();
     expect(baselineFiles).toEqual(["dist/index.js", "src/index.ts", "vendor/lib.go"]);
-  });
+  }, 30_000);
+
+  it("takes the sync-back baseline before the workspace seed sends anything", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-baseline-order-"));
+    cleanupDirs.push(root);
+    await execFileAsync("git", ["init", "-q", root]);
+    await writeFile(path.join(root, "tracked.txt"), "tracked\n");
+    await execFileAsync("git", ["-C", root, "add", "tracked.txt"]);
+    await commitStaged(root);
+    // A change lands on the host while the copy is being seeded.
+    prepareWorkspaceForSshExecution.mockImplementationOnce(async () => {
+      await writeFile(path.join(root, "landed-during-seed.txt"), "scratch\n");
+      await writeFile(path.join(root, "tracked.txt"), "changed during the seed\n");
+      return { gitBacked: true };
+    });
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/app", remoteCwd: "/app",
+        privateKey: "PRIVATE KEY", knownHosts: "KNOWN HOSTS", strictHostKeyChecking: true },
+      runId: "baseline-order", adapterKey: "test", workspaceLocalDir: root,
+    });
+    await prepared.restoreWorkspace();
+
+    // The baseline records the host before the seed, so the restore never mistakes
+    // a change that landed meanwhile for an edit the run made.
+    const [{ baselineSnapshot }] = vi.mocked(restoreWorkspaceFromSshExecution).mock.calls[0] as unknown as [
+      { baselineSnapshot: DirectorySnapshot },
+    ];
+    const afterSeed = await captureDirectorySnapshot(root, { exclude: [".git", ".git/*"] });
+    expect(baselineSnapshot.entries.has("landed-during-seed.txt")).toBe(false);
+    expect(afterSeed.entries.has("landed-during-seed.txt")).toBe(true);
+    expect(baselineSnapshot.entries.get("tracked.txt")).not.toEqual(afterSeed.entries.get("tracked.txt"));
+    expect(prepareWorkspaceForSshExecution).toHaveBeenCalledWith(expect.objectContaining({
+      plan: expect.objectContaining({ gitBacked: true }),
+    }));
+  }, 30_000);
 
   it("keeps syncing a dependency name that the Git workspace tracks", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-tracked-deps-"));
@@ -117,6 +164,7 @@ describe("remote managed runtime", () => {
     await writeFile(path.join(root, "action", "node_modules", "dep", "index.js"), "committed");
     await writeFile(path.join(root, ".cache", "untracked.bin"), "regenerated");
     await execFileAsync("git", ["-C", root, "add", "action/node_modules/dep/index.js"]);
+    await commitStaged(root);
     prepareWorkspaceForSshExecution.mockResolvedValueOnce({ gitBacked: true });
 
     const prepared = await prepareRemoteManagedRuntime({
@@ -135,8 +183,7 @@ describe("remote managed runtime", () => {
     ]);
     expect(baselineSnapshot.entries.has("action/node_modules/dep/index.js")).toBe(true);
     expect(baselineSnapshot.entries.has(".cache/untracked.bin")).toBe(false);
-  });
-
+  }, 30_000);
 
   afterEach(async () => {
     vi.clearAllMocks();
