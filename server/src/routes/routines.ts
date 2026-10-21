@@ -28,8 +28,7 @@ import {
   routineService,
 } from "../services/index.js";
 import { agentTrustService } from "../services/agent-trust.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
-import { routineStepWarnings } from "../services/routine-steps.js";
+import { assertActorMayAssignSteps, routineStepWarnings } from "../services/routine-steps.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, notFound, unauthorized, unsupportedMediaType } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -309,18 +308,13 @@ export function routineRoutes(
       const decision = await decideOnTask(req, "issue:mutate", task, decider);
       if (!decision.allowed) throw forbidden("This agent may not change the task", { issueId: task.id });
     }
-    const defaultAgentId = runAssigneeAgentId ?? routine.assigneeAgentId;
-    const stepAgentIds = new Set((routine.steps ?? []).map((step) => step.assigneeAgentId ?? defaultAgentId));
-    for (const assigneeAgentId of stepAgentIds) {
-      const scope = { projectId: task.projectId, parentIssueId: task.id, assigneeAgentId, assigneeUserId: null };
-      const assign = await decider.decide({
-        actor: req.actor,
-        action: "tasks:assign",
-        resource: { type: "issue", companyId: task.companyId, issueId: null, ...scope },
-        scope,
-      });
-      if (!assign.allowed) throw forbidden(assign.explanation, authorizationDeniedDetails(assign));
-    }
+    await assertActorMayAssignSteps({
+      authorization: decider,
+      actor: req.actor,
+      task,
+      steps: routine.steps ?? [],
+      defaultAssigneeAgentId: runAssigneeAgentId ?? routine.assigneeAgentId,
+    });
   }
 
   async function logRoutineRevisionCreated(req: Request, input: {

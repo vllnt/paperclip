@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createBuildRunOutputSilence,
   createFoldSourceResolvedRun,
@@ -6,7 +6,7 @@ import {
   createScanSilentActiveRuns,
 } from "./use-cases.js";
 import type { RunProcessController, WatchdogRunReader, WatchdogWriter } from "./ports.js";
-import type { RunSnapshot } from "./types.js";
+import type { FoldOutcome, RunSnapshot } from "./types.js";
 
 describe("application", () => {
   const SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
@@ -201,6 +201,73 @@ describe("application", () => {
       });
 
       expect(outcome).toEqual({ kind: "stale" });
+    });
+
+    describe("onRunFolded", () => {
+      const foldInput = () => ({
+        run: makeRun({ processPid: 4242 }),
+        runningAgentAdapterType: "codex_local",
+        sourceIssue: foldSourceIssue,
+        evidence: foldEvidence,
+        existingEvaluation: null,
+        silenceStartedAt: null,
+        silenceAgeMs: null,
+        now: new Date("2026-01-01T05:00:00.000Z"),
+      });
+      const processController: RunProcessController = {
+        cleanupRunProcess: async () => ({
+          attempted: true,
+          outcome: "terminated",
+          adapterType: "codex_local",
+          pid: 4242,
+          processGroupId: null,
+        }),
+      };
+      const writerFor = (outcome: FoldOutcome): WatchdogWriter => ({
+        recordDecision: async () => {
+          throw new Error("not used in this test");
+        },
+        foldSourceResolvedRun: async () => outcome,
+      });
+
+      it("runs after a fold settled the run, with that run", async () => {
+        const onRunFolded = vi.fn(async () => undefined);
+        const foldSourceResolvedRun = createFoldSourceResolvedRun({
+          writer: writerFor({ kind: "folded", evaluationIssueId: null }),
+          processController,
+          onRunFolded,
+        });
+
+        await foldSourceResolvedRun(foldInput());
+
+        expect(onRunFolded).toHaveBeenCalledTimes(1);
+        expect(onRunFolded).toHaveBeenCalledWith(expect.objectContaining({ id: "run-1" }));
+      });
+
+      it("does not run when the compare-and-set found the run already settled", async () => {
+        const onRunFolded = vi.fn(async () => undefined);
+        const foldSourceResolvedRun = createFoldSourceResolvedRun({
+          writer: writerFor({ kind: "stale" }),
+          processController,
+          onRunFolded,
+        });
+
+        await foldSourceResolvedRun(foldInput());
+
+        expect(onRunFolded).not.toHaveBeenCalled();
+      });
+
+      it("never undoes the fold when it fails", async () => {
+        const foldSourceResolvedRun = createFoldSourceResolvedRun({
+          writer: writerFor({ kind: "folded", evaluationIssueId: "eval-1" }),
+          processController,
+          onRunFolded: async () => {
+            throw new Error("log unreadable");
+          },
+        });
+
+        await expect(foldSourceResolvedRun(foldInput())).resolves.toEqual({ kind: "folded", evaluationIssueId: "eval-1" });
+      });
     });
   });
 
