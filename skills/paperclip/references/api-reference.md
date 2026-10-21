@@ -1493,7 +1493,7 @@ Terminal states: `done`, `cancelled`
 | PATCH  | `/api/routine-triggers/:triggerId` | Update trigger (e.g. disable, change cron) |
 | DELETE | `/api/routine-triggers/:triggerId` | Delete trigger |
 | POST   | `/api/routine-triggers/:triggerId/rotate-secret` | Rotate webhook signing secret (previous secret immediately invalidated) |
-| POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies). `targetIssueId` (UUID) starts the routine's steps on that existing task: `202` with the run and `warnings`; `404` task not in the company, `409` task busy (status not backlog/todo/blocked, live run, open steps), `422` no steps or task refused. CLI `routine run <id> --target-issue <uuid-or-identifier>` |
+| POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies). `targetIssueId` (UUID) starts the routine's steps on that existing task: `202` with the run and `warnings`; `404` task not in the company, `409` task busy (status not backlog/todo/blocked, live run, open steps) or the routine was edited while the run started (send it again), `422` no steps or task refused. CLI `routine run <id> --target-issue <uuid-or-identifier>` |
 | POST   | `/api/routine-triggers/public/:publicId/fire` | Fire webhook trigger from external system |
 | GET    | `/api/routines/:routineId/runs` | Run history (default 50) |
 | GET    | `/api/routines/:routineId/event-groups` | Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`) |
