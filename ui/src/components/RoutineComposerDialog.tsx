@@ -190,7 +190,7 @@ export function RoutineComposerDialog({
     queryFn: () => agentsApi.list(companyId),
     enabled: open,
   });
-  const { data: projects } = useQuery({
+  const { data: projects, isFetching: projectsFetching } = useQuery({
     queryKey: queryKeys.projects.list(companyId, { includeArchived: true }),
     queryFn: () => projectsApi.list(companyId, { includeArchived: true }),
     enabled: open,
@@ -304,6 +304,16 @@ export function RoutineComposerDialog({
       })),
     [goals, savedGoalId],
   );
+  // A seeded project the picker does not offer (an archived one, from an out-of-date link) would stay in
+  // the draft with no label. The check waits for a fresh list so a cached one cannot drop a new project.
+  useEffect(() => {
+    if (!open || routine || !projects || projectsFetching) return;
+    setDraft((current) =>
+      current.projectId && !projectOptions.some((option) => option.id === current.projectId)
+        ? { ...current, projectId: "" }
+        : current,
+    );
+  }, [open, routine, projects, projectsFetching, projectOptions]);
   const agentById = useMemo(() => new Map((agents ?? []).map((agent) => [agent.id, agent])), [agents]);
   const projectById = useMemo(() => new Map((projects ?? []).map((project) => [project.id, project])), [projects]);
   const currentAssignee = draft.assigneeAgentId ? agentById.get(draft.assigneeAgentId) ?? null : null;
