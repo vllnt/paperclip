@@ -171,7 +171,7 @@ export function createHttpLogger(baseLogger: Logger) {
         if (
           isRuntimeGitHubHttpRequest(req.method, requestClassificationUrl(req)) ||
           isBrowserSignInInputHttpRequest(requestClassificationUrl(req)) ||
-          false
+          isCompanyEvalHttpRequest(requestClassificationUrl(req))
         ) {
           // Command arguments (message bodies), git objects, sign-in
           // keystrokes (passwords, one-time codes) and eval inputs stay out of logs.
