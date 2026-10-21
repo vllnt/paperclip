@@ -51,7 +51,7 @@ Result: no migration in any slice. `issues.goal_id` and `routines.goal_id` have 
 - **Skill.** `references/routines.md`: `projectId` is optional, and how to list and create a project's routines.
 - **Tests.** Component tests for the dialog in both modes and for the project section; a CLI test for the flag; the project routines e2e test extended to create and edit in place.
 
-## Slice 2: goal links and goal pages (in review, #351)
+## Slice 2: goal links and goal pages (#351)
 
 - **Shared.** `goalId` on the routine list query; `goalAgentLinks`, which derives a goal's agents from its owner, open tasks and routines.
 - **Server.** `?goalId=` on the task and routine lists (a task list `goalId` that is not a UUID answers `422`). No links endpoint (see Schema decisions).
