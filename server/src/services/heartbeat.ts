@@ -8816,7 +8816,7 @@ export async function buildPaperclipWakePayload(input: {
           status: issueSummary.status,
           priority: issueSummary.priority,
           workMode: issueSummary.workMode,
-          goal: issueGoal,
+          ...(issueGoal ? { goal: issueGoal } : {}),
         }
       : null,
     agentMessage: agentMessageText

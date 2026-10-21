@@ -554,8 +554,11 @@ type PaperclipWakeIssue = {
   status: string | null;
   workMode: string | null;
   priority: string | null;
-  /** The task's own goal; an agent reads the rest of it with `GET /api/goals/:id`. */
-  goal: PaperclipWakeIssueGoal | null;
+  /**
+   * The task's own goal; an agent reads the rest of it with `GET /api/goals/:id`. Absent when the task
+   * has no goal, so the serialized payload of such a wake does not change.
+   */
+  goal?: PaperclipWakeIssueGoal;
 };
 
 type PaperclipWakeIssueGoal = {
@@ -942,6 +945,7 @@ function normalizePaperclipWakeIssue(
   const workMode = asString(issue.workMode, "").trim() || null;
   const priority = asString(issue.priority, "").trim() || null;
   if (!id && !identifier && !title) return null;
+  const goal = normalizePaperclipWakeIssueGoal(issue.goal);
   return {
     id,
     identifier,
@@ -951,13 +955,14 @@ function normalizePaperclipWakeIssue(
     status,
     workMode,
     priority,
-    goal: normalizePaperclipWakeIssueGoal(issue.goal),
+    ...(goal ? { goal } : {}),
   };
 }
 
 /**
  * The task's goal as the wake text shows it. The title is user input on one prompt line, so control
- * characters and line breaks become spaces, and it is cut like every goal text an agent reads.
+ * characters and line breaks become spaces, and it is cut like every goal text an agent reads. The id
+ * must be a plain id, so it cannot carry text onto the line either.
  */
 function normalizePaperclipWakeIssueGoal(value: unknown): PaperclipWakeIssueGoal | null {
   const goal = parseObject(value);
@@ -966,7 +971,7 @@ function normalizePaperclipWakeIssueGoal(value: unknown): PaperclipWakeIssueGoal
     asString(goal.title, "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim(),
     GOAL_TEXT_MAX_LENGTH,
   );
-  return id && title ? { id, title } : null;
+  return /^[A-Za-z0-9_-]+$/.test(id) && title ? { id, title } : null;
 }
 
 function normalizePaperclipWakeComment(
