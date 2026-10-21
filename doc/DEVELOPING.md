@@ -1656,6 +1656,25 @@ credentials, query strings, fragments, and wildcards are ignored. Matching is
 by exact normalized origin, so allowing one port does not allow another.
 Link-local destinations remain denied even when explicitly listed.
 
+## GitHub Enterprise on a Private Network
+
+Skill and company-package imports fetch from github.com directly. Any other host
+(a GitHub Enterprise Server, or a pasted URL) goes through the same DNS-pinning
+guard as HTTP adapters: loopback, RFC1918/private, and link-local or
+cloud-metadata destinations are refused. Redirects are followed up to five hops
+and every hop passes the guard again; credentials are dropped when a redirect
+changes origin.
+
+Server owners can opt a GitHub Enterprise Server on a private network in with a
+comma-separated list of exact origins:
+
+```sh
+PAPERCLIP_GITHUB_PRIVATE_ORIGINS=https://ghe.internal.example
+```
+
+Matching is by exact normalized origin. Link-local destinations remain denied
+even when explicitly listed.
+
 ## Company Deletion Toggle
 
 Company deletion is intended as a dev/debug capability and can be disabled at runtime:
