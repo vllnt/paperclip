@@ -108,6 +108,25 @@ export function BreadcrumbBar({ taskDetailLayout = false }: { taskDetailLayout?:
     </Button>
   );
 
+  // The desktop task header always shows the properties control. On mobile the
+  // page registers a control only when it owns a side-panel sheet to open.
+  const panelToggle =
+    taskDetailLayout || (isMobile && breadcrumbPanelControl) ? (
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        className={cn(
+          "size-9 shrink-0 text-muted-foreground",
+          isMobile ? "ml-2" : "ml-5",
+        )}
+        onClick={toggleTaskPanel}
+        aria-label={taskPanelOpen ? "Hide properties" : "Show properties"}
+        title={taskPanelOpen ? "Hide properties" : "Show properties"}
+      >
+        {taskPanelOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
+      </Button>
+    ) : null;
+
   const currentCrumb = breadcrumbs[breadcrumbs.length - 1];
   if (isMobile && breadcrumbs[0]?.label === "Tasks" && currentCrumb.identifier) {
     return (
@@ -121,6 +140,7 @@ export function BreadcrumbBar({ taskDetailLayout = false }: { taskDetailLayout?:
           <CrumbIdentifier identifier={currentCrumb.identifier} />
         </h1>
         {globalToolbarSlots}
+        {panelToggle}
       </div>
     );
   }
@@ -225,18 +245,7 @@ export function BreadcrumbBar({ taskDetailLayout = false }: { taskDetailLayout?:
       {menuButton}
       {breadcrumbTrail}
       {globalToolbarSlots}
-      {taskDetailLayout ? (
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          className="ml-5 size-9 shrink-0 text-muted-foreground"
-          onClick={toggleTaskPanel}
-          aria-label={taskPanelOpen ? "Hide properties" : "Show properties"}
-          title={taskPanelOpen ? "Hide properties" : "Show properties"}
-        >
-          {taskPanelOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
-        </Button>
-      ) : null}
+      {panelToggle}
     </div>
   );
 }

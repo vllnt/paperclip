@@ -4359,6 +4359,49 @@ describe("IssueDetail", () => {
     expect(mockClosePanel).toHaveBeenCalled();
   });
 
+  it("opens and closes the mobile side-panel sheet from the registered header control", async () => {
+    mockSidebarState.isMobile = true;
+    mockSetBreadcrumbPanelControl.mockClear();
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    const panelControl = () =>
+      [...mockSetBreadcrumbPanelControl.mock.calls]
+        .reverse()
+        .map(([control]) => control)
+        .find((control) => control !== null) as {
+        open: boolean;
+        onToggle: () => void;
+      };
+    const sheet = () =>
+      document.querySelector('[data-testid="mobile-task-side-panel"]');
+
+    expect(panelControl()).toMatchObject({ open: false });
+    expect(sheet()).toBeNull();
+
+    await act(async () => {
+      panelControl().onToggle();
+    });
+    await waitForAssertion(() => expect(sheet()).not.toBeNull());
+    expect(panelControl().open).toBe(true);
+    // The sheet is local state: the persisted desktop preference stays untouched.
+    expect(mockSetPanelVisible).not.toHaveBeenCalled();
+
+    await act(async () => {
+      panelControl().onToggle();
+    });
+    await waitForAssertion(() => expect(sheet()).toBeNull());
+    expect(panelControl().open).toBe(false);
+  });
+
   it("starts a planning-mode task as chat-only until its plan document exists", async () => {
     mockSetBreadcrumbToolbar.mockClear();
     mockSetBreadcrumbPanelControl.mockClear();
