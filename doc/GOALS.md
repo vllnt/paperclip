@@ -66,6 +66,8 @@ Goals written before this limit can be longer, so agents get them cut to 280 cha
 grapheme boundary (an emoji or an accented letter is never split), ending with "…":
 
 - in the company focus and the task's own `goal` block in the heartbeat context;
+- in the task's goal line of the wake text (`- issue goal: <title> (goal id <id>)`), which shows
+  only when the task has a goal;
 - from `GET /api/companies/{id}/goals`, `GET /api/goals/{id}` and every goal title in
   `GET /api/issues/{id}`, which the agent tools call. Board users get the stored text.
 
@@ -106,7 +108,7 @@ shows the current focus at the top.
 |---|---|
 | REST | `GET/POST /api/companies/{id}/goals`, `PATCH/DELETE /api/goals/{id}`, `GET /api/companies/{id}/goals/focus`, `GET /api/companies/{id}/goals/progress` |
 | CLI | `goal create/update --kind --horizon --target-date --success-criteria` (board only), `goal focus` |
-| Agents | `companyFocus` in the heartbeat context, focus-first inbox |
+| Agents | `companyFocus` in the heartbeat context, focus-first inbox, the task's goal line in the wake text; remote runs read the focus and progress through the sandbox callback bridge, which passes no goal writes |
 | Web | Current focus panel and planning details on the Goals page, planning fields in goal properties and the New Goal dialog |
 
 ## Not yet

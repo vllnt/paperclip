@@ -330,6 +330,12 @@ export const queryKeys = {
     labels: (companyId: string) => ["issues", companyId, "labels"] as const,
     listByProject: (companyId: string, projectId: string) =>
       ["issues", companyId, "project", projectId] as const,
+    /** The open tasks of a project, every page. */
+    listOpenByProject: (companyId: string, projectId: string) =>
+      ["issues", companyId, "project", projectId, "open"] as const,
+    /** The open tasks whose own goal is this one. */
+    listOpenByGoal: (companyId: string, goalId: string) =>
+      ["issues", companyId, "goal", goalId, "open"] as const,
     listPluginOperationsByProject: (
       companyId: string,
       projectId: string,
@@ -443,7 +449,7 @@ export const queryKeys = {
   routines: {
     /** The prefix of every routine list of a company, whatever its project or filters. */
     all: (companyId: string) => ["routines", companyId] as const,
-    list: (companyId: string, filters?: { projectId?: string | null; q?: string | null; assigneeAgentId?: string | null; folderId?: string | null; status?: string | null; trigger?: string | null }) => {
+    list: (companyId: string, filters?: { projectId?: string | null; q?: string | null; assigneeAgentId?: string | null; folderId?: string | null; status?: string | null; trigger?: string | null; goalId?: string | null }) => {
       const { projectId, ...rest } = filters ?? {};
       const narrowing = Object.fromEntries(Object.entries(rest).filter(([, value]) => value));
       return Object.keys(narrowing).length > 0
@@ -580,6 +586,13 @@ export const queryKeys = {
     /** Under the list key, so invalidating the list refreshes focus and progress too. */
     focus: (companyId: string) => ["goals", companyId, "focus"] as const,
     progress: (companyId: string) => ["goals", companyId, "progress"] as const,
+  },
+  /** Every policy key sits under `["policies", companyId]`, so one invalidation refreshes lists, details and history. */
+  policies: {
+    all: (companyId: string) => ["policies", companyId] as const,
+    list: (companyId: string, filters: { projectId?: string } = {}) =>
+      ["policies", companyId, "list", filters.projectId ?? "all"] as const,
+    revisions: (companyId: string, key: string) => ["policies", companyId, "revisions", key] as const,
   },
   artifacts: {
     list: (
