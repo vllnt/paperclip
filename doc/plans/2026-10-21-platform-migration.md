@@ -415,7 +415,7 @@ These hold only because every table that one invariant touches moves in the **sa
 ### 6.8 The company archive
 
 - The company archive is a company-directed export of the company's own run history: runs, run events, transcripts, costs and activity. Every record passes the read-time redaction module (`AGENTS.md:126-130`; `server/src/services/run-read-redaction.ts`).
-- The core wave moves every source it reads. The archive keeps reading through the module ports, and every record still passes the same redaction module.
+- The core wave moves every source it reads. The archive services are not modules today (`server/src/modules/` has three), so the core wave moves them to module ports first, on Postgres. After that they read through the ports, and every record still passes the same redaction module.
 - Every core-wave slice that changes an archive source gets the privacy review that `AGENTS.md:137` asks for, and updates `doc/company-archive.md` if the meaning of a record changes.
 - The core wave's Verify gate includes a golden comparison of an archive export for the test company, taken from both stores.
 
@@ -472,6 +472,7 @@ These hold only because every table that one invariant touches moves in the **sa
 - **Capture during Shadow.** A temporary trigger on each table of the domain writes the changed row as JSON into one capture table. Deletes are captured as tombstones. TRUNCATE is refused on captured tables.
   - For one row, row locks make the capture order equal to the commit order. Across rows, a transaction can commit after a later sequence number, so the drain worker **deletes each capture row when it applies it** and never advances a high-water mark.
   - A Node worker applies the changes to Convex by `uuid`, through an idempotent upsert that keeps the newest change of each row.
+  - The drain worker and the backfill write through one **capture-apply mutation**, the only exception to the lint rule of the db-writer wrapper (below). It accepts a write only while the company's state for the domain is `postgres` or `fenced`, only from the service issuer with a capture-apply claim, and it writes no outbox entry, so a captured change never goes back to Postgres. C1.4 tests each of these rules.
   - Why triggers, although new tables must not use them: the server has about 1,600 lines of raw SQL and 634 transactions, and some CLI commands write the database directly (section 6.2). Capture inside the application would miss write paths. The triggers are migration tooling: they pass the migration safety checks of `doc/DATABASE.md:215-226` or the slice stops, and they are dropped in R1.
   - Logical replication would avoid triggers, but it needs `wal_level=logical` on the database service, which is a deploy change (U7).
 - **Backfill, in this order:**
@@ -487,7 +488,7 @@ These hold only because every table that one invariant touches moves in the **sa
   - The Node tier subscribes to the outbox. For each document, in order, it writes the row back to Postgres, sends the plugin event and the live event that `logActivity` sends today, and deletes the outbox document.
   - A row that the mirror cannot apply (a foreign key or a unique violation) is a poison row. It raises an alert, blocks the domain's R1 and R2, and is fixed by hand.
   - So Postgres tables of domains not yet moved keep their joins and foreign keys, search and reports can keep reading Postgres, the activity feed stays complete, and a rollback finds Postgres current.
-- **No loop.** The mirror writes with a session setting that the capture triggers check, so a mirrored row is never captured again. A test proves it in C1.4.
+- **No loop.** The mirror writes with a session setting that the capture triggers check. A trigger skips a mirror-session write **only on a table whose state for that company is `convex`**, which the mirror owns, so a mirrored row is never captured again. On every other table a mirror-session write is captured as usual: for example, a mirrored parent delete that cascades into a child table still on Postgres (section 7.4a rule 3.3). C1.4 tests both cases: a mirrored row is not captured again, and the cascade reaches Convex as a tombstone.
 - **Write guard from the fence on.** A trigger on each table of a domain in flight reads the persisted route state (section 7.6) and rejects a write to a company's rows while that state is `fenced` or `convex`, unless the session is the mirror. It is installed with capture in Shadow and is active from step 0 of the flip. A writer that the router does not see (a CLI command, a forgotten loop) fails loudly instead of writing to a store that nobody reads, and it cannot slip a write between the drain and the switch.
 - **Read-your-writes.** The mirror lags by seconds. Code on Postgres that must read a migrated domain's fresh state reads it from Convex through the port, not from the mirror. Where a Postgres row will reference a fresh Convex row by foreign key, the mirror barrier of section 7.4a rule 3 applies. The mirror serves joins, foreign keys, search, reports and plugins.
 
@@ -507,7 +508,7 @@ These hold only because every table that one invariant touches moves in the **sa
 - **Rule 3: every foreign key between two waves has a named strategy.** G1 fails if one has none. The three strategies:
   1. **Same wave** (the default). It is required when the child's key blocks the parent's delete (`onDelete` NO ACTION or RESTRICT). For example, `issues.project_id`, `issues.goal_id` (`packages/db/src/schema/issues.ts:37, 39`), `cost_events.project_id` (`cost_events.ts:16`) and `projects.goal_id` (`projects.ts:12`) put projects and goals in the core wave.
   2. **Child first.** The child flips before its parent. The child's Postgres mirror table drops that foreign key at the flip, and the parent's delete path applies the `onDelete` action to the Convex child through the port, as a saga. Convex checks that the parent exists through the port when it writes the child. Example: documents, which reference agents with SET NULL (`packages/db/src/schema/documents.ts:16-21`).
-  3. **Parent first, with a mirror barrier.** The parent flips before its Postgres children. This is allowed only when every child key is `onDelete` CASCADE or SET NULL, so a mirrored delete cannot fail. A façade write of the parent answers only after the mirror has applied its outbox entry, so a Postgres child created right after it finds its parent. Examples: documents (every child key cascades or sets null, for example `packages/db/src/schema/issue_documents.ts:12`) and labels (`issue_labels.ts:10`).
+  3. **Parent first, with a mirror barrier.** The parent flips before its Postgres children. This is allowed only when every child key is `onDelete` CASCADE or SET NULL, so a mirrored delete cannot fail. A façade write of the parent answers only after the mirror has applied its outbox entry, so a Postgres child created right after it finds its parent. The cascade that a mirrored delete causes in a Postgres child is captured like any other write ("No loop", section 7.4). The parent's delete mutation reads the child domain's route document: it cascades in Convex when the child is `convex`, and it refuses and retries later while the child is `fenced`. Examples: documents (every child key cascades or sets null, for example `packages/db/src/schema/issue_documents.ts:12`) and labels (`issue_labels.ts:10`).
 - **Company removal** (`server/src/services/companies.ts:629-640`) deletes every owned table in one transaction today, so the write guard would reject it once a domain has flipped. For a company with flipped domains it first runs a paginated Convex deletion of those domains and waits until the mirror has applied every tombstone to Postgres. Only then does it run today's transaction, which skips the flipped tables. A removed company leaves no rows in either store.
 - **Instance-wide tables** (no `companyId`) flip once for the whole instance, after every company's flip of the same domain.
 
@@ -525,7 +526,7 @@ These hold only because every table that one invariant touches moves in the **sa
   - A writer that meets `fenced` waits and retries. A REST write answers 503 with `Retry-After` if the fence lasts more than a few seconds. The CLI and the skill retry such answers (slice C1.8) before any live company flips.
 - The test company flips first. The live companies flip only after the test company has run for at least 48 hours with the gates of section 8.7 green, and only on the maintainers' go.
 - The flip of one company:
-  0. **fence:** set the state to `fenced`. The write guard now rejects every write except the mirror's. Wait until every Postgres transaction that started before the fence has ended;
+  0. **fence:** set the state to `fenced`. The write guard now rejects every write except the mirror's. Wait until every Postgres transaction that started before the fence has ended, and until the mirror outbox of every parent domain (section 7.4a rule 3.3) is empty for that company, so that no cascade from a mirrored delete arrives after step 1;
   1. drain capture to zero for that company;
   2. check that the diff is zero;
   3. set the state to `convex`: the guard keeps rejecting Postgres writes, and the wrapper starts to accept Convex writes;
@@ -612,7 +613,7 @@ C0 runs on a throwaway branch and is never merged. Its report becomes one docs p
 | C1.1 | `packages/backend` (schema skeleton, `auth.config.ts`, components config), `packages/client` (hook entry, the rule "pages import only this package" as a lint rule), the response serializers moved to `packages/shared` | M | Health shows the merge commit; a sample of REST answers is byte-equal before and after for the test company |
 | C1.2 | Node tier: JWT signing, JWKS, key rotation, the user token endpoint with its CSRF checks (with OpenAPI and a CLI command for parity), the service token | M | For the test company: the token endpoint answers for a signed-in user; it refuses a cross-origin request, a missing session and an agent key; the JWKS answers; a user token that calls a service function is rejected, and so is a service token on a browser query |
 | C1.3 | Node tier: the Convex client module, the store router with its persisted state (the Postgres route table and the Convex route document), the fence, the idempotency keys | M | The router reports every company on `postgres`; no behavior change |
-| C1.4 | Capture and mirror tooling: capture table and trigger generator, drain worker, backfill runner, db-writer wrapper, write guard, loop test | M | None at run time: the tooling is not armed for any table |
+| C1.4 | Capture and mirror tooling: capture table and trigger generator, drain worker, backfill runner, the capture-apply mutation, db-writer wrapper, write guard. Tests: no loop; a mirrored parent delete whose cascade reaches Convex as a tombstone; each capture-apply rule; the wrapper's refusal outside `convex` | M | None at run time: the tooling is not armed for any table |
 | C1.5 | The diff checker and the golden suite runner | M | The golden suite passes against production for the test company on the Postgres path |
 | C1.6 | Dev and CI: a local backend in `pnpm dev` and in the integration tests, `convex-test`, the CI job | M | none (dev and CI) |
 | C1.7 | Deploy: the backend service with its usage beacon off (`DISABLE_BEACON=true`), an ingress that exposes only the backend's API port, and nightly exports. A deploy-file change goes to the deploy operator as a decision (U7). This slice stops until that decision | S plus the operator's change | The backend's health answers through the ingress; the dashboard port does not; the first nightly export exists |
@@ -646,6 +647,7 @@ Each domain ships as a module refactor (when it is not a module yet), then S, V,
   - agents, runtime state, task sessions, wakeup requests, config revisions, API keys;
   - budgets, budget incidents, cost and finance events;
   - projects, project workspaces and goals (the budget stop pauses projects; issues and cost events reference projects and goals);
+  - execution workspaces, workspace operations, workspace runtime services and execution workspace runtime leases, which run start writes and which reference projects and project workspaces (`packages/db/src/schema/execution_workspaces.ts:20-21`);
   - approvals; routines, which create issues;
   - the company row and its counter document;
   - memberships, invites, join requests and grants, which the actor checks read on every request;
@@ -704,9 +706,9 @@ Waves 3a to 3c can run in parallel across seats 2 and 3, because each domain has
 | 2 (C1) | 11 to 15 | 3 to 4 weeks |
 | 3 (about 13 peripheral domains × refactor, S, V, F, UI, R1) | 80 to 120 | 6 to 10 weeks, with the 48-hour gates overlapping |
 | 4 (heartbeat carve-up) | 40 to 80 | 6 to 10 weeks, partly parallel with phase 3 |
-| 5 (core wave, with its rehearsal) | 50 to 80 | 7 to 11 weeks |
+| 5 (core wave, with its rehearsal and the archive's move to module ports) | 55 to 85 | 7 to 11 weeks |
 | 6 (late wave, R2 slices, retirement) | 30 to 50 | 4 to 6 weeks |
-| **Total** | **about 215 to 350** | **about 5 to 9 months**, if the remote lane gives about two thirds of its 3 to 4 merged PRs a day to this program and the Next.js lane and feature work take the rest |
+| **Total** | **about 220 to 355** | **about 5 to 9 months**, if the remote lane gives about two thirds of its 3 to 4 merged PRs a day to this program and the Next.js lane and feature work take the rest |
 
 ## 9. Risks, rollback and kill criteria
 
