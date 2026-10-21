@@ -911,7 +911,11 @@ export function ProjectDetail() {
                   companyId={project.companyId}
                   projectId={project.id}
                   goalRefs={project.goals}
-                  onGoalIdsChange={project.archivedAt ? undefined : (goalIds) => updateProjectField("goals", { goalIds })}
+                  onGoalIdsChange={project.archivedAt ? undefined : async (goalIds) => {
+                    await updateProjectField("goals", { goalIds });
+                    // The next link or unlink must start from the saved goals, so wait until the page shows them.
+                    await queryClient.refetchQueries({ queryKey: queryKeys.projects.detail(routeProjectRef) });
+                  }}
                 />
                 <ProjectRoutinesSection
                   key={project.id}

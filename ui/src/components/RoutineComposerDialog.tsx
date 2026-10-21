@@ -158,7 +158,7 @@ export interface RoutineComposerDialogProps {
 
 /**
  * The routine composer: creates a routine, or edits the work definition of one (title, instructions,
- * default agent, project, folder and delivery policies). The full routine editor keeps triggers,
+ * default agent, project, folder, goal and delivery policies). The full routine editor keeps triggers,
  * steps, variables and secrets.
  */
 export function RoutineComposerDialog({

@@ -99,18 +99,23 @@ export function GoalDetail() {
   });
 
   // Linked work reads the goal's own tasks and routines; sub-goals keep theirs on their own page.
-  const linkedWorkEnabled = !!resolvedCompanyId && !!goalId;
-  const { data: openTasks } = useQuery({
-    queryKey: queryKeys.issues.listOpenByGoal(resolvedCompanyId!, goalId!),
-    queryFn: () => issuesApi.listAll(resolvedCompanyId!, { goalId: goalId!, status: OPEN_ISSUE_STATUSES.join(",") }),
-    enabled: linkedWorkEnabled
+  // It waits for the goal, so it reads from the goal's company and not the selected one.
+  const goalCompanyId = goal?.companyId;
+  const openTasksQuery = useQuery({
+    queryKey: queryKeys.issues.listOpenByGoal(goalCompanyId!, goalId!),
+    queryFn: () => issuesApi.listAll(goalCompanyId!, { goalId: goalId!, status: OPEN_ISSUE_STATUSES.join(",") }),
+    enabled: !!goalCompanyId && !!goalId
   });
 
-  const { data: goalRoutines } = useQuery({
-    queryKey: queryKeys.routines.list(resolvedCompanyId!, { goalId }),
-    queryFn: () => routinesApi.list(resolvedCompanyId!, { goalId }),
-    enabled: linkedWorkEnabled
+  const goalRoutinesQuery = useQuery({
+    queryKey: queryKeys.routines.list(goalCompanyId!, { goalId }),
+    queryFn: () => routinesApi.list(goalCompanyId!, { goalId }),
+    enabled: !!goalCompanyId && !!goalId
   });
+  const openTasks = openTasksQuery.data ?? [];
+  const goalRoutines = (goalRoutinesQuery.data ?? []).filter((routine) => routine.status !== "archived");
+  const linkedWorkError = openTasksQuery.error ?? goalRoutinesQuery.error;
+  const linkedWorkLoading = openTasksQuery.isLoading || goalRoutinesQuery.isLoading;
 
   const { data: agents } = useQuery({
     queryKey: queryKeys.agents.list(resolvedCompanyId!),
@@ -162,8 +167,8 @@ export function GoalDetail() {
   const agentById = new Map((agents ?? []).map((agent) => [agent.id, agent]));
   const linkedAgents = goalAgentLinks({
     ownerAgentId: goal?.ownerAgentId ?? null,
-    tasks: openTasks ?? [],
-    routines: goalRoutines ?? [],
+    tasks: openTasks,
+    routines: goalRoutines,
   });
 
   useEffect(() => {
@@ -236,13 +241,13 @@ export function GoalDetail() {
             Projects ({linkedProjects.length})
           </TabsTrigger>
           <TabsTrigger value="tasks">
-            Open tasks ({openTasks?.length ?? 0})
+            Open tasks{openTasksQuery.data ? ` (${openTasks.length})` : ""}
           </TabsTrigger>
           <TabsTrigger value="routines">
-            Routines ({goalRoutines?.length ?? 0})
+            Routines{goalRoutinesQuery.data ? ` (${goalRoutines.length})` : ""}
           </TabsTrigger>
           <TabsTrigger value="agents">
-            Agents ({linkedAgents.length})
+            Agents{openTasksQuery.data && goalRoutinesQuery.data ? ` (${linkedAgents.length})` : ""}
           </TabsTrigger>
         </TabsList>
 
@@ -283,11 +288,15 @@ export function GoalDetail() {
         </TabsContent>
 
         <TabsContent value="tasks" className="mt-4">
-          {(openTasks ?? []).length === 0 ? (
+          {openTasksQuery.error ? (
+            <p role="alert" className="text-sm text-destructive">Failed to load the goal's open tasks: {openTasksQuery.error.message}</p>
+          ) : openTasksQuery.isLoading ? (
+            <p className="text-sm text-muted-foreground">Loading open tasks...</p>
+          ) : openTasks.length === 0 ? (
             <p className="text-sm text-muted-foreground">No open tasks for this goal.</p>
           ) : (
             <div className="border border-border">
-              {(openTasks ?? []).map((task) => (
+              {openTasks.map((task) => (
                 <EntityRow
                   key={task.id}
                   identifier={task.identifier ?? undefined}
@@ -308,11 +317,15 @@ export function GoalDetail() {
               Routine
             </Button>
           </div>
-          {(goalRoutines ?? []).length === 0 ? (
+          {goalRoutinesQuery.error ? (
+            <p role="alert" className="text-sm text-destructive">Failed to load the goal's routines: {goalRoutinesQuery.error.message}</p>
+          ) : goalRoutinesQuery.isLoading ? (
+            <p className="text-sm text-muted-foreground">Loading routines...</p>
+          ) : goalRoutines.length === 0 ? (
             <p className="text-sm text-muted-foreground">No routines for this goal.</p>
           ) : (
             <div className="border border-border">
-              {(goalRoutines ?? []).map((routine) => (
+              {goalRoutines.map((routine) => (
                 <EntityRow
                   key={routine.id}
                   title={routine.title}
@@ -329,7 +342,11 @@ export function GoalDetail() {
           <p className="text-sm text-muted-foreground">
             The goal's owner, and the agents of its open tasks and routines.
           </p>
-          {linkedAgents.length === 0 ? (
+          {linkedWorkError ? (
+            <p role="alert" className="text-sm text-destructive">Failed to load the goal's agents: {linkedWorkError.message}</p>
+          ) : linkedWorkLoading ? (
+            <p className="text-sm text-muted-foreground">Loading agents...</p>
+          ) : linkedAgents.length === 0 ? (
             <p className="text-sm text-muted-foreground">No agents work on this goal yet.</p>
           ) : (
             <div className="border border-border">

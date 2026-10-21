@@ -183,7 +183,34 @@ describe("ProjectGoalsSection", () => {
     expect(routinesListMock).not.toHaveBeenCalled();
   });
 
-  it("offers to link the goals that are not linked or cancelled", async () => {
+  it("keeps every change disabled until the save, including the page refresh, finishes", async () => {
+    let finishSave: () => void = () => {};
+    const onGoalIdsChange = vi.fn(() => new Promise<void>((resolve) => {
+      finishSave = resolve;
+    }));
+    await render(
+      <ProjectGoalsSection
+        companyId="company-1"
+        projectId="project-1"
+        goalRefs={[{ id: "goal-1", title: "Ship the beta" }, { id: "goal-2", title: "Cut costs" }]}
+        onGoalIdsChange={onGoalIdsChange}
+      />,
+    );
+
+    await act(() => unlinkButton("Ship the beta")!.click());
+    await flush();
+
+    expect(unlinkButton("Ship the beta")!.disabled).toBe(true);
+    expect(unlinkButton("Cut costs")!.disabled).toBe(true);
+
+    await act(() => finishSave());
+    await flush();
+
+    expect(unlinkButton("Cut costs")!.disabled).toBe(false);
+    expect(onGoalIdsChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers the link picker for a project that can change, and reads no work without goals", async () => {
     await render(
       <ProjectGoalsSection companyId="company-1" projectId="project-1" goalRefs={[]} onGoalIdsChange={vi.fn()} />,
     );
