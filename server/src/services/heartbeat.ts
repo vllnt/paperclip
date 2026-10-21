@@ -22194,7 +22194,8 @@ export function heartbeatService(
    * operator, and an operator Stop. An operator Stop never promotes old queued
    * work by itself; the next explicit wake adopts it. Read once for a whole
    * batch: one pause-hold probe per company, one latest-run read for all issues,
-   * and the per-issue blocker read only for the wakes about to be promoted.
+   * and one blocker read per issue in the batch. The sweep passes only the wakes
+   * it has just chosen, so it reads no more than outrank what it promotes.
    */
   async function readDeferredWakeHolds(candidates: readonly OrphanedDeferredWakeRow[]) {
     // An execution blocker carries its cause, so a reader sees which recovery holds the wake.
@@ -22573,20 +22574,31 @@ export function heartbeatService(
 
     // Without them, an issue is served through its oldest wake that can run now.
     const invokableOrphans = runnableOrphans.filter((orphan) => !notInvokableAgentIds.has(orphan.agentId));
-    // Holds are read before choosing, in one read for the batch. A held wake
-    // stays parked and moves to the back of the recheck window without taking
-    // one of its agent's or the pass's promotion slots, so wakes that can run
-    // are not starved behind wakes that cannot.
-    const { holds, blockers } = await readDeferredWakeHolds(invokableOrphans);
-    const promotableOrphans: OrphanedDeferredWakeRow[] = [];
-    for (const orphan of invokableOrphans) {
-      const hold = holds.get(orphan.wakeId);
-      if (!hold) {
-        promotableOrphans.push(orphan);
-        continue;
+    // A wake that cannot run now (a pause hold, an execution blocker, an
+    // operator Stop or a budget hard stop) must not take one of its agent's or
+    // the pass's promotion slots, or the wakes that can run starve behind it.
+    // The pass chooses, reads why the newly chosen wakes cannot run, sets those
+    // aside and chooses again, so it reads only wakes that outrank what it
+    // finally promotes.
+    const maxTotal = sweepPromotionBudget(opts.maxPromotions);
+    // Company, agent and project decide a budget block, so one read serves every
+    // wake that shares them.
+    const budgetBlockByScope = new Map<string, boolean>();
+    const budgetScopeOf = (orphan: OrphanedDeferredWakeRow) =>
+      `${orphan.companyId}:${orphan.agentId}:${orphan.projectId ?? ""}`;
+    type SetAside =
+      | { kind: "hold"; reason: "pause_hold" | "execution_blocker" | "operator_stop"; cause: string | null; blocker: ExecutionBlocker | null }
+      | { kind: "budget" };
+    const setAsideWake = async (orphan: OrphanedDeferredWakeRow, why: SetAside) => {
+      if (opts.agentId) {
+        // A run-completion pass only looks for wakes to start. It leaves a wake
+        // that cannot run untouched and uncounted; the periodic pass reports it.
+        heldReasons.delete(orphan.wakeId);
+        return;
       }
       const counters = countersForCompany(orphan.companyId);
       try {
+        // The wake stays parked and moves to the back of the recheck window.
         const claimed = await wakeQueue.claimDeferredWakeExamination({
           companyId: orphan.companyId,
           wakeId: orphan.wakeId,
@@ -22596,30 +22608,82 @@ export function heartbeatService(
         if (!claimed) {
           // Another pass owns this wake now.
           heldReasons.delete(orphan.wakeId);
-          continue;
+          return;
+        }
+        if (why.kind === "budget") {
+          // A hard stop leaves the receipt parked and untouched: no run row is
+          // created and none is cancelled later. It resumes when the budget does.
+          result.skippedBudget += 1;
+          counters.skippedBudget += 1;
+          heldReasons.set(orphan.wakeId, { reason: "budget_stop", blocker: null });
+          return;
         }
         // Count it by what holds it, so the endpoint says why it was not woken.
         const reasonKey = {
           pause_hold: "skippedPauseHold",
           execution_blocker: "skippedExecutionBlocker",
           operator_stop: "skippedOperatorStop",
-        }[hold.reason] as "skippedPauseHold" | "skippedExecutionBlocker" | "skippedOperatorStop";
+        }[why.reason] as "skippedPauseHold" | "skippedExecutionBlocker" | "skippedOperatorStop";
         for (const tally of [result, counters]) {
           tally.skippedHeld += 1;
           tally[reasonKey] += 1;
-          if (hold.cause) tally.executionBlockerCauses[hold.cause] = (tally.executionBlockerCauses[hold.cause] ?? 0) + 1;
+          if (why.cause) tally.executionBlockerCauses[why.cause] = (tally.executionBlockerCauses[why.cause] ?? 0) + 1;
         }
-        heldReasons.set(orphan.wakeId, { reason: hold.reason, blocker: blockers.get(orphan.wakeId) ?? null });
+        heldReasons.set(orphan.wakeId, { reason: why.reason, blocker: why.blocker });
       } catch (err) {
         result.failed += 1;
         counters.failed += 1;
         heldReasons.delete(orphan.wakeId);
         logger.warn({ err, queueId: orphan.wakeId }, "failed to keep a held orphaned deferred wake parked");
       }
+    };
+
+    let promotableOrphans = invokableOrphans;
+    let selected = selectDeferredWakesToPromote(promotableOrphans, { maxTotal });
+    const readForHold = new Set<string>();
+    for (;;) {
+      const unread = selected.filter((candidate) => !readForHold.has(candidate.wakeId));
+      if (unread.length === 0) break;
+      for (const candidate of unread) readForHold.add(candidate.wakeId);
+      const { holds, blockers } = await readDeferredWakeHolds(unread);
+      // A hold belongs to the issue and a budget block to its scope, so every
+      // other wake on that issue or in that scope cannot run either.
+      const heldIssues = new Map<string, SetAside>();
+      const blockedScopes = new Set<string>();
+      for (const candidate of unread) {
+        const hold = holds.get(candidate.wakeId);
+        if (hold) {
+          heldIssues.set(candidate.issueId, {
+            kind: "hold",
+            reason: hold.reason,
+            cause: hold.cause,
+            blocker: blockers.get(candidate.wakeId) ?? null,
+          });
+          continue;
+        }
+        const scope = budgetScopeOf(candidate);
+        if (!budgetBlockByScope.has(scope)) {
+          budgetBlockByScope.set(
+            scope,
+            Boolean(await budgets.getInvocationBlock(candidate.companyId, candidate.agentId, {
+              issueId: candidate.issueId,
+              projectId: candidate.projectId,
+            })),
+          );
+        }
+        if (budgetBlockByScope.get(scope)) blockedScopes.add(scope);
+      }
+      if (heldIssues.size === 0 && blockedScopes.size === 0) break;
+      const stillPromotable: OrphanedDeferredWakeRow[] = [];
+      for (const orphan of promotableOrphans) {
+        const hold = heldIssues.get(orphan.issueId);
+        if (hold) await setAsideWake(orphan, hold);
+        else if (blockedScopes.has(budgetScopeOf(orphan))) await setAsideWake(orphan, { kind: "budget" });
+        else stillPromotable.push(orphan);
+      }
+      promotableOrphans = stillPromotable;
+      selected = selectDeferredWakesToPromote(promotableOrphans, { maxTotal });
     }
-    const selected = selectDeferredWakesToPromote(promotableOrphans, {
-      maxTotal: sweepPromotionBudget(opts.maxPromotions),
-    });
     // An eligible issue the pass did not select waits for the next pass.
     const eligibleIssuesByCompany = new Map<string, Set<string>>();
     for (const orphan of promotableOrphans) {
@@ -22635,9 +22699,6 @@ export function heartbeatService(
       countersForCompany(companyId).skippedCapacity += left;
       result.skippedCapacity += left;
     }
-    // Company, agent and project decide a budget block, so one read serves every
-    // wake that shares them.
-    const budgetBlockByScope = new Map<string, boolean>();
 
     for (const candidate of selected) {
       const counters = countersForCompany(candidate.companyId);
@@ -22651,24 +22712,6 @@ export function heartbeatService(
         if (!claimed) {
           // Another pass owns this wake now.
           heldReasons.delete(candidate.wakeId);
-          continue;
-        }
-        const budgetScope = `${candidate.companyId}:${candidate.agentId}:${candidate.projectId ?? ""}`;
-        if (!budgetBlockByScope.has(budgetScope)) {
-          budgetBlockByScope.set(
-            budgetScope,
-            Boolean(await budgets.getInvocationBlock(candidate.companyId, candidate.agentId, {
-              issueId: candidate.issueId,
-              projectId: candidate.projectId,
-            })),
-          );
-        }
-        if (budgetBlockByScope.get(budgetScope)) {
-          // A hard stop leaves the receipt parked and untouched: no run row is
-          // created and none is cancelled later. It resumes when the budget does.
-          result.skippedBudget += 1;
-          counters.skippedBudget += 1;
-          heldReasons.set(candidate.wakeId, { reason: "budget_stop", blocker: null });
           continue;
         }
         // Only wakes requested before the promotion started may be folded into
