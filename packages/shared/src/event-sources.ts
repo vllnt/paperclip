@@ -14,6 +14,42 @@ export type EventSourceSigningMode = (typeof EVENT_SOURCE_SIGNING_MODES)[number]
 export const EVENT_SOURCE_NORMALIZERS = ["generic_v1", "gatus"] as const;
 export type EventSourceNormalizer = (typeof EVENT_SOURCE_NORMALIZERS)[number];
 
+/**
+ * Normalizer of the built-in Paperclip event source. Kept out of `EVENT_SOURCE_NORMALIZERS` on purpose:
+ * a user can never create a source with it or switch a source to it.
+ */
+export const PAPERCLIP_INTERNAL_EVENT_NORMALIZER = "paperclip_v1";
+export type PaperclipInternalEventNormalizer = typeof PAPERCLIP_INTERNAL_EVENT_NORMALIZER;
+
+/** `NormalizedEvent.source` of every event Paperclip publishes about itself. */
+export const PAPERCLIP_INTERNAL_EVENT_SOURCE = "paperclip";
+/** The only internal event type so far: a task was created. */
+export const PAPERCLIP_ISSUE_CREATED_EVENT_TYPE = "issue.created";
+/** Name of the built-in source as the board sees it. */
+export const PAPERCLIP_INTERNAL_EVENT_SOURCE_NAME = "Paperclip (built-in)";
+/** Prefix of the event label that carries one label of the created task: `label_<name>` = `true`. */
+export const PAPERCLIP_ISSUE_LABEL_EVENT_PREFIX = "label_";
+/** Most task labels one `issue.created` event carries; the rest of `EVENT_MAX_LABELS` goes to `project` and `created_by`. */
+export const PAPERCLIP_ISSUE_EVENT_MAX_LABELS = 30;
+
+const EVENT_LABEL_KEY_MAX_LENGTH = 64;
+
+/**
+ * The event label key for one label of a task: `label_` plus the label name lowercased, with every
+ * run of characters outside `[a-z0-9_]` turned into one `_` and the edges trimmed of `_`. The key is cut
+ * to 64 characters. A name with nothing left has no key.
+ * @example paperclipIssueLabelEventKey("Needs Review!") // "label_needs_review"
+ */
+export function paperclipIssueLabelEventKey(name: string): string | null {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, EVENT_LABEL_KEY_MAX_LENGTH - PAPERCLIP_ISSUE_LABEL_EVENT_PREFIX.length)
+    .replace(/^_+|_+$/g, "");
+  return slug.length > 0 ? `${PAPERCLIP_ISSUE_LABEL_EVENT_PREFIX}${slug}` : null;
+}
+
 /** Ordered lowest to highest; `minSeverity` compares by index. */
 export const EVENT_SEVERITIES = ["info", "warning", "critical"] as const;
 export type EventSeverity = (typeof EVENT_SEVERITIES)[number];
@@ -310,8 +346,12 @@ export const eventGroupingSchema = z.object({
   repeatCommentCooldownSec: z.number().int().min(0).max(86_400).optional().default(900),
   rewakeOnSeverityIncrease: z.boolean().optional().default(true),
   onRecovery: z.enum(EVENT_ON_RECOVERY_MODES).optional().default("comment_and_wake"),
+  /**
+   * `event_issue` attaches the routine's steps to the task the event is about instead of opening a
+   * group issue. It is valid only on a trigger of the built-in Paperclip source, for a routine with steps.
+   */
   issueMode: z
-    .union([z.literal("group"), z.object({ appendToIssueId: z.string().guid() }).strict()])
+    .union([z.literal("group"), z.literal("event_issue"), z.object({ appendToIssueId: z.string().guid() }).strict()])
     .optional()
     .default("group"),
 }).strict();
@@ -404,12 +444,12 @@ export interface EventSource {
   enabled: boolean;
   archived: boolean;
   publicId: string;
-  /** Absolute ingress URL (`POST`). */
-  ingressUrl: string;
+  /** Absolute ingress URL (`POST`); `null` for the built-in Paperclip source, which has no ingress. */
+  ingressUrl: string | null;
   secretId: string | null;
   signingMode: EventSourceSigningMode;
   replayWindowSec: number;
-  normalizer: EventSourceNormalizer;
+  normalizer: EventSourceNormalizer | PaperclipInternalEventNormalizer;
   normalizerConfig: Record<string, unknown> | null;
   pinnedLabels: Record<string, string>;
   rateLimitPerMinute: number;

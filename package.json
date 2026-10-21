@@ -49,6 +49,7 @@
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:factory-throughput-kpi": "node --test scripts/factory-throughput-kpi.test.mjs scripts/lib/factory-kpi-*.test.mjs",
     "test:ci-scripts": "node --test scripts/ci/*.test.mjs",
+    "test:perf-prober": "node --test tests/perf/backend/prod-readonly.test.mjs",
     "test:install-sh-docker": "./scripts/test-install-sh-docker.sh",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
