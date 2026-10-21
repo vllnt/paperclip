@@ -6,6 +6,12 @@ import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "@paperclipai/adapter-codex-local/server";
 import { buildPaperclipTaskMarkdown } from "../services/heartbeat.js";
 import { AGENT_CHAT_DIRECTIVE } from "../services/agent-conversations.js";
+import {
+  POLICY_INDEX_MAX_ACTIVE_ENTRIES,
+  POLICY_INDEX_MAX_CHARS,
+  capPolicyIndexEntries,
+  type PolicyIndexEntry,
+} from "@paperclipai/shared";
 
 async function writeFakeCodexCommand(commandPath: string): Promise<void> {
   const script = `#!/usr/bin/env node
@@ -1549,6 +1555,99 @@ process.exit(1);
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+  describe("policy index prompt size", () => {
+    // Realistic board text: a 40 character title and a 120 character summary per policy.
+    const policyIndexFor = (count: number) => {
+      const entries: PolicyIndexEntry[] = Array.from({ length: count }, (_, index) => ({
+        state: "active",
+        key: `policy-${String(index).padStart(2, "0")}`,
+        title: `Policy number ${String(index).padStart(2, "0")} for the whole company`,
+        summary: "Follow this rule on every task, and say so in the task comment when you cannot follow it.",
+        scope: "company",
+        via: "scope",
+      }));
+      const capped = capPolicyIndexEntries(entries);
+      return { ...capped, digest: `digest-${count}`, lastSentDigest: null };
+    };
+
+    const runWithPolicies = async (policies: ReturnType<typeof policyIndexFor> | null, sessionId: string | null) => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-policies-"));
+      const workspace = path.join(root, "workspace");
+      const commandPath = path.join(root, "codex");
+      const capturePath = path.join(root, "capture.json");
+      await fs.mkdir(workspace, { recursive: true });
+      await writeFakeCodexCommand(commandPath);
+      const previousHome = process.env.HOME;
+      process.env.HOME = root;
+      await seedSharedCodexAuth(root);
+      let promptMetrics: Record<string, number> = {};
+      try {
+        const result = await execute({
+          runId: "run-policies",
+          agent: { id: "agent-1", companyId: "company-1", name: "Codex Coder", adapterType: "codex_local", adapterConfig: { engine: "cli" } },
+          runtime: { sessionId: null, sessionParams: { sessionId, cwd: workspace }, sessionDisplayId: null, taskKey: null },
+          config: { engine: "cli", command: commandPath, cwd: workspace, env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath } },
+          context: {
+            paperclipTaskMarkdown: "Ship the change.",
+            issueId: "issue-1",
+            taskId: "issue-1",
+            ...(policies ? { paperclipPolicies: policies } : {}),
+          },
+          authToken: "run-jwt-token",
+          onLog: async () => {},
+          onMeta: async (meta) => {
+            promptMetrics = meta.promptMetrics ?? {};
+          },
+        });
+        expect(result.exitCode).toBe(0);
+        const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+        return { prompt: capture.prompt, promptMetrics };
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    };
+
+    it("leaves the prompt byte-identical with no policy", async () => {
+      const without = await runWithPolicies(null, null);
+      const empty = await runWithPolicies(policyIndexFor(0), null);
+      expect(empty.prompt).toBe(without.prompt);
+      expect(empty.promptMetrics.taskContextChars).toBe(without.promptMetrics.taskContextChars);
+      expect(empty.promptMetrics.heartbeatPromptChars).toBe(without.promptMetrics.heartbeatPromptChars);
+      expect(empty.prompt).not.toContain("## Policies");
+    });
+
+    it.each([5, 50])("adds one bounded section for %i active policies", async (count) => {
+      const without = await runWithPolicies(null, null);
+      const withPolicies = await runWithPolicies(policyIndexFor(count), null);
+      const added = withPolicies.promptMetrics.taskContextChars - without.promptMetrics.taskContextChars;
+      expect(withPolicies.prompt.match(/^## Policies$/gm)).toHaveLength(1);
+      expect(withPolicies.prompt).toContain("- `policy-00` (company): Policy number 00 for the whole company.");
+      // The brief is unchanged: the section is added, nothing is replaced.
+      expect(withPolicies.prompt).toContain("Ship the change.");
+      expect(added).toBeGreaterThan(0);
+      // 4000 characters of lines, plus the heading, the intro and the "+N more" line.
+      expect(added).toBeLessThanOrEqual(POLICY_INDEX_MAX_CHARS + 700);
+      if (count > POLICY_INDEX_MAX_ACTIVE_ENTRIES) {
+        expect(withPolicies.prompt).toContain(`+${count - POLICY_INDEX_MAX_ACTIVE_ENTRIES} more active policies`);
+        expect(withPolicies.prompt).not.toContain(`policy-${String(count - 1).padStart(2, "0")}\``);
+      } else {
+        expect(withPolicies.prompt).not.toContain("more active polic");
+      }
+      // The heartbeat prompt does not carry the section a second time.
+      expect(withPolicies.promptMetrics.heartbeatPromptChars).toBe(without.promptMetrics.heartbeatPromptChars);
+    });
+
+    it("sends a resumed session the index only when it changed since the session was last told", async () => {
+      const unchanged = await runWithPolicies({ ...policyIndexFor(5), lastSentDigest: "digest-5" }, "codex-session-1");
+      expect(unchanged.prompt).not.toContain("## Policies");
+      const changed = await runWithPolicies({ ...policyIndexFor(5), lastSentDigest: "an-older-digest" }, "codex-session-1");
+      expect(changed.prompt).toContain("## Policies");
+      expect(changed.prompt).toContain("The policy list changed since your last turn");
+    });
+  });
+
   it("uses a worktree-isolated CODEX_HOME and mounts the operational skill by default", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-"));
     const workspace = path.join(root, "workspace");

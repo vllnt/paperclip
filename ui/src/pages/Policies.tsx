@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { CompanyPolicy } from "@paperclipai/shared";
 import { Plus, ScrollText } from "lucide-react";
+import { useSearchParams } from "@/lib/router";
 import { Button } from "@/components/ui/button";
 import { policiesApi } from "../api/policies";
 import { projectsApi } from "../api/projects";
@@ -40,6 +41,23 @@ export function Policies() {
     [projects],
   );
   const policies = policiesQuery.data ?? [];
+
+  // A `policy://<key>` chip links here as `?key=<key>`: open that policy once, then drop the parameter.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const linkedKey = searchParams.get("key");
+  useEffect(() => {
+    if (!linkedKey || !policiesQuery.data) return;
+    const linked = policiesQuery.data.find((policy) => policy.key === linkedKey.toLowerCase());
+    if (linked) setEditor({ open: true, policy: linked });
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete("key");
+        return next;
+      },
+      { replace: true },
+    );
+  }, [linkedKey, policiesQuery.data, setSearchParams]);
   const archivedCount = policies.filter((policy) => policy.status === "archived").length;
   const visible = showArchived ? policies : policies.filter((policy) => policy.status !== "archived");
   const companyPolicies = visible.filter((policy) => !policy.projectId);

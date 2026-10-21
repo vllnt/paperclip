@@ -595,6 +595,8 @@ export const COMPANY_POLICY_SCOPES = ["company", "project"] as const;
 export type CompanyPolicyScope = (typeof COMPANY_POLICY_SCOPES)[number];
 
 export const COMPANY_POLICY_KEY_MAX_LENGTH = 64;
+/** A policy key is a lowercase slug. The validator and the `policy://` mention parser share this rule. */
+export const COMPANY_POLICY_KEY_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 export const COMPANY_POLICY_TITLE_MAX_LENGTH = 200;
 export const COMPANY_POLICY_SUMMARY_MAX_LENGTH = 280;
 export const COMPANY_POLICY_BODY_MAX_LENGTH = 100_000;

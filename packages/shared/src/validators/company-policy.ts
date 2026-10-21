@@ -3,6 +3,7 @@ import {
   COMPANY_POLICY_BODY_MAX_LENGTH,
   COMPANY_POLICY_CHANGE_SUMMARY_MAX_LENGTH,
   COMPANY_POLICY_KEY_MAX_LENGTH,
+  COMPANY_POLICY_KEY_PATTERN,
   COMPANY_POLICY_SCOPES,
   COMPANY_POLICY_STATUSES,
   COMPANY_POLICY_SUMMARY_MAX_LENGTH,
@@ -14,7 +15,7 @@ export const companyPolicyKeySchema = z
   .trim()
   .min(1)
   .max(COMPANY_POLICY_KEY_MAX_LENGTH)
-  .regex(/^[a-z0-9][a-z0-9-]*$/, "A policy key must be lowercase letters, numbers or -, and start with a letter or number");
+  .regex(COMPANY_POLICY_KEY_PATTERN, "A policy key must be lowercase letters, numbers or -, and start with a letter or number");
 
 const titleSchema = z
   .string()

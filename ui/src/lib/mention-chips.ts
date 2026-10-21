@@ -2,6 +2,7 @@ import type { CSSProperties } from "react";
 import {
   parseAgentMentionHref,
   parseIssueReferenceHref,
+  parsePolicyMentionHref,
   parseProjectMentionHref,
   parseRoutineMentionHref,
   parseSkillMentionHref,
@@ -37,6 +38,10 @@ export type ParsedMentionChip =
   | {
       kind: "routine";
       routineId: string;
+    }
+  | {
+      kind: "policy";
+      policyKey: string;
     };
 
 const iconMaskCache = new Map<string, string>();
@@ -97,6 +102,14 @@ export function parseMentionChipHref(href: string): ParsedMentionChip | null {
     };
   }
 
+  const policy = parsePolicyMentionHref(href);
+  if (policy) {
+    return {
+      kind: "policy",
+      policyKey: policy.key,
+    };
+  }
+
   return null;
 }
 
@@ -149,6 +162,7 @@ export function clearMentionChipDecoration(element: HTMLElement) {
     "paperclip-mention-chip--issue",
     "paperclip-mention-chip--project",
     "paperclip-mention-chip--routine",
+    "paperclip-mention-chip--policy",
     "paperclip-mention-chip--user",
     "paperclip-mention-chip--skill",
     "paperclip-project-mention-chip",

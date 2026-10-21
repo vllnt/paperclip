@@ -38,6 +38,7 @@ import {
 } from "./execute.js";
 import { ACPX_HANDSHAKE_TIMEOUT_MS } from "./constants.js";
 import { sessionCodec } from "./session-codec.js";
+import { POLICY_INDEX_MAX_CHARS, capPolicyIndexEntries, type PolicyIndexEntry } from "@paperclipai/shared";
 import { runChildProcess } from "../server-utils.js";
 import { createPromptContextFixture } from "../test-fixtures/prompt-context.js";
 import { setExpensiveWorkspaceGitExecutor } from "../git-workspace-sync.js";
@@ -799,6 +800,57 @@ describe("shared ACPX engine runtime behavior", () => {
     const ordinary = await runExecutor({ ...config, promptTemplate: "" }, { context: { ...context, conversationMode: false } });
     expect(String(ordinary.meta[0]?.prompt)).not.toContain("Execution contract:");
     expect(String(ordinary.meta[0]?.prompt)).toContain("Create child issues from the approved plan");
+  });
+
+  describe("policy index", () => {
+    const config = { agent: "custom", agentCommand: "node ./fake-acp.js" };
+    const taskContext = { taskId: "issue-1", paperclipTaskMarkdown: "Ship the change." };
+    const policyIndexFor = (count: number, lastSentDigest: string | null = null) => {
+      const entries: PolicyIndexEntry[] = Array.from({ length: count }, (_, index) => ({
+        state: "active",
+        key: `policy-${String(index).padStart(2, "0")}`,
+        title: `Policy number ${String(index).padStart(2, "0")} for the whole company`,
+        summary: "Follow this rule on every task, and say so in the task comment when you cannot follow it.",
+        scope: "company",
+        via: "scope",
+      }));
+      return { ...capPolicyIndexEntries(entries), digest: `digest-${count}`, lastSentDigest };
+    };
+    const metricsOf = (meta: Array<Record<string, unknown>>) => meta[0]?.promptMetrics as Record<string, number>;
+
+    it("leaves the prompt byte-identical with no policy", async () => {
+      const without = await runExecutor(config, { context: taskContext });
+      const empty = await runExecutor(config, { context: { ...taskContext, paperclipPolicies: policyIndexFor(0) } });
+      expect(String(empty.meta[0]?.prompt)).toBe(String(without.meta[0]?.prompt));
+      expect(String(empty.turnInputs[0]?.text)).toBe(String(without.turnInputs[0]?.text));
+      expect(metricsOf(empty.meta).taskContextChars).toBe(metricsOf(without.meta).taskContextChars);
+      expect(String(empty.meta[0]?.prompt)).not.toContain("## Policies");
+    });
+
+    it.each([5, 50])("adds one bounded section for %i active policies", async (count) => {
+      const without = await runExecutor(config, { context: taskContext });
+      const withPolicies = await runExecutor(config, { context: { ...taskContext, paperclipPolicies: policyIndexFor(count) } });
+      const prompt = String(withPolicies.meta[0]?.prompt);
+      const added = metricsOf(withPolicies.meta).taskContextChars - metricsOf(without.meta).taskContextChars;
+      expect(prompt.match(/^## Policies$/gm)).toHaveLength(1);
+      expect(prompt).toContain("Ship the change.");
+      expect(added).toBeGreaterThan(0);
+      expect(added).toBeLessThanOrEqual(POLICY_INDEX_MAX_CHARS + 700);
+      expect(metricsOf(withPolicies.meta).heartbeatPromptChars).toBe(metricsOf(without.meta).heartbeatPromptChars);
+      if (count > 20) expect(prompt).toContain(`+${count - 20} more active policies`);
+    });
+
+    it("sends a resumed session the index only when it changed since the session was last told", async () => {
+      const fresh = await runExecutor(config, { context: { ...taskContext, paperclipPolicies: policyIndexFor(5) } });
+      expect(String(fresh.meta[0]?.prompt)).toContain("## Policies");
+      const runtime = { sessionParams: fresh.result.sessionParams };
+      const unchanged = await runExecutor(config, { context: { ...taskContext, paperclipPolicies: policyIndexFor(5, "digest-5") }, runtime });
+      expect(unchanged.sessionInputs[0]?.resumeSessionId).toBe(fresh.result.sessionId);
+      expect(String(unchanged.meta[0]?.prompt)).not.toContain("## Policies");
+      const changed = await runExecutor(config, { context: { ...taskContext, paperclipPolicies: policyIndexFor(5, "an-older-digest") }, runtime });
+      expect(String(changed.meta[0]?.prompt)).toContain("## Policies");
+      expect(String(changed.meta[0]?.prompt)).toContain("The policy list changed since your last turn");
+    });
   });
 
   it("uses only the guarded external-chat contract for a default ACPX prompt", async () => {

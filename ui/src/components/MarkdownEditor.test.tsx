@@ -3,7 +3,13 @@
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
-import { buildIssueReferenceHref, buildProjectMentionHref, buildRoutineMentionHref, buildSkillMentionHref } from "@paperclipai/shared";
+import {
+  buildIssueReferenceHref,
+  buildPolicyMentionHref,
+  buildProjectMentionHref,
+  buildRoutineMentionHref,
+  buildSkillMentionHref,
+} from "@paperclipai/shared";
 import {
   computeMentionMenuPosition,
   findClosestAutocompleteAnchor,
@@ -1148,6 +1154,16 @@ describe("MarkdownEditor", () => {
     });
   });
 
+  it("keeps policy slash queries active across spaces", () => {
+    expect(findMentionMatch("/policy:Never ship on Friday", "/policy:Never ship on Friday".length)).toEqual({
+      trigger: "skill",
+      marker: "/",
+      query: "policy:Never ship on Friday",
+      atPos: 0,
+      endPos: "/policy:Never ship on Friday".length,
+    });
+  });
+
   it("does not treat Enter as skill autocomplete accept", () => {
     expect(shouldAcceptAutocompleteKey("Enter", "skill")).toBe(false);
     expect(shouldAcceptAutocompleteKey("Enter", "skill", true)).toBe(true);
@@ -1236,6 +1252,29 @@ describe("MarkdownEditor", () => {
     });
 
     expect(found).toBe(routineLink);
+  });
+
+  it("finds policy anchors by policy key instead of visible text", () => {
+    const editable = document.createElement("div");
+    const policyLink = document.createElement("a");
+    policyLink.setAttribute("href", buildPolicyMentionHref("never-ship-on-friday"));
+    policyLink.textContent = "Never ship on Friday ";
+    const otherLink = document.createElement("a");
+    otherLink.setAttribute("href", buildPolicyMentionHref("review-before-merge"));
+    otherLink.textContent = "Never ship on Friday";
+    editable.append(otherLink, policyLink);
+
+    const found = findClosestAutocompleteAnchor(editable, {
+      id: "policy:never-ship-on-friday",
+      kind: "policy",
+      policyKey: "never-ship-on-friday",
+      name: "Never ship on Friday",
+      summary: null,
+      href: buildPolicyMentionHref("never-ship-on-friday"),
+      aliases: ["policy:Never ship on Friday", "policy:never-ship-on-friday", "Never ship on Friday", "never-ship-on-friday"],
+    });
+
+    expect(found).toBe(policyLink);
   });
 
   it("places the caret after the mention's trailing space when present", () => {
