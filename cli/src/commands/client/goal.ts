@@ -1,6 +1,7 @@
 import { Command } from "commander";
-import type { CompanyFocus, Goal } from "@paperclipai/shared";
-import { createGoalSchema, updateGoalSchema } from "@paperclipai/shared";
+import type { Agent, CompanyFocus, Goal, GoalAgentLink, GoalProgress, Issue, Project, RoutineListItem } from "@paperclipai/shared";
+import { OPEN_ISSUE_STATUSES, createGoalSchema, goalAgentLinks, updateGoalSchema } from "@paperclipai/shared";
+import type { PaperclipApiClient } from "../../client/http.js";
 import {
   addCommonClientOptions,
   apiPath,
@@ -10,6 +11,18 @@ import {
   resolveCommandContext,
   type BaseClientOptions,
 } from "./common.js";
+
+/** The work linked to one goal, as `goal links` prints it. */
+export interface GoalLinks {
+  goal: Goal;
+  progress: GoalProgress | null;
+  projects: Array<Pick<Project, "id" | "name" | "status">>;
+  tasks: Array<Pick<Issue, "id" | "identifier" | "title" | "status" | "assigneeAgentId">>;
+  routines: Array<Pick<RoutineListItem, "id" | "title" | "status" | "assigneeAgentId" | "projectId">>;
+  agents: Array<GoalAgentLink & { name: string | null }>;
+}
+
+const TASK_PAGE_SIZE = 500;
 
 interface GoalListOptions extends BaseClientOptions {
   companyId?: string;
@@ -195,6 +208,51 @@ export function registerGoalCommands(program: Command): void {
 
   addCommonClientOptions(
     goal
+      .command("progress")
+      .description("Show each goal's task progress: tasks linked to the goal or a goal below it")
+      .option("-C, --company-id <id>", "Company ID")
+      .action(async (opts: GoalListOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const [progress, goals] = await Promise.all([
+            ctx.api.get<Record<string, GoalProgress>>(apiPath`/api/companies/${ctx.companyId}/goals/progress`),
+            ctx.api.get<Goal[]>(apiPath`/api/companies/${ctx.companyId}/goals`),
+          ]);
+          if (ctx.json) {
+            printOutput(progress ?? {}, { json: true });
+            return;
+          }
+          for (const row of goals ?? []) {
+            const counts = progress?.[row.id];
+            if (!counts) continue;
+            console.log(formatInlineRecord({ id: row.id, title: row.title, done: counts.done, open: counts.open, total: counts.total }));
+          }
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+
+  addCommonClientOptions(
+    goal
+      .command("links")
+      .description("Show the work linked to a goal: its projects, open tasks, routines and agents. Sub-goals are not included")
+      .argument("<goalId>", "Goal ID")
+      .action(async (goalId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const links = await readGoalLinks(ctx.api, goalId);
+          if (ctx.json) printOutput(links, { json: true });
+          else printLinks(links);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    goal
       .command("delete")
       .description("Delete a goal. Only the board can delete a short term goal or a milestone")
       .argument("<goalId>", "Goal ID")
@@ -234,6 +292,80 @@ function printFocus(focus: CompanyFocus): void {
   }
   console.log("");
   console.log(focus.guidance);
+}
+
+async function listOpenGoalTasks(api: PaperclipApiClient, companyId: string, goalId: string): Promise<Issue[]> {
+  const tasks: Issue[] = [];
+  let afterId: string | undefined;
+  for (;;) {
+    const params = new URLSearchParams({
+      goalId,
+      status: OPEN_ISSUE_STATUSES.join(","),
+      limit: String(TASK_PAGE_SIZE),
+      sortField: "id",
+      sortDir: "asc",
+    });
+    if (afterId) params.set("afterId", afterId);
+    const page = (await api.get<Issue[]>(`${apiPath`/api/companies/${companyId}/issues`}?${params}`)) ?? [];
+    tasks.push(...page);
+    const last = page.at(-1);
+    // The server drops rows the caller may not see after it applies the page limit, so a short page
+    // is not the last one. An empty page ends the read: a caller with narrow access can still miss
+    // rows behind a full page of rows it may not see, until the list returns its raw cursor.
+    if (!last) return tasks;
+    afterId = last.id;
+  }
+}
+
+/**
+ * Reads the work linked to a goal from the list APIs, so the caller sees only what its own access
+ * allows: projects that link the goal, open tasks and routines (not archived) whose own goal it is, and the agents
+ * that `goalAgentLinks` derives from them.
+ * @param api The API client.
+ * @param goalId The goal.
+ * @returns The goal, its task progress and its linked work.
+ */
+export async function readGoalLinks(api: PaperclipApiClient, goalId: string): Promise<GoalLinks> {
+  const goal = await api.get<Goal>(apiPath`/api/goals/${goalId}`);
+  if (!goal) throw new Error(`Goal ${goalId} not found.`);
+  const companyId = goal.companyId;
+  const [progress, projects, tasks, routines, agents] = await Promise.all([
+    api.get<Record<string, GoalProgress>>(apiPath`/api/companies/${companyId}/goals/progress`),
+    api.get<Project[]>(apiPath`/api/companies/${companyId}/projects`),
+    listOpenGoalTasks(api, companyId, goalId),
+    api.get<RoutineListItem[]>(`${apiPath`/api/companies/${companyId}/routines`}?${new URLSearchParams({ goalId })}`),
+    api.get<Agent[]>(apiPath`/api/companies/${companyId}/agents`),
+  ]);
+  const agentNames = new Map((agents ?? []).map((agent) => [agent.id, agent.name]));
+  const goalRoutines = (routines ?? []).filter((routine) => routine.status !== "archived");
+  return {
+    goal,
+    progress: progress?.[goalId] ?? null,
+    projects: (projects ?? [])
+      .filter((project) => project.goalIds.includes(goalId))
+      .map(({ id, name, status }) => ({ id, name, status })),
+    tasks: tasks.map(({ id, identifier, title, status, assigneeAgentId }) => ({ id, identifier, title, status, assigneeAgentId })),
+    routines: goalRoutines.map(({ id, title, status, assigneeAgentId, projectId }) => ({ id, title, status, assigneeAgentId, projectId })),
+    agents: goalAgentLinks({ ownerAgentId: goal.ownerAgentId, tasks, routines: goalRoutines })
+      .map((link) => ({ ...link, name: agentNames.get(link.agentId) ?? null })),
+  };
+}
+
+function printLinks(links: GoalLinks): void {
+  const { goal, progress } = links;
+  const counts = progress ? `  (${progress.done}/${progress.total} done, ${progress.open} open)` : "";
+  console.log(`${goal.title}${counts}  ${goal.id}`);
+  const sections: Array<[string, string[]]> = [
+    ["Projects", links.projects.map((project) => formatInlineRecord(project))],
+    ["Open tasks", links.tasks.map((task) => formatInlineRecord(task))],
+    ["Routines", links.routines.map((routine) => formatInlineRecord(routine))],
+    ["Agents", links.agents.map((agent) => formatInlineRecord({ ...agent, reasons: agent.reasons.join(",") }))],
+  ];
+  for (const [title, lines] of sections) {
+    console.log("");
+    console.log(`${title} (${lines.length})`);
+    for (const line of lines) console.log(`  ${line}`);
+  }
 }
 
 function parseNullableString(value: string | undefined): string | null | undefined {

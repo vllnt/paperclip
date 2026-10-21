@@ -13,6 +13,7 @@ import {
   documents,
   executionWorkspaces,
   folders,
+  goals,
   heartbeatRuns,
   instanceSettings,
   issueInboxArchives,
@@ -81,6 +82,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(goals);
     await db.delete(agents);
     await db.delete(companies);
     await db.delete(instanceSettings);
@@ -445,6 +447,39 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(projectRoutines.map((entry) => entry.id)).toEqual([routine.id]);
     expect(allRoutines.map((entry) => entry.id)).toEqual(expect.arrayContaining([routine.id, otherRoutine.id]));
+  });
+
+  it("filters listed routines by their own goal, without the goals below it", async () => {
+    const { companyId, agentId, projectId, routine, svc } = await seedFixture();
+    const goalId = randomUUID();
+    const subGoalId = randomUUID();
+    await db.insert(goals).values([
+      { id: goalId, companyId, title: "Ship the beta", level: "company", status: "active" },
+      { id: subGoalId, companyId, title: "Beta docs", level: "team", status: "active", parentId: goalId },
+    ]);
+    const routineFor = (title: string, linkedGoalId: string) =>
+      svc.create(
+        companyId,
+        {
+          projectId,
+          goalId: linkedGoalId,
+          parentIssueId: null,
+          title,
+          description: null,
+          assigneeAgentId: agentId,
+          priority: "medium",
+          status: "active",
+          concurrencyPolicy: "coalesce_if_active",
+          catchUpPolicy: "skip_missed",
+        },
+        {},
+      );
+    const goalRoutine = await routineFor("goal routine", goalId);
+    await routineFor("sub-goal routine", subGoalId);
+
+    expect((await svc.list(companyId, { goalId })).map((entry) => entry.id)).toEqual([goalRoutine.id]);
+    expect((await svc.list(companyId, { goalId, projectId })).map((entry) => entry.id)).toEqual([goalRoutine.id]);
+    expect((await svc.list(companyId)).map((entry) => entry.id)).toContain(routine.id);
   });
 
   it("does not reveal folders owned by another company", async () => {
