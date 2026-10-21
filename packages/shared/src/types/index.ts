@@ -803,6 +803,7 @@ export type {
   IssueTreePreviewWarning,
 } from "./issue-tree-control.js";
 export type { Goal, GoalProgress, CompanyFocus, CompanyFocusGoal, CompanyFocusMilestone, IssueCompanyFocus } from "./goal.js";
+export type { CompanyPolicy, CompanyPolicyRevision } from "./company-policy.js";
 export type { Approval, ApprovalComment } from "./approval.js";
 export type {
   BudgetPolicy,

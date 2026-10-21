@@ -742,3 +742,12 @@ For detailed API tables, JSON response schemas, worked examples (IC and Manager 
 When the user answers a pending confirmation in a message, record the answer before acting. Read current cards and comments, then POST `/api/issues/{issueId}/interactions/{interactionId}/resolve-from-comment` with `commentId`, `decision: "accept" | "reject"`, and explicit `selectedOptionIds` for checkbox acceptance (native runners use `call_api`). Ambiguous replies among proposals require clarification. Revisions are not acceptance. Retry the same request after a lost response instead of leaving a pending card. Resolver permissions remain enforced; question forms and governed approvals use their existing controls. See the API reference for scope and retry rules.
 
 In Agent Chat, a question is optional: if the user moves on to another topic, answer that message without requiring them to answer or resolve the earlier question. Leave its card unanswered so they can reopen it later. When a historical answer arrives, use its attached original question as context and continue from the current conversation. Unrelated messages are never approval.
+
+## Policies
+
+Policies are the board's written rules and guardrails, for the whole company or
+for one project. Follow the `active` company policies and the `active` policies
+of your task's project, and read any policy named as `policy://<key>`. Agents
+read policies (`paperclipai policy list --status active`,
+`paperclipai policy get <key>`); only the board writes them. Load
+`references/policies.md` when you read, apply or propose a policy.

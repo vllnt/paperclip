@@ -584,6 +584,13 @@ export const queryKeys = {
     focus: (companyId: string) => ["goals", companyId, "focus"] as const,
     progress: (companyId: string) => ["goals", companyId, "progress"] as const,
   },
+  /** Every policy key sits under `["policies", companyId]`, so one invalidation refreshes lists, details and history. */
+  policies: {
+    all: (companyId: string) => ["policies", companyId] as const,
+    list: (companyId: string, filters: { projectId?: string } = {}) =>
+      ["policies", companyId, "list", filters.projectId ?? "all"] as const,
+    revisions: (companyId: string, key: string) => ["policies", companyId, "revisions", key] as const,
+  },
   artifacts: {
     list: (
       companyId: string,
