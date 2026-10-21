@@ -45,6 +45,7 @@ import {
   SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT,
   SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
   sandboxCallbackBridgeDirectories,
+  sanitizeSandboxCallbackBridgeHeaders,
   startSandboxCallbackBridgeServer,
   startSandboxCallbackBridgeWorker,
   syncRemoteTextFileWithHashSkip,
@@ -4741,8 +4742,11 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         `[paperclip] Bridge proxy ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
       );
     }
+    // Forward only the allowlisted headers, the one rule the sandbox gateway
+    // and the HTTP/2 host apply too: a queue_v1 entry is a file any sandbox
+    // process can write, so its headers are never trusted as-is.
     const headers = new Headers();
-    for (const [key, value] of Object.entries(request.headers)) {
+    for (const [key, value] of Object.entries(sanitizeSandboxCallbackBridgeHeaders(request.headers))) {
       if (value.trim().length === 0) continue;
       headers.set(key, value);
     }
@@ -5019,7 +5023,9 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
           // through the existing `forwardBridgeRequest` — the same function
           // the file bridge uses. The route allowlist, the header allowlist,
           // and the per-request debug-log suppression already ran inside
-          // `createHttp2BridgeServer`'s own stream handler before this call.
+          // `createHttp2BridgeServer`'s own stream handler before this call;
+          // `forwardBridgeRequest` applies the same default header allowlist
+          // again, so both transports forward under one header rule.
           // It records the request span with the same latency-and-outcome
           // shape the retired duplex_v1 broker recorded: `ok` for any
           // delivered host response (any status), `error` only when the

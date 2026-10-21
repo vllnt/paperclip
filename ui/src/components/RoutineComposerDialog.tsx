@@ -18,6 +18,7 @@ import { accessApi } from "../api/access";
 import { agentsApi } from "../api/agents";
 import { ApiError } from "../api/client";
 import { foldersApi } from "../api/folders";
+import { goalsApi } from "../api/goals";
 import { projectsApi } from "../api/projects";
 import { routinesApi } from "../api/routines";
 import { useToastActions } from "../context/ToastContext";
@@ -42,11 +43,12 @@ const catchUpPolicyDescriptions: Record<string, string> = {
   enqueue_missed_with_cap: "Catch up missed schedule windows after recovery; sub-hourly schedules are combined into one catch-up run, slower schedules replay each missed window up to a cap.",
 };
 
-/** The fields the composer edits. Empty strings mean "none" for the project and the agent. */
+/** The fields the composer edits. Empty strings mean "none" for the project, the goal and the agent. */
 export interface RoutineComposerDraft {
   title: string;
   description: string;
   projectId: string;
+  goalId: string;
   folderId: string | null;
   assigneeAgentId: string;
   priority: string;
@@ -59,6 +61,7 @@ const emptyRoutineDraft: RoutineComposerDraft = {
   title: "",
   description: "",
   projectId: "",
+  goalId: "",
   folderId: null,
   assigneeAgentId: "",
   priority: "medium",
@@ -76,6 +79,7 @@ const editableRoutineFields = [
   "title",
   "description",
   "projectId",
+  "goalId",
   "folderId",
   "assigneeAgentId",
   "concurrencyPolicy",
@@ -93,6 +97,7 @@ function routineMutationPayload(draft: RoutineComposerDraft) {
     ...draft,
     description: draft.description.trim() || null,
     projectId: draft.projectId || null,
+    goalId: draft.goalId || null,
     folderId: draft.folderId || null,
     assigneeAgentId: draft.assigneeAgentId || null,
   };
@@ -101,13 +106,14 @@ function routineMutationPayload(draft: RoutineComposerDraft) {
 /**
  * The composer draft of a saved routine.
  * @param routine The routine to edit.
- * @returns Its editable fields, with null project and agent as empty strings.
+ * @returns Its editable fields, with null project, goal and agent as empty strings.
  */
 export function routineComposerDraftFrom(routine: Routine): RoutineComposerDraft {
   return {
     title: routine.title,
     description: routine.description ?? "",
     projectId: routine.projectId ?? "",
+    goalId: routine.goalId ?? "",
     folderId: routine.folderId ?? null,
     assigneeAgentId: routine.assigneeAgentId ?? "",
     priority: routine.priority,
@@ -152,7 +158,7 @@ export interface RoutineComposerDialogProps {
 
 /**
  * The routine composer: creates a routine, or edits the work definition of one (title, instructions,
- * default agent, project, folder and delivery policies). The full routine editor keeps triggers,
+ * default agent, project, folder, goal and delivery policies). The full routine editor keeps triggers,
  * steps, variables and secrets.
  */
 export function RoutineComposerDialog({
@@ -187,6 +193,11 @@ export function RoutineComposerDialog({
   const { data: projects } = useQuery({
     queryKey: queryKeys.projects.list(companyId, { includeArchived: true }),
     queryFn: () => projectsApi.list(companyId, { includeArchived: true }),
+    enabled: open,
+  });
+  const { data: goals } = useQuery({
+    queryKey: queryKeys.goals.list(companyId),
+    queryFn: () => goalsApi.list(companyId),
     enabled: open,
   });
   const { data: routineFolders } = useQuery({
@@ -259,9 +270,10 @@ export function RoutineComposerDialog({
 
   const recentAssigneeIds = useMemo(() => getRecentAssigneeIds(), [open]);
   const recentProjectIds = useMemo(() => getRecentProjectIds(), [open]);
-  // An edited routine keeps showing its saved agent and project even when terminated or archived.
+  // An edited routine keeps showing its saved agent, project and goal even when terminated, archived or cancelled.
   const savedAssigneeId = routine?.assigneeAgentId ?? null;
   const savedProjectId = routine?.projectId ?? null;
+  const savedGoalId = routine?.goalId ?? null;
   const assigneeOptions = useMemo<InlineEntityOption[]>(
     () =>
       sortAgentsByRecency(
@@ -282,6 +294,15 @@ export function RoutineComposerDialog({
         searchText: project.description ?? "",
       })),
     [projects, savedProjectId],
+  );
+  const goalOptions = useMemo<InlineEntityOption[]>(
+    () =>
+      (goals ?? []).filter((goal) => goal.status !== "cancelled" || goal.id === savedGoalId).map((goal) => ({
+        id: goal.id,
+        label: goal.status === "cancelled" ? `${goal.title} (cancelled)` : goal.title,
+        searchText: goal.description ?? "",
+      })),
+    [goals, savedGoalId],
   );
   const agentById = useMemo(() => new Map((agents ?? []).map((agent) => [agent.id, agent])), [agents]);
   const projectById = useMemo(() => new Map((projects ?? []).map((project) => [project.id, project])), [projects]);
@@ -471,6 +492,17 @@ export function RoutineComposerDialog({
                     ))}
                   </SelectContent>
                 </Select>
+                <span>toward</span>
+                <InlineEntitySelector
+                  value={draft.goalId}
+                  options={goalOptions}
+                  placeholder="Goal"
+                  noneLabel="No goal"
+                  searchPlaceholder="Search goals..."
+                  emptyMessage="No goals found."
+                  onChange={(goalId) => setDraft((current) => ({ ...current, goalId }))}
+                  onConfirm={() => descriptionEditorRef.current?.focus()}
+                />
               </div>
             </div>
           </div>
