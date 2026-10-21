@@ -41,6 +41,7 @@ packages/plugins/plugin-convex/tests/reaper.spec.ts
 packages/plugins/plugin-convex/tests/resilience.spec.ts
 packages/plugins/plugin-convex/tests/review.spec.ts
 packages/plugins/plugin-convex/tests/ui.spec.tsx
+packages/plugins/plugin-github/tests/review-verdicts.spec.ts
 packages/plugins/plugin-github/tests/sync-job-context.spec.ts
 packages/plugins/plugin-github/tests/sync-queued-ui.spec.tsx
 packages/plugins/plugin-github/tests/sync-scope-loss.spec.ts

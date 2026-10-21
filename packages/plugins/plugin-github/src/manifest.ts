@@ -1,10 +1,10 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { PLUGIN_ID } from "./contracts.js";
 const manifest: PaperclipPluginManifestV1 = {
-  id: PLUGIN_ID, apiVersion: 1, version: "0.12.0", displayName: "GitHub",
+  id: PLUGIN_ID, apiVersion: 1, version: "0.13.0", displayName: "GitHub",
   description: "Manage GitHub repositories, Projects and synced tasks with Paperclip’s native GitHub channel and review connector.",
   author: "VLLNT", categories: ["connector"],
-  capabilities: ["companies.read", "agents.read", "chat.endpoints.read", "issues.create", "issues.update", "issues.wakeup", "jobs.schedule", "events.subscribe", "webhooks.receive", "projects.read", "project.workspaces.read", "issues.read", "plugin.state.read", "plugin.state.write",
+  capabilities: ["companies.read", "agents.read", "chat.endpoints.read", "issues.create", "issues.update", "issues.wakeup", "jobs.schedule", "events.subscribe", "webhooks.receive", "projects.read", "project.workspaces.read", "issues.read", "issue.comments.read", "plugin.state.read", "plugin.state.write",
     "secrets.read-ref", "secrets.write-own", "skills.managed", "http.outbound", "activity.log.write", "ui.page.register", "ui.sidebar.register",
     "ui.detailTab.register", "ui.action.register", "instance.settings.register", "agent.tools.register"],
   entrypoints: { worker: "./dist/worker.js", ui: "./dist/ui" },
@@ -60,10 +60,10 @@ The operator can edit this skill for each company, repository or organization po
       signingKey: { type: "object", format: "secret-ref", properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { const: "latest" } }, required: ["type", "secretId"], additionalProperties: false },
       // Agents never merge a pull request that touches a protected path. An instance administrator may release some of them for
       // one repository. The host validates this shape when the config is saved; the worker reads it again (and validates it
-      // again) at every merge. CODEOWNERS paths, control paths and tiers paths are never released, and a repository with a tiers file cannot opt in, whatever it says.
+      // again) at every merge. CODEOWNERS paths, the paths of a repository's protectedPathPolicy rules and tiers paths are never released here, and a repository with a tiers file cannot opt in, whatever it says.
       agentMergeablePaths: {
         type: "array", maxItems: 50,
-        description: "Lets agents merge pull requests that touch protected paths under .github/ (such as workflows) in the repositories listed here. Each entry names one repository (owner/name), the paths to release (allow, under .github/, for example .github/**) and paths to keep refused (exclude). One refused file refuses the whole pull request. CODEOWNERS files, the control paths (paperclip/**, scripts/**, ROADMAP.md, data/company/strategy/**) and the paths of a paperclip/tiers.yaml are never released, and a repository with a paperclip/tiers.yaml on its base branch cannot opt in. A control repository without that file can opt in, for .github/ only. Only an instance administrator can change this. A file-name exclusion is a speed bump, not a boundary: a new workflow file or a local action can still reach production. The real boundary is GitHub's environment protection (required reviewers) on the deployment.",
+        description: "Lets agents merge pull requests that touch protected paths under .github/ (such as workflows) in the repositories listed here, with no review. Each entry names one repository (owner/name), the paths to release (allow, under .github/, for example .github/**) and paths to keep refused (exclude). One refused file refuses the whole pull request. CODEOWNERS files, the paths of the repository's protectedPathPolicy rules and the paths of a paperclip/tiers.yaml are never released here, and a repository with a paperclip/tiers.yaml on its base branch cannot opt in. Only an instance administrator can change this. A file-name exclusion is a speed bump, not a boundary: a new workflow file or a local action can still reach production. The real boundary is GitHub's environment protection (required reviewers) on the deployment.",
         items: {
           type: "object", additionalProperties: false, required: ["repository", "allow"],
           properties: {
@@ -80,7 +80,49 @@ The operator can edit this skill for each company, repository or organization po
             }
           }
         }
-      }
+      },
+      // Which paths agents may not merge, and which they may merge once reviewers approved the exact head commit. Read at every
+      // merge, from here only: never from a pull request or a file of the repository. Without an entry for a repository, the
+      // minimum list (.github/** and CODEOWNERS files) and the paths of its paperclip/tiers.yaml refuse, as they always did.
+      protectedPathPolicy: {
+        type: "array", maxItems: 50,
+        description: "Per repository, ordered rules for protected paths. A refuse rule (the default for a rule with no action) protects its paths and keeps agents from merging a pull request that changes them. A require rule lets an agent merge a pull request that changes its paths when each named lens has an approval at the pull request's exact head commit from an agent you listed for that lens. The first rule that covers a path decides. A CODEOWNERS file is governed only by a rule with codeowners set to true. An approval is the first line of a comment on an issue assigned to the merging agent: VERDICT <lens> APPROVE <full head sha>; the agent that merges never approves its own merge, and a later push makes an approval stale. allowAdmin lets an --admin merge go ahead for a rule's paths (the plugin's admin merge checks still apply). Only an instance administrator can change this. A setting that cannot be read refuses every merge in its repository.",
+        items: {
+          type: "object", additionalProperties: false, required: ["repository", "rules"],
+          properties: {
+            repository: { type: "string", pattern: "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$", description: "owner/name. Matched exactly and without regard to case; list a repository once." },
+            rules: {
+              type: "array", minItems: 1, maxItems: 50,
+              description: "Rules in order; the first one that covers a path decides.",
+              items: {
+                type: "object", additionalProperties: false, required: ["paths"],
+                properties: {
+                  paths: { type: "array", minItems: 1, maxItems: 50, description: "Paths or globs the rule covers, for example scripts/** or paperclip/tiers.yaml.", items: { type: "string", maxLength: 200, pattern: "^[A-Za-z0-9._\\-/*?]+$", not: { anyOf: [{ pattern: "^/" }, { pattern: "\\.\\." }, { pattern: "//" }] } } },
+                  action: { type: "string", enum: ["refuse", "require"], description: "refuse (the default): agents cannot merge a change to these paths. require: they can, with every named lens approved at the head." },
+                  lenses: { type: "array", minItems: 1, maxItems: 10, description: "For require: the lenses that must approve, by the names defined in this entry's lenses.", items: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9 &._-]{0,39}$" } },
+                  allowAdmin: { type: "boolean", description: "For require: whether an --admin merge may go ahead for these paths. Default false." },
+                  codeowners: { type: "boolean", description: "For require: whether the rule also covers CODEOWNERS files. Default false: a CODEOWNERS file stays refused." }
+                },
+                allOf: [
+                  { if: { properties: { action: { const: "require" } }, required: ["action"] }, then: { required: ["lenses"] }, else: { not: { anyOf: [{ required: ["lenses"] }, { required: ["allowAdmin"] }, { required: ["codeowners"] }] } } }
+                ]
+              }
+            },
+            lenses: {
+              type: "array", maxItems: 10,
+              description: "The reviewer lenses the rules may require, each with the Paperclip agents whose verdicts count for it.",
+              items: {
+                type: "object", additionalProperties: false, required: ["name", "agents"],
+                properties: {
+                  name: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9 &._-]{0,39}$", description: "The lens name a rule uses, and the scope a reviewer writes in a verdict. Compared without regard to case." },
+                  aliases: { type: "array", maxItems: 5, description: "Other spellings of the scope that count for this lens.", items: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9 &._-]{0,39}$" } },
+                  agents: { type: "array", minItems: 1, maxItems: 20, description: "Paperclip agent IDs whose verdicts count for this lens.", items: { type: "string", pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" } }
+                }
+              }
+            }
+          }
+        }
+      },
     }
   },
   tools: [

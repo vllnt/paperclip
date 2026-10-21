@@ -366,7 +366,65 @@ the App user. The plugin never re-enables writes itself.
 
 ### Releasing protected paths for agent merges
 
-By default an agent never merges a pull request that touches a protected path (`.github/**`, CODEOWNERS and, in a control repository, its control paths); a person merges it in the GitHub web UI. An **instance administrator** can release some of these paths for chosen repositories with the company's plugin config, field `agentMergeablePaths`:
+By default an agent never merges a pull request that touches a protected path: `.github/**`, CODEOWNERS files and the paths listed in the repository's `paperclip/tiers.yaml` (read at the base commit). A person merges it in the GitHub web UI. No other path is protected unless an instance administrator names it. Two company-config fields let an **instance administrator** change this for chosen repositories. Both are read at every merge from the plugin config only, never from a pull request or a file of the repository, and the host validates them when they are saved.
+
+- `protectedPathPolicy` protects more paths, and lets reviewer agents approve a merge that touches some of them. This is the field to use when approvals should gate a path.
+- `agentMergeablePaths` releases some `.github/` paths with no review at all.
+
+#### Rules that refuse or require approvals: `protectedPathPolicy`
+
+An entry per repository lists ordered rules and the reviewer lenses they may use. The default for a rule is **refuse**. An install with no entry behaves as before.
+
+```sh
+# config:set replaces the whole config, so merge the new field into the current one (as in the setup above).
+current="$(paperclipai plugin config "$PLUGIN" -C "$COMPANY" --json)"
+payload="$(CURRENT="$current" node -e '
+  const current = JSON.parse(process.env.CURRENT || "null")?.configJson ?? {};
+  process.stdout.write(JSON.stringify({ configJson: { ...current, protectedPathPolicy: [{
+    repository: "owner/repo",
+    lenses: [
+      { name: "security", aliases: ["Security reviewer"], agents: ["<security reviewer agent id>"] },
+      { name: "dx", agents: ["<dx reviewer agent id>"] },
+    ],
+    rules: [
+      { paths: ["data/**"], action: "refuse" },
+      { paths: ["scripts/**", ".github/workflows/**"], action: "require", lenses: ["security", "dx"], allowAdmin: true },
+      { paths: ["CODEOWNERS", ".github/CODEOWNERS"], action: "require", lenses: ["security"], codeowners: true },
+    ],
+  }] } }));')"
+paperclipai plugin config:set "$PLUGIN" -C "$COMPANY" --payload-json "$payload" --json
+```
+
+- `repository` is `owner/name`, matched exactly and without regard to case. List a repository once.
+- A rule has `paths` (paths or globs: `*`, `?`, `**`) and an `action`. The first rule that covers a path decides. The paths of every rule are protected, on top of the minimum list.
+- `action: "refuse"` (the default) keeps agents from merging a change to those paths. It takes no `lenses`, `allowAdmin` or `codeowners`.
+- `action: "require"` lets an agent merge a change to those paths when **every named lens has an approval at the pull request's exact head commit**. `lenses` names lenses defined in the same entry. A path no rule covers (a path only the tiers file protects) stays refused. **One file that is refused, or that lacks an approval, stops the whole pull request.**
+- A **lens** has a `name`, optional `aliases` (other spellings of the scope a reviewer writes) and `agents`, the Paperclip agent IDs whose verdicts count for it.
+- `allowAdmin` (default `false`) lets an `--admin` merge go ahead for a rule's paths. The plugin's own admin-merge checks still apply, and an `--admin` merge touching a rule that does not allow it is refused.
+- `codeowners` (default `false`) is the only way a rule covers a CODEOWNERS file. Without it a CODEOWNERS file stays refused, even when a rule's glob would match it.
+
+**How an approval is given.** A reviewer agent writes the first line of a comment on a Paperclip issue assigned to the merging agent (status `in_review` or `in_progress`):
+
+```
+VERDICT <lens> APPROVE <full 40-character head sha>
+```
+
+The form `VERDICT: APPROVE <lens> <owner/repo>#<number> @ <sha>` is read too, and names the pull request. A `BLOCK` at the head keeps the lens from being approved. The plugin counts a verdict only when:
+
+- the comment's **author** (the agent id Paperclip recorded, not the comment text) is one of the lens's `agents`,
+- it names the pull request's **exact head** (a push makes every earlier approval stale) and, in the second form, this pull request,
+- it is the author's latest verdict for that lens at the head, and the comment is not deleted, and
+- the author is not the agent asking for the merge: nobody approves their own merge.
+
+The plugin re-reads the pull request's head after it reads the approvals; a head that moved refuses the merge. A policy that cannot be read (an unknown action, a lens nobody defined, a repeated repository, an agent that is not an ID) **refuses every merge in its repository**, and a setting that is not a list refuses every merge. The merge evidence and the activity log record which rules were used and which approvals were counted (`github.protected_path_merge_allowed`).
+
+*Limit:* verdicts are found on the open issues assigned to the merging agent (at most 25). The plugin has no way to ask which issue a run belongs to, so a review comment on another issue is not seen.
+
+**Upgrading to 0.13.0.** Earlier versions refused the control paths of one built-in control repository. 0.13.0 has no built-in list. If an install relied on it, save a `protectedPathPolicy` entry for that repository (a `refuse` rule over the same paths gives the old behaviour) as part of the upgrade; until then only the minimum list and the repository's tiers file protect it.
+
+#### Releasing `.github/` paths with no review: `agentMergeablePaths`
+
+An instance administrator can release some `.github/` paths for chosen repositories with the company's plugin config, field `agentMergeablePaths`:
 
 ```sh
 # config:set replaces the whole config, so merge the new field into the current one (as in the setup above).
@@ -382,7 +440,7 @@ paperclipai plugin config:set "$PLUGIN" -C "$COMPANY" --payload-json "$payload" 
 - `repository` is `owner/name`. It is matched exactly and without regard to case. The default is no entries, which behaves as before.
 - `allow` lists paths under `.github/`, as globs (`*`, `?`, `**`). `exclude` lists paths or globs that stay refused.
 - A pull request merges when every protected file it touches is covered by `allow` and by no `exclude`. **One file that is not released refuses the whole pull request.** The refusal names only the files that are not released. A rename counts both names.
-- **Never released, whatever the config says:** the CODEOWNERS paths, the control paths (`paperclip/**`, `scripts/**`, `ROADMAP.md`, `data/company/strategy/**`), the tiers paths, and any path that is not in its normal form (a `.`, `..` or empty segment, as in `.github/../scripts/x`). A repository with a `paperclip/tiers.yaml` on its base branch cannot opt in at all. A control repository without that file opts in like any other repository, with its own entry and for `.github/**` only; its control paths stay refused. An `allow` entry that names CODEOWNERS or reaches outside `.github/` is refused when the config is saved. An entry that is not valid at the moment of a merge is dropped and releases nothing.
+- **Never released, whatever the config says:** the CODEOWNERS paths, the paths of the repository's `protectedPathPolicy` rules (a policy rule wins over a release), the tiers paths, and any path that is not in its normal form (a `.`, `..` or empty segment, as in `.github/../scripts/x`). A repository with a `paperclip/tiers.yaml` on its base branch cannot opt in at all. An `allow` entry that names CODEOWNERS or reaches outside `.github/` is refused when the config is saved. An entry that is not valid at the moment of a merge is dropped and releases nothing.
 - The config is read at every merge, from the plugin config only. It is never read from the pull request or from a file of the repository, so a pull request cannot widen its own release. Only an instance administrator can save it.
 - Unchanged: the exact head SHA of the merge, the file list read again after the head, the refusal of auto-merge and the merge queue, the admin-merge rules and every other write-identity gate.
 - The merge evidence records `releasedProtectedFiles` (at most 100, with `releasedProtectedFilesCount`) and `releasedBy: "config:agentMergeablePaths"`.
@@ -572,6 +630,22 @@ owns bot identity and governed formal reviews; the plugin App remains the
 repository/task management actor.
 
 
+## 0.13.0 — Configurable protected paths
+
+- New company config `protectedPathPolicy`: per repository, ordered rules that
+  `refuse` (the default) or `require` approvals from named reviewer lenses at the
+  pull request's exact head. The merge guard checks the approvals before it
+  merges, records the rule and the approvals it used, and the `--admin` override is
+  allowed per rule (`allowAdmin`). CODEOWNERS files stay refused unless a rule
+  sets `codeowners`.
+- The built-in list of control paths and control repositories is gone: the
+  protected list is `.github/**`, CODEOWNERS files, the repository's tiers file
+  and the paths of its policy rules. **Upgrade step:** an install that relied on
+  the built-in list saves a `protectedPathPolicy` entry for that repository.
+- Adds the `issue.comments.read` capability (to read reviewer verdicts); upgrading
+  asks the operator to approve it. Behaviour is otherwise unchanged until an
+  administrator saves a policy.
+
 ## 0.12.0 — Write identity and the App user
 
 - Per-action write identity (App or the run's user) with repository overrides,
@@ -581,9 +655,9 @@ repository/task management actor.
   a company secret, an hourly fence check that turns writes off on drift, a
   kill switch, a repository allowlist, privileged-action toggles, a write
   throttle, an admin-merge guard, a protected-path merge guard (no agent merge
-  touching `.github/**`, CODEOWNERS or, in the control repository, `paperclip/**`,
-  `scripts/**` and the base branch's `paperclip/tiers.yaml` list, except what an instance
-  administrator releases per repository with `agentMergeablePaths`; no auto-merge
+  touching `.github/**`, CODEOWNERS or the base branch's `paperclip/tiers.yaml` list,
+  except what an instance administrator releases per repository with
+  `agentMergeablePaths`; no auto-merge
   or merge queue) and server-side commit signing.
 - Declares `writeIdentityAction`, `signCommitAction` and the
   `secrets.write-own` capability; upgrading asks the operator to approve it.

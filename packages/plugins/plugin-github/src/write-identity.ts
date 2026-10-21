@@ -29,7 +29,8 @@ import {
 } from "@paperclipai/shared/github-write-identity";
 import { boardScope, requireInstanceAdmin } from "./setup.js";
 import { GitHubError, type GitHubClient } from "./github.js";
-import { SKILLS_LOCK_FILE, TIERS_FILE, parseAgentMergeablePaths, parseProtectedPaths, protectedFiles, protectedPatterns, skillsLockException, splitReleased, type AgentMergeableRule, type ChangedFile } from "./protected-paths.js";
+import { SKILLS_LOCK_FILE, TIERS_FILE, classifyKeptFiles, lensKey, parseAgentMergeablePaths, parseProtectedPathPolicy, parseProtectedPaths, protectedFiles, protectedPatterns, requirementsOf, skillsLockException, splitReleased, type AgentMergeableRule, type ChangedFile } from "./protected-paths.js";
+import { currentVerdicts, lensOutcome, type LensVerdict, type VerdictComment } from "./review-verdicts.js";
 import type { Catalog, Repository } from "./contracts.js";
 import { UserAuthorization, UserAuthorizationError, type FenceStatus, type UserAuthorizationState } from "./user-authorization.js";
 import { CLOCK_SKEW_ALERT_MS } from "./clock.js";
@@ -54,6 +55,9 @@ const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MAX_PULL_REQUEST_FILE_PAGES = 30;
 /** Released files named in a merge's evidence; the count says how many there were. */
 const MAX_RELEASED_LISTED = 100;
+/** The open issues of the merging agent that Paperclip reads for reviewer verdicts (per status), and the statuses it reads. */
+const MAX_VERDICT_ISSUES = 25;
+const VERDICT_ISSUE_STATUSES = ["in_review", "in_progress"] as const;
 /** Pages read for a fence or merge check; a list that still has a next page after this fails closed. */
 const MAX_PAGES = 10;
 /** The conclusions of a finished check run that pass a required check, as GitHub counts them. */
@@ -502,19 +506,35 @@ export function registerWriteIdentity(
 
   /**
    * P4b: a merge as the App user goes ahead only when its diff touches no
-   * protected path. The protected list is read from the base branch (never the
-   * head): the plugin's minimum list plus `protectedPaths` of paperclip/tiers.yaml
-   * at the base commit. The files are every file of the pull request at the
+   * protected path, or when the admin's `protectedPathPolicy` lets reviewers
+   * approve it. The protected list is read from the base branch (never the
+   * head): the plugin's minimum list, `protectedPaths` of paperclip/tiers.yaml
+   * at the base commit and the paths of the policy rules in the plugin config.
+   * The files are every file of the pull request at the
    * expected head (renames count both names, deletions count), read whole;
-   * a cut list, an unreadable tiers file or a head that moves refuses. The merge
-   * itself names the head SHA, so a push after this check fails it.
+   * a cut list, an unreadable tiers file, an unreadable policy or a head that
+   * moves refuses. A file that a `require` rule governs needs every lens of the
+   * rule approved at the exact head by an agent the config names for that lens;
+   * approvals at another commit count for nothing. The merge itself names the
+   * head SHA, so a push after this check fails it.
    */
-  async function protectedPathEvidence(companyId: string, current: GitHubWriteIdentityPolicy, repository: string, pullRequest: number | null | undefined, expectedHeadSha: string | null | undefined) {
+  async function protectedPathEvidence(companyId: string, current: GitHubWriteIdentityPolicy, repository: string, pullRequest: number | null | undefined, expectedHeadSha: string | null | undefined,
+    caller: { agentId?: string | null; runId?: string | null; admin: boolean }) {
     const human = `a human must merge it: ${current.userLogin ?? "the App user"} in the GitHub web UI`;
     expectedHeadSha = expectedHeadSha?.toLowerCase() ?? null;
     if (!pullRequest || !expectedHeadSha || !FULL_SHA.test(expectedHeadSha)) {
       throw new Denied("A merge needs the pull request number and its full expected head commit SHA (gh pr merge <number> --match-head-commit <40-character sha>), so a push after Paperclip's check fails the merge.");
     }
+    // The admin's settings, read now (never from the pull request): the policy for this repository and the opt-in.
+    const config = await ctx.config.get(companyId);
+    const name = repository.toLowerCase();
+    const parsedPolicy = parseProtectedPathPolicy(config.protectedPathPolicy);
+    const policyProblems = parsedPolicy.problems.filter(problem => problem.repository === null || problem.repository === name);
+    if (policyProblems.length) {
+      ctx.logger.warn("protectedPathPolicy is not valid; merges are refused where it applies", { companyId, repository, problems: parsedPolicy.problems.slice(0, 5).map(problem => problem.message) });
+      throw new Denied(`The protectedPathPolicy plugin setting is not valid${policyProblems[0]!.repository === null ? "" : ` for ${repository}`} (${policyProblems[0]!.message}), so Paperclip cannot tell what a merge there needs; it refuses merges there until an instance administrator fixes the setting.`, { protectedPathPolicyProblems: policyProblems.slice(0, 5).map(problem => problem.message) });
+    }
+    const policy = parsedPolicy.policies.find(entry => entry.repository === name) ?? null;
     const token = await readToken(companyId, current, repository);
     const readPullRequest = async () => (await github.request<any>(`/repos/${repository}/pulls/${pullRequest}`, token)).data;
     const pr = await readPullRequest();
@@ -540,7 +560,7 @@ export function registerWriteIdentity(
     } catch (error) {
       throw new Denied(`Paperclip cannot read ${TIERS_FILE} on the base branch${error instanceof Error && !(error instanceof GitHubError) ? ` (${error.message})` : ""}, so it cannot tell which paths are protected; ${human}.`, evidence);
     }
-    const patterns = protectedPatterns(repository, tiers);
+    const patterns = protectedPatterns(tiers, policy);
     const files: ChangedFile[] = [];
     for (let page = 1; ; page += 1) {
       if (page > MAX_PULL_REQUEST_FILE_PAGES) throw new Denied(`Pull request #${pullRequest} changes more files than GitHub lists (3,000), so Paperclip cannot check them all; ${human}.`, evidence);
@@ -555,31 +575,83 @@ export function registerWriteIdentity(
       throw new Denied(`GitHub listed ${files.length} of the ${Number(pr.changed_files) || "?"} files pull request #${pullRequest} changes, so Paperclip cannot check them all; ${human}.`, evidence);
     }
     // The list belongs to this head: the pull request must not have moved meanwhile.
-    const again = await readPullRequest();
-    if (again?.head?.sha !== headSha || again?.base?.sha !== baseSha) throw new Denied(`Pull request #${pullRequest} changed while Paperclip checked it; run the merge again.`, evidence);
+    const unchanged = async () => {
+      const again = await readPullRequest();
+      if (again?.head?.sha !== headSha || again?.base?.sha !== baseSha) throw new Denied(`Pull request #${pullRequest} changed while Paperclip checked it; run the merge again.`, evidence);
+    };
+    await unchanged();
     const touched = protectedFiles(files, patterns);
     // An instance admin may release some protected files for this repository (the plugin config, read now, never from the head).
-    // A file the opt-in does not release keeps the refusal for the whole pull request.
-    const optIn = touched.length ? await agentMergeableRule(companyId, repository) : { rule: null, problems: [] as string[] };
-    const { released, kept } = splitReleased(touched, optIn.rule, tiers);
+    // A file the opt-in does not release keeps the refusal for the whole pull request, unless a policy rule governs it.
+    const optIn = touched.length ? agentMergeableRule(companyId, repository, config.agentMergeablePaths) : { rule: null, problems: [] as string[] };
+    const { released, kept } = splitReleased(touched, optIn.rule, tiers, policy);
     const releaseEvidence = released.length ? { releasedProtectedFiles: released.slice(0, MAX_RELEASED_LISTED), releasedProtectedFilesCount: released.length, releasedBy: "config:agentMergeablePaths" } : {};
-    if (!kept.length) return { ...evidence, files: files.length, protectedPaths: patterns.length, ...releaseEvidence };
-    if (kept.length === 1 && kept[0] === SKILLS_LOCK_FILE) {
+    const { refused, governed } = classifyKeptFiles(kept, policy);
+    const done = { ...evidence, files: files.length, protectedPaths: patterns.length, ...releaseEvidence };
+    let skillsLockOnly = false;
+    if (refused.length === 1 && refused[0] === SKILLS_LOCK_FILE) {
       const [baseLock, headLock] = await Promise.all([file(SKILLS_LOCK_FILE, baseSha), file(SKILLS_LOCK_FILE, headSha)]).catch(() => [null, null]);
       const reason = baseLock === null || headLock === null ? `${SKILLS_LOCK_FILE} could not be read at both ends` : skillsLockException({ baseLock, headLock, files, patterns });
-      if (reason === null) return { ...evidence, files: files.length, protectedPaths: patterns.length, skillsLockSnapshotOnly: true };
-      throw new Denied(`This pull request changes the protected path ${SKILLS_LOCK_FILE} beyond skill snapshot hashes (${reason}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: kept });
+      if (reason !== null) throw new Denied(`This pull request changes the protected path ${SKILLS_LOCK_FILE} beyond skill snapshot hashes (${reason}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: refused });
+      skillsLockOnly = true;
+    } else if (refused.length) {
+      throw new Denied(`This pull request changes protected paths (${listPaths20(refused)}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: refused, ...(optIn.problems.length ? { agentMergeablePathsProblems: optIn.problems.slice(0, 5) } : {}) });
     }
-    const listed = kept.slice(0, 20).join(", ") + (kept.length > 20 ? `, and ${kept.length - 20} more` : "");
-    throw new Denied(`This pull request changes protected paths (${listed}); agents cannot merge it, ${human}.`, { ...evidence, protectedFiles: kept, ...(optIn.problems.length ? { agentMergeablePathsProblems: optIn.problems.slice(0, 5) } : {}) });
+    const skillsEvidence = skillsLockOnly ? { skillsLockSnapshotOnly: true } : {};
+    if (!governed.length || !policy) return { ...done, ...skillsEvidence };
+
+    // Every governed file needs its rule's lenses approved at this head, by the agents the config names.
+    const needs = requirementsOf(governed, policy);
+    const governedEvidence = { ...evidence, protectedFiles: governed.map(entry => entry.path) };
+    const used = needs.rules.map(rule => ({ index: rule.index, paths: rule.paths, lenses: rule.lenses, allowAdmin: rule.allowAdmin, files: rule.files.slice(0, 20) }));
+    if (caller.admin && needs.withoutAdmin.length) {
+      throw new Denied(`This pull request changes protected paths (${listPaths20(governed.map(entry => entry.path))}) whose protectedPathPolicy rule does not allow an --admin merge (rule ${needs.withoutAdmin.map(index => index + 1).join(", ")} of ${repository}); merge it without --admin once ${needs.lenses.join(", ")} approved the head.`, { ...governedEvidence, requiredBy: used });
+    }
+    const read = await readLensVerdicts(companyId, repository, pullRequest, headSha, policy.lenses, caller.agentId);
+    const outcomes = needs.lenses.map(lens => ({ lens, outcome: lensOutcome(read.verdicts, lens) }));
+    const missing = outcomes.filter(entry => entry.outcome !== "approved");
+    if (missing.length) {
+      const why = missing.map(entry => entry.outcome === "blocked" ? `${entry.lens} (blocked at this head)` : `${entry.lens} (no approval at this head)`).join(", ");
+      throw new Denied(`This pull request changes protected paths (${listPaths20(governed.map(entry => entry.path))}); merging it needs an approval at its head ${headSha.slice(0, 12)} from: ${why}. A reviewer records it as the first line of a comment on an issue assigned to the agent that merges: VERDICT <lens> APPROVE <full head sha>.${read.capped ? ` Paperclip read only the first ${MAX_VERDICT_ISSUES} open issues of that agent.` : ""}`,
+        { ...governedEvidence, requiredBy: used, lenses: outcomes, verdicts: read.verdicts });
+    }
+    // The approvals belong to this head: it must not have moved while they were read.
+    await unchanged();
+    const approvals = needs.lenses.flatMap(lens => read.verdicts.filter(verdict => lensKey(verdict.lens) === lensKey(lens) && verdict.decision === "APPROVE"));
+    return { ...done, ...skillsEvidence, requiredBy: used, approvals };
+  }
+
+  /** The files for a refusal message: the first twenty, and how many more there are. */
+  function listPaths20(paths: string[]): string {
+    return paths.slice(0, 20).join(", ") + (paths.length > 20 ? `, and ${paths.length - 20} more` : "");
+  }
+
+  /**
+   * The current verdicts of the lens reviewers at one head. They are comments on the open issues assigned to the agent that
+   * asks for the merge (the merge gate holds the issue the reviewers wrote on). Only the comment's author counts: the config
+   * names the agents that may approve each lens, and the comment must name the exact head commit.
+   */
+  async function readLensVerdicts(companyId: string, repository: string, pullRequest: number, headSha: string, lenses: Parameters<typeof currentVerdicts>[1]["lenses"], agentId: string | null | undefined) {
+    if (!agentId) return { verdicts: [] as LensVerdict[], capped: false };
+    const issues = new Map<string, string>();
+    let capped = false;
+    for (const status of VERDICT_ISSUE_STATUSES) {
+      const page = await ctx.issues.list({ companyId, assigneeAgentId: agentId, status, limit: MAX_VERDICT_ISSUES });
+      if (page.length >= MAX_VERDICT_ISSUES) capped = true;
+      for (const issue of page) if (issue.companyId === companyId) issues.set(issue.id, issue.id);
+    }
+    const comments: VerdictComment[] = (await Promise.all([...issues.keys()].map(async issueId => (await ctx.issues.listComments(issueId, companyId)).map(comment => ({
+      id: comment.id, issueId, authorAgentId: comment.authorAgentId, body: comment.body, createdAt: comment.createdAt, deletedAt: comment.deletedAt ?? null,
+    }))))).flat();
+    return { verdicts: currentVerdicts(comments, { repository, pullRequest, headSha, lenses, mergingAgentId: agentId }), capped };
   }
 
   /**
    * The instance admin's opt-in for one repository, from the company's plugin config at the moment of the merge. An entry that
    * is not valid releases nothing; a problem is logged and shown in the refusal's evidence, never guessed around.
    */
-  async function agentMergeableRule(companyId: string, repository: string): Promise<{ rule: AgentMergeableRule | null; problems: string[] }> {
-    const { rules, problems } = parseAgentMergeablePaths((await ctx.config.get(companyId)).agentMergeablePaths);
+  function agentMergeableRule(companyId: string, repository: string, value: unknown): { rule: AgentMergeableRule | null; problems: string[] } {
+    const { rules, problems } = parseAgentMergeablePaths(value);
     if (problems.length) ctx.logger.warn("agentMergeablePaths has entries that are not valid and release nothing", { companyId, problems: problems.slice(0, 5) });
     return { rule: rules.find(rule => rule.repository === repository.toLowerCase()) ?? null, problems };
   }
@@ -850,7 +922,7 @@ export function registerWriteIdentity(
     // A pull request checked against one base could otherwise be retargeted (for example to main) after the merge guard.
     if (input.retarget) throw new Denied(`Agents do not change a pull request's base branch: a human must, ${current.userLogin ?? "the App user"} in the GitHub web UI.`);
     const merged = (input.merge || input.privileged.includes("adminMerge")) && input.repository
-      ? await protectedPathEvidence(companyId, current, input.repository, input.pullRequest, input.expectedHeadSha)
+      ? await protectedPathEvidence(companyId, current, input.repository, input.pullRequest, input.expectedHeadSha, { agentId: input.agentId, runId: input.runId, admin: input.privileged.includes("adminMerge") })
       : undefined;
     const admin = input.privileged.includes("adminMerge") && input.repository
       ? await adminMergeEvidence(companyId, current, input.repository, input.pullRequest, input.expectedHeadSha)
@@ -880,7 +952,22 @@ export function registerWriteIdentity(
     // The token is taken first so a failed token leaves no "allowed" record; the record is written before it is returned.
     const token = await userToken(companyId);
     await recordPrivilegedAllowed(companyId, latest.privileged, input, workflows !== undefined);
+    await recordProtectedMerge(companyId, input, merged);
     return { user, token, evidence };
+  }
+
+  /**
+   * A merge that a policy rule let through on reviewers' approvals is recorded before the credential is returned: the rules
+   * and the approvals it used, the agent and run that asked, and whether it was an admin merge. A merge that cannot be recorded does not happen.
+   */
+  async function recordProtectedMerge(companyId: string, input: { repository: string | null; privileged: GitHubPrivilegedAction[]; pullRequest?: number | null; agentId?: string | null; runId?: string | null }, merged: Record<string, unknown> | undefined): Promise<void> {
+    if (!merged?.requiredBy) return;
+    await ctx.activity.log({
+      companyId, message: "github.protected_path_merge_allowed",
+      ...(input.agentId ? { entityType: "agent", entityId: input.agentId } : {}),
+      metadata: { repository: input.repository, pullRequest: input.pullRequest ?? null, headSha: merged.headSha ?? null, admin: input.privileged.includes("adminMerge"),
+        agentId: input.agentId ?? null, runId: input.runId ?? null, requiredBy: merged.requiredBy, approvals: merged.approvals ?? [] },
+    });
   }
 
   /**
