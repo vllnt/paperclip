@@ -11,6 +11,17 @@ const MENTION_COMMENT_LIMIT = 50;
 /** A run names at most this many skills. */
 const SKILL_KEY_LIMIT = 200;
 
+/** The keys of a company's skills, for a read that has no run to name the skills it uses. */
+export async function listCompanySkillKeys(db: Db, companyId: string): Promise<string[]> {
+  const rows = await db
+    .select({ key: companySkills.key })
+    .from(companySkills)
+    .where(eq(companySkills.companyId, companyId))
+    .orderBy(asc(companySkills.key))
+    .limit(SKILL_KEY_LIMIT);
+  return rows.map((row) => row.key);
+}
+
 export function createPostgresPolicyIndexRows(db: Db): PolicyIndexRowsPort {
   return {
     async load({ companyId, projectId, mentionedKeys, limit }) {

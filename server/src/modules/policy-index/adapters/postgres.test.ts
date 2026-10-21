@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -17,7 +16,7 @@ import {
   projects,
   type Db,
 } from "@paperclipai/db";
-import type { CreateCompanyPolicy } from "@paperclipai/shared";
+import type { CreateCompanyPolicy, UpdateCompanyPolicy } from "@paperclipai/shared";
 import { POLICY_INDEX_QUERY_LIMIT } from "@paperclipai/shared";
 import { companyPolicyService } from "../../../services/company-policies.js";
 import { describeEmbeddedPostgres, seedCompanyWithBoardAccess, useEmbeddedPostgres } from "../../../__tests__/helpers/route-test-harness.js";
@@ -56,7 +55,9 @@ describeEmbeddedPostgres("policy index postgres adapters", () => {
       .insert(issues)
       .values({ companyId: seeded.companyId, title: "Task", status: "todo", priority: "medium", projectId: project!.id })
       .returning();
-    return { ...seeded, create, project: project!, other: other!, issue: issue! };
+    const update = (key: string, input: UpdateCompanyPolicy) =>
+      policies.update(seeded.companyId, key, input, { userId: seeded.userId });
+    return { ...seeded, create, update, project: project!, other: other!, issue: issue! };
   }
 
   it("lists the company's and the project's active policies, with title and summary and no body", async () => {
@@ -184,12 +185,14 @@ describeEmbeddedPostgres("policy index postgres adapters", () => {
   });
 
   it("scans the committed instructions file by content hash and ignores a missing file", async () => {
-    const { companyId, create, issue } = await seed();
+    const { companyId, create, update, issue } = await seed();
     await create({ key: "from-instructions", title: "From instructions" });
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "policy-index-"));
     tempRoots.push(root);
     const file = path.join(root, "AGENTS.md");
-    await fs.writeFile(file, "Always read [p](policy://from-instructions).");
+    const original = "Always read [p](policy://from-instructions).";
+    await fs.writeFile(file, original);
+    const before = await fs.stat(file);
     const cache = createMentionScanCache();
     const resolver = createPolicyIndexResolver(ctx.db, { scanCache: cache });
     const base = { companyId, projectId: null, issue: { id: issue.id, title: "Task", description: null } };
@@ -200,6 +203,14 @@ describeEmbeddedPostgres("policy index postgres adapters", () => {
     expect(cache.size).toBe(1);
 
     await expect(resolver.resolve({ ...base, instructionsFilePath: path.join(root, "missing.md") })).resolves.toBeDefined();
+
+    // The scan only reads. A policy edit changes the index digest and never the instructions file, which
+    // the agent's working copy is made from.
+    await update("from-instructions", { summary: "Changed." });
+    const edited = await resolver.resolve({ ...base, instructionsFilePath: file });
+    expect(edited.digest).not.toBe(found.digest);
+    expect(await fs.readFile(file, "utf8")).toBe(original);
+    expect((await fs.stat(file)).mtimeMs).toBe(before.mtimeMs);
   });
 
   it("reports an unreadable source and still returns the index", async () => {
@@ -212,6 +223,5 @@ describeEmbeddedPostgres("policy index postgres adapters", () => {
     tempRoots.push(root);
     const index = await resolver.resolve({ companyId, projectId: null, issue: { id: issue.id, title: "Task", description: null }, instructionsFilePath: root });
     expect(index.entries.map((entry) => entry.key)).toEqual(["company-rule"]);
-    expect(randomUUID()).toBeTruthy();
   });
 });

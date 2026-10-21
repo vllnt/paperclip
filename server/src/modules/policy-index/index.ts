@@ -13,6 +13,7 @@ import { sharedMentionScanCache, type MentionScanCache } from "./adapters/scan-c
 
 export type { ResolvePolicyIndexInput } from "./application/resolve-policy-index.js";
 export { mergeMentionedKeys } from "./domain/policy-index.js";
+export { listCompanySkillKeys } from "./adapters/postgres.js";
 
 /**
  * Where a task session stores the digest of the policy index it was last told. Server-owned: it is

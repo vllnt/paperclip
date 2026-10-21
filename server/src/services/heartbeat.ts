@@ -7035,7 +7035,7 @@ function isPathInsideRoot(input: { rootPath: string; filePath: string }) {
   );
 }
 
-function resolveRootBoundInstructionsFingerprintPath(input: {
+export function resolveRootBoundInstructionsFingerprintPath(input: {
   instructionsFilePath: string | null;
   instructionsRootPath: string | null;
   instructionsEntryFile: string | null;

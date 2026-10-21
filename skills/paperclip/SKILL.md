@@ -749,5 +749,9 @@ Policies are the board's written rules and guardrails, for the whole company or
 for one project. Follow the `active` company policies and the `active` policies
 of your task's project, and read any policy named as `policy://<key>`. Agents
 read policies (`paperclipai policy list --status active`,
-`paperclipai policy get <key>`); only the board writes them. Load
+`paperclipai policy get <key>`); only the board writes them. Your prompt
+carries a "## Policies" index (key, title, summary and scope, never the body) of
+the policies that apply to your task; `GET /api/issues/{issueId}/heartbeat-context`
+returns the same index as `policies`. A resumed session is sent the index again
+only when it changed. Read the full text of a policy before you rely on it. Load
 `references/policies.md` when you read, apply or propose a policy.
