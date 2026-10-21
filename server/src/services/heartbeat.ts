@@ -96,6 +96,7 @@ import {
   registerAdapterExecutionControl,
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
+import { resolveRunStopSignal } from "./run-stop-signal.js";
 import {
   acknowledgeAdapterSteering,
   clearAdapterSteering,
@@ -23309,6 +23310,44 @@ export function heartbeatService(
     }
   }
 
+  // An issue mutation (a reassignment) can finish stopping a run before the
+  // executor reaches its final write. The late finalization is then skipped, and
+  // it would drop the usage the provider reported while it stopped. Record only
+  // that usage and its cost row: the run keeps its stopped state, and no
+  // presentation or recovery step runs for it.
+  async function recordUsageOfRunStoppedByIssueMutation(input: {
+    agent: typeof agents.$inferSelect;
+    stoppedRun: typeof heartbeatRuns.$inferSelect;
+    adapterResult: AdapterExecutionResult;
+    usageJson: Record<string, unknown> | null;
+    normalizedUsage: UsageTotals | null;
+    legacySessionId: string | null;
+  }) {
+    const { stoppedRun, usageJson } = input;
+    const stoppedByIssueMutation =
+      readNonEmptyString(parseObject(stoppedRun.resultJson).issueMutationStopId) !== null;
+    if (!usageJson || stoppedRun.status !== "cancelled" || !stoppedByIssueMutation) return;
+    const [recorded] = await db
+      .update(heartbeatRuns)
+      .set({ usageJson, updatedAt: new Date() })
+      .where(
+        and(
+          eq(heartbeatRuns.id, stoppedRun.id),
+          eq(heartbeatRuns.status, "cancelled"),
+          isNull(heartbeatRuns.usageJson),
+        ),
+      )
+      .returning({ id: heartbeatRuns.id });
+    if (!recorded) return;
+    await updateRuntimeState(
+      input.agent,
+      stoppedRun,
+      input.adapterResult,
+      { legacySessionId: input.legacySessionId },
+      input.normalizedUsage,
+    );
+  }
+
   // A 403 from claimQueuedRun comes from the run's own persisted identity
   // (an unverifiable interrupt receipt, a manual wake with no user). Those rows
   // do not change, so the claim fails the same way on every pass and restart.
@@ -29161,6 +29200,23 @@ export function heartbeatService(
               },
               "skipping late run finalization because the run already left running state",
             );
+            if (persistedRunWrite.run) {
+              try {
+                await recordUsageOfRunStoppedByIssueMutation({
+                  agent,
+                  stoppedRun: persistedRunWrite.run,
+                  adapterResult,
+                  usageJson,
+                  normalizedUsage,
+                  legacySessionId: nextSessionState.legacySessionId,
+                });
+              } catch (err) {
+                logger.warn(
+                  { err, runId: run.id },
+                  "failed to record the usage of a run stopped by an issue mutation",
+                );
+              }
+            }
             return;
           }
         }
@@ -33672,6 +33728,11 @@ export function heartbeatService(
     terminationGraceMs?: number;
     /** Caller is immediately scheduling an explicit successor path. */
     suppressImmediateRecovery?: boolean;
+    /**
+     * The run is stopped by its own request after it finished its work. Let the
+     * provider process write its final usage before it ends.
+     */
+    flushFinalUsage?: boolean;
   };
 
   function cancellationTerminationGraceMs(
@@ -33833,9 +33894,11 @@ export function heartbeatService(
               await terminateHeartbeatRunProcess({
                 pid: running.child.pid,
                 processGroupId: running.processGroupId,
-                // Codex handles Ctrl-C by cancelling its tool sessions. SIGTERM
-                // can leave commands in their separate process groups alive.
-                signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
+                signal: resolveRunStopSignal({
+                  adapterType: agent?.adapterType,
+                  ownsAdapterControl: Boolean(control),
+                  flushFinalUsage: options.flushFinalUsage === true,
+                }),
                 graceMs: cancellationTerminationGraceMs(
                   running.graceSec,
                   options.terminationGraceMs,
