@@ -64,6 +64,15 @@ async function seed(request: APIRequestContext) {
     assigneeAgentId: scheduler.id,
   });
   await post(request, `/api/companies/${company.id}/routines`, { title: "Routine of another goal", goalId: subGoal.id });
+  // An archived routine is not part of the goal's work, and its agent is not one of the goal's agents.
+  const retired = await agent("Retired reporter");
+  await post(request, `/api/companies/${company.id}/routines`, {
+    title: "Retired beta report",
+    goalId: goal.id,
+    projectId: project.id,
+    assigneeAgentId: retired.id,
+    status: "archived",
+  });
   return { company, goal, project };
 }
 
@@ -107,12 +116,14 @@ for (const viewport of [
     const routines = page.getByRole("tabpanel");
     await expect(routines.getByText("Nightly beta build")).toBeVisible();
     await expect(routines.getByText("Routine of another goal")).toHaveCount(0);
+    await expect(routines.getByText("Retired beta report")).toHaveCount(0);
 
     await page.getByRole("tab", { name: "Agents (3)" }).click();
     const agents = page.getByRole("tabpanel");
     await expect(agents.getByText("Goal owner")).toBeVisible();
     await expect(agents.getByText("Builder")).toBeVisible();
     await expect(agents.getByText("Scheduler")).toBeVisible();
+    await expect(agents.getByText("Retired reporter")).toHaveCount(0);
     await expect(agents.getByText("Open tasks", { exact: true })).toBeVisible();
     await expectNoHorizontalScroll(page, viewport.width);
     if (SCREENSHOT_DIR) await page.screenshot({ path: `${SCREENSHOT_DIR}/goal-linked-work-${viewport.name}.png`, fullPage: true });
@@ -121,6 +132,30 @@ for (const viewport of [
     await expect(page).toHaveURL(/\/agents\//);
 
     expect(errors).toEqual([]);
+  });
+
+  test(`a goal page shows a list that failed to load and keeps the rest of its work (${viewport.name})`, async ({ page }) => {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    const errors = collectConsoleErrors(page);
+    const { company, goal } = await seed(page.request);
+    await page.route(/\/api\/companies\/[^/]+\/routines\?(?:.*&)?goalId=/, (route) =>
+      route.fulfill({ status: 500, json: { error: "Routine list unavailable" } }),
+    );
+
+    await page.goto(`/${company.issuePrefix}/goals/${goal.id}`);
+    await page.getByRole("tab", { name: "Routines", exact: true }).click();
+    // The page retries a failed list before it reports the failure.
+    await expect(page.getByRole("tabpanel").getByRole("alert")).toContainText("Failed to load the goal's routines", { timeout: 20_000 });
+    await expectNoHorizontalScroll(page, viewport.width);
+
+    await page.getByRole("tab", { name: "Agents", exact: true }).click();
+    await expect(page.getByRole("tabpanel").getByRole("alert")).toContainText("Failed to load the goal's agents");
+
+    await page.getByRole("tab", { name: "Open tasks (1)" }).click();
+    await expect(page.getByRole("tabpanel").getByText("Write the release notes")).toBeVisible();
+
+    // The browser logs each refused list request; nothing else may fail.
+    expect(errors.filter((error) => !error.includes("status of 500"))).toEqual([]);
   });
 
   test(`a goal page creates a routine for the goal in place (${viewport.name})`, async ({ page }) => {
