@@ -17,7 +17,15 @@ export const CURSOR_OVERLAP_MS = 1_000;
 export const SYNC_PAGE_SIZE = 100;
 /** Tasks that need a second look (edited here, or failed last time). Beyond this, the full pass finds the rest. */
 export const QUEUE_LIMIT = 500;
-export const QUEUE_PER_REPOSITORY = 100;
+/**
+ * A run looks at no more of them than this per repository, and at none once this share of the company's run is used, so they
+ * never take the time that GitHub's changes need.
+ */
+export const QUEUE_PER_REPOSITORY = 20;
+export const QUEUE_SHARE = 0.3;
+/** An issue that failed is looked at again after 1, 2, 4 and 8 minutes; after this many failures only the full pass looks at it. */
+export const QUEUE_ATTEMPTS = 5;
+export const QUEUE_RETRY_MS = 60_000;
 /** An issue in a repository that no project links is only fetched one by one: at most this many per run, none more often than this. */
 export const TRACKED_PER_RUN = 10;
 export const TRACKED_RECHECK_MS = 300_000;

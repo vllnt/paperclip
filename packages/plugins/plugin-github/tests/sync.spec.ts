@@ -5,7 +5,7 @@ import { register } from "../src/worker.js";
 import { seedConnection } from "./connection.js";
 import { GitHubClient, GitHubError } from "../src/github.js";
 import { matchingRule, mergeSnapshots, validateSettings } from "../src/sync.js";
-import { resumeFrom } from "../src/sync-window.js";
+import { QUEUE_LIMIT, QUEUE_PER_REPOSITORY, QUEUE_RETRY_MS, resumeFrom } from "../src/sync-window.js";
 import type { AutomationRule, GitHubIssue } from "../src/contracts.js";
 const companyId = "c1";
 const actor = { companyId, actor: { type: "user" as const, userId: "u1", companyId, agentId: null, runId: null } };
@@ -328,14 +328,62 @@ describe("incremental GitHub task sync", () => {
     expect(f.list.mock.calls.at(-1)?.[5]?.since).toBeUndefined();
     expect(f.remote.get(1)?.title).toBe("Local title");
   });
-  it("retries an issue whose sync failed on the next run, though GitHub lists nothing new for it", async () => {
+  it("retries an issue whose sync failed a minute later, though GitHub lists nothing new for it", async () => {
     const f = await synced();
     await editHere(f, 1, "Local title");
     f.update.mockRejectedValueOnce(new GitHubError(403));
     expect((await f.service.sync(companyId))?.warnings.join(" ")).toContain("denied");
     expect(f.remote.get(1)?.title).toBe("Issue 1");
+    skewClock()(QUEUE_RETRY_MS);
     await f.service.sync(companyId);
     expect(f.remote.get(1)?.title).toBe("Local title");
+  });
+  it("looks at an issue that keeps failing later each time, and leaves it to the full pass after a few failures", async () => {
+    const f = await synced();
+    await editHere(f, 1, "Local title");
+    f.update.mockRejectedValue(new GitHubError(403));
+    const advance = skewClock(), looks: number[] = [];
+    for (let minute = 0; minute < 20; minute++) {
+      f.get.mockClear();
+      await f.service.sync(companyId);
+      if (f.get.mock.calls.length) looks.push(minute);
+      advance(60_000);
+    }
+    expect(looks).toEqual([0, 1, 3, 7, 15]);
+    expect(await f.h.ctx.state.get(queueKey())).toEqual({});
+  });
+  it("gives the issues that keep failing only a share of the run, so GitHub's changes still sync", async () => {
+    const f = await fixture();
+    f.remote.clear();
+    for (let number = 1; number <= 60; number++) f.remote.set(number, edited(number, number));
+    await f.service.sync(companyId);
+    // Every task is marked done here, and the App may not write issues: each push fails, after 3 s per read.
+    for (const task of await f.native()) {
+      await f.h.ctx.issues.update(task.id, { status: "done" }, companyId);
+      await f.h.emit("issue.updated", { id: task.id }, { companyId, actorType: "user", entityId: task.id });
+    }
+    f.update.mockRejectedValue(new GitHubError(403));
+    const advance = skewClock();
+    f.get.mockImplementation(async (_id, _pem, _repo, number) => { advance(3_000); return f.remote.get(number)!; });
+    f.remote.set(61, edited(61, 70, { title: "New on GitHub" }));
+    const read = () => new Set(f.get.mock.calls.map(call => call[3]));
+    f.get.mockClear();
+    expect(await f.service.sync(companyId)).toMatchObject({ imported: 1, partial: false });
+    expect((await f.native()).find(task => task.originId === "61")?.title).toBe("New on GitHub");
+    const first = read();
+    expect(first.size).toBeLessThanOrEqual(QUEUE_PER_REPOSITORY);
+    f.get.mockClear();
+    await f.service.sync(companyId);
+    expect([...read()].filter(number => first.has(number))).toEqual([]);
+  });
+  it("drops the asks for issues of a repository that is no longer linked, so a full queue takes new edits again", async () => {
+    const f = await synced();
+    await f.h.ctx.state.set(queueKey(), Object.fromEntries(Array.from({ length: QUEUE_LIMIT }, (_, index) => [String(1000 + index), { repositoryId: 99, number: index + 1, at: 0 }])));
+    await f.service.sync(companyId);
+    expect(await f.h.ctx.state.get(queueKey())).toEqual({});
+    await editHere(f, 2, "Local title");
+    await f.service.sync(companyId);
+    expect(f.remote.get(2)?.title).toBe("Local title");
   });
   it("drops the ask for an issue that GitHub no longer has", async () => {
     const f = await synced();

@@ -4,8 +4,8 @@ import { GitHubClient, GitHubError } from "./github.js";
 import { boardScope } from "./setup.js";
 import type { PluginWriteRequest } from "./write-identity.js";
 import { nativeGitHubReady } from "./native-github.js";
-import { JOB_BUDGET_MS, HEAD_MARGIN_MS, QUEUE_LIMIT, QUEUE_PER_REPOSITORY, RUN_BUDGET_MS, SYNC_PAGE_SIZE, TRACKED_PER_RUN, TRACKED_RECHECK_MS,
-  currentSweep, newestUpdate, resumeFrom, validTime, walkUpdated, type RepoCursor, type WalkEnd } from "./sync-window.js";
+import { JOB_BUDGET_MS, HEAD_MARGIN_MS, QUEUE_ATTEMPTS, QUEUE_LIMIT, QUEUE_PER_REPOSITORY, QUEUE_RETRY_MS, QUEUE_SHARE, RUN_BUDGET_MS, SYNC_PAGE_SIZE,
+  TRACKED_PER_RUN, TRACKED_RECHECK_MS, currentSweep, newestUpdate, resumeFrom, validTime, walkUpdated, type RepoCursor, type WalkEnd } from "./sync-window.js";
 import { PLUGIN_ID, type AutomationRule, type ConnectionState, type GitHubIssue, type Repository, type SyncReport, type SyncSettings, type TaskRepository, type TaskRepositories } from "./contracts.js";
 
 const ORIGIN = `plugin:${PLUGIN_ID}:issue` as const;
@@ -13,11 +13,14 @@ const defaults: SyncSettings = { enabled: true, rules: [] };
 type Snapshot = { title: string; body: string; state: string };
 type Link = { issueId: string; githubId: number; number: number; repositoryId: number; base: Snapshot; ruleMatch?: string; conflicts?: string[]; wakePending?: string; projectless?: boolean };
 type Pending = { issueId: string; repositoryId: number; phase: "ready" | "posting"; title: string; body: string };
-/** GitHub issues that need a look although GitHub did not report a change: edited here, or failed last time. Keyed by GitHub issue ID. */
-type SyncQueue = Record<string, { repositoryId: number; number: number; at: number }>;
+/**
+ * GitHub issues that need a look although GitHub did not report a change: edited here, or failed last time. Keyed by GitHub
+ * issue ID. `at` is when the look is due; `attempts` counts the failures since the last ask.
+ */
+type SyncQueue = Record<string, { repositoryId: number; number: number; at: number; attempts?: number }>;
 type Tracked = Record<string, { repositoryId: number; number: number; checkedAt?: string }>;
 interface RunScope { auth: { id: string; pem: string }; config: SyncSettings; report: SyncReport; deadline: number; resyncAt: string | undefined;
-  queued: SyncQueue; connected(): Promise<boolean> }
+  queued: SyncQueue; /** The queue lane takes no issue after this. */ queueDeadline: number; connected(): Promise<boolean> }
 type Credentials = (companyId: string) => Promise<{ id: string; pem: string }>;
 export interface GitHubWebhookPayload {
   action?: string;
@@ -370,10 +373,22 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     const head = validTime(saved?.head) ?? (startedAt === undefined && sweptAt !== undefined ? new Date(Date.parse(sweptAt) - HEAD_MARGIN_MS).toISOString() : undefined);
     return { head, sweptAt, sweep: startedAt === undefined ? undefined : { startedAt, since } };
   }
-  /** Drops the ask for a second look at an issue, unless a newer ask came in while the run was working on it. */
-  function settle(companyId: string, queued: SyncQueue, githubId: number | string) {
-    const asked = queued[String(githubId)];
-    return asked ? changeQueue(companyId, queue => { if (queue[String(githubId)]?.at === asked.at) delete queue[String(githubId)]; }) : Promise.resolve();
+  /** Drops the asks for a second look at these issues, except one that a newer ask replaced while the run was working on it. */
+  function settle(companyId: string, queued: SyncQueue, ...githubIds: Array<number | string>) {
+    const asked = githubIds.map(String).filter(id => queued[id]);
+    return asked.length ? changeQueue(companyId, queue => { for (const id of asked) if (queue[id]?.at === queued[id].at) delete queue[id]; }) : Promise.resolve();
+  }
+  /**
+   * Asks for another look at an issue whose sync failed, later each time; after QUEUE_ATTEMPTS failures only the full pass looks
+   * at it. An issue that keeps failing therefore costs a few looks, not one on every run. A newer ask stays as it is.
+   */
+  function retry(companyId: string, queued: SyncQueue, item: { githubId: number | string; repositoryId: number; number: number }) {
+    const id = String(item.githubId), taken = queued[id], attempts = (taken?.attempts ?? 0) + 1;
+    return changeQueue(companyId, queue => {
+      if (queue[id] && queue[id].at !== taken?.at) return;
+      if (attempts >= QUEUE_ATTEMPTS) delete queue[id];
+      else if (queue[id] || Object.keys(queue).length < QUEUE_LIMIT) queue[id] = { repositoryId: item.repositoryId, number: item.number, at: Date.now() + QUEUE_RETRY_MS * 2 ** (attempts - 1), attempts };
+    });
   }
   /**
    * One repository's part of a run, in the order that keeps GitHub's news first: the issues that were asked for again, then what
@@ -408,7 +423,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       try { await reconcile(companyId, repo, remote, projectIds, auth, config, report); await settle(companyId, scope.queued, remote.id); }
       catch (error) {
         warn(error, `${repo.fullName} #${remote.number}`);
-        await enqueue(companyId, { githubId: remote.id, repositoryId: repo.id, number: remote.number });
+        await retry(companyId, scope.queued, { githubId: remote.id, repositoryId: repo.id, number: remote.number });
       }
     }
     const walk = (from: string | undefined, commit: (since: string) => Promise<void>) => walkUpdated<GitHubIssue>({ from, deadline, commit,
@@ -427,9 +442,11 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
         return listed.length;
       } });
     async function asked(): Promise<"done" | "budget"> {
-      const mine = Object.entries(scope.queued).filter(([, item]) => item.repositoryId === repo.id).sort(([, a], [, b]) => a.at - b.at).slice(0, QUEUE_PER_REPOSITORY);
+      const now = Date.now();
+      const mine = Object.entries(scope.queued).filter(([, item]) => item.repositoryId === repo.id && item.at <= now).sort(([, a], [, b]) => a.at - b.at).slice(0, QUEUE_PER_REPOSITORY);
       for (const [githubId, item] of mine) {
         if (Date.now() >= deadline) return "budget";
+        if (Date.now() >= scope.queueDeadline) break;
         try {
           const remote = await github.getIssue(auth.id, auth.pem, repo, item.number);
           await recover([remote]);
@@ -437,7 +454,7 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
         } catch (error) {
           // A deleted or moved issue has nothing left to sync.
           if (error instanceof GitHubError && (error.status === 404 || error.status === 410)) await settle(companyId, scope.queued, githubId);
-          else warn(error, `${repo.fullName} #${item.number}`);
+          else { warn(error, `${repo.fullName} #${item.number}`); await retry(companyId, scope.queued, { githubId, repositoryId: repo.id, number: item.number }); }
         }
       }
       return "done";
@@ -478,6 +495,10 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
   /** Issues of repositories that no project links are fetched one by one, a few per run, and at once when edited here. */
   async function syncTracked(companyId: string, linked: Repository[], scope: RunScope): Promise<"done" | "stopped"> {
     const tracked = (await ctx.state.get(key(companyId, "standalone")) as Tracked | null) ?? {};
+    // An ask for an issue whose repository is neither linked nor tracked any more has no lane to take it: it would hold its
+    // place in the queue for ever, and a full queue drops new asks.
+    await settle(companyId, scope.queued, ...Object.entries(scope.queued)
+      .filter(([githubId, item]) => !tracked[githubId] && !linked.some(repo => repo.id === item.repositoryId)).map(([githubId]) => githubId));
     const now = Date.now(), checked = (item: Tracked[string]) => Date.parse(validTime(item.checkedAt) ?? "") || 0;
     const due = Object.entries(tracked).filter(([githubId, item]) => !linked.some(repo => repo.id === item.repositoryId)
       && (scope.queued[githubId] || now - checked(item) >= TRACKED_RECHECK_MS)).sort(([, a], [, b]) => checked(a) - checked(b)).slice(0, TRACKED_PER_RUN);
@@ -492,8 +513,9 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
         if (String(remote.id) !== githubId) throw new Error("Issue moved. Open it in its destination repository to reconnect.");
         scope.report.checked = (scope.report.checked ?? 0) + 1;
         await reconcile(companyId, repo, remote, repo.projects.map(p => p.id), scope.auth, scope.config, scope.report);
-        await settle(companyId, scope.queued, githubId);
       } catch (error) { if (isScopeLoss(error)) throw error; scope.report.warnings.push(`GitHub issue #${item.number}: ${errorText(error)}`); }
+      // Looked at, whatever came of it: one that failed is looked at again with the other tracked issues, not on every run.
+      await settle(companyId, scope.queued, githubId);
       item.checkedAt = new Date().toISOString();
     }
     if (due.length) await ctx.state.set(key(companyId, "standalone"), tracked);
@@ -516,7 +538,8 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       const data = await sources.repositories(companyId);
       report.warnings.push(...data.warnings);
       const auth = await credentials(companyId);
-      const scope: RunScope = { auth, config, report, deadline, connected, queued: await queueFor(companyId), resyncAt: validTime(await ctx.state.get(key(companyId, "resync"))) };
+      const scope: RunScope = { auth, config, report, deadline, connected, queued: await queueFor(companyId), resyncAt: validTime(await ctx.state.get(key(companyId, "resync"))),
+        queueDeadline: startedAt + QUEUE_SHARE * (deadline - startedAt) };
       const works: Array<Awaited<ReturnType<typeof repoWork>>> = [];
       const stop = () => { report.warnings.push(DISCONNECTED_DURING_SYNC); return report; };
       for (const repo of data.repositories) {
