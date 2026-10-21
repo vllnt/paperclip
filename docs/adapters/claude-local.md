@@ -163,6 +163,8 @@ On-call checklist if you see this in production:
 
 The adapter creates a temporary directory with symlinks to Paperclip skills and passes it via `--add-dir`. This makes skills discoverable without polluting the agent's working directory.
 
+These directories (one per set of instructions and skills, with the run's copy of the instructions) live in the company's Claude prompt cache in the instance directory. Each run marks the directory it uses. At most once an hour per company, a run removes the directories that no run has used for 7 days, without following the skill links inside them. A failed cleanup is retried later and never fails the run.
+
 ## Remote credential ownership
 
 When no API key or `CLAUDE_CODE_OAUTH_TOKEN` is configured,
