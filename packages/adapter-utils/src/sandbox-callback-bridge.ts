@@ -238,6 +238,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/issues\/[^/]+\/release$/ },
   { method: "PATCH", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/approvals$/ },
+  // Wait: an agent ends its turn with `issue wait`. The server lets only the issue's own assignee (or the
+  // board) set a wait, enforces the company boundary and logs the change. The id slot excludes ?, #, %, .
+  // and \ like the skill and decision rules.
+  { method: "POST", path: /^\/api\/issues\/[^/?#%.\\]+\/wait$/ },
 
   // Files: the queue encodes binary bodies; HTTP/2 carries the same bytes directly.
   { method: "GET", path: /^\/api\/issues\/[^/]+\/attachments$/ },
