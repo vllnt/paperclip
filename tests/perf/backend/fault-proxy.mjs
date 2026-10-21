@@ -237,8 +237,11 @@ export async function startFaultProxy({ targetHost = "127.0.0.1", targetPort, li
       mode = { name, ...options };
       if (previous === "refuse" && name !== "refuse") await listen();
       if (name === "refuse") {
-        if (previous !== "refuse") await new Promise((resolve) => server.close(() => resolve()));
+        // close() stops listening at once but calls back only when every
+        // open connection has ended, so reset them before waiting for it.
+        const closed = previous === "refuse" ? null : new Promise((resolve) => server.close(() => resolve()));
         for (const connection of [...connections]) reset(connection);
+        await closed;
       } else if (name === "flap") {
         for (const connection of connections) {
           clearTimeout(connection.lifeTimer);

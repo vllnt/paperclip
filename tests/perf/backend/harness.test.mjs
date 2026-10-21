@@ -148,6 +148,19 @@ describe("fault proxy", () => {
     await client.ended;
   });
 
+  it("refuse: resets the open connections and does not wait for them to close on their own", async () => {
+    await proxy.setMode("pass");
+    const client = connect(proxy.port);
+    await client.opened;
+    client.socket.write(startup());
+    await until(() => client.state.received.length >= 6);
+    // A database pool keeps its connections open, so the switch must not wait for them.
+    const switched = await Promise.race([proxy.setMode("refuse").then(() => "switched"), sleep(1_000).then(() => "hung")]);
+    assert.equal(switched, "switched");
+    assert.equal(await client.ended, "ECONNRESET");
+    await proxy.setMode("pass");
+  });
+
   it("stall: forwards nothing for the stall, then resets the connection", async () => {
     await proxy.setMode("pass");
     const client = connect(proxy.port);
