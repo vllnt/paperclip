@@ -31,6 +31,11 @@ interface RoutineRunOptions extends JsonOptions {
 /** The loose 8-4-4-4-12 hex shape the server accepts for `targetIssueId`. */
 const ISSUE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+interface RoutineTimelineOptions extends CompanyOptions {
+  from?: string;
+  to?: string;
+}
+
 interface RoutineListOptions extends CompanyOptions {
   q?: string;
   agentId?: string;
@@ -57,6 +62,15 @@ function routineListQuery(opts: RoutineListOptions): string {
   return query ? `?${query}` : "";
 }
 
+/** Builds the timeline query from the CLI flags; the server validates the dates and the window. */
+function routineTimelineQuery(opts: RoutineTimelineOptions): string {
+  const params = new URLSearchParams();
+  if (opts.from) params.set("from", opts.from);
+  if (opts.to) params.set("to", opts.to);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
 export function registerRoutineApiCommands(program: Command): void {
   const routine = program.command("routine").description("Routine API operations");
   addCommonClientOptions(
@@ -75,6 +89,27 @@ export function registerRoutineApiCommands(program: Command): void {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
           const query = routineListQuery(opts);
           printOutput(await ctx.api.get(`${apiPath`/api/companies/${ctx.companyId}/routines`}${query}`), { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+    { includeCompany: false },
+  );
+  addCommonClientOptions(
+    routine
+      .command("timeline")
+      .description(
+        "Show every routine with its runs in a window, the next scheduled fires, and the links between routines, " +
+          "steps, event sources, goals and projects (use --json for the full result)",
+      )
+      .option("-C, --company-id <id>", "Company ID")
+      .option("--from <iso>", "Window start, an ISO date-time with an offset; default a day before now")
+      .option("--to <iso>", "Window end, an ISO date-time with an offset; default a day after now (at most 31 days wide)")
+      .action(async (opts: RoutineTimelineOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const query = routineTimelineQuery(opts);
+          printOutput(await ctx.api.get(`${apiPath`/api/companies/${ctx.companyId}/routines/timeline`}${query}`), { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }

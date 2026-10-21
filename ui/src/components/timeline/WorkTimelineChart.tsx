@@ -12,10 +12,11 @@ import { resolveAgentAppearance } from "@paperclipai/shared";
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "@/lib/router";
-import type { WorkTimelineActor, WorkTimelineResult } from "@paperclipai/shared";
+import type { WorkTimelineActor, WorkTimelineResult, WorkTimelineSpan } from "@paperclipai/shared";
 import { applyCompanyPrefix, extractCompanyPrefixFromPath } from "@/lib/company-routes";
 import {
   AXIS_H,
+  SECTION_H,
   actorType,
   barColor,
   chooseTickStepMs,
@@ -111,6 +112,7 @@ interface TooltipState {
   y: number;
   bar: PositionedBar;
   connectorHint: string | null;
+  hint: string | null;
 }
 
 interface DragSelectionState {
@@ -238,9 +240,28 @@ function ActorGlyph({
   );
 }
 
+/** How one bar is drawn when the caller colours by something other than who started the run. */
+export interface TimelineBarStyle {
+  /** fill colour; `none` draws a hollow bar. */
+  fill: string;
+  /** outline colour; defaults to the foreground. */
+  stroke?: string;
+  dashed?: boolean;
+}
+
 export interface WorkTimelineChartProps {
   data: WorkTimelineResult;
   zoom: ZoomLevel;
+  /** draws a bar in its own style; return null to keep the default "Signal" colours. */
+  barStyle?: (span: WorkTimelineSpan) => TimelineBarStyle | null;
+  /** replaces the default click, which opens the span's issue in a new tab. */
+  onSpanClick?: (span: WorkTimelineSpan) => void;
+  /** one extra line in the hover tooltip. */
+  spanHint?: (span: WorkTimelineSpan) => string | null;
+  /** the first scroll centres on this time instead of the end of the window. */
+  focusMs?: number;
+  /** keep empty rows, order and group rows, set the narrowest bar; keep the object stable between renders. */
+  layoutOptions?: Pick<LayoutOptions, "keepEmptyActors" | "compareActors" | "sectionOf" | "minBarPx">;
   zoomScale?: number;
   onZoomScaleChange?: (nextScale: number, nextZoom: ZoomLevel) => void;
   onVisibleRangeLabelChange?: (label: string) => void;
@@ -252,6 +273,11 @@ export interface WorkTimelineChartProps {
 export function WorkTimelineChart({
   data,
   zoom,
+  barStyle,
+  onSpanClick,
+  spanHint,
+  focusMs,
+  layoutOptions,
   zoomScale,
   onZoomScaleChange,
   onVisibleRangeLabelChange,
@@ -295,8 +321,8 @@ export function WorkTimelineChart({
   const now = nowMs ?? defaultNowRef.current;
   const pxPerMinute = zoomScale ?? zoomScaleForLevel(zoom, viewportW || DEFAULT_VIEWPORT_W);
   const layout = useMemo(
-    () => computeLayout(data, { ...GEOM, pxPerMinute, nowMs: now }),
-    [data, pxPerMinute, now],
+    () => computeLayout(data, { ...GEOM, ...layoutOptions, pxPerMinute, nowMs: now }),
+    [data, layoutOptions, pxPerMinute, now],
   );
   const connectedRunIds = useMemo(() => {
     if (!hoveredRunId) return null;
@@ -345,9 +371,11 @@ export function WorkTimelineChart({
     const windowKey = `${data.window.from}:${data.window.to}`;
     if (initialWindowKeyRef.current !== windowKey) {
       initialWindowKeyRef.current = windowKey;
-      const latest = Math.max(0, layout.width - nextViewportW);
-      el.scrollLeft = latest;
-      setScrollLeft(latest);
+      const initial = focusMs === undefined
+        ? Math.max(0, layout.width - nextViewportW)
+        : timeToScrollLeft(focusMs, nextViewportW);
+      el.scrollLeft = initial;
+      setScrollLeft(initial);
       centerMsRef.current = scrollCenterMs(el);
       return;
     }
@@ -450,7 +478,13 @@ export function WorkTimelineChart({
 
   const showTooltip = (evt: React.MouseEvent, bar: PositionedBar) => {
     setHoveredRunId(bar.span.runId);
-    setTooltip({ x: evt.clientX, y: evt.clientY, bar, connectorHint: connectorHintForBar(bar) });
+    setTooltip({
+      x: evt.clientX,
+      y: evt.clientY,
+      bar,
+      connectorHint: connectorHintForBar(bar),
+      hint: spanHint?.(bar.span) ?? null,
+    });
   };
 
   const handleWheel = (evt: React.WheelEvent<HTMLDivElement>) => {
@@ -495,6 +529,18 @@ export function WorkTimelineChart({
                 <stop offset="100%" stopColor="var(--color-foreground)" stopOpacity={0} />
               </linearGradient>
             </defs>
+
+            {/* section bands: a titled strip above the first row of each group */}
+            {layout.rows.map((row) =>
+              row.sectionTitle === null ? null : (
+                <g key={`section-${row.actor.id}`} data-testid="work-timeline-section">
+                  <rect x={0} y={row.y - SECTION_H + AXIS_H} width={layout.width} height={SECTION_H} fill="var(--color-muted)" />
+                  <text x={12} y={row.y - SECTION_H + AXIS_H + 17} fontSize={11} fontWeight={600} fill="var(--color-muted-foreground)">
+                    {row.sectionTitle}
+                  </text>
+                </g>
+              ),
+            )}
 
             {/* row backgrounds */}
             {layout.rows.map((row, i) => (
@@ -591,8 +637,11 @@ export function WorkTimelineChart({
                 {row.bars.map((bar) => {
                   const yTop = bar.yTop + AXIS_H;
                   const w = bar.x2 - bar.x1;
-                  const cancelled = isCancelledStatus(bar.span.status);
-                  const color = barColor(bar);
+                  const custom = barStyle?.(bar.span) ?? null;
+                  const cancelled = custom ? custom.fill === "none" : isCancelledStatus(bar.span.status);
+                  const color = custom && !cancelled ? custom.fill : barColor(bar);
+                  const outline = custom?.stroke ?? (cancelled ? TIMELINE_COLORS.cancelled : "var(--color-foreground)");
+                  const dashed = custom ? custom.dashed === true : cancelled;
                   const connectedState =
                     connectedRunIds == null ? "idle" : connectedRunIds.has(bar.span.runId) ? "connected" : "faded";
                   const barOpacity =
@@ -615,7 +664,7 @@ export function WorkTimelineChart({
                           setHoveredRunId(null);
                         }}
                         onMouseDown={(e) => e.stopPropagation()}
-                        onClick={() => openIssue(bar.span.issueId)}
+                        onClick={() => (onSpanClick ? onSpanClick(bar.span) : openIssue(bar.span.issueId))}
                       >
                         {/* "Signal" encoding: fill = how the run started (delegated /
                             automation); cancelled runs drop the fill and read as a
@@ -627,9 +676,9 @@ export function WorkTimelineChart({
                           height={bar.height}
                           rx={3}
                           fill={cancelled ? "transparent" : color}
-                          stroke={cancelled ? TIMELINE_COLORS.cancelled : "var(--color-foreground)"}
+                          stroke={outline}
                           strokeWidth={1.5}
-                          strokeDasharray={cancelled ? "4 3" : undefined}
+                          strokeDasharray={dashed ? "4 3" : undefined}
                           opacity={barOpacity}
                         />
                         {/* in-progress fade to "now" */}
@@ -704,6 +753,14 @@ function ActorGutter({ rows, height }: { rows: ReturnType<typeof computeLayout>[
         const actorGlyphId = svgFragmentId(`gutter-${row.actor.id}`);
         return (
           <g key={`gutter-${row.actor.id}`}>
+            {row.sectionTitle !== null && (
+              <g>
+                <rect x={0} y={row.y - SECTION_H + AXIS_H} width={GEOM.gutter} height={SECTION_H} fill="var(--color-muted)" />
+                <text x={12} y={row.y - SECTION_H + AXIS_H + 17} fontSize={11} fontWeight={600} fill="var(--color-muted-foreground)">
+                  {truncate(row.sectionTitle, 24)}
+                </text>
+              </g>
+            )}
             <rect
               x={0}
               y={row.y + AXIS_H}
@@ -801,6 +858,7 @@ function Tooltip({ tooltip, now }: { tooltip: TooltipState; now: number }) {
           {bar.span.retryOfRunId ? " · retry" : ""}
         </div>
       )}
+      {tooltip.hint && <div className="text-muted-foreground">{tooltip.hint}</div>}
       {tooltip.connectorHint && (
         <div className="text-muted-foreground">{tooltip.connectorHint}</div>
       )}

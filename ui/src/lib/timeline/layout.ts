@@ -33,6 +33,14 @@ export interface LayoutOptions {
   laneGap: number;
   /** wall-clock "now" in ms, used to close in-progress runs. */
   nowMs: number;
+  /** keep a row for an actor with no run in the window (default: drop it). */
+  keepEmptyActors?: boolean;
+  /** row order; default is by each actor's first run. */
+  compareActors?: (a: WorkTimelineActor, b: WorkTimelineActor) => number;
+  /** group rows under a titled band; a new band starts where the group changes. */
+  sectionOf?: (actor: WorkTimelineActor) => string | null;
+  /** narrowest a bar may be drawn, in px (default 3). */
+  minBarPx?: number;
 }
 
 export interface PositionedBar {
@@ -66,6 +74,8 @@ export interface PositionedMarker {
 
 export interface ActorRow {
   actor: WorkTimelineActor;
+  /** title of the band that starts above this row, or null when this row continues the previous band. */
+  sectionTitle: string | null;
   /** top of the row (excluding axis offset) in px. */
   y: number;
   /** row height in px. */
@@ -109,6 +119,8 @@ export interface TimelineLayout {
 }
 
 export const AXIS_H = 32;
+/** height of a section band, in px. */
+export const SECTION_H = 26;
 const RUNNING_STATUSES = new Set(["running", "in_progress", "queued", "pending"]);
 const CANCELLED_STATUSES = new Set(["cancelled", "canceled", "aborted", "skipped"]);
 
@@ -253,7 +265,7 @@ function resolveKickoff(
 }
 
 export function computeLayout(result: WorkTimelineResult, opts: LayoutOptions): TimelineLayout {
-  const { pxPerMinute, gutter, rowH, barH, laneGap, nowMs } = opts;
+  const { pxPerMinute, gutter, rowH, barH, laneGap, nowMs, sectionOf, minBarPx = 3 } = opts;
   const fromMs = new Date(result.window.from).getTime();
   const toMs = new Date(result.window.to).getTime();
   const actorById = new Map(result.actors.map((a) => [a.id, a]));
@@ -271,8 +283,11 @@ export function computeLayout(result: WorkTimelineResult, opts: LayoutOptions): 
   for (const s of result.spans) noteActivity(s.actorId, spanStartMs(s));
 
   const rowActors = result.actors
-    .filter((a) => firstActivity.has(a.id)) // drop actors with no run in-window
-    .sort((a, b) => (firstActivity.get(a.id)! - firstActivity.get(b.id)!));
+    .filter((a) => opts.keepEmptyActors || firstActivity.has(a.id)) // drop actors with no run in-window
+    .sort(
+      opts.compareActors
+        ?? ((a, b) => (firstActivity.get(a.id)! - firstActivity.get(b.id)!)),
+    );
 
   // Issue hue map (ordered by first appearance) for the task color map.
   const issueOrder: string[] = [];
@@ -289,7 +304,17 @@ export function computeLayout(result: WorkTimelineResult, opts: LayoutOptions): 
   const barIndex = new Map<string, PositionedBar>(); // runId -> bar
   const rows: ActorRow[] = [];
   let y = 0;
+  let currentSection: string | null | undefined;
   for (const actor of rowActors) {
+    let sectionTitle: string | null = null;
+    if (sectionOf) {
+      const section = sectionOf(actor);
+      if (section !== currentSection) {
+        currentSection = section;
+        sectionTitle = section;
+        y += SECTION_H;
+      }
+    }
     const runs = result.spans
       .filter((s) => s.actorId === actor.id)
       .sort((p, q) => spanStartMs(p) - spanStartMs(q));
@@ -323,7 +348,7 @@ export function computeLayout(result: WorkTimelineResult, opts: LayoutOptions): 
       const laneTop = y + 6 + lane * (barH + laneGap);
       const x1 = x(spanStartMs(r));
       const x2raw = x(spanEndMs(r, nowMs));
-      const x2 = Math.max(x1 + 3, x2raw); // clamp sub-minute runs to a visible min width
+      const x2 = Math.max(x1 + minBarPx, x2raw); // clamp sub-minute runs to a visible min width
       const bar: PositionedBar = {
         span: r,
         x1,
@@ -342,7 +367,7 @@ export function computeLayout(result: WorkTimelineResult, opts: LayoutOptions): 
 
     const activeMs = runs.reduce((sum, r) => sum + Math.max(0, spanEndMs(r, nowMs) - spanStartMs(r)), 0);
 
-    rows.push({ actor, y, h, laneCount, bars, markers, runCount: runs.length, activeMs });
+    rows.push({ actor, sectionTitle, y, h, laneCount, bars, markers, runCount: runs.length, activeMs });
     y += h;
   }
 

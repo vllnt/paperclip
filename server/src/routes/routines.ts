@@ -7,14 +7,17 @@ import {
   createDocumentAnnotationThreadSchema,
   createRoutineTriggerSchema,
   parseListRoutinesQuery,
+  resolveRoutineTimelineWindow,
   rotateRoutineTriggerSecretSchema,
   routineStepSchema,
+  routineTimelineQuerySchema,
   runRoutineSchema,
   updateDocumentAnnotationThreadSchema,
   updateRoutineSchema,
   updateRoutineTriggerSchema,
   type RoutineRunSummary,
   type RoutineStep,
+  type RoutineTimelineWindow,
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
@@ -28,6 +31,7 @@ import {
   routineService,
 } from "../services/index.js";
 import { agentTrustService } from "../services/agent-trust.js";
+import { routineTimelineService } from "../services/routine-timeline.js";
 import { assertActorMayAssignSteps, routineStepWarnings } from "../services/routine-steps.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, notFound, unauthorized, unsupportedMediaType } from "../errors.js";
@@ -43,6 +47,7 @@ export function routineRoutes(
     pluginWorkerManager: options.pluginWorkerManager,
   });
   const documentAnnotationsSvc = documentAnnotationService(db);
+  const timelineSvc = routineTimelineService(db);
   const access = accessService(db);
   const issues = issueService(db);
   const agentTrust = agentTrustService(db, { agents: agentService(db), projects: projectService(db) });
@@ -272,13 +277,20 @@ export function routineRoutes(
   ): Promise<Array<RoutineRunSummary | null>> {
     if (req.actor.type !== "agent") return runs;
     const ids = [...new Set(runs.flatMap((run) => (run?.linkedIssue ? [run.linkedIssue.id] : [])))];
+    const readable = await readableTaskIds(req, companyId, ids);
+    return runs.map((run) => (run?.linkedIssue && !readable.has(run.linkedIssue.id) ? { ...run, linkedIssue: null } : run));
+  }
+
+  /** The tasks among `ids` that the caller may read; an agent is asked per task, board users read them all. */
+  async function readableTaskIds(req: Request, companyId: string, ids: string[]): Promise<Set<string>> {
+    if (req.actor.type !== "agent") return new Set(ids);
     const readable = new Set<string>();
     await Promise.all(
       (await issues.listAccessFields(companyId, ids)).map(async (task) => {
         if ((await decideOnTask(req, "issue:read", task)).allowed) readable.add(task.id);
       }),
     );
-    return runs.map((run) => (run?.linkedIssue && !readable.has(run.linkedIssue.id) ? { ...run, linkedIssue: null } : run));
+    return readable;
   }
 
   /**
@@ -352,6 +364,31 @@ export function routineRoutes(
     const result = await svc.list(companyId, parseListRoutinesQuery(req.query));
     const lastRuns = await withReadableLinkedIssues(req, companyId, result.map((routine) => routine.lastRun));
     res.json(result.map((routine, index) => ({ ...routine, lastRun: lastRuns[index] ?? null })));
+  });
+
+  router.get("/companies/:companyId/routines/timeline", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    // The page spans every routine and run of the company, as the work timeline spans its tasks.
+    const scope = await access.decide({
+      actor: req.actor,
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    });
+    if (!scope.allowed) throw forbidden("The routines timeline is outside this actor's authorization boundary");
+
+    const query = routineTimelineQuerySchema.parse(req.query);
+    let window: RoutineTimelineWindow;
+    try {
+      window = resolveRoutineTimelineWindow(query, new Date());
+    } catch (err) {
+      throw badRequest(err instanceof Error ? err.message : "Invalid window");
+    }
+    res.json(await timelineSvc.get({
+      companyId,
+      window,
+      readableIssueIds: (ids) => readableTaskIds(req, companyId, ids),
+    }));
   });
 
   router.post("/companies/:companyId/routines", validate(createRoutineSchema), async (req, res) => {
