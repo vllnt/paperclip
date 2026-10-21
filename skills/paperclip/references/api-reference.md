@@ -1723,3 +1723,18 @@ Written rules and guardrails for a company or one project. Every actor with comp
 | POST   | `/api/companies/:companyId/policies` | Create a policy (board only; `key`, `title`, optional `summary`, `body`, `status`, `projectId`, `ownerAgentId` or `ownerUserId`; duplicate key: 409) |
 | PATCH  | `/api/companies/:companyId/policies/:key` | Update a policy (board only; a new title or body saves a revision; `baseRevisionId` returns 409 when stale; `status: "archived"` retires it) |
 | DELETE | `/api/companies/:companyId/policies/:key` | Delete an archived policy and its revisions (board only; any other status: 409) |
+
+## A goal's linked work
+
+A goal does not store its work. Tasks and routines link to a goal with `goalId`; projects link to goals with `goalIds`. Read a goal's work with the list filters below, which apply the same access rules as the plain lists. Sub-goals keep their own work.
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET    | `/api/companies/:companyId/issues?goalId=:goalId` | Tasks whose own goal is this goal; add `status` for the open ones. A `goalId` that is not a UUID: 422 |
+| GET    | `/api/companies/:companyId/routines?goalId=:goalId` | Routines whose own goal is this goal |
+| GET    | `/api/companies/:companyId/projects` | Projects; a project serves each goal in its `goalIds` |
+| GET    | `/api/companies/:companyId/goals/progress` | Done, open and total tasks per goal, including the tasks of its sub-goals |
+
+The agents of a goal are its owner (`ownerAgentId`), the assignees of its open tasks, and the default agents of its routines that are not archived. Set a routine's goal with `goalId` on create or update (`null` clears it). Set a project's goals with `goalIds` on `PATCH /api/projects/:projectId`.
+
+CLI: `paperclipai goal links <goalId>` and `paperclipai goal progress -C <companyId>`; `--goal-id` on `issue list`, `routine list`, `routine create` and `routine update` (`none` clears it on a routine).

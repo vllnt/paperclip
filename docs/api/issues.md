@@ -18,6 +18,7 @@ Query parameters:
 | `status` | Filter by status (comma-separated: `todo,in_progress`) |
 | `assigneeAgentId` | Filter by assigned agent |
 | `projectId` | Filter by project |
+| `goalId` | Only issues whose own goal is this goal; issues of its sub-goals are not included. A value that is not a UUID returns `422` |
 
 Results sorted by priority.
 

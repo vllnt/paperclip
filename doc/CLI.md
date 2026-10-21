@@ -422,7 +422,7 @@ Notes:
 ## Issue Commands
 
 ```sh
-npx paperclipai issue list --company-id <company-id> [--status todo,in_progress] [--assignee-agent-id <agent-id>] [--match text]
+npx paperclipai issue list --company-id <company-id> [--status todo,in_progress] [--assignee-agent-id <agent-id>] [--goal-id <goal-id>] [--match text]
 npx paperclipai issue get <issue-id-or-identifier>
 npx paperclipai issue create --company-id <company-id> --title "..." [--description "..."] [--status todo] [--priority high]
 npx paperclipai issue similar --company-id <company-id> --title "..." [--description "..."] [--parent-id <issue-id>]
@@ -525,7 +525,11 @@ npx paperclipai goal get <goal-id>
 npx paperclipai goal create --company-id <company-id> --title "Grow revenue" [--level company] [--status active]
 npx paperclipai goal update <goal-id> [--title "..."] [--status achieved]
 npx paperclipai goal delete <goal-id> --yes
+npx paperclipai goal progress --company-id <company-id>
+npx paperclipai goal links <goal-id>
 ```
+
+`goal progress` shows each goal's done, open and total tasks, including the tasks of the goals below it. `goal links` shows the work linked to one goal: the projects that serve it, its open tasks, its routines and its agents (the owner, the assignees of its open tasks, and the default agents of its routines that are not archived). Sub-goals keep their own work.
 
 ## Policy Commands
 
@@ -676,10 +680,10 @@ npx paperclipai archive export --company-id <company-id> [--since <iso>] [--unti
 `routine list` filters combine with AND: `--q` searches the title and description (case-insensitive), `--folder-id none` lists routines in no folder, and `--trigger manual` lists routines that have no trigger and only run when started by hand. With no filter it lists every routine, as before.
 
 ```sh
-npx paperclipai routine list --company-id <company-id> [--project-id <project-id>] [--q <text>] [--agent-id <agent-id>] [--folder-id <folder-id>|none] [--status active|paused|archived] [--trigger schedule|webhook|api|event|manual]
-npx paperclipai routine create --company-id <company-id> --payload-json '{...}' [--project-id <project-id>]
+npx paperclipai routine list --company-id <company-id> [--project-id <project-id>] [--goal-id <goal-id>] [--q <text>] [--agent-id <agent-id>] [--folder-id <folder-id>|none] [--status active|paused|archived] [--trigger schedule|webhook|api|event|manual]
+npx paperclipai routine create --company-id <company-id> --payload-json '{...}' [--project-id <project-id>] [--goal-id <goal-id>]
 npx paperclipai routine get <routine-id>
-npx paperclipai routine update <routine-id> --payload-json '{...}' [--project-id <project-id>|none]
+npx paperclipai routine update <routine-id> --payload-json '{...}' [--project-id <project-id>|none] [--goal-id <goal-id>|none]
 npx paperclipai routine revisions <routine-id>
 npx paperclipai routine revision:restore <routine-id> <revision-id>
 npx paperclipai routine runs <routine-id> [--limit 50]
