@@ -54,6 +54,19 @@ This keeps the base prompt small — full skill content is only loaded on demand
 - **Include code examples** — concrete API calls and command examples are more reliable than prose
 - **Keep skills focused** — one skill per concern; don't combine unrelated procedures
 - **Reference files sparingly** — put supporting detail in `references/` rather than bloating the main SKILL.md
+- **Treat the SKILL.md body as a cost of every turn** — once a skill is loaded, its whole body is re-read on every turn of the run. Keep the body to what every run needs (the loop, the hot routes, the critical rules). Move anything an agent needs only in one area to a file in `references/`, and say in the body when to read it
+
+## The Bundled `paperclip` Skill: a Small Core
+
+The bundled `paperclip` skill follows the rule above strictly. `skills/paperclip/SKILL.md` is the core and stays within 20,000 characters: the heartbeat loop, the hot routes, the critical rules and a **Reference index** that says when to read each file in `skills/paperclip/references/`. Every other section (interactions, decisions, approvals, monitors, planning, secrets, chat, and the rest) is a reference that the agent reads in full before it acts in that area.
+
+When you change this skill:
+
+- Add detail to the matching reference, not to the core. Add a rule to the core only if every run needs it.
+- Give a new reference file one line in the **Reference index** of `SKILL.md`. The line names the file and says when to read it.
+- Use relative links inside the skill (`references/x.md` from the core, `x.md` between references). Write a command path relative to the skill directory, as `scripts/paperclip-upload-artifact.sh` is.
+- Add the new file to `skillSources` in `packages/paperclip-runner/spec/capability/source-contract.json`, then regenerate the capability contract (see `packages/paperclip-runner/package.json`, scripts `generate:capability-contract` and `check:capability-inventory`).
+- `server/src/__tests__/paperclip-skill-core.test.ts` checks the size budget, that every reference is indexed, and that every local link and anchor resolves.
 
 ## Skill Injection
 

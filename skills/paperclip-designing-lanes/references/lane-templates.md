@@ -2,7 +2,7 @@
 
 Each template gives the stages of one work item, who owns each child, and a short worked example. The shape is always the same: a standing lane parent, one work-item parent per unit of work, one child per role. The lane lead owns the work item, creates the child for the next stage, and waits `blocked` on it. Names, identifiers, and commit SHAs below are examples.
 
-Sources use the same notation as `SKILL.md`: `[paperclip § Section]` is a section of the `paperclip` skill; other sources are repository paths.
+Sources use the same notation as `SKILL.md`: `[paperclip § Section]` is a section of the `paperclip` skill (`[paperclip references/<file>.md § Section]` when the section lives in one of its references); other sources are repository paths.
 
 ## Contents
 
@@ -24,10 +24,10 @@ Stages: plan (optional) → implement → review per routed lens at head H → v
 | verify | verifier | every review is clean at H | evidence attached (test output, preview, screenshots) |
 | merge | the agent or person allowed to merge | verify is `done` | PR merged at H |
 
-- **Plan on the implement child.** For a large or risky change, the implementer saves a `plan` document on the implement child and, when approval is required, waits `in_review` on a confirmation [paperclip § Planning]. An accepted plan continues on the same issue [`doc/execution-semantics.md` § 7]. A separate plan child adds a cold start and splits one owner's work.
+- **Plan on the implement child.** For a large or risky change, the implementer saves a `plan` document on the implement child and, when approval is required, waits `in_review` on a confirmation [paperclip references/planning.md § Planning]. An accepted plan continues on the same issue [`doc/execution-semantics.md` § 7]. A separate plan child adds a cold start and splits one owner's work.
 - **Route lenses by what changed.** Example lenses: security (auth, secrets, permissions), data (migrations), UI (pages, components), API contract (routes, CLI). A change that touches nothing risky can need one general review. Use one review child per lens, or one execution-policy stage per lens on the implement child; see "Choose one review tool per lens" in `SKILL.md`.
-- **A verdict counts only at the head it reviewed.** If the PR head moves after a review, that verdict is stale. The one exception is a proven clean rebase: the same patch on a new base, with evidence such as `git range-diff` output showing no change, posted on the work item. Paperclip uses the same rule for confirmations: a newer document revision expires a pending confirmation as `stale_target` [paperclip § Issue-Thread Interactions].
-- **The implementer waits for CI, nobody else.** It ends its turn with `issue wait`, naming the PR and head. The lead waits on blockers [paperclip § Monitors and Watchers].
+- **A verdict counts only at the head it reviewed.** If the PR head moves after a review, that verdict is stale. The one exception is a proven clean rebase: the same patch on a new base, with evidence such as `git range-diff` output showing no change, posted on the work item. Paperclip uses the same rule for confirmations: a newer document revision expires a pending confirmation as `stale_target` [paperclip references/interactions.md § Issue-thread interactions].
+- **The implementer waits for CI, nobody else.** It ends its turn with `issue wait`, naming the PR and head. The lead waits on blockers [paperclip references/monitors.md § Monitors and watchers].
 - **Repairs reopen the implement child.** The lead comments the findings with `"reopen": true`. The implementer resumes its session on that issue. Reopen the review child for the new head the same way.
 - **Merge belongs to the merge child.** If the instance turned on git status automation (off by default), a merged PR can also close a linked task. It ignores stacked merges and holds back on gated issues [`doc/ISSUE-GIT-LINKS.md`]. A lane does not depend on it.
 
@@ -69,7 +69,7 @@ Stages: draft → review → apply → verify live.
 | apply | the owner allowed to make the change | change applied; this child is the implementer |
 | verify live | verifier | the change works in real runs, with numbers |
 
-- **Apply needs the right authority.** Agents create and manage only routines assigned to themselves [`references/routines.md` of the `paperclip` skill]. Only board users change a routine gate script [`server/src/services/routines.ts` `assertCanChangeGate`]. Company skill installs follow `references/company-skills.md` of the `paperclip` skill. When the change needs board consent, use `request_board_approval` [paperclip § Requesting Board Approval].
+- **Apply needs the right authority.** Agents create and manage only routines assigned to themselves [`references/routines.md` of the `paperclip` skill]. Only board users change a routine gate script [`server/src/services/routines.ts` `assertCanChangeGate`]. Company skill installs follow `references/company-skills.md` of the `paperclip` skill. When the change needs board consent, use `request_board_approval` [paperclip references/approvals.md § Requesting board approval].
 - **Live evidence needs real runs.** The apply child is the implementer, so it may end its turn with `issue wait` (for example `--in 24h --reason "first day of runs after the change"`). On the wake, it records before and after numbers from the [lane metrics](lane-metrics.md) and closes. The verifier then reads the same data independently.
 - Name the metric that must move, and its current value, in the draft. A process change without a number to check cannot be verified live.
 
@@ -91,7 +91,7 @@ A watch lane looks at something outside Paperclip on a schedule. Its job is to f
   - Without a gate, the first step of the run is the check. When nothing changed, close the run issue `done` with a one-line comment such as "No change since 5d2b7a0". A routine fire wakes with `issue_assigned`, and a run on that wake that ends with no issue comment can queue one follow-up wake to ask for it [`server/src/services/heartbeat.ts` `shouldRequireIssueCommentForWake`].
 - **Create no issue when nothing changed.** A skipped routine run creates no issue and wakes no agent. Use `concurrencyPolicy: "skip_if_active"` or `"coalesce_if_active"` so that ticks do not stack [`references/routines.md` § Concurrency Policies].
 - **A finding becomes a work item in the owning lane.** Create it under that lane's parent, assigned to that lane's lead, with `goalId`, `projectId`, and an `idempotencyKey` built from the finding's identity. Then close the run issue `done` with a comment that names the new work item. The watch run does not fix the finding.
-- **Run a cross-lane watcher at standard trust.** A standard-trust agent can create an issue for another agent [paperclip § Delegating review tasks, courier pattern] and write to any issue it can see [`doc/SPEC-implementation.md` § 9.3.1]. A low-trust run can assign new issues only to itself or to agents inside its boundary [`doc/LOW-TRUST-PRESETS.md`], so it cannot hand a finding to another lane's lead.
+- **Run a cross-lane watcher at standard trust.** A standard-trust agent can create an issue for another agent [paperclip references/delegation.md § Delegating review tasks, courier pattern] and write to any issue it can see [`doc/SPEC-implementation.md` § 9.3.1]. A low-trust run can assign new issues only to itself or to agents inside its boundary [`doc/LOW-TRUST-PRESETS.md`], so it cannot hand a finding to another lane's lead.
 - For alerts from an event source, repeats and recoveries arrive as comments on the same issue, not as new issues [`references/routines.md` § Event Triggers].
 
 **Worked example.** A routine "Dependency advisories for `web-app`" runs every hour. Its gate script lists open advisories and exits 1 when there are none. One hour, it prints `GHSA-xxxx-yyyy in parser@2.1.0`. The routine creates a run issue and wakes Watcher. Watcher creates EX-270 "Upgrade parser for GHSA-xxxx-yyyy" under the code lane parent EX-200 with `idempotencyKey: "advisory:web-app:GHSA-xxxx-yyyy"`, then closes the run issue with "Filed EX-270". The next hour prints the same line, so the gate skips the run.
@@ -103,9 +103,9 @@ Intake turns requests into work items. It does not do the work.
 - **Deduplicate before you create.**
   - Send an `idempotencyKey` built from the external identity (for example `pr:web-app:412`). A repeat create returns the first issue. Keys are kept for 7 days [`server/src/services/issues.ts` `ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS`].
   - Without `allowDuplicate`, an open issue with the same normalized title under the same parent, created in the last 48 h, is returned instead of a new one [`packages/shared/src/validators/issue.ts` `allowDuplicate`, `server/src/services/issues.ts` recent-open-title check].
-  - For older items, check `POST /api/companies/{companyId}/issues/similar` (CLI `paperclipai issue similar`) [`server/src/routes/issue-duplicates.ts`], or search with `GET /api/companies/{companyId}/issues?q=...` [paperclip § Searching Issues].
+  - For older items, check `POST /api/companies/{companyId}/issues/similar` (CLI `paperclipai issue similar`) [`server/src/routes/issue-duplicates.ts`], or search with `GET /api/companies/{companyId}/issues?q=...` [paperclip § Key Endpoints (Hot Routes)].
 - **Every work item gets** `parentId` (the lane parent), `goalId`, `projectId`, one assignee (the lane lead), and a self-contained description with acceptance criteria. Send `goalId` explicitly: `POST /api/companies/{companyId}/issues` copies the parent's project but not its goal, and without `goalId` it uses the project's goal or the company default [`server/src/services/issue-goal-fallback.ts`]. When the instance has isolated workspaces enabled, also send `executionWorkspacePreference: "isolated_workspace"`.
-- **Start or park on purpose.** A work item that is assigned and `todo` starts automatically. Create work that must not start yet as `backlog`. Create it `blocked` with `blockedByIssueIds` when it waits for another issue [paperclip § Status Quick Guide, `doc/execution-semantics.md` § 8 Agent-assigned `todo` and Agent-assigned `backlog`].
+- **Start or park on purpose.** A work item that is assigned and `todo` starts automatically. Create work that must not start yet as `backlog`. Create it `blocked` with `blockedByIssueIds` when it waits for another issue [paperclip § Status quick guide, `doc/execution-semantics.md` § 8 Agent-assigned `todo` and Agent-assigned `backlog`].
 - One-off plans go through `paperclip-converting-plans-to-tasks`. Intake handles the recurring stream.
 
 **Worked example.** Three bug reports arrive from the support inbox. Two describe the same crash. Intake creates EX-280 "Crash on empty cart" with `idempotencyKey: "support:ticket-5521"`. For the second report, `issues/similar` finds EX-280, so Intake comments the extra report there instead. It creates EX-281 for the third report. Both work items go under the code lane parent EX-200 with the "Checkout reliability" goal and the `web-app` project.
@@ -123,7 +123,7 @@ Stages: merge the whole change behind a flag → review and refactor on main →
 | clean fix (only if the review finds problems) | implementer | follow-up PRs merged and linked on this child |
 | release | the agent that turns the flag on | approval recorded; the flag is on |
 
-- Record the release gate as `request_board_approval` linked to the release child [paperclip § Requesting Board Approval], or as an execution-policy `approval` stage on the release child [`references/api-reference.md` § Cross-Agent Review Gates of the `paperclip` skill].
+- Record the release gate as `request_board_approval` linked to the release child [paperclip references/approvals.md § Requesting board approval], or as an execution-policy `approval` stage on the release child [`references/api-reference.md` § Cross-Agent Review Gates of the `paperclip` skill].
 - Create the release child only after the clean children are `done`. Code that is merged but not cleaned must not turn on.
 - The cost: `main` carries unreviewed code behind a flag. Do not use this lane for security or data-migration changes.
 
