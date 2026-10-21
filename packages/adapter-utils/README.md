@@ -43,6 +43,12 @@ helpers in [`src/ssh.ts`](./src/ssh.ts):
 calls for adapters that want a per-run remote workspace and an automatic
 `restoreWorkspace()` finally hook.
 
+The invariant is pinned by the `no-remote-git contract` case in
+[`src/ssh-fixture.test.ts`](./src/ssh-fixture.test.ts), which asserts that a
+remote-only commit propagates to the local worktree through the
+prepare → restore round-trip with no git remote configured at any point. Do
+not regress that test.
+
 ### What the SSH restore guarantees on the primary checkout
 
 After a Git-backed restore, HEAD, the index and the working tree of the local
@@ -55,10 +61,20 @@ deleted. Several runs can share one checkout.
   is seeded is therefore never read as an edit the run made, and a file created
   in that window is never deleted.
 - **The index follows HEAD.** When the restore integrates the run's commits,
-  `integrateImportedGitHead` moves the branch ref only. The restore then resets
-  the index to HEAD and checks out, from HEAD, each tracked file that equals the
-  blob the run committed but differs from the integrated HEAD. A plain
-  `git commit` on the checkout never deletes the run's files.
+  `integrateImportedGitHead` moves the branch ref only. The restore resets the
+  index to HEAD right after the ref moves, so the index follows HEAD even when
+  the file merge then fails. After the merge it checks out, from HEAD, each
+  tracked file that equals the blob the run committed but differs from the
+  integrated HEAD. A plain `git commit` on the checkout never deletes the run's
+  files. A reset that meets another git process's `index.lock` waits for it,
+  for about two seconds.
+- **A run that moved to another commit follows HEAD too.** A run that checks
+  out an older commit of the local history and commits nothing integrates
+  nothing, yet its copy holds that commit's files. When the run's HEAD differs
+  from the local HEAD, the restore realigns those files the same way, without
+  resetting the index. A run whose HEAD equals the local HEAD runs no hook, so
+  a read-only run skips the merge lock unless the local HEAD moved during the
+  run.
 - **Known edges.** A file the run edited after its last commit differs from the
   run's committed blob, so on a true both-sides conflict the run's dirty file
   wins. A path the merge deleted locally while the copy still has it stays
@@ -66,9 +82,3 @@ deleted. Several runs can share one checkout.
 
 The invariant is pinned by
 [`src/ssh-restore-primary-coherence.test.ts`](./src/ssh-restore-primary-coherence.test.ts).
-
-The invariant is pinned by the `no-remote-git contract` case in
-[`src/ssh-fixture.test.ts`](./src/ssh-fixture.test.ts), which asserts that a
-remote-only commit propagates to the local worktree through the
-prepare → restore round-trip with no git remote configured at any point. Do
-not regress that test.
