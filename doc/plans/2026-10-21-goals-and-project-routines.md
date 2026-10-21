@@ -1,6 +1,6 @@
 # Plan: Goals with their linked work, and routines per project
 
-Status: slices 1 (#345) and 2 (#351) are merged. Slice 3 is in review.
+Status: slices 1 (#345) and 2 (#351) are merged. Slice 3 is #372.
 
 ## Context
 
@@ -30,12 +30,12 @@ In plain words: today a goal is a title in a tree, and a project's routines live
 - The skill's routine reference marks `projectId` as required; the validator has it optional.
 - Nothing lists a goal's tasks, routines or agents; there is no `goalId` filter on the task or routine lists and no links endpoint.
 - The project page cannot link or unlink a goal: the project form redesign removed the goal field, while `PATCH /projects/:id` and the CLI still take `goalIds`.
-- Remote runs reach only the goal list and goal detail through the sandbox callback bridge; runtime tools have no goal tools; the wake payload has no goal.
+- Remote runs reach only the goal list and goal detail through the sandbox callback bridge; runtime tools have no dedicated goal focus or progress tools; the wake payload has no goal. (Slice 3 found that native runtimes already reach every goal read through the OpenAPI catalog, and MCP through its goal tools and its generic API tool, so it adds no tools.)
 
 ## Schema decisions
 
 - **Project goals reuse `project_goals`.** A goal linked to a project through `project_goals` is that project's goal. No `goals.project_id` and no new goal level.
-- **A goal's agents are derived, not stored.** "Agents linked to a goal" means the goal's owner plus the assignees of its open tasks and its routines. That answers "who works on this goal" without a table that can drift from the work. An explicit agent-to-goal link can come later if a request needs an agent tied to a goal without any work.
+- **A goal's agents are derived, not stored.** "Agents linked to a goal" means the goal's owner plus the assignees of its open tasks and the default agents of its routines that are not archived. That answers "who works on this goal" without a table that can drift from the work. An explicit agent-to-goal link can come later if a request needs an agent tied to a goal without any work.
 - **No skill-to-goal table.** Skills read goals through the API and the CLI; nothing in the request needs a stored link.
 - **A step keeps inheriting its parent task's goal.** No `goalId` in the step JSON until a request needs a step to serve a different goal from its run.
 - **No links endpoint.** A goal's linked work is composed from the `goalId` list filters and the project list, so it inherits the visibility rules of those lists for agent keys instead of copying them into a new route.
@@ -59,9 +59,9 @@ Result: no migration in any slice. `issues.goal_id` and `routines.goal_id` have 
 - **CLI.** `goal links <id>`, `goal progress`, and `--goal-id` on `issue list`, `routine list`, `routine create` and `routine update` (`none` clears a routine's goal).
 - **OpenAPI and docs.** The `goalId` filters in the OpenAPI document, `docs/api/` and `doc/CLI.md`; a new last section, "A goal's linked work", in the skill's API reference, with its row in the runner capability inventory.
 
-## Slice 3: agents read goals
+## Slice 3: agents read goals (#372)
 
-- **Sandbox callback bridge: reads only.** The bridge admits the goal focus and progress reads, next to the goal list and goal detail that it already admitted. The task and routine lists with `goalId` already pass. Goal writes (create and update) do not pass the bridge, even where the REST API lets the same agent write. Admitting them is a separate decision, because it widens what a remote run can change.
+- **Sandbox callback bridge: reads only.** The bridge admits the goal focus and progress reads, next to the goal list and goal detail that it already admitted. The task and routine lists with `goalId` already pass. Goal writes (create, update and delete) do not pass the bridge, even where the REST API lets the same agent write. Admitting them is a separate decision, because it widens what a remote run can change.
 - **Runtime tools: none added.** Native runtime agents call the API through the OpenAPI document, which lists the goal reads and the `goalId` filters. MCP has the goal list and goal detail tools, `goalId` on the issue list tool, and the generic API request tool for the focus, the progress and a goal's routines.
 - **Wake payload.** The task's own goal (id and title) in the wake issue summary, read inside the run's company and cut like every goal text an agent reads. The wake text shows it on one line, `- issue goal: <title> (goal id <id>)`, only when the task has a goal. A wake without a goal leaves out the key, so its text and its JSON copy do not change. A chat wake shows no goal.
 - **Skill.** The "A goal's linked work" section of the API reference tells an agent how to read its task's goal, the focus and the progress, and how to link new work with `goalId` on task and routine writes, within its existing permissions. No CLI change: the CLI already reads goals, the focus and the progress.
