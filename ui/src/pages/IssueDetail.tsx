@@ -5584,25 +5584,44 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     breadcrumbStatusKey,
   ]);
 
+  const toggleMobileTaskSidePanel = useCallback(
+    () => setMobilePropsOpen((open) => !open),
+    [],
+  );
+
   useEffect(() => {
-    if (!streamlinedTaskDetailEnabled || !taskChatShellEnabled || !issue?.id) {
+    if (!streamlinedTaskDetailEnabled || !issue?.id) {
       setBreadcrumbPanelControl(null);
       return;
     }
 
-    setBreadcrumbPanelControl({
-      open: panelVisible && !suppressPanelUntilPlan,
-      onToggle: toggleTaskSidePanel,
-    });
+    // On mobile the side panel is a sheet, so the header control drives the
+    // sheet instead of the persisted desktop `panelVisible` preference.
+    if (isMobile) {
+      setBreadcrumbPanelControl({
+        open: mobilePropsOpen,
+        onToggle: toggleMobileTaskSidePanel,
+      });
+    } else if (taskChatShellEnabled) {
+      setBreadcrumbPanelControl({
+        open: panelVisible && !suppressPanelUntilPlan,
+        onToggle: toggleTaskSidePanel,
+      });
+    } else {
+      setBreadcrumbPanelControl(null);
+    }
 
     return () => setBreadcrumbPanelControl(null);
   }, [
+    isMobile,
     issue?.id,
+    mobilePropsOpen,
     panelVisible,
     setBreadcrumbPanelControl,
     streamlinedTaskDetailEnabled,
     suppressPanelUntilPlan,
     taskChatShellEnabled,
+    toggleMobileTaskSidePanel,
     toggleTaskSidePanel,
   ]);
 

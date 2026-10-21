@@ -159,6 +159,41 @@ describe("BreadcrumbBar", () => {
     expect(container.querySelector('button[aria-label="Open sidebar"]')).not.toBeNull();
   });
 
+  it("opens the side panel from the mobile task header when the page registers a control", async () => {
+    viewport.isMobile = true;
+    const onToggle = vi.fn();
+    await act(async () => {
+      root.render(
+        <BreadcrumbProvider>
+          <TaskBreadcrumbs identifier="TES-3" panelControl={{ open: false, onToggle }} />
+        </BreadcrumbProvider>,
+      );
+    });
+
+    const launcher = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Show properties"]',
+    );
+    expect(launcher).not.toBeNull();
+    expect(launcher?.closest(".h-\\(--sz-60px\\)")?.textContent).toContain("TES-3");
+
+    act(() => launcher?.click());
+    expect(onToggle).toHaveBeenCalledOnce();
+  });
+
+  it("shows no mobile panel control when the page registers none", async () => {
+    viewport.isMobile = true;
+    await act(async () => {
+      root.render(
+        <BreadcrumbProvider>
+          <TaskBreadcrumbs identifier="TES-3" />
+        </BreadcrumbProvider>,
+      );
+    });
+
+    expect(container.querySelector('button[aria-label="Show properties"]')).toBeNull();
+    expect(container.querySelector('button[aria-label="Hide properties"]')).toBeNull();
+  });
+
   it("renders a page toolbar in the same persistent row as the task breadcrumb", async () => {
     const onOpen = vi.fn();
     await act(async () => {
