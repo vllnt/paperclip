@@ -739,7 +739,7 @@ describeEmbeddedPostgres("routine step condition backstop", () => {
     expect(await statusOf(runs[0]!.issueOf("rework"))).toBe("cancelled");
   });
 
-  it("looks only at runs that have conditions and whose root still waits", async () => {
+  it("looks only at runs that have conditions and whose root is not finished", async () => {
     const { runs, plainRuns } = await seedGateRuns(2, { plainRuns: 1 });
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, runs[0]!.rootId));
     const { backstop } = backstopFor();
