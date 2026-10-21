@@ -21,6 +21,8 @@ const activeAgents = [{ id: "agent-1", name: "Builder", role: "engineer", status
 const activeProjects = [{ id: "project-1", name: "Project Alpha", color: null, archivedAt: null }];
 const agentsListMock = vi.hoisted(() => vi.fn());
 const projectsListMock = vi.hoisted(() => vi.fn());
+const activeGoals = [{ id: "goal-1", title: "Ship the beta", description: null, status: "active" }];
+const goalsListMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/router", () => ({
   Link: ({ to, children, ...props }: AnchorHTMLAttributes<HTMLAnchorElement> & { to: string; children: ReactNode }) => (
@@ -32,12 +34,24 @@ vi.mock("../api/routines", () => ({ routinesApi: { create: createMock, update: u
 vi.mock("../api/agents", () => ({ agentsApi: { list: agentsListMock } }));
 vi.mock("../api/projects", () => ({ projectsApi: { list: projectsListMock } }));
 vi.mock("../api/folders", () => ({ foldersApi: { list: foldersListMock } }));
+vi.mock("../api/goals", () => ({ goalsApi: { list: goalsListMock } }));
 vi.mock("../api/access", () => ({ accessApi: { listUserDirectory: vi.fn(async () => ({ users: [] })) } }));
 vi.mock("../context/ToastContext", () => ({ useToastActions: () => ({ pushToast: pushToastMock }) }));
 vi.mock("./MarkdownEditor", () => ({ MarkdownEditor: () => <div data-testid="markdown-editor" /> }));
 vi.mock("./InlineEntitySelector", () => ({
-  InlineEntitySelector: (props: { value?: string; placeholder?: string; options?: { label: string }[] }) => (
-    <button type="button" data-selector={props.placeholder} data-labels={props.options?.map((option) => option.label).join("|")}>
+  InlineEntitySelector: (props: {
+    value?: string;
+    placeholder?: string;
+    options?: { id: string; label: string }[];
+    onChange?: (id: string) => void;
+  }) => (
+    // A click picks the first option, standing in for a choice in the real picker.
+    <button
+      type="button"
+      data-selector={props.placeholder}
+      data-labels={props.options?.map((option) => option.label).join("|")}
+      onClick={() => props.onChange?.(props.options?.[0]?.id ?? "")}
+    >
       {props.value || props.placeholder}
     </button>
   ),
@@ -102,6 +116,18 @@ describe("routineEditPatch", () => {
     });
   });
 
+  it("links, changes and clears the goal", () => {
+    const routine = savedRoutine({ goalId: "goal-1" });
+    expect(routineEditPatch(routine, { ...routineComposerDraftFrom(routine), goalId: "goal-2" })).toEqual({
+      goalId: "goal-2",
+      baseRevisionId: "revision-3",
+    });
+    expect(routineEditPatch(routine, { ...routineComposerDraftFrom(routine), goalId: "" })).toEqual({
+      goalId: null,
+      baseRevisionId: "revision-3",
+    });
+  });
+
   it("clears the instructions with null", () => {
     const routine = savedRoutine();
     expect(routineEditPatch(routine, { ...routineComposerDraftFrom(routine), description: "   " })).toEqual({
@@ -128,6 +154,7 @@ describe("RoutineComposerDialog", () => {
     foldersListMock.mockClear();
     agentsListMock.mockReset().mockResolvedValue(activeAgents);
     projectsListMock.mockReset().mockResolvedValue(activeProjects);
+    goalsListMock.mockReset().mockResolvedValue(activeGoals);
     onOpenChange.mockReset();
   });
 
@@ -206,6 +233,37 @@ describe("RoutineComposerDialog", () => {
       title: "Routine created",
       action: { label: "Add a trigger", href: "/routines/routine-new/triggers" },
     }));
+  });
+
+  it("creates a routine for the goal it opened with", async () => {
+    createMock.mockResolvedValue({ ...savedRoutine({ id: "routine-new", goalId: "goal-1" }), warnings: [] });
+
+    await render(
+      <RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} initialDraft={{ goalId: "goal-1" }} afterCreate="stay" />,
+    );
+
+    expect(dialog()?.querySelector('[data-selector="Goal"]')?.textContent).toBe("goal-1");
+    await act(() => typeInto(titleInput(), "Weekly sweep"));
+    await act(() => dialogButton("Create routine")!.click());
+    await flush();
+
+    expect(createMock).toHaveBeenCalledWith("company-1", expect.objectContaining({ title: "Weekly sweep", goalId: "goal-1", projectId: null }));
+  });
+
+  it("links a saved routine to a goal", async () => {
+    const routine = savedRoutine();
+    updateMock.mockResolvedValue({ ...routine, goalId: "goal-1", warnings: [] });
+
+    await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} routine={routine} />);
+    expect(dialog()?.querySelector('[data-selector="Goal"]')?.textContent).toBe("Goal");
+    expect(dialogButton("Save changes")?.disabled).toBe(true);
+
+    await act(() => (dialog()!.querySelector('[data-selector="Goal"]') as HTMLButtonElement).click());
+    expect(dialog()?.querySelector('[data-selector="Goal"]')?.textContent).toBe("goal-1");
+    await act(() => dialogButton("Save changes")!.click());
+    await flush();
+
+    expect(updateMock).toHaveBeenCalledWith("routine-1", { goalId: "goal-1", baseRevisionId: "revision-3" });
   });
 
   it("opens trigger setup after a create by default", async () => {
@@ -352,10 +410,23 @@ describe("RoutineComposerDialog", () => {
     expect(projectSelector()).toBe("project-1");
   });
 
+  it("lists a saved routine's cancelled goal only while editing it", async () => {
+    goalsListMock.mockResolvedValue([...activeGoals, { id: "goal-old", title: "Old goal", description: null, status: "cancelled" }]);
+
+    await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} routine={savedRoutine({ goalId: "goal-old" })} />);
+    expect(dialog()?.querySelector('[data-selector="Goal"]')?.getAttribute("data-labels")).toBe("Ship the beta|Old goal (cancelled)");
+
+    await act(() => root!.unmount());
+    root = null;
+    await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} />);
+    expect(dialog()?.querySelector('[data-selector="Goal"]')?.getAttribute("data-labels")).toBe("Ship the beta");
+  });
+
   it("fetches nothing while closed and loads its lists once opened", async () => {
     await render(<RoutineComposerDialog companyId="company-1" open={false} onOpenChange={onOpenChange} />);
     expect(dialog()).toBeNull();
     expect(foldersListMock).not.toHaveBeenCalled();
+    expect(goalsListMock).not.toHaveBeenCalled();
 
     await act(() => root!.render(
       <QueryClientProvider client={queryClient}>
@@ -366,6 +437,7 @@ describe("RoutineComposerDialog", () => {
 
     expect(dialog()).not.toBeNull();
     expect(foldersListMock).toHaveBeenCalledWith("company-1", "routine");
+    expect(goalsListMock).toHaveBeenCalledWith("company-1");
   });
 
   it("shows a create failure inline", async () => {

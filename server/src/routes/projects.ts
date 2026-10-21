@@ -789,11 +789,12 @@ export function projectRoutes(db: Db, options: { pluginWorkerManager?: Pick<Plug
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
-    const project = await svc.remove(id);
-    if (!project) {
+    const removed = await svc.remove(id, { removePolicies: req.actor.type === "board" });
+    if (!removed) {
       res.status(404).json({ error: "Project not found" });
       return;
     }
+    const { project, removedPolicyKeys } = removed;
 
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -804,6 +805,7 @@ export function projectRoutes(db: Db, options: { pluginWorkerManager?: Pick<Plug
       action: "project.deleted",
       entityType: "project",
       entityId: project.id,
+      ...(removedPolicyKeys.length > 0 ? { details: { removedPolicyKeys } } : {}),
     });
 
     res.json(project);
