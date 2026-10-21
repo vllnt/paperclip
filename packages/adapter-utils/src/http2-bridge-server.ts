@@ -33,10 +33,13 @@ import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
 import {
   authorizeSandboxCallbackBridgeRequestWithRoutes,
   compareBridgeTokensConstantTime,
+  parseCanonicalBridgeRequestTarget,
   sanitizeSandboxCallbackBridgeHeaders,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
   DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
+  type CanonicalBridgeRequestPath,
+  type CanonicalBridgeRequestPathResult,
   type SandboxCallbackBridgeRouteRule,
 } from "./sandbox-callback-bridge.js";
 
@@ -508,28 +511,6 @@ export function wrapDuplexChannelAsNodeDuplex(
 // Canonical `:path` parsing (accepted security fix 3)
 // ---------------------------------------------------------------------------
 
-/** The reason {@link parseCanonicalBridgeRequestPath} rejected one request. */
-export type CanonicalBridgeRequestPathRejection =
-  | "missing_path"
-  | "duplicate_pseudo_header"
-  | "non_origin_form"
-  | "encoded_slash"
-  | "backslash"
-  | "nul_byte"
-  | "dot_segment";
-
-/** The one parsed pathname and query. Both the route allowlist and the forward
- * URL builder read this same value; the host never parses `:path` twice. */
-export interface CanonicalBridgeRequestPath {
-  pathname: string;
-  /** The query string, in `URL.search` form: empty, or a leading `?`. */
-  query: string;
-}
-
-export type CanonicalBridgeRequestPathResult =
-  | { ok: true; value: CanonicalBridgeRequestPath }
-  | { ok: false; reason: CanonicalBridgeRequestPathRejection };
-
 /** The request pseudo-headers HTTP/2 allows exactly one of, per request. */
 const REQUEST_PSEUDO_HEADER_NAMES = [":method", ":scheme", ":authority", ":path"] as const;
 
@@ -538,11 +519,9 @@ const REQUEST_PSEUDO_HEADER_NAMES = [":method", ":scheme", ":authority", ":path"
  * returned pathname and query to both the route allowlist and the forward URL
  * builder — never a second, independent parse of the raw header.
  *
- * The parser rejects a request that carries any of: a duplicate pseudo-header,
- * a missing or empty `:path`, a non-origin-form path, an encoded slash, a
- * backslash, a NUL byte, or a dot segment (checked before URL normalization
- * would silently remove it, and after percent-decoding each segment, so an
- * encoded dot segment cannot slip through).
+ * The parser rejects a request that carries a duplicate pseudo-header, then
+ * applies {@link parseCanonicalBridgeRequestTarget}, the rule the queue_v1
+ * host applies too.
  */
 export function parseCanonicalBridgeRequestPath(
   headers: http2.IncomingHttpHeaders,
@@ -552,47 +531,7 @@ export function parseCanonicalBridgeRequestPath(
       return { ok: false, reason: "duplicate_pseudo_header" };
     }
   }
-  const rawPath = headers[":path"];
-  if (typeof rawPath !== "string" || rawPath.length === 0) {
-    return { ok: false, reason: "missing_path" };
-  }
-  // Origin-form only: a single leading "/", never "//" (network-path form) and
-  // never an absolute-form URI ("scheme://...").
-  if (!rawPath.startsWith("/") || rawPath.startsWith("//") || rawPath.includes("://")) {
-    return { ok: false, reason: "non_origin_form" };
-  }
-  if (/%2f/i.test(rawPath)) {
-    return { ok: false, reason: "encoded_slash" };
-  }
-  if (rawPath.includes("\\")) {
-    return { ok: false, reason: "backslash" };
-  }
-  if (rawPath.includes("\0") || /%00/i.test(rawPath)) {
-    return { ok: false, reason: "nul_byte" };
-  }
-  const queryIndex = rawPath.indexOf("?");
-  const rawPathname = queryIndex === -1 ? rawPath : rawPath.slice(0, queryIndex);
-  for (const segment of rawPathname.split("/")) {
-    let decoded: string;
-    try {
-      decoded = decodeURIComponent(segment);
-    } catch {
-      return { ok: false, reason: "non_origin_form" };
-    }
-    if (decoded === "." || decoded === "..") {
-      return { ok: false, reason: "dot_segment" };
-    }
-  }
-  // Every raw-string check above passed, and the path carries no dot segment,
-  // so `URL` normalization here changes nothing but percent-encoding; it stays
-  // safe to build the canonical pathname and query from it.
-  let url: URL;
-  try {
-    url = new URL(rawPath, "http://bridge.internal");
-  } catch {
-    return { ok: false, reason: "non_origin_form" };
-  }
-  return { ok: true, value: { pathname: url.pathname, query: url.search } };
+  return parseCanonicalBridgeRequestTarget(headers[":path"]);
 }
 
 /**
