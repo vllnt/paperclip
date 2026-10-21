@@ -29,6 +29,13 @@ describe("native continuation event projection", () => {
     expect(build({ ...wake, executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "different", messages: [message] } } })).toBeNull();
     expect(build({ ...wake, executionContinuation: null })).toBeNull();
   });
+  it("falls back to the full prompt when new comments are outside the history window", () => {
+    const entry = { id: "outside", authorType: "user", authorId: "board", createdAt: "2026-10-01T00:00:00.000Z", chars: 9_000, deleted: false, preview: "Long request", sourceTrust: null };
+    const delta = (extra: Record<string, unknown>) => ({ ...wake, executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [message], ...extra } } });
+    expect(build(delta({ olderMessages: [entry] }))).toBeNull();
+    expect(build(delta({ unlistedMessages: 3 }))).toBeNull();
+    expect(build(delta({ olderMessages: [] }))).not.toBeNull();
+  });
   it("delivers the current authenticated answer once, not all prior answers", () => {
     const text = build({ ...wake, interactionId: "new-question", executionContinuation: { ...wake.executionContinuation, resumeDelta: { baseRunId: "prior", messages: [] }, humanResponses: [...wake.executionContinuation.humanResponses, { id: "new-question", kind: "ask_user_questions", status: "answered", resolvedByUserId: "board", result: { answer: "NEW_ANSWER" } }] } })!;
     expect(text.split("NEW_ANSWER")).toHaveLength(2);

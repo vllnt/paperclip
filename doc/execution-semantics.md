@@ -461,6 +461,33 @@ An interaction can be created by a run on another task in the same company, or b
 
 New interactions exclude known comments from other tasks when recording their origins. At dispatch, older interactions may discard a copied origin only when both the producer's saved context and a comment on that producer's other task prove where it came from. Missing records, cross-company references, explicit wake comments, and unrelated origins still fail closed.
 
+### Bounded task history on wake
+
+A wake of the issue's assignee carries the task history in its continuation context (`executionContinuation`). The history is a bounded window, so a long-lived issue cannot make a prompt that is larger than the model context.
+
+- **Pinned comments.** The latest human request and the comments that woke the run are always in `messages`. Each is cut at 16,000 characters. They count toward the 48,000-character total: the latest request first, then the wake comments, newest first. When the total is used up, each further pinned comment keeps 200 characters.
+- **Newest comments.** Then come the newest other comments, up to 20. Each is cut at 4,000 characters, until all bodies together reach 48,000 characters. The window stops at the first comment that does not fit, so the recent part has no gaps.
+- **Cut marker.** A cut body ends with `[truncated: N more characters; read comment <id>]`.
+- **Older comments.** `olderMessages` lists each older comment with its id, author, time, length and a one-line preview of 120 characters. It lists at most the 50 newest of them, and `window` counts the rest.
+- **Documents.** `documents` lists the issue documents without system documents: key, title, revision, updated time and length, at most 20. A quarantined document's title is hidden. The task brief cuts the plan body at 32,000 characters and says where to read the rest.
+- **Objective and summary.** The envelope keeps the whole objective, because server checks (for example the native completion contract) read it. A prompt shows at most 16,000 characters of it. The completed-work summary is cut at 16,000 characters.
+- **Size guard.** If the envelope (without its resume delta, with the objective at its shown size) is still above 160,000 characters, the guard removes content in this order, until it fits:
+  1. index entries
+  2. the oldest unpinned comments
+  3. the oldest completed actions and interaction outcomes (the outcome of the triggering interaction stays)
+  4. it cuts the summary and the pinned comments to 2,000 characters
+  Human responses and recovery outcomes are never removed, so they alone can keep an envelope above the ceiling.
+- **Coverage.** `coverage.kind` is `bounded_task_history` when anything was left out or cut, and `window` says what was kept. `coverage.throughCommentId` is still the newest comment of the issue. A thread that fits keeps `full_task_history` and has no `window` or `olderMessages`.
+- **Resumed sessions.** A resumed session gets `resumeDelta`. Its `messages` are the comments of the current window that are new or edited since the named run. A body that only changed its cut length is not sent again. New or edited comments outside the window are listed in `resumeDelta.olderMessages` with a preview, at most 50, and `resumeDelta.unlistedMessages` counts the rest. The prompt says that their bodies must be read. An edit is seen only for a comment that the named run had in `messages`. A comment that commits after a newer comment was delivered sorts before it, so it can be missed when it falls outside the window. A native-runtime resume falls back to the full prompt when the delta lists comments outside the window.
+
+The prompt tells the agent how to read more only when it needs it:
+
+- one comment: `GET /api/issues/{id}/comments/{commentId}` (`paperclipai issue comment:get`)
+- older pages: `GET /api/issues/{id}/comments?order=desc&after={oldestIncludedCommentId}&limit=20` (`paperclipai issue comments --order desc --after-comment-id … --limit 20`)
+- documents: `GET /api/issues/{id}/documents/{key}` (`paperclipai issue document:get`)
+
+The request and authority checks still read every comment row and the whole objective. Only what the prompt carries is bounded.
+
 ### Comment interrupts and ownership handoffs
 
 A board comment can be an interrupt, an ownership change, both, or neither. Paperclip must keep those concepts separate in the product contract.

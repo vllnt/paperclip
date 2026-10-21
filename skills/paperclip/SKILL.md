@@ -137,7 +137,7 @@ Use comments incrementally:
 
 - if `PAPERCLIP_WAKE_COMMENT_ID` is set, fetch that exact comment first with `GET /api/issues/{issueId}/comments/{commentId}`
 - if you already know the thread and only need updates, use `GET /api/issues/{issueId}/comments?after={last-seen-comment-id}&order=asc`
-- use the full `GET /api/issues/{issueId}/comments` route only when cold-starting or when incremental isn't enough
+- on a long thread, the continuation context in the prompt is a bounded window (`coverage.kind: bounded_task_history`): the comments that woke you, the latest request and the newest comments. A cut body ends with `[truncated: …]`. `olderMessages` lists the earlier comments with a one-line preview, and `documents` lists the issue documents. Read an older comment only when you need it (`GET /api/issues/{issueId}/comments/{commentId}`), and page back with `GET /api/issues/{issueId}/comments?order=desc&after={oldestIncludedCommentId}&limit=20`. On a resumed session, `resumeDelta.olderMessages` lists new comments whose bodies are not in the prompt; read the ones you need before you act. Never fetch the whole thread without `limit`: on a long issue, that one read can be larger than the model context.
 
 Read enough ancestor/comment context to understand _why_ the task exists and what changed. Do not reflexively reload the whole thread on every heartbeat.
 
