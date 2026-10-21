@@ -22,6 +22,7 @@ import {
   derivePaperclipViteHmrPort,
   type DeploymentExposure,
   type DeploymentMode,
+  type UiHealthState,
 } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
@@ -194,6 +195,7 @@ import {
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
 import { precompressedStatic } from "./middleware/precompressed-static.js";
+import { mountNextUi, resolveUiRuntime } from "./ui-runtime/next-ui.js";
 import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
 
@@ -681,6 +683,7 @@ export async function createApp(
       authReady: opts.authReady,
       companyDeletionEnabled: opts.companyDeletionEnabled,
       databaseBackupHealth: opts.databaseBackupHealth,
+      getUiStatus: () => uiHealth(),
     }),
   );
   api.use(openApiRoutes());
@@ -922,6 +925,10 @@ export async function createApp(
     null;
   let viteDevServer: { close(): Promise<void> } | null = null;
   let viteHmrServer: HttpServer | null = null;
+  // `GET /api/health` reads the web app's state through this; the UI setup near
+  // the end of createApp replaces it once a Next.js child exists.
+  let uiHealth: () => UiHealthState = () => "disabled";
+  let stopNextUi: (() => Promise<void>) | null = null;
   const loader = pluginLoader(
     db,
     {
@@ -1012,7 +1019,53 @@ export async function createApp(
   );
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  if (opts.uiMode === "static") {
+  const nextUiRoot = path.resolve(__dirname, "../../ui");
+  // PAPERCLIP_UI_RUNTIME picks the Next.js child or today's Vite path (see
+  // ui-runtime/next-ui.ts). The Vite branches below run unchanged under "vite".
+  const uiRuntime =
+    opts.uiMode === "none"
+      ? "vite"
+      : resolveUiRuntime({
+          env: process.env,
+          uiRoot: nextUiRoot,
+          dev: opts.uiMode === "vite-dev",
+          warn: (message) => logger.warn(message),
+        });
+  // The managed-runtime supervisor waits for the app port AND its derived Vite
+  // HMR companion port to bind before publishing the service. Only the dev Vite
+  // server uses that port; every other UI mode binds a placeholder listener on
+  // it, or the supervisor kills a healthy server at the readiness deadline
+  // (PAP-18043).
+  const bindManagedRuntimeHmrPlaceholder = async () => {
+    if (process.env.PAPERCLIP_MANAGED_RUNTIME_EXPOSURE !== "tailscale_https") {
+      return;
+    }
+    const hmrServer = createHttpServer((_req, res) => {
+      res.writeHead(426, { "Content-Type": "text/plain" });
+      res.end("Upgrade Required");
+    });
+    await listenViteHmrServer(
+      hmrServer,
+      resolveViteHmrPort(opts.serverPort),
+      opts.bindHost,
+    );
+    viteHmrServer = hmrServer;
+  };
+
+  if (opts.uiMode !== "none" && uiRuntime === "next") {
+    const nextUi = mountNextUi(app, {
+      uiRoot: nextUiRoot,
+      dev: opts.uiMode === "vite-dev",
+      logger,
+    });
+    uiHealth = nextUi.health;
+    stopNextUi = nextUi.stop;
+    // index.ts registers this first among the `upgrade` listeners (dev only).
+    app.locals.paperclipUiUpgrade = nextUi.upgrade;
+    await bindManagedRuntimeHmrPlaceholder();
+  }
+
+  if (opts.uiMode === "static" && uiRuntime === "vite") {
     // Try published location first (server/ui-dist/), then monorepo dev location (../../ui/dist)
     const candidates = [
       path.resolve(__dirname, "../ui-dist"),
@@ -1071,29 +1124,14 @@ export async function createApp(
           .set("Cache-Control", "no-cache")
           .end(readBrandedStaticIndexHtml(uiDist));
       });
+      uiHealth = () => "ready";
     } else {
       console.warn("[paperclip] UI dist not found; running in API-only mode");
     }
-    if (process.env.PAPERCLIP_MANAGED_RUNTIME_EXPOSURE === "tailscale_https") {
-      // The managed-runtime supervisor waits for the app port AND its derived
-      // Vite HMR companion port to bind before publishing the service. Static
-      // mode has no Vite, so bind the same placeholder listener dev mode uses
-      // or the supervisor kills a healthy server at the readiness deadline
-      // (PAP-18043).
-      const hmrServer = createHttpServer((_req, res) => {
-        res.writeHead(426, { "Content-Type": "text/plain" });
-        res.end("Upgrade Required");
-      });
-      await listenViteHmrServer(
-        hmrServer,
-        resolveViteHmrPort(opts.serverPort),
-        opts.bindHost,
-      );
-      viteHmrServer = hmrServer;
-    }
+    await bindManagedRuntimeHmrPlaceholder();
   }
 
-  if (opts.uiMode === "vite-dev") {
+  if (opts.uiMode === "vite-dev" && uiRuntime === "vite") {
     const uiRoot = path.resolve(__dirname, "../../ui");
     const publicUiRoot = path.resolve(uiRoot, "public");
     const hmrPort = resolveViteHmrPort(opts.serverPort);
@@ -1167,6 +1205,7 @@ export async function createApp(
       }
     });
     app.use(vite.middlewares);
+    uiHealth = () => "ready";
   }
 
   app.use(errorHandler);
@@ -1362,6 +1401,9 @@ export async function createApp(
   const shutdownAppServices = (): Promise<void> => {
     if (appServicesShutdown) return appServicesShutdown;
     appServicesShutdown = (async () => {
+      // Signal the UI child first so its SIGTERM-to-SIGKILL grace runs beside
+      // the rest of the teardown instead of after it; it is awaited last.
+      const nextUiStopped = stopNextUi?.() ?? Promise.resolve();
       // The scheduler tick queries the database. Stop it here, inside the
       // awaited teardown, so no tick runs after the caller ends the pool.
       scheduler.stop();
@@ -1396,6 +1438,7 @@ export async function createApp(
       // caller stops the database and the provider. A lease release that
       // fails stays a durable record for the startup reaper.
       await setupTokenLoginService?.shutdown();
+      await nextUiStopped;
     })();
     return appServicesShutdown;
   };

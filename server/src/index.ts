@@ -132,6 +132,7 @@ import {
   resolveShutdownBudgetMs,
   runBoundedShutdown,
 } from "./shutdown.js";
+import type { MountedNextUi } from "./ui-runtime/next-ui.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
@@ -967,6 +968,11 @@ async function startServerWithDatabaseTeardown(
 
   let startupListenerBound = false;
   try {
+  // Development with the Next.js runtime only: carries hot reload to the UI
+  // child. It goes first so the live-events listener, which closes paths it does
+  // not know, finds the upgrade already marked as handled.
+  const uiUpgrade = app.locals.paperclipUiUpgrade as MountedNextUi["upgrade"] | undefined;
+  if (uiUpgrade) server.prependListener("upgrade", uiUpgrade);
   setupRunnerPrpWebSocketServer(server, { apiUrl: configuredApiUrl });
   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
     pluginWorkerManager,

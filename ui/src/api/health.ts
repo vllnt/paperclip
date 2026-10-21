@@ -1,4 +1,4 @@
-import type { ServerInfoSnapshot } from "@paperclipai/shared";
+import type { ServerInfoSnapshot, UiHealthState } from "@paperclipai/shared";
 import { tenantSessionRecovery } from "@/lib/tenant-session-recovery";
 import { ApiError } from "./client";
 import { ApiUnavailableError, readApiJson } from "./response";
@@ -27,6 +27,11 @@ export type CloudInstanceHealthStatus = {
 
 export type HealthStatus = {
   status: "ok" | "starting";
+  /**
+   * State of the web app's server process. A 200 never carries `failed`: the
+   * server answers 503 with `error: "ui_unavailable"` instead.
+   */
+  ui?: Exclude<UiHealthState, "failed">;
   version?: string;
   /** Commit of the running server; null when build metadata is unavailable. */
   commit?: string | null;

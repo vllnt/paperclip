@@ -341,6 +341,7 @@ import {
   listRoutinesQuerySchema,
   observabilityUsageQuerySchema,
   observabilityUsageResponseSchema,
+  UI_HEALTH_STATES,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -1968,7 +1969,13 @@ registry.registerPath({
   responses: {
     200: r.ok(
       z.object({
-        status: z.enum(["ok", "unhealthy"]),
+        // "starting" while startup recovery runs (routes/health.ts).
+        status: z.enum(["ok", "starting", "unhealthy"]),
+        // State of the web app: `ready` once its child process has reported in
+        // (or its build is served from disk), `starting` while that is pending,
+        // `disabled` when this process serves no web app. `failed` never rides
+        // a 200: it is the 503 below.
+        ui: z.enum(UI_HEALTH_STATES).optional(),
         version: z.string().optional(),
         // Running build commit (full git SHA), or null when git metadata is
         // unavailable. Present on every response shape, including redacted ones.
@@ -2037,18 +2044,29 @@ registry.registerPath({
     // The database-unreachable body still carries version and commit so
     // deployment tooling can verify the running build during an outage;
     // serverInfo rides only on full-details (board/agent) responses.
+    // The other variant means the API works but the web app failed to start.
     503: {
       description: "Service unavailable",
       content: {
         "application/json": {
-          schema: z.object({
-            status: z.literal("unhealthy"),
-            version: z.string(),
-            serverVersion: z.string(),
-            commit: z.string().nullable(),
-            error: z.literal("database_unreachable"),
-            serverInfo: healthServerInfoSchema.optional(),
-          }),
+          schema: z.union([
+            z.object({
+              status: z.literal("unhealthy"),
+              version: z.string(),
+              serverVersion: z.string(),
+              commit: z.string().nullable(),
+              error: z.literal("database_unreachable"),
+              serverInfo: healthServerInfoSchema.optional(),
+            }),
+            z.object({
+              status: z.literal("unhealthy"),
+              version: z.string(),
+              serverVersion: z.string(),
+              commit: z.string().nullable(),
+              error: z.literal("ui_unavailable"),
+              ui: z.literal("failed"),
+            }),
+          ]),
         },
       },
     },

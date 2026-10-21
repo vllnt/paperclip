@@ -52,11 +52,13 @@ self.addEventListener("fetch", (event) => {
   if (BUILD_ID.startsWith("__")) return;
   const { request } = event;
   const url = new URL(request.url);
-  // Only immutable Vite build assets have a public offline-cache contract.
-  // Never infer that application/extension responses are public from absent
-  // headers, or from an in-memory classification lost when this worker restarts.
+  // Only immutable build assets have a public offline-cache contract: Vite's
+  // hashed /assets/ files and everything under Next.js's /_next/static/ (the
+  // server serves it immutable). Never infer that application/extension
+  // responses are public from absent headers, or from an in-memory
+  // classification lost when this worker restarts.
   const publicAsset = url.origin === self.location.origin && !url.search &&
-    /^\/assets\/[^/]+-[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9.]+$/.test(url.pathname);
+    /^\/(?:assets\/[^/]+-[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9.]+|_next\/static\/.+)$/.test(url.pathname);
 
   // Explicitly private requests must bypass BOTH cache writes and offline
   // fallback, including extension endpoints outside the host /api namespace.

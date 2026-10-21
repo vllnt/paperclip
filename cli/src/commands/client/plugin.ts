@@ -34,6 +34,8 @@ interface PluginRecord {
 /** Subset of `GET /api/health` we surface as install/target diagnostics. */
 interface TargetHealth {
   status?: string;
+  /** Web app state: starting, ready or disabled (a failed one answers 503, which the probe reports as unreachable). */
+  ui?: string;
   version?: string;
   deploymentMode?: string;
   deploymentExposure?: string;
@@ -230,6 +232,7 @@ export function formatTargetDiagnostics(diag: TargetDiagnostics): string {
   const health = diag.health ?? {};
   const detailParts: string[] = [];
   if (health.status) detailParts.push(`status=${health.status}`);
+  if (health.ui) detailParts.push(`ui=${health.ui}`);
   if (health.version) detailParts.push(`version=${health.version}`);
   if (health.deploymentMode) detailParts.push(`mode=${health.deploymentMode}`);
   if (health.deploymentExposure) detailParts.push(`exposure=${health.deploymentExposure}`);

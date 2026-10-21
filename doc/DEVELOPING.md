@@ -106,6 +106,22 @@ A tab left open across a deploy asks for chunk names that no longer exist. `inst
 
 `vite build` writes a `.br` (Brotli) and a `.gz` (gzip) file next to every script, stylesheet, SVG and JSON file in `assets/` that is at least 1 KB and compresses smaller. The server (`server/src/middleware/precompressed-static.ts`) sends the Brotli file to clients that accept it, the gzip file to the rest of the clients that accept gzip, and the plain file otherwise, with `Vary: Accept-Encoding`. The app therefore does not depend on a reverse proxy to compress its own bundle. Range requests and files without a sibling get the plain file. The server reads the list of precompressed files when it starts, so restart it after rebuilding the UI to serve the new copies; until then new files go out uncompressed. `index.html` and the service worker are not precompressed. Compression time depends on the emitted assets.
 
+### UI runtime: Next.js child or Vite build (`PAPERCLIP_UI_RUNTIME`)
+
+The server serves the web app in one of two ways, chosen at start by `PAPERCLIP_UI_RUNTIME`:
+
+- `vite`: today's path. Express serves `ui/dist` (or `server/ui-dist`), or the Vite middleware in development.
+- `next`: Express starts Next.js as a second process (`ui/next-server.mjs`) on a loopback port and proxies every non-API `GET` and `HEAD` request to it. Express keeps the API, the websockets, auth and the cache headers; Next.js never listens on a public address.
+- unset: `next` when a build exists (`ui/.next/BUILD_ID`), otherwise `vite`. In development (`PAPERCLIP_UI_DEV_MIDDLEWARE`) the default stays `vite`; set `PAPERCLIP_UI_RUNTIME=next` to run `next dev` instead. `next` without a build falls back to `vite` with a warning.
+
+How the child behaves (`server/src/ui-runtime/`):
+
+- The child reports `{ type: "ready", port }` over IPC once `app.prepare()` has finished and it listens. The UI is `starting` until then, `ready` after, and `failed` when the child crashes or misses the 60-second deadline (counted from spawn) before it was ever ready. A child that was ready and crashes goes back to `starting`. The server restarts it with a delay of 1 s that doubles to 30 s, and resets after 60 s of uptime. While `starting`, a page request waits for readiness; while `failed`, it gets a plain 503 page from Express.
+- `GET /api/health` reports `ui`: `starting`, `ready`, `failed` or `disabled` (no web app served: API-only, or the Vite runtime without a build). While `failed`, it answers 503 with `{ "status": "unhealthy", "error": "ui_unavailable", "ui": "failed" }`; the API keeps working. While `starting`, it keeps its normal status code.
+- Every proxied response gets `Cache-Control: private, no-store` and `Cookie` added to `Vary`, whatever Next.js sent. Other methods get 405 (in development `POST /__nextjs_*` passes), and `/_next/image` and `/_next/mcp` get 404. `/_next/static/*` and `ui/public` are served by Express, and `/sw.js` is stamped with the Next.js build id.
+- In development the server adds one first `upgrade` listener that pipes only the hot-reload socket (`/_next/hmr`) to the child. The other upgrade listeners are unchanged.
+- `PAPERCLIP_UI_MAX_OLD_SPACE_MB` (default 512) sets the child's heap limit. Next.js telemetry is always off in the child.
+
 ## Storybook
 
 The board UI Storybook keeps stories and Storybook config under `ui/storybook/` so component review files stay out of the app source routes.

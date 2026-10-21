@@ -4,7 +4,7 @@ import { Router } from "express";
 import type { Db } from "@paperclipai/db";
 import { and, count, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, instanceUserRoles, invites } from "@paperclipai/db";
-import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
+import type { DeploymentExposure, DeploymentMode, UiHealthState } from "@paperclipai/shared";
 import {
   readPersistedDevServerStatus,
   removeDevServerRestartRequest,
@@ -128,6 +128,11 @@ export function healthRoutes(
     serverInfo?: ServerInfoSnapshot;
     databaseBackupHealth?: InspectDatabaseBackupHealthOptions;
     runtimeEnv?: CloudInstanceEnv;
+    /**
+     * State of the web app. When given, every response carries it as `ui`, and
+     * `failed` turns the response into a 503. Omitted: no `ui` field.
+     */
+    getUiStatus?: () => UiHealthState;
   } = {
     deploymentMode: "local_trusted",
     deploymentExposure: "private",
@@ -257,6 +262,22 @@ export function healthRoutes(
     // one, unlike the fuller `serverInfo` block. Deploy tooling (and anyone)
     // can read which commit this server is running without authenticating.
     const commit = serverInfo.git.available ? serverInfo.git.fullSha : null;
+    // A failed web app fails the health check although the API works: the
+    // container health check tests only the status code, so a deploy whose UI
+    // cannot start does not count as healthy. Version and commit stay on the
+    // body, like on the database-unreachable one.
+    const ui = opts.getUiStatus?.();
+    const uiField = ui ? { ui } : {};
+    const respondUiUnavailable = () => {
+      res.status(503).json({
+        status: "unhealthy",
+        version: serverVersion,
+        serverVersion,
+        commit,
+        error: "ui_unavailable",
+        ui: "failed",
+      });
+    };
     const exposeDevServerDetails =
       exposeFullDetails || hasDevServerStatusToken(req.get("x-paperclip-dev-server-status-token"));
     // Workspace readiness names the instance and execution workspace that
@@ -272,6 +293,10 @@ export function healthRoutes(
       : null;
 
     if (!db) {
+      if (ui === "failed") {
+        respondUiUnavailable();
+        return;
+      }
       res.json(
         exposeFullDetails
           ? {
@@ -280,6 +305,7 @@ export function healthRoutes(
               serverVersion: serverVersion,
               commit,
               serverInfo,
+              ...uiField,
               ...(cloud ? { cloud } : {}),
               ...(hiddenSettings.length ? { hiddenSettings } : {}),
             }
@@ -287,6 +313,7 @@ export function healthRoutes(
               status: healthStatus,
               deploymentMode: opts.deploymentMode,
               commit,
+              ...uiField,
               ...(cloud ? { cloud } : {}),
               ...(hiddenSettings.length ? { hiddenSettings } : {}),
             },
@@ -314,6 +341,13 @@ export function healthRoutes(
         ...(workspace ? { workspace } : {}),
         ...(cloud ? { cloud } : {}),
       });
+      return;
+    }
+
+    // The database being unreachable is the more basic failure and was handled
+    // above; a failed web app comes next.
+    if (ui === "failed") {
+      respondUiUnavailable();
       return;
     }
 
@@ -415,6 +449,7 @@ export function healthRoutes(
         commit,
         bootstrapStatus,
         bootstrapInviteActive,
+        ...uiField,
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
         ...(redactedWarnings ? { warnings: redactedWarnings } : {}),
         ...(devServer ? { devServer } : {}),
@@ -442,6 +477,7 @@ export function healthRoutes(
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },
+      ...uiField,
       serverInfo,
       startupRecovery,
       nativeRecovery,
