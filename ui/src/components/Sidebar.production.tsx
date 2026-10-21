@@ -20,6 +20,7 @@ import {
   MessagesSquare,
   GanttChartSquare,
   LayoutGrid,
+  ScrollText,
 } from "lucide-react";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -231,6 +232,7 @@ export function Sidebar() {
 
         <SidebarSection label="Company" collapsible={{ open: companyOpen, onOpenChange: setCompanyOpen }}>
           <SidebarNavItem to="/org" label="Org" icon={Network} />
+          <SidebarNavItem to="/policies" label="Policies" icon={ScrollText} />
           <PluginSlotOutlet
             slotTypes={["sidebar"]}
             sidebarSection="org"

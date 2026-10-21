@@ -644,6 +644,16 @@ export {
 } from "./goal.js";
 
 export {
+  companyPolicyKeySchema,
+  createCompanyPolicySchema,
+  updateCompanyPolicySchema,
+  listCompanyPoliciesQuerySchema,
+  type CreateCompanyPolicy,
+  type UpdateCompanyPolicy,
+  type ListCompanyPoliciesQuery,
+} from "./company-policy.js";
+
+export {
   applyOnboardingSeedSchema,
   type ApplyOnboardingSeed,
 } from "./onboarding-seed.js";
