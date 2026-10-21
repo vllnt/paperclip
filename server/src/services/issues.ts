@@ -8602,6 +8602,23 @@ export function issueService(db: Db) {
       return getIssueByIdentifier(identifier);
     },
 
+    /** The fields an access decision on a task needs, for the given tasks of one company. */
+    listAccessFields: async (companyId: string, ids: string[]) => {
+      if (ids.length === 0) return [];
+      return db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          projectId: issues.projectId,
+          parentId: issues.parentId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          status: issues.status,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), inArray(issues.id, ids)));
+    },
+
     getCurrentScheduledRetry: async (issueId: string) => {
       const issue = await db
         .select({ id: issues.id, companyId: issues.companyId })

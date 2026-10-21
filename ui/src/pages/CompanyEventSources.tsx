@@ -23,7 +23,12 @@ import { SecretDialog, type RevealedSecret } from "@/components/event-sources/Se
 import { SourceFormDialog } from "@/components/event-sources/SourceFormDialog";
 import { TestPanel } from "@/components/event-sources/TestPanel";
 import { DELIVERY_STATUS_META, ToneBadge, signingModeLabel } from "@/components/event-sources/meta";
-import { eventSourcesApi, type EventSource, type EventSourceWithSecret } from "@/api/eventSources";
+import {
+  eventSourcesApi,
+  isPaperclipInternalSource,
+  type EventSource,
+  type EventSourceWithSecret,
+} from "@/api/eventSources";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { useToastActions } from "@/context/ToastContext";
@@ -359,7 +364,7 @@ function SourceBadges({ source }: { source: EventSource }) {
     <div className="flex flex-wrap items-center gap-1.5">
       <SourceStateBadge source={source} />
       <Badge variant="outline" className="font-normal">
-        {signingModeLabel(source.signingMode)}
+        {isPaperclipInternalSource(source) ? "Managed by Paperclip" : signingModeLabel(source.signingMode)}
       </Badge>
       {source.normalizer === "gatus" && (
         <Badge variant="outline" className="font-normal">
@@ -372,21 +377,40 @@ function SourceBadges({ source }: { source: EventSource }) {
 
 function SourceActionButtons({ source, actions }: { source: EventSource; actions: SourceActions }) {
   if (source.archived) return null;
+  // Paperclip manages the built-in source: the board can only switch it on or off.
+  const managed = isPaperclipInternalSource(source);
   return (
     <div className="flex flex-wrap items-center gap-1">
-      <Button variant="ghost" size="sm" onClick={() => actions.onEdit(source)}>
-        Edit
-      </Button>
-      <Button variant="ghost" size="sm" onClick={() => actions.onRotate(source)}>
-        Rotate secret
-      </Button>
+      {!managed && (
+        <>
+          <Button variant="ghost" size="sm" onClick={() => actions.onEdit(source)}>
+            Edit
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => actions.onRotate(source)}>
+            Rotate secret
+          </Button>
+        </>
+      )}
       <Button variant="ghost" size="sm" disabled={actions.busy} onClick={() => actions.onToggleEnabled(source)}>
         {source.enabled ? "Disable" : "Enable"}
       </Button>
-      <Button variant="ghost" size="sm" onClick={() => actions.onArchive(source)}>
-        Archive
-      </Button>
+      {!managed && (
+        <Button variant="ghost" size="sm" onClick={() => actions.onArchive(source)}>
+          Archive
+        </Button>
+      )}
     </div>
+  );
+}
+
+/** The ingest URL of an external source, or what replaces it for the built-in one. */
+function IngressField({ source }: { source: EventSource }) {
+  if (source.ingressUrl) return <CopyField label="Ingest URL" value={source.ingressUrl} />;
+  return (
+    <p className="text-sm text-muted-foreground">
+      Paperclip publishes these events itself, so there is no ingest URL or secret. Choose it as the event source of
+      a routine trigger to start the routine’s steps when a task is created.
+    </p>
   );
 }
 
@@ -409,7 +433,7 @@ function EventSourceCard({ source, actions }: { source: EventSource; actions: So
           <Link to={`/company/settings/event-sources?source=${source.id}`}>Test &amp; deliveries</Link>
         </Button>
       </div>
-      <CopyField label="Ingest URL" value={source.ingressUrl} />
+      <IngressField source={source} />
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs text-muted-foreground">{lastEventText(source)}</p>
         <SourceActionButtons source={source} actions={actions} />
@@ -420,6 +444,7 @@ function EventSourceCard({ source, actions }: { source: EventSource; actions: So
 
 function EventSourceDetail({ source, actions }: { source: EventSource; actions: SourceActions }) {
   const pinned = Object.entries(source.pinnedLabels ?? {});
+  const managed = isPaperclipInternalSource(source);
   return (
     <div className="space-y-8">
       <div className="space-y-3">
@@ -433,14 +458,17 @@ function EventSourceDetail({ source, actions }: { source: EventSource; actions: 
           </div>
           <SourceActionButtons source={source} actions={actions} />
         </div>
-        <CopyField label="Ingest URL" value={source.ingressUrl} />
+        <IngressField source={source} />
         <dl className="grid gap-x-6 gap-y-1 text-sm sm:grid-cols-2">
-          <DetailRow term="Secret" detail="Hidden. Rotate it to get a new one." />
+          <DetailRow
+            term="Secret"
+            detail={managed ? "None. Paperclip publishes these events itself." : "Hidden. Rotate it to get a new one."}
+          />
           <DetailRow term="Last event" detail={lastEventText(source).replace(/^Last event /, "")} />
-          <DetailRow term="Rate limit" detail={`${source.rateLimitPerMinute} events per minute`} />
+          {!managed && <DetailRow term="Rate limit" detail={`${source.rateLimitPerMinute} events per minute`} />}
           <DetailRow term="Storm breaker" detail={`${source.maxNewIssuesPerHour} new issues per hour`} />
           <DetailRow term="Delivery log" detail={`Kept ${source.retentionDays} days`} />
-          {source.signingMode === "hmac_sha256" && (
+          {!managed && source.signingMode === "hmac_sha256" && (
             <DetailRow term="Replay window" detail={`${source.replayWindowSec} seconds`} />
           )}
           <DetailRow
@@ -452,6 +480,10 @@ function EventSourceDetail({ source, actions }: { source: EventSource; actions: 
       {source.archived ? (
         <p className="text-sm text-muted-foreground">
           This source is archived. It no longer accepts events.
+        </p>
+      ) : managed ? (
+        <p className="text-sm text-muted-foreground">
+          There is nothing to test here. To try a trigger on this source, create a task that matches its filters.
         </p>
       ) : (
         <TestPanel source={source} />

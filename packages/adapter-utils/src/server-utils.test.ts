@@ -4052,6 +4052,64 @@ describe("wake continuation comment ownership", () => {
     expect(prompt).toContain("Current delta body");
   });
 
+  const indexEntry = (id: string) => ({
+    id,
+    authorType: "agent",
+    authorId: "agent-1",
+    createdAt: "2026-09-20T00:00:00.000Z",
+    chars: 3_000,
+    deleted: false,
+    preview: `preview of ${id}`,
+    sourceTrust: null,
+  });
+  const boundedContinuation = (resumeDelta?: Record<string, unknown>) => ({
+    ...continuation([message("comment-latest", "Latest body")]),
+    ...(resumeDelta ? { resumeDelta } : {}),
+    olderMessages: [indexEntry("comment-old-1"), indexEntry("comment-old-2")],
+    window: {
+      totalMessages: 120,
+      includedMessages: 1,
+      truncatedMessages: 0,
+      indexedMessages: 2,
+      unindexedMessages: 117,
+      oldestIncludedCommentId: "comment-latest",
+      droppedEvidenceEntries: 0,
+      limits: { maxComments: 20, maxCommentChars: 4_000, maxTotalChars: 48_000, maxIndexEntries: 50, maxPinnedCommentChars: 16_000, maxEnvelopeChars: 160_000 },
+    },
+    coverage: { kind: "bounded_task_history", throughCommentId: "comment-latest", summaryThroughCommentId: null },
+  });
+
+  it("tells a fresh session that its history is bounded and how to read older comments", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_commented",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Task", description: null },
+      fallbackFetchNeeded: false,
+      executionContinuation: boundedContinuation(),
+    });
+    expect(prompt).not.toContain("History is complete through the coverage cursor.");
+    expect(prompt).toContain("History is bounded to fit the model context. `messages` holds 1 of the 120 comments");
+    expect(prompt).toContain("`GET /api/issues/issue-1/comments/{commentId}` (CLI: `paperclipai issue comment:get issue-1 <commentId>`)");
+    expect(prompt).toContain("`GET /api/issues/issue-1/comments?order=desc&after=comment-latest&limit=20`");
+    expect(prompt).toContain("Do not fetch the whole thread without `limit`.");
+    expect(prompt).toContain("preview of comment-old-1");
+  });
+
+  it("renders only the delta's newly indexed older comments on a resumed session", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_commented",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Task", description: null },
+      fallbackFetchNeeded: false,
+      executionContinuation: boundedContinuation({
+        baseRunId: "run-old",
+        messages: [message("comment-latest", "Latest body")],
+        olderMessages: [indexEntry("comment-old-2")],
+      }),
+    }, { resumedSession: true });
+    expect(prompt).toContain("These are new or edited messages since the named run");
+    expect(prompt).toContain("preview of comment-old-2");
+    expect(prompt).not.toContain("preview of comment-old-1");
+  });
+
   it("does not repeat the shared issue brief as continuation objective on a fresh owned wake", () => {
     const objective = "Assignment brief owned by task markdown.";
     const prompt = renderPaperclipWakePrompt({

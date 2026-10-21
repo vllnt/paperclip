@@ -24,6 +24,83 @@ export const RUN_CONTEXT_DEFAULTS = {
   truncationMarker: false,
 } as const satisfies ResolvedRunContextSettings;
 
+/** Bounds of the issue-history window that a wake's continuation context carries. */
+export interface ThreadWindowLimits {
+  /** Most comments kept in `messages`, newest first, pinned ones included. */
+  maxComments: number;
+  /** Characters kept of one comment body that is not pinned. */
+  maxCommentChars: number;
+  /** Characters of all kept comment bodies together. */
+  maxTotalChars: number;
+  /** Most older comments listed in the one-line `olderMessages` index. */
+  maxIndexEntries: number;
+}
+
+/**
+ * Default history window: the newest 20 comments, 4,000 characters each and
+ * 48,000 in total, plus an index of up to 50 older comments. The comments that
+ * woke the run and the latest human request are always kept.
+ */
+export const THREAD_WINDOW_DEFAULTS = {
+  maxComments: 20,
+  maxCommentChars: 4_000,
+  maxTotalChars: 48_000,
+  maxIndexEntries: 50,
+} as const satisfies ThreadWindowLimits;
+
+/**
+ * Characters of the continuation objective that a wake prompt shows. The
+ * envelope keeps the whole objective, because server checks read it.
+ */
+export const CONTINUATION_OBJECTIVE_MAX_CHARS = 16_000;
+
+/**
+ * The first `end` characters of `text`, one fewer when the cut would split a
+ * surrogate pair. A lone surrogate is invalid JSON for Postgres `jsonb`.
+ *
+ * @param text Text to cut.
+ * @param end Characters to keep.
+ * @returns The prefix, never ending in a high surrogate.
+ */
+export function sliceWhole(text: string, end: number): string {
+  let stop = Math.max(0, Math.min(end, text.length));
+  const lastCode = text.charCodeAt(stop - 1);
+  if (stop > 0 && stop < text.length && lastCode >= 0xd800 && lastCode <= 0xdbff) stop -= 1;
+  return text.slice(0, stop);
+}
+
+/**
+ * Cut text to `max` characters, never inside a surrogate pair, and say how
+ * many characters are left and how to read them.
+ *
+ * @param text Text to cut.
+ * @param max Characters to keep.
+ * @param readHint Where the full text is, for example `read comment <id>`.
+ * @returns The text, or its cut prefix followed by a `[truncated: …]` line.
+ * @example cutText("abcdef", 3, "read comment c1") // "abc\n[truncated: 3 more characters; read comment c1]"
+ */
+export function cutText(text: string, max: number, readHint: string): string {
+  if (text.length <= max) return text;
+  const kept = sliceWhole(text, max);
+  return `${kept}\n[truncated: ${text.length - kept.length} more characters; ${readHint}]`;
+}
+
+const CUT_MARKER = /\n\[truncated: \d+ more characters; [^\n]*\]$/;
+
+/**
+ * Whether two copies of one comment body, each possibly cut by
+ * {@link cutText} at a different length, hold the same text.
+ *
+ * @returns True when the bodies are equal, or when the kept text of the cut one is a prefix of the other.
+ */
+export function sameCutText(a: string, b: string): boolean {
+  if (a === b) return true;
+  const keptA = a.replace(CUT_MARKER, "");
+  const keptB = b.replace(CUT_MARKER, "");
+  if (keptA === a && keptB === b) return false;
+  return keptA.length <= keptB.length ? keptB.startsWith(keptA) : keptA.startsWith(keptB);
+}
+
 const boundedInt = (limits: { min: number; max: number }) =>
   z.number().int().min(limits.min).max(limits.max);
 

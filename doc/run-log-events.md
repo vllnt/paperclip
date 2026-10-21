@@ -303,6 +303,24 @@ continuation recovery stop until the configuration is repaired. Classification
 uses raw provider diagnostics in memory before redaction; stored diagnostics
 remain redacted and bounded.
 
+A prompt that does not fit the model's context window fails the same way on
+every attempt. When the adapter's terminal error message says so (for example
+"Prompt is too long", "Context window limit exceeded" or
+`context_length_exceeded`), the run's error code is `context_window_exceeded`,
+whatever code or error family the adapter chose. Only the short error message
+is read, never stdout or a transcript, because an agent's own output can quote
+these words. No automatic path retries the run: the bounded retry, the
+interaction-continuation infrastructure retry, the release-path recovery (for the
+assignee and for a pending review participant), the recovery service's
+continuation and the chat completion outbox all skip it, so the failure takes no
+run slot. The run log gets one `lifecycle` event (`warn`, payload
+`{ errorCode: "context_window_exceeded" }`) that says why. An assigned task
+becomes `blocked` with the usual recovery notice, so a person decides the next
+step, for example a fresh session. The run failure cause is `context_overflow`.
+The task session is kept: a different wake that was already queued for the same
+task, or a goal resumed at server start, still resumes that session and can fail
+the same way until a person resets the session.
+
 Provider identity diagnostics remain in the local run log. They record the notification method, expected and received thread/turn identifiers, and the classification (root, verified descendant, stale, unrelated informational, or invalid authoritative). They omit the original provider payload and credentials. Repeated informational notices are bounded.
 
 Ignored unrelated Codex notifications use `harness.diagnostic` with code

@@ -148,6 +148,17 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(f.wakeup).toHaveBeenCalledTimes(2);
     expect((await f.rows())[0].attempts).toBe(1);
   });
+  it("stops re-waking a completion turn whose prompt overflowed the context window", async () => {
+    const f = await seed(); await f.finish(); const [delivery] = await f.rows();
+    await f.service.deliver(delivery.id);
+    const [queued] = await f.rows();
+    await db.update(heartbeatRuns).set({ status: "failed", error: "Prompt is too long", errorCode: "context_window_exceeded" })
+      .where(eq(heartbeatRuns.id, queued.targetRunId!));
+    await f.due(); await f.service.deliver(delivery.id);
+    // The same session would overflow again, so no replacement turn starts.
+    expect(f.wakeup).toHaveBeenCalledTimes(1);
+    expect(await f.rows()).toMatchObject([{ status: "exhausted", attempts: 1, error: "Prompt is too long" }]);
+  });
   async function interruptedBootstrap() {
     const f = await seed(); await f.finish(); const run = await f.run();
     const interrupted = await terminalizeLegacyExecution({ db, run, status: "interrupted", patch: {

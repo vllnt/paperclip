@@ -1,11 +1,17 @@
 import {
+  PAPERCLIP_ISSUE_CREATED_EVENT_TYPE,
+  PAPERCLIP_ISSUE_LABEL_EVENT_PREFIX,
+} from "@paperclipai/shared";
+import {
   EVENT_ON_RECOVERY_MODES,
   EVENT_SEVERITIES,
+  isPaperclipInternalSource,
   type EventGrouping,
   type EventMatch,
   type EventOnRecovery,
   type EventRoutineTrigger,
   type EventSeverity,
+  type EventSource,
 } from "@/api/eventSources";
 
 /**
@@ -46,7 +52,8 @@ export type EventTriggerDraft = {
   cooldownMinutes: string;
   rewakeOnSeverityIncrease: boolean;
   onRecovery: EventOnRecovery;
-  issueMode: "group" | "append";
+  /** `event_issue` is fixed for the built-in Paperclip source: the steps attach to the created task. */
+  issueMode: "group" | "append" | "event_issue";
   appendToIssueId: string;
   fallback: boolean;
 };
@@ -105,10 +112,56 @@ export function normalizeEventDraft(value: unknown): EventTriggerDraft {
     onRecovery: (EVENT_ON_RECOVERY_MODES as readonly string[]).includes(raw.onRecovery as string)
       ? (raw.onRecovery as EventOnRecovery)
       : base.onRecovery,
-    issueMode: raw.issueMode === "append" ? "append" : "group",
+    issueMode: raw.issueMode === "append" || raw.issueMode === "event_issue" ? raw.issueMode : "group",
     appendToIssueId: typeof raw.appendToIssueId === "string" ? raw.appendToIssueId : "",
-    fallback: raw.fallback === true,
+    fallback: raw.fallback === true && raw.issueMode !== "event_issue",
   };
+}
+
+/** Event label keys the built-in Paperclip source sets on `issue.created`, offered as filters. */
+export const ISSUE_CREATED_CREATOR_LABEL = "created_by";
+export const ISSUE_CREATED_PROJECT_LABEL = "project";
+/** Starter row for a task-label filter: the key is `label_<slug>`, the value is always `true`. */
+export const ISSUE_CREATED_LABEL_FILTER_KEY = PAPERCLIP_ISSUE_LABEL_EVENT_PREFIX;
+
+/**
+ * What changes in the draft when the board picks a source. The built-in Paperclip source fixes the
+ * issue mode to `event_issue`, presets the event type and drops the emitter, severity and fallback
+ * settings that do not apply to it. Leaving it undoes that, so `event_issue` never reaches another
+ * source (the server answers 422). Choosing the same source again changes nothing.
+ */
+export function eventSourcePatch(
+  draft: EventTriggerDraft,
+  source: Pick<EventSource, "id" | "normalizer"> | null,
+): Partial<EventTriggerDraft> {
+  const sourceId = source?.id ?? "";
+  if (sourceId === draft.sourceId) return {};
+  if (source && isPaperclipInternalSource(source)) {
+    return {
+      sourceId,
+      sources: [],
+      types: [PAPERCLIP_ISSUE_CREATED_EVENT_TYPE],
+      minSeverity: "any",
+      labels: [],
+      issueMode: "event_issue",
+      appendToIssueId: "",
+      fallback: false,
+    };
+  }
+  if (draft.issueMode !== "event_issue") return { sourceId };
+  return { sourceId, types: [], labels: [], issueMode: "group" };
+}
+
+/** Adds the filter `key = values`, or replaces the values when a row for the key exists. */
+export function withLabelFilter(labels: LabelPairDraft[], key: string, values: string[]): LabelPairDraft[] {
+  const index = labels.findIndex((pair) => pair.key.trim() === key);
+  if (index === -1) return [...labels, newLabelPair(key, values)];
+  return labels.map((pair, position) => (position === index ? { ...pair, values } : pair));
+}
+
+/** Whether the draft already filters on the label `key`. */
+export function hasLabelFilter(draft: EventTriggerDraft, key: string): boolean {
+  return draft.labels.some((pair) => pair.key.trim() === key);
 }
 
 export type GroupKeyCheck = {
@@ -189,9 +242,11 @@ export function validateEventDraft(draft: EventTriggerDraft): {
   errors.labels = validateLabelPairs(draft.labels);
   if (!errors.labels) delete errors.labels;
   const groupKey = validateGroupKeyTemplate(draft.groupKey);
-  if (groupKey.error) errors.groupKey = groupKey.error;
+  // The group settings are hidden and ignored when the steps attach to the created task.
+  const grouped = draft.issueMode !== "event_issue";
+  if (grouped && groupKey.error) errors.groupKey = groupKey.error;
   const cooldown = Number(draft.cooldownMinutes);
-  if (draft.cooldownMinutes.trim() === "" || !Number.isFinite(cooldown) || cooldown < 0) {
+  if (grouped && (draft.cooldownMinutes.trim() === "" || !Number.isFinite(cooldown) || cooldown < 0)) {
     errors.cooldown = "Enter 0 or more minutes.";
   }
   if (draft.issueMode === "append" && !UUID_PATTERN.test(draft.appendToIssueId.trim())) {
@@ -235,6 +290,17 @@ export function buildEventMatch(draft: EventTriggerDraft): EventMatch {
 }
 
 export function buildEventGrouping(draft: EventTriggerDraft): EventGrouping {
+  if (draft.issueMode === "event_issue") {
+    // No group exists in this mode, so the hidden group settings are sent as the defaults.
+    const defaults = defaultEventDraft();
+    return {
+      groupKey: DEFAULT_GROUP_KEY,
+      repeatCommentCooldownSec: Number(DEFAULT_COOLDOWN_MINUTES) * 60,
+      rewakeOnSeverityIncrease: defaults.rewakeOnSeverityIncrease,
+      onRecovery: defaults.onRecovery,
+      issueMode: "event_issue",
+    };
+  }
   return {
     groupKey: draft.groupKey.trim(),
     repeatCommentCooldownSec: Math.round(Number(draft.cooldownMinutes) * 60),
@@ -250,7 +316,8 @@ export function buildEventTriggerPayload(draft: EventTriggerDraft) {
     eventSourceId: draft.sourceId,
     eventMatch: buildEventMatch(draft),
     eventGrouping: buildEventGrouping(draft),
-    fallback: draft.fallback,
+    // The server refuses a fallback trigger on the built-in source.
+    fallback: draft.issueMode === "event_issue" ? false : draft.fallback,
   };
 }
 
@@ -260,6 +327,7 @@ export function eventDraftFromTrigger(trigger: EventRoutineTrigger): EventTrigge
   const grouping = trigger.eventGrouping;
   const append =
     grouping && typeof grouping.issueMode === "object" ? grouping.issueMode.appendToIssueId : "";
+  const eventIssue = grouping?.issueMode === "event_issue";
   return {
     sourceId: trigger.eventSourceId ?? "",
     sources: match.sources ?? [],
@@ -275,7 +343,7 @@ export function eventDraftFromTrigger(trigger: EventRoutineTrigger): EventTrigge
         : base.cooldownMinutes,
     rewakeOnSeverityIncrease: grouping?.rewakeOnSeverityIncrease ?? base.rewakeOnSeverityIncrease,
     onRecovery: grouping?.onRecovery ?? base.onRecovery,
-    issueMode: append ? "append" : "group",
+    issueMode: eventIssue ? "event_issue" : append ? "append" : "group",
     appendToIssueId: append,
     fallback: trigger.fallback === true,
   };
@@ -301,6 +369,12 @@ export function describeEventMatch(match: EventMatch | null | undefined, fallbac
   }
   const base = parts.length > 0 ? parts.join(" · ") : "Every event from the source";
   return fallback ? `Fallback · ${base}` : base;
+}
+
+/** The card line of a saved event trigger: its filters, and where the steps go for `event_issue`. */
+export function describeEventTrigger(trigger: EventRoutineTrigger): string {
+  const match = describeEventMatch(trigger.eventMatch, trigger.fallback);
+  return trigger.eventGrouping?.issueMode === "event_issue" ? `${match} · Steps attach to the created task` : match;
 }
 
 export const ON_RECOVERY_LABELS: Record<EventOnRecovery, string> = {

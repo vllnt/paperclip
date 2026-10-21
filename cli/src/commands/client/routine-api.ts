@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
+import type { RoutineStepWarning } from "@paperclipai/shared";
 import {
   addCommonClientOptions,
   apiPath,
@@ -22,6 +23,13 @@ interface JsonOptions extends CompanyOptions {
 interface RoutineWriteOptions extends JsonOptions {
   stepsFile?: string;
 }
+
+interface RoutineRunOptions extends JsonOptions {
+  targetIssue?: string;
+}
+
+/** The loose 8-4-4-4-12 hex shape the server accepts for `targetIssueId`. */
+const ISSUE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface RoutineListOptions extends CompanyOptions {
   q?: string;
@@ -108,8 +116,14 @@ export function registerRoutineApiCommands(program: Command): void {
         }
       }),
   );
-  addIdPost(routine, "run", "Run a routine", "routines", "run");
-  addIdPost(routine, "trigger:create", "Create a routine trigger", "routines", "triggers");
+  addRoutineRun(routine);
+  addIdPost(
+    routine,
+    "trigger:create",
+    "Create a routine trigger (an event trigger can set eventGrouping.issueMode to event_issue to start the steps on the created task)",
+    "routines",
+    "triggers",
+  );
   addIdPatch(routine, "trigger:update", "Update a routine trigger", "routine-triggers");
   addIdDelete(routine, "trigger:delete", "Delete a routine trigger", "routine-triggers");
   addIdPost(routine, "trigger:rotate-secret", "Rotate a routine trigger secret", "routine-triggers", "rotate-secret");
@@ -157,6 +171,74 @@ async function routineWritePayload(opts: RoutineWriteOptions): Promise<unknown> 
   return { ...payload, steps };
 }
 
+function isStepWarning(value: unknown): value is RoutineStepWarning {
+  return (
+    isJsonObject(value) &&
+    value.code === "step_agent_unavailable" &&
+    typeof value.stepKey === "string" &&
+    typeof value.agentId === "string" &&
+    typeof value.reason === "string"
+  );
+}
+
+/**
+ * Writes the step warnings of a routine save or run to stderr, one line each, so stdout stays the
+ * response. The save or run already succeeded; a warning says a step may not start.
+ */
+function printStepWarnings(response: unknown): void {
+  if (!isJsonObject(response) || !Array.isArray(response.warnings)) return;
+  for (const warning of response.warnings) {
+    if (isStepWarning(warning)) {
+      console.error(`warning: step "${warning.stepKey}": agent ${warning.agentId} is ${warning.reason}`);
+    }
+  }
+}
+
+/** Prints a routine write or run response, with its step warnings on stderr. */
+function printRoutineResult(response: unknown, json: boolean | undefined): void {
+  printStepWarnings(response);
+  printOutput(response, { json });
+}
+
+function addRoutineRun(parent: Command): void {
+  addCommonClientOptions(
+    parent
+      .command("run")
+      .description("Run a routine; --target-issue starts its steps on an existing task instead of creating one")
+      .argument("<id>", "Routine ID")
+      .option("--payload-json <json>", "JSON payload", "{}")
+      .option("--target-issue <issue>", "Start the routine's steps on this task (UUID or identifier such as PC-12)")
+      .action(async (id: string, opts: RoutineRunOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          let body = parseJson(opts.payloadJson ?? "{}");
+          if (opts.targetIssue) {
+            if (!isJsonObject(body)) throw new Error("--payload-json must be a JSON object when --target-issue is used.");
+            if ("targetIssueId" in body) {
+              throw new Error("Pass the task either as targetIssueId in --payload-json or with --target-issue, not both.");
+            }
+            const targetIssueId = await resolveIssueId(opts.targetIssue, (issue) =>
+              ctx.api.get<unknown>(apiPath`/api/issues/${issue}`),
+            );
+            body = { ...body, targetIssueId };
+          }
+          printRoutineResult(await ctx.api.post(apiPath`/api/routines/${id}/run`, body), ctx.json);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+}
+
+/** A UUID passes through; an identifier such as PC-12 is looked up with the issue GET, which accepts both. */
+async function resolveIssueId(reference: string, fetchIssue: (reference: string) => Promise<unknown>): Promise<string> {
+  const trimmed = reference.trim();
+  if (ISSUE_ID_PATTERN.test(trimmed)) return trimmed;
+  const issue = await fetchIssue(trimmed);
+  if (isJsonObject(issue) && typeof issue.id === "string") return issue.id;
+  throw new Error(`Could not find the task "${trimmed}".`);
+}
+
 function addRoutineCreate(parent: Command): void {
   addCommonClientOptions(
     parent
@@ -168,7 +250,7 @@ function addRoutineCreate(parent: Command): void {
       .action(async (opts: RoutineWriteOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
-          printOutput(await ctx.api.post(apiPath`/api/companies/${ctx.companyId}/routines`, await routineWritePayload(opts)), { json: ctx.json });
+          printRoutineResult(await ctx.api.post(apiPath`/api/companies/${ctx.companyId}/routines`, await routineWritePayload(opts)), ctx.json);
         } catch (err) {
           handleCommandError(err);
         }
@@ -188,7 +270,7 @@ function addRoutineUpdate(parent: Command): void {
       .action(async (id: string, opts: RoutineWriteOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
-          printOutput(await ctx.api.patch(apiPath`/api/routines/${id}`, await routineWritePayload(opts)), { json: ctx.json });
+          printRoutineResult(await ctx.api.patch(apiPath`/api/routines/${id}`, await routineWritePayload(opts)), ctx.json);
         } catch (err) {
           handleCommandError(err);
         }

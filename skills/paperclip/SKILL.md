@@ -137,7 +137,7 @@ Use comments incrementally:
 
 - if `PAPERCLIP_WAKE_COMMENT_ID` is set, fetch that exact comment first with `GET /api/issues/{issueId}/comments/{commentId}`
 - if you already know the thread and only need updates, use `GET /api/issues/{issueId}/comments?after={last-seen-comment-id}&order=asc`
-- use the full `GET /api/issues/{issueId}/comments` route only when cold-starting or when incremental isn't enough
+- on a long thread, the continuation context in the prompt is a bounded window (`coverage.kind: bounded_task_history`): the comments that woke you, the latest request and the newest comments. A cut body ends with `[truncated: …]`. `olderMessages` lists the earlier comments with a one-line preview, and `documents` lists the issue documents. Read an older comment only when you need it (`GET /api/issues/{issueId}/comments/{commentId}`), and page back with `GET /api/issues/{issueId}/comments?order=desc&after={oldestIncludedCommentId}&limit=20`. On a resumed session, `resumeDelta.olderMessages` lists new comments whose bodies are not in the prompt; read the ones you need before you act. Never fetch the whole thread without `limit`: on a long issue, that one read can be larger than the model context.
 
 Read enough ancestor/comment context to understand _why_ the task exists and what changed. Do not reflexively reload the whole thread on every heartbeat.
 
@@ -506,6 +506,21 @@ POST /api/issues/{issueId}/interactions
 
 The responder submits verdicts with `POST /api/issues/{issueId}/interactions/{interactionId}/verdicts`. Partial submissions keep the interaction `pending` and wake the assignee once with `newlyResolvedItemIds`; when every item has a verdict, the interaction becomes `answered`.
 
+## Proving a Deploy
+
+To confirm that production runs a merged commit, read the server's health route with your run credentials. It is read-only, and the queue and HTTP/2 sandbox bridges carry it:
+
+```bash
+PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"
+PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"
+curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "$PAPERCLIP_API_BASE/api/health" | jq '{status, commit}'
+```
+
+- `status: "ok"` means the server finished startup. `starting` means startup recovery is still running: wait and read again. `unhealthy` (HTTP 503) means the database probe failed.
+- `commit` is the full git SHA of the running build, or `null` when the build has no git metadata. A `Deploy completed source build` commit on `main` proves the build, not that production pulled it: compare `commit` with the merge. After `git fetch`, `git merge-base --is-ancestor <merge sha> <commit>` exits 0 when the running build contains the merge.
+- The response also carries other server details. For an agent, host backup paths and failure-marker text are replaced by a fixed warning code and message. Quote only `status` and `commit` as evidence.
+
 ## Niche Workflow Pointers
 
 Load `references/workflows.md` when the task matches one of these:
@@ -537,7 +552,7 @@ If you are asked to install a skill for the company or an agent you MUST read:
 Routines are recurring tasks. Each time a routine fires it creates an execution issue assigned to the routine's agent — the agent picks it up in the normal heartbeat flow.
 
 - Create and manage routines with the routines API — agents can only manage routines assigned to themselves. For repeatable multi-stage work, give the routine `steps` (sub-tasks each run creates in order, with review loops and fork/join) instead of creating the sub-tasks by hand; see `references/routines.md`.
-- Add triggers per routine: `schedule` (cron), `webhook`, `api` (manual), or `event` (an external signed alert from a board-created event source; see `references/routines.md`).
+- Add triggers per routine: `schedule` (cron), `webhook`, `api` (manual), or `event` (an external signed alert from a board-created event source; see `references/routines.md`). A routine with `steps` can also start them on a task that already exists (`targetIssueId` on the manual run) or on each task a person creates (an `event` trigger on the built-in Paperclip source with `issueMode: "event_issue"`). Save and run responses carry `warnings` for steps whose agent cannot take work. See `references/routines.md`.
 - Control concurrency and catch-up behaviour with `concurrencyPolicy` and `catchUpPolicy`.
 
 If you are asked to create or manage routines you MUST read:

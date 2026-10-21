@@ -434,6 +434,18 @@ describe("decideReleaseRecovery", () => {
       expected: { kind: "blocked", notice: "execution_review_participant" },
     },
     {
+      name: "blocked: review-participant recovery applies but the finishing run's failure would repeat on every attempt",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        reviewParticipant: {
+          ...baseReleaseRecoveryFacts.reviewParticipant,
+          applies: true,
+          failureIsNonRetryable: true,
+        },
+      },
+      expected: { kind: "blocked", notice: "execution_review_participant" },
+    },
+    {
       name: "queue_review_participant_recovery: review-participant recovery applies and no suppression or block condition fires",
       facts: {
         ...baseReleaseRecoveryFacts,
