@@ -30,6 +30,7 @@ const ACTIVITY_ROW_VERBS: Record<string, string> = {
   "issue.checked_out": "checked out",
   "issue.released": "released",
   "heartbeat.deferred_wake_held": "is holding a deferred wake on",
+  "heartbeat.deferred_wake_closed": "closed a deferred wake on",
   "issue.comment_added": "commented on",
   "issue.comment_cancelled": "cancelled a queued comment on",
   "issue.queued_comment_edited": "edited a queued comment on",
@@ -46,6 +47,7 @@ const ACTIVITY_ROW_VERBS: Record<string, string> = {
   "issue.document_deleted": "deleted document from",
   "issue.monitor_scheduled": "scheduled monitor on",
   "issue.monitor_triggered": "triggered monitor for",
+  "issue.monitor_pull_request_unchanged": "found the pull request unchanged and re-armed the monitor on",
   "issue.monitor_cleared": "cleared monitor on",
   "issue.monitor_skipped": "skipped monitor for",
   "issue.monitor_exhausted": "exhausted monitor on",
@@ -156,6 +158,7 @@ const ISSUE_ACTIVITY_LABELS: Record<string, string> = {
   "issue.document_deleted": "deleted a document",
   "issue.monitor_scheduled": "scheduled a monitor",
   "issue.monitor_triggered": "triggered a monitor",
+  "issue.monitor_pull_request_unchanged": "found the pull request unchanged and re-armed the monitor",
   "issue.monitor_cleared": "cleared a monitor",
   "issue.monitor_skipped": "skipped a monitor",
   "issue.monitor_exhausted": "exhausted a monitor",
@@ -480,6 +483,10 @@ export function formatActivityVerb(
   if (action === "issue.updated") {
     const issueUpdatedVerb = formatIssueUpdatedVerb(details);
     if (issueUpdatedVerb) return issueUpdatedVerb;
+  }
+
+  if (action === "heartbeat.deferred_wake_closed") {
+    if (details?.reason === "superseded") return "closed a superseded deferred wake on";
   }
 
   if (action === "issue.stalled_review_decided") {

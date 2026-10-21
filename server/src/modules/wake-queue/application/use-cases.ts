@@ -1,5 +1,6 @@
 import { enrichPromotedWakeContext } from "../domain/context.js";
 import { AUTOMATION_WAKE_REASON_SET } from "../domain/automation-wake-coalesce.js";
+import { QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY } from "../domain/deferred-wake-sweep.js";
 import {
   decideQueuedCommentAction,
   decideReleaseRecovery,
@@ -505,7 +506,12 @@ async function promoteDeferredWake(
   delete promotedPayload["_paperclipWakeContext"];
   delete promotedPayload["queuedCommentInterrupt"];
 
-  const promotedContextSeed: Record<string, unknown> = { ...workingCandidate.deferredContextSeed };
+  // The promoted run waits in the agent's queue from the wake's request, so
+  // time spent parked behind the issue's run counts as time in line.
+  const promotedContextSeed: Record<string, unknown> = {
+    ...workingCandidate.deferredContextSeed,
+    [QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY]: workingCandidate.requestedAt.toISOString(),
+  };
   if (pauseHold.activePauseHold) {
     promotedContextSeed.treeHoldInteraction = true;
     promotedContextSeed.activeTreeHold = {
@@ -674,12 +680,24 @@ async function runReleaseRecoveryTail(
         })
       : false;
 
+  // A recovery run for the review participant resumes the same session, so a
+  // failure that repeats on every attempt blocks the issue instead.
+  const reviewParticipantFailureIsNonRetryable =
+    reviewParticipantApplies &&
+    UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.has(run.status)
+      ? await transaction.isFinishingRunFailureNonRetryable({
+          companyId: run.companyId,
+          runId: run.id,
+        })
+      : false;
+
   const decision = decideReleaseRecovery({
     suppressImmediateRecovery,
     reviewParticipant: {
       applies: reviewParticipantApplies,
       isExecutionReviewParticipantRecoveryRun:
         isExecutionReviewParticipantRecoveryRun(run),
+      failureIsNonRetryable: reviewParticipantFailureIsNonRetryable,
     },
     immediate: {
       applies: immediateApplies,

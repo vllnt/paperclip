@@ -1942,6 +1942,36 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
     }
   });
 
+  it("serves only exact GET health through HTTP/2", async () => {
+    const health = { status: "ok", commit: "0123456789abcdef0123456789abcdef01234567" };
+    const forwarded: string[] = [];
+    const { gateway, handle } = createTestPair({
+      forwardRequest: async (request) => {
+        forwarded.push(`${request.method} ${request.pathname}`);
+        return { status: 200, body: Buffer.from(JSON.stringify(health)) };
+      },
+    });
+    try {
+      for (const [method, path, status] of [
+        ["GET", "/api/health", 200],
+        ["POST", "/api/health", 403],
+        ["POST", "/api/health/dev-server/restart", 403],
+        ["GET", "/api/health/extra", 403],
+        ["GET", "/api/healthz", 403],
+      ] as const) {
+        const response = await gateway.forwardRequest({
+          method, path, query: "", headers: {}, body: Buffer.alloc(0), receivedToken: BRIDGE_TOKEN,
+        });
+        expect(response.status).toBe(status);
+        if (status === 200) expect(JSON.parse(response.body!.toString())).toEqual(health);
+      }
+      expect(forwarded).toEqual(["GET /api/health"]);
+    } finally {
+      await gateway.close();
+      await handle.close();
+    }
+  });
+
   it("rejects a route the allowlist does not carry, before the forwarder runs", async () => {
     const forwarderTracker = createForwarderCallTracker();
     const { gateway, handle } = createTestPair({

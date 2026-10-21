@@ -58,6 +58,7 @@ import {
 import { auditSectionHref } from "./audit/audit-navigation";
 import { routineDetailHref } from "../components/RoutineContextualSidebar";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "../hooks/useSharedPolling";
+import { useNewRoutineLink } from "../hooks/useNewRoutineLink";
 import { useStreamlinedUiEnabled } from "../hooks/useStreamlinedUiEnabled";
 import type { RoutineListItem, RoutineVariable } from "@paperclipai/shared";
 import type { FolderListItem } from "@paperclipai/shared";
@@ -785,6 +786,11 @@ export function Routines({ fixedAssigneeAgentId, embedded = false, excludeRoutin
     }));
     setComposerOpen(true);
   }
+
+  useNewRoutineLink((projectId) => {
+    if (projectId) setDraft((current) => ({ ...current, projectId }));
+    openCreateRoutine();
+  }, !embedded);
 
   async function moveSelectedRoutines(folderId: string | null) {
     const ids = selectedRoutineIds;

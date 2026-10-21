@@ -74,6 +74,23 @@ describe("issue subresource commands", () => {
     expect(JSON.parse(String(init.body))).toEqual({ in: "10m", reason: "CI on PR #4320 head abc123" });
   });
 
+  it("sends a pull request wait target when given", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run([
+      "issue", "wait", ISSUE_ID, "--in", "10m", "--reason", "Review on the fix",
+      "--pull-request", "https://github.com/acme/app/pull/7",
+    ]);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({
+      in: "10m",
+      reason: "Review on the fix",
+      pullRequest: "https://github.com/acme/app/pull/7",
+    });
+  });
+
   it("refuses an out-of-bounds wait before calling the API", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);

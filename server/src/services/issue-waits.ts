@@ -33,6 +33,8 @@ export async function scheduleIssueWaitMonitor(
     notes: string;
     serviceName: string | null;
     externalRef: string | null;
+    /** Canonical github.com pull request URL the wait is about, if any. */
+    pullRequestUrl?: string | null;
     activity: {
       actorType: "agent" | "user" | "system";
       actorId: string;
@@ -53,6 +55,7 @@ export async function scheduleIssueWaitMonitor(
       kind: "external_service" as const,
       serviceName: input.serviceName,
       externalRef: input.externalRef,
+      pullRequestUrl: input.pullRequestUrl ?? null,
       timeoutAt: null,
       maxAttempts: ISSUE_WAIT_MONITOR_MAX_ATTEMPTS,
       recoveryPolicy: "wake_owner" as const,

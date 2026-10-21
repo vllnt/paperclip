@@ -177,6 +177,7 @@ function toDeferredWakeCandidate(row: typeof agentWakeupRequests.$inferSelect): 
     triggerDetail: row.triggerDetail,
     requestedByActorType: toRequestedByActorType(row.requestedByActorType),
     requestedByActorId: row.requestedByActorId,
+    requestedAt: row.requestedAt,
     payload,
     queuedCommentIds,
     preservesIndependentContinuation,
@@ -706,6 +707,15 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         run.errorCode === "chat_failed_run_retry_not_authorized" ||
         classifyContinuationFailure(run).kind === "non_retryable"
       );
+    },
+
+    async isFinishingRunFailureNonRetryable({ companyId, runId }) {
+      if (companyId !== run.companyId || runId !== run.id) {
+        throw new Error(
+          "wake-queue: recovery source does not match the locked execution",
+        );
+      }
+      return classifyContinuationFailure(run).kind === "non_retryable";
     },
 
     async queueReviewParticipantRecoveryRun({ companyId, issue, finishingRun, recoveryAgent, sessionBefore, now }) {

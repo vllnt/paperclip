@@ -2,6 +2,7 @@ import { and, eq, gte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import { ISSUE_PRIORITIES, type IssuePriority } from "@paperclipai/shared";
+import { QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY } from "../modules/wake-queue/domain/deferred-wake-sweep.js";
 import { PLANNED_RESTART_RESUME_RETRY_REASON } from "./execution-recovery-attempt.js";
 
 /**
@@ -30,7 +31,16 @@ type QueuedRunTiming = {
   createdAt: Date;
   scheduledRetryAt: Date | null;
   scheduledRetryReason?: string | null;
+  contextSnapshot?: Record<string, unknown> | null;
 };
+
+/** The parked request time from the run context, when it is a valid instant before the run's creation. */
+function parkedRequestedAt(run: QueuedRunTiming): number | null {
+  const raw = run.contextSnapshot?.[QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY];
+  if (typeof raw !== "string") return null;
+  const time = Date.parse(raw);
+  return Number.isNaN(time) || time >= run.createdAt.getTime() ? null : time;
+}
 
 /**
  * One agent's queued runs. The company predicate lets the planner use the
@@ -60,8 +70,12 @@ function priorityLevel(priority: string | null | undefined) {
 
 function rank(run: QueuedRunTiming, issue: QueuedRunIssueFacts | null, now: Date) {
   // A promoted scheduled retry keeps its creation time; it waits in the queue
-  // only from the moment it became due.
-  const queuedSince = Math.max(run.createdAt.getTime(), run.scheduledRetryAt?.getTime() ?? 0);
+  // only from the moment it became due. A re-delivered parked wake waits from
+  // its original request.
+  const queuedSince = Math.max(
+    parkedRequestedAt(run) ?? run.createdAt.getTime(),
+    run.scheduledRetryAt?.getTime() ?? 0,
+  );
   const agingSteps = Math.max(0, Math.floor((now.getTime() - queuedSince) / QUEUED_RUN_PRIORITY_AGING_STEP_MS));
   const baseLevel = issue ? priorityLevel(issue.priority) : DEFAULT_PRIORITY_LEVEL;
   return {
@@ -85,6 +99,10 @@ function rank(run: QueuedRunTiming, issue: QueuedRunIssueFacts | null, now: Date
  * 5. at equal effective priority, a run that has aged starts before a fresh one,
  *    and fresh runs of in-progress issues start before other fresh runs;
  * 6. then the run that has waited longest first, measured like aging.
+ *
+ * A run re-delivered from a parked wake is measured from the wake's request
+ * (`QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY`), so parked and queued work is served
+ * first come, first served at equal priority.
  */
 export function orderQueuedRunsForClaim<T extends QueuedRunTiming>(
   runs: readonly T[],

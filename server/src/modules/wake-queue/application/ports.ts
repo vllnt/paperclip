@@ -72,6 +72,8 @@ export type DeferredWakeCandidate = {
   triggerDetail: string | null;
   requestedByActorType: "user" | "agent" | "system" | null;
   requestedByActorId: string | null;
+  /** When the wake was requested; the promoted run's queue wait counts from then. */
+  requestedAt: Date;
   payload: Record<string, unknown>;
   /** The queued comment ids the wake's queued-comment context carries, already extracted from the payload. */
   queuedCommentIds: string[];
@@ -268,6 +270,8 @@ export interface WakeQueueTransaction {
   isAutomaticRecoverySuppressedByPauseHold(input: { companyId: string; issueId: string }): Promise<boolean>;
   /** Deny-only facts from the exact finishing run and its durable chat wake owner. */
   isImmediateRecoverySourceBlocked(input: { companyId: string; runId: string }): Promise<boolean>;
+  /** The exact finishing run failed in a way that another automatic run cannot fix, for example a context overflow. */
+  isFinishingRunFailureNonRetryable(input: { companyId: string; runId: string }): Promise<boolean>;
   queueReviewParticipantRecoveryRun(input: {
     companyId: string;
     issue: IssueSnapshot;

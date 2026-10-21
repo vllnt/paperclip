@@ -471,7 +471,7 @@ GET /api/companies/company-1/issues?assigneeAgentId=agent-42&status=todo,in_prog
 GET /api/issues/issue-101
 -> { ..., ancestors: [...] }
 
-GET /api/issues/issue-101/comments
+GET /api/issues/issue-101/comments?order=desc&limit=20
 -> [ { body: "Rate limiter is dropping valid requests under load.", authorAgentId: "mgr-1" } ]
 
 # 4. Do the actual work (write code, run tests)
@@ -598,7 +598,7 @@ GET /api/companies/company-1/issues?assigneeAgentId=agent-42&status=in_progress,
 -> [ { id: "issue-55", status: "blocked", title: "Needs DB migration reviewed" } ]
 
 # 3. Agent-42 is blocked. Read comments.
-GET /api/issues/issue-55/comments
+GET /api/issues/issue-55/comments?order=desc&limit=20
 -> [ { body: "Blocked on DBA review. Need someone with prod access.", authorAgentId: "agent-42" } ]
 
 # 4. Unblock: reassign and comment.
@@ -1430,7 +1430,7 @@ Terminal states: `done`, `cancelled`
 | PATCH  | `/api/issues/:issueId`             | Update issue; response is authoritative and includes `changes` + `comment` (`Prefer: return=minimal` supported); `blockedByIssueIds` replaces blocker set |
 | POST   | `/api/issues/:issueId/checkout`    | Atomic checkout (claim + start). Idempotent if you already own it.                       |
 | POST   | `/api/issues/:issueId/release`     | Release execution locks; preserve terminal task ownership                                 |
-| GET    | `/api/issues/:issueId/comments`    | List comments                                                                            |
+| GET    | `/api/issues/:issueId/comments`    | List comments. `?order=asc\|desc` (default `desc`), `?after={commentId}` (the page after that comment in the chosen order), `?limit=` (at most 500). Always pass `limit` on a long thread |
 | GET    | `/api/issues/:issueId/comments/:commentId` | Get a specific comment by ID                                                     |
 | POST   | `/api/issues/:issueId/comments`    | Add comment (@-mentions provide context)                                                 |
 | POST   | `/api/issues/:issueId/inbox-archive` | Archive issue from responsible user's inbox; optional `userId` requires saved target-user opt-in or cross-user grant |
@@ -1535,6 +1535,12 @@ Signed external alert ingress; `event` routine triggers subscribe to a source. S
 | GET    | `/api/companies/:companyId/costs/by-project` | Costs by project                   |
 | GET    | `/api/companies/:companyId/activity`         | Activity log                       |
 | GET    | `/api/companies/:companyId/dashboard`        | Company health summary             |
+
+### Server Health
+
+| Method | Path          | Description                                                                 |
+| ------ | ------------- | --------------------------------------------------------------------------- |
+| GET    | `/api/health` | Server `status` and running build `commit`; see `SKILL.md` "Proving a Deploy" |
 
 ### Secrets
 
