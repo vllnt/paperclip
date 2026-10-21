@@ -721,7 +721,7 @@ import {
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
-import { DEFAULT_DEFERRED_WAKE_MAX_AGE_HOURS, type DeferredWakeSweepCounters } from "@paperclipai/shared";
+import type { DeferredWakeSweepCounters } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { getEnvironmentDriverTraits } from "./environment-driver-traits.js";
@@ -10048,7 +10048,6 @@ function deferredWakeCountersForCompany(companyId: string): DeferredWakeSweepCou
       examined: 0,
       promoted: 0,
       retired: 0,
-      expired: 0,
       superseded: 0,
       coalesced: 0,
       stillDeferred: 0,
@@ -22064,26 +22063,16 @@ export function heartbeatService(
       : { outcome: "retired" as const, runId: null };
   }
 
-  async function getDeferredWakeMaxAgeHours() {
-    return (await instanceSettings.getGeneral()).deferredWakeMaxAgeHours ?? DEFAULT_DEFERRED_WAKE_MAX_AGE_HOURS;
-  }
-
   /**
-   * Closes an orphaned parked wake the sweep must not run (expired or
-   * superseded) and records why on its issue, in one transaction under the
-   * issue row lock, which serializes it with admission.
+   * Closes a superseded orphaned parked wake, which the sweep must not run,
+   * and records why on its issue, in one transaction under the issue row lock,
+   * which serializes it with admission.
    *
    * @returns Whether this call closed the wake; `false` when another writer moved
    * or touched it first, or a superseded wake's agent holds the issue again.
    */
-  async function closeParkedWake(
-    wake: OrphanedDeferredWakeRow,
-    disposition: "expired" | "superseded",
-    maxAgeHours: number,
-  ) {
-    const error = disposition === "expired"
-      ? `Expired: parked longer than ${maxAgeHours} h, the instance's deferred-wake max age. This wake will not run.`
-      : "Superseded: the issue is now assigned to another agent. This wake will not run.";
+  async function closeSupersededParkedWake(wake: OrphanedDeferredWakeRow) {
+    const error = "Superseded: the issue is now assigned to another agent. This wake will not run.";
     const publications: ActivityPublication[] = [];
     const closed = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
@@ -22093,7 +22082,7 @@ export function heartbeatService(
         wakeId: wake.wakeId,
         issueId: wake.issueId,
         observedUpdatedAt: wake.observedUpdatedAt,
-        ...(disposition === "superseded" ? { supersededAgentId: wake.agentId } : {}),
+        supersededAgentId: wake.agentId,
         error,
         now,
       }, txDb);
@@ -22108,12 +22097,10 @@ export function heartbeatService(
         entityId: wake.issueId,
         details: {
           wakeId: wake.wakeId,
-          reason: disposition,
+          reason: "superseded",
           wakeReason: wake.wakeReason,
           parkedSince: wake.requestedAt.toISOString(),
-          ...(disposition === "expired"
-            ? { maxAgeHours }
-            : { issueAssigneeAgentId: wake.issueAssigneeAgentId }),
+          issueAssigneeAgentId: wake.issueAssigneeAgentId,
         },
       }, publications);
       return true;
@@ -22129,8 +22116,8 @@ export function heartbeatService(
    * claim-time stale-run cancel, a reaped holder), and the older recovery only
    * saw comment-shaped wakes of an agent that had already run the issue. This
    * finds every wake whose open issue has no lock and no live run, closes the
-   * ones that must not run (older than the instance's max age, or an assignee
-   * wake whose agent lost the issue), skips held work, and re-delivers the rest
+   * ones that must not run (an assignee wake whose agent lost the issue), skips
+   * held work, and re-delivers the rest
    * in priority then FIFO order: at most one per issue,
    * `DEFERRED_WAKE_SWEEP_MAX_PER_AGENT_PER_PASS` per agent and
    * `DEFERRED_WAKE_SWEEP_MAX_PER_PASS` per pass, so a backlog drains over
@@ -22152,7 +22139,6 @@ export function heartbeatService(
       scanned: 0,
       promoted: 0,
       retired: 0,
-      expired: 0,
       superseded: 0,
       coalesced: 0,
       stillDeferred: 0,
@@ -22194,27 +22180,25 @@ export function heartbeatService(
       counters.lastExaminedAt = now;
     }
 
-    // Close what must not run before anything is chosen, so an old backlog
-    // cannot start stale work: a wake parked longer than the instance's max
-    // age, and an assignee wake whose agent no longer holds the issue.
-    const maxAgeHours = await getDeferredWakeMaxAgeHours();
+    // Close what must not run before anything is chosen: an assignee wake
+    // whose agent no longer holds the issue. Every other wake runs, however
+    // long it waited.
     const runnableOrphans: OrphanedDeferredWakeRow[] = [];
     for (const orphan of orphans) {
-      const disposition = decideDeferredWakeDisposition(orphan, { now, maxAgeMs: maxAgeHours * 60 * 60 * 1000 });
-      if (disposition === "promote") {
+      if (decideDeferredWakeDisposition(orphan) === "promote") {
         runnableOrphans.push(orphan);
         continue;
       }
       const counters = countersForCompany(orphan.companyId);
       try {
-        if (await closeParkedWake(orphan, disposition, maxAgeHours)) {
-          result[disposition] += 1;
-          counters[disposition] += 1;
+        if (await closeSupersededParkedWake(orphan)) {
+          result.superseded += 1;
+          counters.superseded += 1;
         }
       } catch (err) {
         result.failed += 1;
         counters.failed += 1;
-        logger.warn({ err, queueId: orphan.wakeId, disposition }, "failed to close a parked deferred wake");
+        logger.warn({ err, queueId: orphan.wakeId }, "failed to close a superseded parked deferred wake");
       }
     }
 

@@ -1847,8 +1847,6 @@ export {
 } from "./execution-workspace-guards.js";
 
 export {
-  DEFAULT_DEFERRED_WAKE_MAX_AGE_HOURS,
-  MAX_DEFERRED_WAKE_MAX_AGE_HOURS,
   MAX_TASK_DRAIN_TTL_MS,
   startTaskDrainRequestSchema,
   type StartTaskDrainRequest,

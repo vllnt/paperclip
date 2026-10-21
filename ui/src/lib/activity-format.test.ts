@@ -63,9 +63,6 @@ describe("activity formatting", () => {
   });
 
   it("names a deferred wake the sweep closed, and why", () => {
-    expect(formatActivityVerb("heartbeat.deferred_wake_closed", { reason: "expired" })).toBe(
-      "closed an expired deferred wake on",
-    );
     expect(formatActivityVerb("heartbeat.deferred_wake_closed", { reason: "superseded" })).toBe(
       "closed a superseded deferred wake on",
     );

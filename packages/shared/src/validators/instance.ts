@@ -23,11 +23,6 @@ export const backupRetentionPolicySchema = z.object({
   monthlyMonths: presetSchema(MONTHLY_RETENTION_PRESETS, "monthlyMonths").default(DEFAULT_BACKUP_RETENTION.monthlyMonths),
 });
 
-/** How long a parked wake may wait before it expires, when the instance sets nothing. */
-export const DEFAULT_DEFERRED_WAKE_MAX_AGE_HOURS = 24;
-/** Upper bound for `deferredWakeMaxAgeHours`: 30 days. */
-export const MAX_DEFERRED_WAKE_MAX_AGE_HOURS = 720;
-
 export const instanceGeneralSettingsSchema = z.object({
   censorUsernameInLogs: z.boolean().default(false),
   feedbackDataSharingPreference: feedbackDataSharingPreferenceSchema.default(
@@ -45,9 +40,6 @@ export const instanceGeneralSettingsSchema = z.object({
   // Pull requests always link to tasks. This switch lets that link also move a task's
   // status (open → in_review, merged → done). Absent = off.
   gitStatusAutomation: z.boolean().optional(),
-  // A parked (deferred) wake older than this many hours is expired instead of
-  // promoted into a run. Absent = DEFAULT_DEFERRED_WAKE_MAX_AGE_HOURS.
-  deferredWakeMaxAgeHours: z.number().int().min(1).max(MAX_DEFERRED_WAKE_MAX_AGE_HOURS).optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

@@ -484,7 +484,6 @@ export function formatActivityVerb(
   }
 
   if (action === "heartbeat.deferred_wake_closed") {
-    if (details?.reason === "expired") return "closed an expired deferred wake on";
     if (details?.reason === "superseded") return "closed a superseded deferred wake on";
   }
 

@@ -193,94 +193,26 @@ describe("selectDeferredWakesToPromote", () => {
 });
 
 describe("decideDeferredWakeDisposition", () => {
-  const now = new Date(Date.UTC(2026, 9, 20, 12, 0, 0));
-  const hour = 60 * 60 * 1000;
-  const facts = (input: {
-    hoursAgo: number;
-    wakeReason?: string | null;
-    assignee?: string | null;
-    issueStatus?: string;
-    carriesSavedInput?: boolean;
-    mergedWakeCount?: number;
-  }) => ({
+  const facts = (input: { wakeReason?: string | null; assignee?: string | null } = {}) => ({
     agentId: "agent-a",
-    requestedAt: new Date(now.getTime() - input.hoursAgo * hour),
     wakeReason: input.wakeReason === undefined ? "issue_assigned" : input.wakeReason,
     issueAssigneeAgentId: input.assignee === undefined ? "agent-a" : input.assignee,
-    issueStatus: input.issueStatus ?? "todo",
-    carriesSavedInput: input.carriesSavedInput ?? false,
-    mergedWakeCount: input.mergedWakeCount ?? 0,
   });
 
-  it("promotes a fresh wake for the current assignee", () => {
-    expect(decideDeferredWakeDisposition(facts({ hoursAgo: 1 }), { now, maxAgeMs: 24 * hour })).toBe("promote");
-  });
-
-  it("expires a wake parked longer than the max age, whatever its reason", () => {
-    expect(decideDeferredWakeDisposition(facts({ hoursAgo: 25 }), { now, maxAgeMs: 24 * hour })).toBe("expired");
-    expect(
-      decideDeferredWakeDisposition(facts({ hoursAgo: 25, wakeReason: "issue_comment_mentioned", assignee: "agent-b" }), {
-        now,
-        maxAgeMs: 24 * hour,
-      }),
-    ).toBe("expired");
-  });
-
-  it("never expires a wake that carries saved input, so a saved message is still delivered", () => {
-    expect(
-      decideDeferredWakeDisposition(facts({ hoursAgo: 200, wakeReason: "issue_comment_mentioned", carriesSavedInput: true }), {
-        now,
-        maxAgeMs: 24 * hour,
-      }),
-    ).toBe("promote");
-    expect(
-      decideDeferredWakeDisposition(facts({ hoursAgo: 200, wakeReason: "issue_commented", assignee: "agent-b", carriesSavedInput: true }), {
-        now,
-        maxAgeMs: 24 * hour,
-      }),
-    ).toBe("superseded");
-  });
-
-  it("expires an old wake only on an issue that stranded-issue recovery dispatches again", () => {
-    for (const issueStatus of ["todo", "in_progress"]) {
-      expect(decideDeferredWakeDisposition(facts({ hoursAgo: 200, issueStatus }), { now, maxAgeMs: 24 * hour })).toBe(
-        "expired",
-      );
-    }
-    // The recovery re-dispatches in_review only for a pending agent review participant.
-    for (const issueStatus of ["blocked", "backlog", "in_review"]) {
-      expect(decideDeferredWakeDisposition(facts({ hoursAgo: 200, issueStatus }), { now, maxAgeMs: 24 * hour })).toBe(
-        "promote",
-      );
-    }
-  });
-
-  it("never expires a wake that later wakes were merged into, since the merged signal may be fresh", () => {
-    expect(
-      decideDeferredWakeDisposition(facts({ hoursAgo: 200, mergedWakeCount: 1 }), { now, maxAgeMs: 24 * hour }),
-    ).toBe("promote");
-  });
-
-  it("keeps a wake exactly at the max age", () => {
-    expect(decideDeferredWakeDisposition(facts({ hoursAgo: 24 }), { now, maxAgeMs: 24 * hour })).toBe("promote");
+  it("promotes a wake for the current assignee", () => {
+    expect(decideDeferredWakeDisposition(facts())).toBe("promote");
   });
 
   it("supersedes an assignee wake whose agent no longer holds the issue", () => {
     for (const wakeReason of ["issue_assigned", "issue_commented", "issue_reopened_via_comment", "issue_continuation_needed"]) {
-      expect(
-        decideDeferredWakeDisposition(facts({ hoursAgo: 1, wakeReason, assignee: "agent-b" }), { now, maxAgeMs: 24 * hour }),
-      ).toBe("superseded");
+      expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: "agent-b" }))).toBe("superseded");
     }
-    expect(
-      decideDeferredWakeDisposition(facts({ hoursAgo: 1, assignee: null }), { now, maxAgeMs: 24 * hour }),
-    ).toBe("superseded");
+    expect(decideDeferredWakeDisposition(facts({ assignee: null }))).toBe("superseded");
   });
 
   it("still delivers a wake that addresses a non-assignee on purpose", () => {
     for (const wakeReason of ["issue_comment_mentioned", "execution_review_requested", "approval_approved", null]) {
-      expect(
-        decideDeferredWakeDisposition(facts({ hoursAgo: 1, wakeReason, assignee: "agent-b" }), { now, maxAgeMs: 24 * hour }),
-      ).toBe("promote");
+      expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: "agent-b" }))).toBe("promote");
     }
   });
 });

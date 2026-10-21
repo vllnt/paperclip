@@ -390,8 +390,6 @@ export interface DeferredWakeSweepCounters {
   promoted: number;
   /** Retired by admission instead of started (for example, skipped as final). */
   retired: number;
-  /** Parked longer than the instance's deferred-wake max age: closed with a reason, never run. */
-  expired: number;
   /** An assignee wake for an agent that no longer holds the issue: closed with a reason, never run. */
   superseded: number;
   /** Duplicate parked wakes of the same agent and issue folded into a promoted wake's run. */

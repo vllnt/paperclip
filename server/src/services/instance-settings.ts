@@ -213,10 +213,6 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       ...(parsed.data.companyRunTiers ? { companyRunTiers: parsed.data.companyRunTiers } : {}),
       // Absent => off; only carry through an explicit choice.
       ...(parsed.data.gitStatusAutomation !== undefined ? { gitStatusAutomation: parsed.data.gitStatusAutomation } : {}),
-      // Absent => DEFAULT_DEFERRED_WAKE_MAX_AGE_HOURS; only carry through an explicit choice.
-      ...(parsed.data.deferredWakeMaxAgeHours !== undefined
-        ? { deferredWakeMaxAgeHours: parsed.data.deferredWakeMaxAgeHours }
-        : {}),
     };
   }
   return {

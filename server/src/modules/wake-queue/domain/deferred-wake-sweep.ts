@@ -67,68 +67,29 @@ export const COALESCIBLE_PARKED_WAKE_REASONS: readonly string[] = [
   "issue_blockers_resolved",
 ];
 
-/**
- * Issue statuses whose assigned work the stranded-issue recovery dispatches
- * again when no run serves it. Only a wake on such an issue may expire: if the
- * work is still needed, that recovery starts it with the issue as it is now.
- * A wake on any other issue may be the only thing that would move it, so it
- * never expires: `blocked` and `backlog`, and `in_review`, which that recovery
- * re-dispatches only for a pending agent review participant.
- */
-const EXPIRABLE_ISSUE_STATUSES: ReadonlySet<string> = new Set(["todo", "in_progress"]);
-
-/**
- * Whether a parked wake on an issue in this status may expire. The sweep's
- * close rechecks it under the issue lock, because the status can change after
- * the sweep read it.
- *
- * @param issueStatus - The issue's current status.
- * @returns True for `todo` and `in_progress`.
- */
-export function isExpirableIssueStatus(issueStatus: string): boolean {
-  return EXPIRABLE_ISSUE_STATUSES.has(issueStatus);
-}
-
 export type DeferredWakeDisposition =
   /** Re-deliver it through ordinary admission. */
   | "promote"
-  /** Parked longer than the max age: close it with a reason, never run it. */
-  | "expired"
   /** An assignee wake for an agent that no longer holds the issue: close it, never run it. */
   | "superseded";
 
 export type DeferredWakeDispositionFacts = {
   agentId: string;
-  requestedAt: Date;
   /** The reason the wake was requested for (the parked context's `wakeReason`, else the row's reason). */
   wakeReason: string | null;
   issueAssigneeAgentId: string | null;
-  issueStatus: string;
-  /**
-   * The wake delivers saved input: something a person asked for or decided,
-   * a comment, an answer, an approval, a completed child, or a message held
-   * for execution recovery.
-   */
-  carriesSavedInput: boolean;
-  /** How many later wakes were merged into this one while it was parked; its age then says nothing about them. */
-  mergedWakeCount: number;
 };
 
 /**
- * Decides whether an orphaned parked wake may still run. An old backlog must
- * not start stale work after a deploy, so a wake parked longer than
- * `maxAgeMs` expires and an assignee wake whose agent lost the issue is
- * superseded. Both are closed with their reason instead of started.
- *
- * A wake never expires when closing it could lose work: it carries saved
- * input (dropping it would lose what the sender was told is saved), a later
- * wake was merged into it (the merged signal may be fresh), or its issue is
- * not one the stranded-issue recovery would dispatch again.
+ * Decides whether an orphaned parked wake may still run. An assignee wake
+ * whose agent lost the issue is superseded: the new assignee got its own
+ * wake, and this one could not check the issue out. It is closed with its
+ * reason instead of started. Every other wake is promoted, however long it
+ * waited: closing an old wake on an open issue could leave assigned work with
+ * no run, because the stranded-issue recovery does not dispatch every such
+ * issue again.
  */
-export function decideDeferredWakeDisposition(
-  wake: DeferredWakeDispositionFacts,
-  input: { now: Date; maxAgeMs: number },
-): DeferredWakeDisposition {
+export function decideDeferredWakeDisposition(wake: DeferredWakeDispositionFacts): DeferredWakeDisposition {
   if (
     wake.wakeReason !== null &&
     ASSIGNEE_WAKE_REASONS.has(wake.wakeReason) &&
@@ -136,9 +97,6 @@ export function decideDeferredWakeDisposition(
   ) {
     return "superseded";
   }
-  const expirable =
-    !wake.carriesSavedInput && wake.mergedWakeCount === 0 && isExpirableIssueStatus(wake.issueStatus);
-  if (expirable && input.now.getTime() - wake.requestedAt.getTime() > input.maxAgeMs) return "expired";
   return "promote";
 }
 

@@ -203,38 +203,6 @@ describe("InstanceGeneralSettings sign-out", () => {
     resolveSettings?.();
     await vi.waitFor(() => expect(signOutButton()?.disabled).toBe(false));
   });
-
-  function expiryButtons() {
-    return Array.from(
-      container.querySelectorAll<HTMLButtonElement>('[aria-label="Parked wake expiry"] button'),
-    );
-  }
-
-  it("shows the default parked wake expiry and saves a chosen preset", async () => {
-    await renderPage(SELF_HOSTED_HEALTH);
-
-    const pressed = expiryButtons().filter((button) => button.getAttribute("aria-pressed") === "true");
-    expect(pressed.map((button) => button.textContent)).toEqual(["24 hours"]);
-
-    const twoDays = expiryButtons().find((button) => button.textContent === "2 days");
-    flushSync(() => twoDays?.click());
-
-    await vi.waitFor(() => expect(mockInstanceSettingsApi.updateGeneral).toHaveBeenCalledOnce());
-    expect(mockInstanceSettingsApi.updateGeneral.mock.calls[0]?.[0]).toEqual({ deferredWakeMaxAgeHours: 48 });
-  });
-
-  it("shows a saved parked wake expiry that is not a preset", async () => {
-    mockInstanceSettingsApi.getGeneral.mockResolvedValue({
-      censorUsernameInLogs: false,
-      feedbackDataSharingPreference: "not_allowed",
-      backupRetention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
-      deferredWakeMaxAgeHours: 36,
-    });
-    await renderPage(SELF_HOSTED_HEALTH);
-
-    await vi.waitFor(() => expect(container.textContent).toContain("Current value: 36 hours."));
-    expect(expiryButtons().some((button) => button.getAttribute("aria-pressed") === "true")).toBe(false);
-  });
 });
 
 describe("InstanceGeneralSettings operator-hidden sections", () => {

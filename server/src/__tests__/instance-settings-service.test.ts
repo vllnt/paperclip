@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { patchInstanceGeneralSettingsSchema, type InstanceExperimentalSettings } from "@paperclipai/shared";
+import type { InstanceExperimentalSettings } from "@paperclipai/shared";
 import {
   applyExperimentalSettingsPatch,
   instanceSettingsService,
@@ -26,22 +26,6 @@ describe("instance settings service", () => {
     expect((await load({})).gitStatusAutomation).toBeUndefined();
     expect((await load({ gitStatusAutomation: true })).gitStatusAutomation).toBe(true);
     expect((await load({ gitStatusAutomation: false })).gitStatusAutomation).toBe(false);
-  });
-
-  it("leaves the deferred-wake max age unset unless it was stored, and carries a valid stored value through", async () => {
-    const load = async (general: Record<string, unknown>) => {
-      const row = { id: "settings", defaultEnvironmentId: null, general, experimental: {}, createdAt: new Date(), updatedAt: new Date() };
-      const db = { select: () => ({ from: () => ({ where: () => Promise.resolve([row]) }) }) };
-      return (await instanceSettingsService(db as never).get()).general;
-    };
-
-    expect((await load({})).deferredWakeMaxAgeHours).toBeUndefined();
-    expect((await load({ deferredWakeMaxAgeHours: 48 })).deferredWakeMaxAgeHours).toBe(48);
-    expect(patchInstanceGeneralSettingsSchema.safeParse({ deferredWakeMaxAgeHours: 1 }).success).toBe(true);
-    expect(patchInstanceGeneralSettingsSchema.safeParse({ deferredWakeMaxAgeHours: 720 }).success).toBe(true);
-    for (const invalid of [0, 721, 1.5, "24"]) {
-      expect(patchInstanceGeneralSettingsSchema.safeParse({ deferredWakeMaxAgeHours: invalid }).success).toBe(false);
-    }
   });
 
   it("keeps chat connectors opt-in across legacy storage and patches without disabling Apps", () => {

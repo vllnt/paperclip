@@ -6,7 +6,6 @@ import {
   WEEKLY_RETENTION_PRESETS,
   MONTHLY_RETENTION_PRESETS,
   DEFAULT_BACKUP_RETENTION,
-  DEFAULT_DEFERRED_WAKE_MAX_AGE_HOURS,
 } from "@paperclipai/shared";
 import { LogOut, SlidersHorizontal } from "lucide-react";
 import { healthApi } from "@/api/health";
@@ -20,13 +19,6 @@ import { cn } from "../lib/utils";
 import { useSignOut } from "@/hooks/useSignOut";
 
 const FEEDBACK_TERMS_URL = import.meta.env.VITE_FEEDBACK_TERMS_URL?.trim() || "https://paperclip.ing/tos";
-/** Parked wake expiry choices in hours; the API accepts any whole number from 1 to 720. */
-const DEFERRED_WAKE_MAX_AGE_PRESETS: readonly number[] = [6, 12, 24, 48, 72, 168];
-
-function formatHours(hours: number) {
-  if (hours % 24 === 0 && hours >= 48) return `${hours / 24} days`;
-  return hours === 1 ? "1 hour" : `${hours} hours`;
-}
 
 export function InstanceGeneralSettings({ embedded = false }: { embedded?: boolean }) {
   const { setBreadcrumbs } = useBreadcrumbs();
@@ -86,7 +78,6 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
   const censorUsernameInLogs = generalQuery.data?.censorUsernameInLogs === true;
   const feedbackDataSharingPreference = generalQuery.data?.feedbackDataSharingPreference ?? "prompt";
   const backupRetention: BackupRetentionPolicy = generalQuery.data?.backupRetention ?? DEFAULT_BACKUP_RETENTION;
-  const deferredWakeMaxAgeHours = generalQuery.data?.deferredWakeMaxAgeHours ?? DEFAULT_DEFERRED_WAKE_MAX_AGE_HOURS;
   const hiddenSettings = new Set(healthQuery.data?.hiddenSettings ?? []);
   const showDeploymentStatus = !hiddenSettings.has("instance.general.deploymentStatus");
   const showCensorUsernameInLogs = !hiddenSettings.has("instance.general.censorUsernameInLogs");
@@ -96,7 +87,6 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
   const visibleTopics = [
     ...(showCensorUsernameInLogs ? ["log display"] : []),
     ...(showBackupRetention ? ["backup retention"] : []),
-    "parked wake expiry",
     ...(showFeedbackDataSharing ? ["data sharing"] : []),
   ];
   const topicSummary = visibleTopics.length > 2
@@ -288,44 +278,6 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
         </div>
       </section>
       )}
-
-      <section>
-        <div className="space-y-3">
-          <div className="space-y-1.5">
-            <h2 className="text-sm font-semibold">Parked wake expiry</h2>
-            <p className="max-w-2xl text-sm text-muted-foreground">
-              A wake that arrives while another run holds its task is parked until it can run. A parked wake
-              older than this is closed with a reason on its task instead of starting a run, so an old backlog
-              cannot start stale work. The default is {DEFAULT_DEFERRED_WAKE_MAX_AGE_HOURS} hours.
-            </p>
-          </div>
-          <div className="flex flex-wrap gap-2" role="group" aria-label="Parked wake expiry">
-            {DEFERRED_WAKE_MAX_AGE_PRESETS.map((hours) => {
-              const active = deferredWakeMaxAgeHours === hours;
-              return (
-                <button
-                  key={hours}
-                  type="button"
-                  aria-pressed={active}
-                  disabled={updateGeneralMutation.isPending || signOutMutation.isPending}
-                  className={cn(
-                    "rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60",
-                    active
-                      ? "border-foreground bg-accent text-foreground"
-                      : "border-border bg-background hover:bg-accent/50",
-                  )}
-                  onClick={() => updateGeneralMutation.mutate({ deferredWakeMaxAgeHours: hours })}
-                >
-                  <div className="text-sm font-medium">{formatHours(hours)}</div>
-                </button>
-              );
-            })}
-          </div>
-          {!DEFERRED_WAKE_MAX_AGE_PRESETS.includes(deferredWakeMaxAgeHours) ? (
-            <p className="text-sm text-muted-foreground">Current value: {formatHours(deferredWakeMaxAgeHours)}.</p>
-          ) : null}
-        </div>
-      </section>
 
       {showFeedbackDataSharing && (
       <section>
