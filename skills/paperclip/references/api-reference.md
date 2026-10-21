@@ -1536,6 +1536,12 @@ Signed external alert ingress; `event` routine triggers subscribe to a source. S
 | GET    | `/api/companies/:companyId/activity`         | Activity log                       |
 | GET    | `/api/companies/:companyId/dashboard`        | Company health summary             |
 
+### Server Health
+
+| Method | Path          | Description                                                                 |
+| ------ | ------------- | --------------------------------------------------------------------------- |
+| GET    | `/api/health` | Server `status` and running build `commit`; see `SKILL.md` "Proving a Deploy" |
+
 ### Secrets
 
 | Method | Path | Description |
