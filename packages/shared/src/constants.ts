@@ -598,6 +598,7 @@ export const COMPANY_POLICY_KEY_MAX_LENGTH = 64;
 export const COMPANY_POLICY_TITLE_MAX_LENGTH = 200;
 export const COMPANY_POLICY_SUMMARY_MAX_LENGTH = 280;
 export const COMPANY_POLICY_BODY_MAX_LENGTH = 100_000;
+export const COMPANY_POLICY_CHANGE_SUMMARY_MAX_LENGTH = 500;
 
 /** Shown to agents beside the company focus so every run applies it the same way. */
 export const COMPANY_FOCUS_GUIDANCE =

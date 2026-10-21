@@ -4,14 +4,16 @@ import { StatusBadge } from "./StatusBadge";
 export interface PolicyListProps {
   policies: CompanyPolicy[];
   onOpen: (policy: CompanyPolicy) => void;
+  /** The accessible name of the list. */
+  label: string;
   /** Project names by ID; when given, a project policy shows which project it applies to. */
   projectNames?: Map<string, string>;
 }
 
 /** Rows of policies: title, `policy://` key, status, scope and summary. Selecting a row opens it. */
-export function PolicyList({ policies, onOpen, projectNames }: PolicyListProps) {
+export function PolicyList({ policies, onOpen, label, projectNames }: PolicyListProps) {
   return (
-    <ul className="rounded-lg border border-border" aria-label="Policies">
+    <ul className="rounded-lg border border-border" aria-label={label}>
       {policies.map((policy) => {
         const scopeLabel = policy.projectId
           ? projectNames?.get(policy.projectId) ?? null

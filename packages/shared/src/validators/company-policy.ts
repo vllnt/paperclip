@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   COMPANY_POLICY_BODY_MAX_LENGTH,
+  COMPANY_POLICY_CHANGE_SUMMARY_MAX_LENGTH,
   COMPANY_POLICY_KEY_MAX_LENGTH,
   COMPANY_POLICY_SCOPES,
   COMPANY_POLICY_STATUSES,
@@ -67,7 +68,7 @@ export const updateCompanyPolicySchema = z
     projectId: z.string().guid().optional().nullable(),
     ...ownerFields,
     /** Saved with the new revision when the title or body changes. */
-    changeSummary: z.string().trim().max(500).optional().nullable(),
+    changeSummary: z.string().trim().max(COMPANY_POLICY_CHANGE_SUMMARY_MAX_LENGTH).optional().nullable(),
     /** The revision this edit started from. A newer revision on the server returns 409. */
     baseRevisionId: z.string().guid().optional().nullable(),
   })

@@ -911,7 +911,12 @@ export function ProjectDetail() {
                   projectId={project.id}
                   canCreate={!project.archivedAt}
                 />
-                <ProjectPoliciesSection key={`policies-${project.id}`} companyId={project.companyId} projectId={project.id} />
+                <ProjectPoliciesSection
+                  key={`policies-${project.id}`}
+                  companyId={project.companyId}
+                  projectId={project.id}
+                  canCreate={!project.archivedAt}
+                />
               </div>
             }
             onUpdate={(data) => updateProject.mutate(data)}

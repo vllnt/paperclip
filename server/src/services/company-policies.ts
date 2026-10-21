@@ -74,6 +74,11 @@ function mapRevision(policyId: string, row: typeof documentRevisions.$inferSelec
   };
 }
 
+/** An empty summary is stored as no summary. */
+function normalizeSummary(summary: string | null | undefined): string | null | undefined {
+  return summary === undefined ? undefined : summary || null;
+}
+
 function listFilter(companyId: string, query: ListCompanyPoliciesQuery): SQL | undefined {
   const conditions: SQL[] = [eq(companyPolicies.companyId, companyId)];
   if (query.projectId) conditions.push(eq(companyPolicies.projectId, query.projectId));
@@ -194,7 +199,7 @@ export function companyPolicyService(db: Db) {
           projectId: input.projectId ?? null,
           documentId: document.id,
           key: input.key,
-          summary: input.summary ?? null,
+          summary: normalizeSummary(input.summary) ?? null,
           status: input.status,
           ownerAgentId: input.ownerAgentId ?? null,
           ownerUserId: input.ownerUserId ?? null,
@@ -278,8 +283,9 @@ export function companyPolicyService(db: Db) {
       }
 
       const patch: Partial<typeof companyPolicies.$inferInsert> = {};
-      if (input.summary !== undefined && input.summary !== policy.summary) {
-        patch.summary = input.summary;
+      const summary = normalizeSummary(input.summary);
+      if (summary !== undefined && summary !== policy.summary) {
+        patch.summary = summary;
         changed.push("summary");
       }
       if (input.status !== undefined && input.status !== policy.status) {
@@ -313,6 +319,11 @@ export function companyPolicyService(db: Db) {
   /** Deletes an archived policy with its document and revisions. Archive is the normal way to retire one. */
   async function remove(companyId: string, key: string): Promise<CompanyPolicy> {
     return db.transaction(async (tx) => {
+      await tx
+        .select({ id: companyPolicies.id })
+        .from(companyPolicies)
+        .where(and(eq(companyPolicies.companyId, companyId), eq(companyPolicies.key, key)))
+        .for("update");
       const policy = await requireByKey(tx, companyId, key);
       if (policy.status !== "archived") {
         throw conflict("Archive the policy before you delete it. Archiving keeps policy:// references valid.");

@@ -96,14 +96,14 @@ export function Policies() {
       {companyPolicies.length > 0 ? (
         <section className="flex flex-col gap-2" aria-labelledby="company-policies-heading">
           <h2 id="company-policies-heading" className="text-xs text-muted-foreground">Company</h2>
-          <PolicyList policies={companyPolicies} onOpen={openPolicy} />
+          <PolicyList policies={companyPolicies} onOpen={openPolicy} label="Company policies" />
         </section>
       ) : null}
 
       {projectPolicies.length > 0 ? (
         <section className="flex flex-col gap-2" aria-labelledby="project-policies-heading">
           <h2 id="project-policies-heading" className="text-xs text-muted-foreground">Projects</h2>
-          <PolicyList policies={projectPolicies} onOpen={openPolicy} projectNames={projectNames} />
+          <PolicyList policies={projectPolicies} onOpen={openPolicy} label="Project policies" projectNames={projectNames} />
         </section>
       ) : null}
 

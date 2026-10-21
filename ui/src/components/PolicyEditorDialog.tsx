@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  COMPANY_POLICY_CHANGE_SUMMARY_MAX_LENGTH,
   COMPANY_POLICY_KEY_MAX_LENGTH,
   COMPANY_POLICY_STATUSES,
   COMPANY_POLICY_SUMMARY_MAX_LENGTH,
@@ -15,10 +16,20 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { accessApi } from "../api/access";
 import { agentsApi } from "../api/agents";
 import { policiesApi } from "../api/policies";
 import { projectsApi } from "../api/projects";
+import { buildCompanyUserInlineOptions } from "../lib/company-members";
 import { queryKeys } from "../lib/queryKeys";
 import { timeAgo } from "../lib/timeAgo";
 import { MarkdownBody } from "./MarkdownBody";
@@ -54,6 +65,44 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Paperclip could not save the policy.";
 }
 
+/** The editable fields of a policy, as the dialog holds them. */
+export interface PolicyEditorForm {
+  title: string;
+  body: string;
+  summary: string;
+  status: CompanyPolicyStatus;
+  projectId: string | null;
+  /** `none`, `agent:<id>` or `user:<id>`. */
+  owner: string;
+  changeSummary: string;
+}
+
+/**
+ * The PATCH body for an edited policy: only the changed fields. A title or body change also sends the
+ * revision the edit started from, so the server refuses it when someone saved a newer revision first.
+ */
+export function buildPolicyPatch(policy: CompanyPolicy, form: PolicyEditorForm): UpdateCompanyPolicy {
+  const patch: UpdateCompanyPolicy = {};
+  const title = form.title.trim();
+  const summary = form.summary.trim() || null;
+  const owners = ownerFields(form.owner);
+  if (title !== policy.title) patch.title = title;
+  if (form.body !== policy.body) patch.body = form.body;
+  if (patch.title !== undefined || patch.body !== undefined) {
+    patch.baseRevisionId = policy.latestRevisionId;
+    if (form.changeSummary.trim()) patch.changeSummary = form.changeSummary.trim();
+  }
+  if (summary !== policy.summary) patch.summary = summary;
+  if (form.status !== policy.status) patch.status = form.status;
+  if (form.projectId !== policy.projectId) patch.projectId = form.projectId;
+  if (owners.ownerAgentId !== policy.ownerAgentId || owners.ownerUserId !== policy.ownerUserId) {
+    if (owners.ownerAgentId) patch.ownerAgentId = owners.ownerAgentId;
+    else if (owners.ownerUserId) patch.ownerUserId = owners.ownerUserId;
+    else Object.assign(patch, { ownerAgentId: null, ownerUserId: null });
+  }
+  return patch;
+}
+
 export interface PolicyEditorDialogProps {
   companyId: string;
   open: boolean;
@@ -83,9 +132,70 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
   const [showHistory, setShowHistory] = useState(false);
   const [viewedRevisionId, setViewedRevisionId] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const invalidate = () => queryClient.invalidateQueries({ queryKey: queryKeys.policies.all(companyId) });
+
+  const save = useMutation({
+    mutationFn: async () => {
+      const projectId = scope === COMPANY_SCOPE ? null : scope;
+      if (!policy) {
+        const owners = ownerFields(owner);
+        return policiesApi.create(companyId, {
+          key: key.trim(),
+          title: title.trim(),
+          summary: summary.trim() || null,
+          body,
+          status,
+          projectId,
+          ...(owners.ownerAgentId ? { ownerAgentId: owners.ownerAgentId } : {}),
+          ...(owners.ownerUserId ? { ownerUserId: owners.ownerUserId } : {}),
+        });
+      }
+      return policiesApi.update(
+        companyId,
+        policy.key,
+        buildPolicyPatch(policy, { title, body, summary, status, projectId, owner, changeSummary }),
+      );
+    },
+    onSuccess: async () => {
+      await invalidate();
+      onOpenChange(false);
+    },
+    // A newer revision (409) or a changed policy: refresh the cached policies, so reopening loads the newest one.
+    onError: () => void invalidate(),
+  });
+
+  const restore = useMutation({
+    mutationFn: (revision: CompanyPolicyRevision) =>
+      policiesApi.update(companyId, policy!.key, {
+        title: revision.title ?? policy!.title,
+        body: revision.body,
+        changeSummary: `Restore revision ${revision.revisionNumber}`,
+        baseRevisionId: policy!.latestRevisionId,
+      }),
+    onSuccess: async () => {
+      await invalidate();
+      onOpenChange(false);
+    },
+    onError: () => void invalidate(),
+  });
+
+  const remove = useMutation({
+    mutationFn: () => policiesApi.remove(companyId, policy!.key),
+    onSuccess: async () => {
+      await invalidate();
+      onOpenChange(false);
+    },
+  });
+
+  const resetSave = save.reset;
+  const resetRestore = restore.reset;
+  const resetRemove = remove.reset;
 
   useEffect(() => {
     if (!open) return;
+    resetSave();
+    resetRestore();
+    resetRemove();
     setTitle(policy?.title ?? "");
     setKey(policy?.key ?? "");
     setKeyEdited(false);
@@ -98,7 +208,7 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
     setShowHistory(false);
     setViewedRevisionId(null);
     setConfirmDelete(false);
-  }, [open, policy, defaultProjectId]);
+  }, [open, policy, defaultProjectId, resetSave, resetRestore, resetRemove]);
 
   const { data: projects } = useQuery({
     queryKey: queryKeys.projects.list(companyId),
@@ -108,6 +218,11 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
   const { data: agents } = useQuery({
     queryKey: queryKeys.agents.list(companyId),
     queryFn: () => agentsApi.list(companyId),
+    enabled: open,
+  });
+  const { data: userDirectory } = useQuery({
+    queryKey: queryKeys.access.companyUserDirectory(companyId),
+    queryFn: () => accessApi.listUserDirectory(companyId),
     enabled: open,
   });
   const revisionsQuery = useQuery({
@@ -125,69 +240,15 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
     return list;
   }, [projects, policy?.projectId, defaultProjectId]);
 
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: queryKeys.policies.all(companyId) });
-
-  const save = useMutation({
-    mutationFn: async () => {
-      const projectId = scope === COMPANY_SCOPE ? null : scope;
-      const owners = ownerFields(owner);
-      const trimmedSummary = summary.trim() || null;
-      if (!policy) {
-        return policiesApi.create(companyId, {
-          key: key.trim(),
-          title: title.trim(),
-          summary: trimmedSummary,
-          body,
-          status,
-          projectId,
-          ...(owners.ownerAgentId ? { ownerAgentId: owners.ownerAgentId } : {}),
-          ...(owners.ownerUserId ? { ownerUserId: owners.ownerUserId } : {}),
-        });
-      }
-      const patch: UpdateCompanyPolicy = {};
-      if (title.trim() !== policy.title) patch.title = title.trim();
-      if (body !== policy.body) patch.body = body;
-      if (patch.title !== undefined || patch.body !== undefined) {
-        patch.baseRevisionId = policy.latestRevisionId;
-        if (changeSummary.trim()) patch.changeSummary = changeSummary.trim();
-      }
-      if (trimmedSummary !== policy.summary) patch.summary = trimmedSummary;
-      if (status !== policy.status) patch.status = status;
-      if (projectId !== policy.projectId) patch.projectId = projectId;
-      if (owners.ownerAgentId !== policy.ownerAgentId || owners.ownerUserId !== policy.ownerUserId) {
-        if (owners.ownerAgentId) patch.ownerAgentId = owners.ownerAgentId;
-        else if (owners.ownerUserId) patch.ownerUserId = owners.ownerUserId;
-        else Object.assign(patch, { ownerAgentId: null, ownerUserId: null });
-      }
-      return policiesApi.update(companyId, policy.key, patch);
-    },
-    onSuccess: async () => {
-      await invalidate();
-      onOpenChange(false);
-    },
-  });
-
-  const restore = useMutation({
-    mutationFn: (revision: CompanyPolicyRevision) =>
-      policiesApi.update(companyId, policy!.key, {
-        title: revision.title ?? policy!.title,
-        body: revision.body,
-        changeSummary: `Restore revision ${revision.revisionNumber}`,
-        baseRevisionId: policy!.latestRevisionId,
-      }),
-    onSuccess: async () => {
-      await invalidate();
-      onOpenChange(false);
-    },
-  });
-
-  const remove = useMutation({
-    mutationFn: () => policiesApi.remove(companyId, policy!.key),
-    onSuccess: async () => {
-      await invalidate();
-      onOpenChange(false);
-    },
-  });
+  const userOptions = useMemo(() => {
+    const list = buildCompanyUserInlineOptions(userDirectory?.users);
+    const currentOwner = policy?.ownerUserId ? `user:${policy.ownerUserId}` : null;
+    if (currentOwner && !list.some((option) => option.id === currentOwner)) {
+      list.push({ id: currentOwner, label: "Former member" });
+    }
+    return list;
+  }, [userDirectory?.users, policy?.ownerUserId]);
+  const agentOptions = (agents ?? []).filter((agent) => agent.status !== "terminated" || agent.id === policy?.ownerAgentId);
 
   const keyValid = /^[a-z0-9][a-z0-9-]*$/.test(key.trim());
   const canSave = title.trim().length > 0 && (!isNew || keyValid) && !save.isPending;
@@ -220,9 +281,9 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="policy-key">Key</Label>
             {isNew ? (
               <>
+                <Label htmlFor="policy-key">Key</Label>
                 <Input
                   id="policy-key"
                   className="font-mono"
@@ -240,7 +301,10 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
                 </p>
               </>
             ) : (
-              <p id="policy-key" className="font-mono text-sm text-muted-foreground">policy://{policy.key}</p>
+              <>
+                <span className="text-sm font-medium">Key</span>
+                <p className="font-mono text-sm text-muted-foreground">policy://{policy.key}</p>
+              </>
             )}
           </div>
 
@@ -255,8 +319,8 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
             />
           </div>
 
-          <div className="flex flex-col gap-1.5">
-            <Label>Policy</Label>
+          <div className="flex flex-col gap-1.5" role="group" aria-labelledby="policy-body-label">
+            <Label id="policy-body-label">Policy</Label>
             <MarkdownEditor
               value={body}
               onChange={setBody}
@@ -305,14 +369,26 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value={NO_OWNER}>No owner</SelectItem>
-                  {policy?.ownerUserId ? (
-                    <SelectItem value={`user:${policy.ownerUserId}`}>Board member</SelectItem>
+                  {userOptions.length > 0 ? (
+                    <SelectGroup>
+                      <SelectLabel>People</SelectLabel>
+                      {userOptions.map((option) => (
+                        <SelectItem key={option.id} value={option.id}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
                   ) : null}
-                  {(agents ?? []).map((agent) => (
-                    <SelectItem key={agent.id} value={`agent:${agent.id}`}>
-                      {agent.name}
-                    </SelectItem>
-                  ))}
+                  {agentOptions.length > 0 ? (
+                    <SelectGroup>
+                      <SelectLabel>Agents</SelectLabel>
+                      {agentOptions.map((agent) => (
+                        <SelectItem key={agent.id} value={`agent:${agent.id}`}>
+                          {agent.name}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  ) : null}
                 </SelectContent>
               </Select>
             </div>
@@ -324,7 +400,7 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
               <Input
                 id="policy-change-summary"
                 value={changeSummary}
-                maxLength={500}
+                maxLength={COMPANY_POLICY_CHANGE_SUMMARY_MAX_LENGTH}
                 placeholder="Saved with the new revision when the title or policy text changes"
                 onChange={(event) => setChangeSummary(event.target.value)}
               />
@@ -352,47 +428,54 @@ export function PolicyEditorDialog({ companyId, open, onOpenChange, policy, defa
                     Failed to load history: {revisionsQuery.error.message}
                   </p>
                 ) : (
-                  <ol className="flex flex-col rounded-lg border border-border" aria-label="Policy revisions">
-                    {(revisionsQuery.data ?? []).map((revision) => {
-                      const isLatest = revision.id === policy.latestRevisionId;
-                      const isViewed = viewedRevisionId === revision.id;
-                      return (
-                        <li key={revision.id} className="flex flex-col gap-2 border-b border-border px-3 py-2 last:border-b-0">
-                          <div className="flex flex-wrap items-center gap-2 text-sm">
-                            <span className="font-mono text-xs text-muted-foreground">#{revision.revisionNumber}</span>
-                            <span className="min-w-0 flex-1 truncate">{revision.changeSummary ?? revision.title ?? "Revision"}</span>
-                            <span className="text-xs text-muted-foreground">{timeAgo(revision.createdAt)}</span>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => setViewedRevisionId(isViewed ? null : revision.id)}
-                            >
-                              {isViewed ? "Hide" : "View"}
-                            </Button>
-                            {!isLatest ? (
+                  <>
+                    {(revisionsQuery.data?.length ?? 0) < policy.latestRevisionNumber ? (
+                      <p className="text-xs text-muted-foreground">
+                        Showing the newest {revisionsQuery.data?.length ?? 0} of {policy.latestRevisionNumber} revisions.
+                      </p>
+                    ) : null}
+                    <ol className="flex flex-col rounded-lg border border-border" aria-label="Policy revisions">
+                      {(revisionsQuery.data ?? []).map((revision) => {
+                        const isLatest = revision.id === policy.latestRevisionId;
+                        const isViewed = viewedRevisionId === revision.id;
+                        return (
+                          <li key={revision.id} className="flex flex-col gap-2 border-b border-border px-3 py-2 last:border-b-0">
+                            <div className="flex flex-wrap items-center gap-2 text-sm">
+                              <span className="font-mono text-xs text-muted-foreground">#{revision.revisionNumber}</span>
+                              <span className="min-w-0 flex-1 truncate">{revision.changeSummary ?? revision.title ?? "Revision"}</span>
+                              <span className="text-xs text-muted-foreground">{timeAgo(revision.createdAt)}</span>
                               <Button
                                 type="button"
-                                variant="outline"
+                                variant="ghost"
                                 size="sm"
-                                disabled={restore.isPending}
-                                onClick={() => restore.mutate(revision)}
+                                onClick={() => setViewedRevisionId(isViewed ? null : revision.id)}
                               >
-                                Restore
+                                {isViewed ? "Hide" : "View"}
                               </Button>
-                            ) : (
-                              <span className="text-xs text-muted-foreground">Current</span>
-                            )}
-                          </div>
-                          {isViewed ? (
-                            <div className="rounded-md bg-muted px-3 py-2 text-sm">
-                              <MarkdownBody>{revision.body || "_Empty_"}</MarkdownBody>
+                              {!isLatest ? (
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={restore.isPending}
+                                  onClick={() => restore.mutate(revision)}
+                                >
+                                  Restore
+                                </Button>
+                              ) : (
+                                <span className="text-xs text-muted-foreground">Current</span>
+                              )}
                             </div>
-                          ) : null}
-                        </li>
-                      );
-                    })}
-                  </ol>
+                            {isViewed ? (
+                              <div className="rounded-md bg-muted px-3 py-2 text-sm">
+                                <MarkdownBody>{revision.body || "_Empty_"}</MarkdownBody>
+                              </div>
+                            ) : null}
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  </>
                 )
               ) : null}
             </div>

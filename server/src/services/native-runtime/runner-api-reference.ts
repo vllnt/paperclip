@@ -835,7 +835,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "GET /api/companies/{}/policies": {
     "section": "Policies",
-    "description": "List policies, company ones first; optional filters `scope` (`company`, `project`), `projectId`, `status` (`draft`, `active`, `archived`)"
+    "description": "List policies, company ones first; optional filters `scope` (`company`, `project`), `projectId`, `status` (`draft`, `active`, `archived`); `scope=company` with `projectId`: 400"
   },
   "GET /api/companies/{}/policies/{}": {
     "section": "Policies",

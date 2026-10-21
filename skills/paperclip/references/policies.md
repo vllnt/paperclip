@@ -46,7 +46,8 @@ GET /api/companies/{companyId}/policies/{key}/revisions
 ```
 
 List filters: `scope` (`company` or `project`), `projectId` and `status`. The
-list returns company policies first.
+list returns company policies first. `projectId` with `scope=company` returns
+`400`.
 
 ## Write policies (board only)
 
@@ -67,4 +68,5 @@ paperclipai policy delete code-review --yes
 - Archive a policy to retire it. The key stays reserved, so old
   `policy://<key>` references never point at a different policy.
 - Delete works only on an archived policy. Any other status returns `409`.
+- Deleting a project also deletes its policies.
 - A duplicate key returns `409`.

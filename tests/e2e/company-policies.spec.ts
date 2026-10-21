@@ -100,6 +100,7 @@ for (const viewport of [
     await companySection.getByText("Code review").click();
     dialog = page.getByRole("dialog", { name: "Edit policy" });
     await expect(dialog.getByText("policy://code-review")).toBeVisible();
+    await expect(dialog.getByRole("alert"), "the cancelled create's error is gone").toHaveCount(0);
     await typeBody(dialog, page, "Ask two agents to review each pull request.");
     await dialog.getByLabel("Change note").fill("Two reviewers");
     await dialog.getByRole("button", { name: "Save" }).click();

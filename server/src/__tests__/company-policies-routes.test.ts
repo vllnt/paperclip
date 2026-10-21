@@ -16,6 +16,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { companyPolicyRoutes } from "../routes/company-policies.js";
 import { buildOpenApiSpec } from "../routes/openapi.js";
+import { projectService } from "../services/projects.js";
 import {
   describeEmbeddedPostgres,
   seedCompanyWithBoardAccess,
@@ -174,6 +175,45 @@ describeEmbeddedPostgres("company policy routes", () => {
     expect(active.body.map((policy: { key: string }) => policy.key)).toEqual(["security", "project-style"]);
 
     expect((await request(app).get(url).query({ status: "deleted" })).status).toBe(400);
+    expect((await request(app).get(url).query({ scope: "company", projectId: project.id })).status).toBe(400);
+  });
+
+  it("stores an empty summary as no summary", async () => {
+    const seeded = await seedCompanyWithBoardAccess(ctx.db, "Policies");
+    const app = createApp(ctx.db, seeded.actor);
+    const url = `/api/companies/${seeded.companyId}/policies`;
+
+    const created = await request(app).post(url).send({ key: "naming", title: "Naming", summary: "  " });
+    expect(created.status).toBe(201);
+    expect(created.body.summary).toBeNull();
+
+    await request(app).patch(`${url}/naming`).send({ summary: "Use clear names." });
+    const cleared = await request(app).patch(`${url}/naming`).send({ summary: "" });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.summary).toBeNull();
+  });
+
+  it("removes a project's policies with their documents when the project is deleted", async () => {
+    const seeded = await seedCompanyWithBoardAccess(ctx.db, "Policies");
+    const project = await seedProject(ctx.db, seeded.companyId);
+    const app = createApp(ctx.db, seeded.actor);
+    const url = `/api/companies/${seeded.companyId}/policies`;
+    const projectPolicy = await request(app)
+      .post(url)
+      .send({ key: "release", title: "Release", body: "Tag every release.", status: "active", projectId: project.id });
+    const companyPolicy = await request(app).post(url).send({ key: "naming", title: "Naming", status: "active" });
+
+    const removed = await projectService(ctx.db).remove(project.id);
+
+    expect(removed?.removedPolicyKeys).toEqual(["release"]);
+    expect((await request(app).get(url)).body.map((policy: { key: string }) => policy.key)).toEqual(["naming"]);
+    const remainingDocuments = await ctx.db.select({ id: documents.id }).from(documents);
+    expect(remainingDocuments.map((row) => row.id)).toEqual([companyPolicy.body.documentId]);
+    const remainingRevisions = await ctx.db
+      .select({ id: documentRevisions.id })
+      .from(documentRevisions)
+      .where(eq(documentRevisions.documentId, projectPolicy.body.documentId));
+    expect(remainingRevisions).toEqual([]);
   });
 
   it("saves a revision for a body change, edits other fields in place, and logs what changed", async () => {

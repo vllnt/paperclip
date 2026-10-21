@@ -6,7 +6,7 @@ import {
   listCompanyPoliciesQuerySchema,
   updateCompanyPolicySchema,
 } from "@paperclipai/shared";
-import { badRequest } from "../errors.js";
+import { badRequest, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { companyPolicyService, logActivity } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -30,6 +30,9 @@ export function companyPolicyRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     const query = listCompanyPoliciesQuerySchema.safeParse(req.query);
     if (!query.success) throw badRequest(query.error.issues[0]?.message ?? "Invalid policy filter");
+    if (query.data.scope === "company" && query.data.projectId) {
+      throw badRequest("A company-scope list cannot filter by projectId. Use scope=project, or leave out scope.");
+    }
     res.json(await svc.list(companyId, query.data));
   });
 
@@ -37,10 +40,7 @@ export function companyPolicyRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const policy = await svc.getByKey(companyId, parseKey(req.params.key));
-    if (!policy) {
-      res.status(404).json({ error: "Policy not found" });
-      return;
-    }
+    if (!policy) throw notFound("Policy not found");
     res.json(policy);
   });
 

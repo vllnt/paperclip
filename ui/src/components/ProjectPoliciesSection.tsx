@@ -12,10 +12,12 @@ import { PolicyList } from "./PolicyList";
 export interface ProjectPoliciesSectionProps {
   companyId: string;
   projectId: string;
+  /** False for an archived project: its policies stay readable and editable, but no new one starts there. */
+  canCreate?: boolean;
 }
 
 /** The project Configuration tab's policies: rules for this project's tasks, on top of the company policies. */
-export function ProjectPoliciesSection({ companyId, projectId }: ProjectPoliciesSectionProps) {
+export function ProjectPoliciesSection({ companyId, projectId, canCreate = true }: ProjectPoliciesSectionProps) {
   const [showArchived, setShowArchived] = useState(false);
   const [editor, setEditor] = useState<{ open: boolean; policy: CompanyPolicy | null }>({ open: false, policy: null });
 
@@ -39,10 +41,12 @@ export function ProjectPoliciesSection({ companyId, projectId }: ProjectPolicies
               {showArchived ? "Hide archived" : `Show archived (${archivedCount})`}
             </Button>
           ) : null}
-          <Button size="sm" variant="outline" onClick={openNew}>
-            <Plus className="h-3.5 w-3.5" />
-            New policy
-          </Button>
+          {canCreate ? (
+            <Button size="sm" variant="outline" onClick={openNew}>
+              <Plus className="h-3.5 w-3.5" />
+              New policy
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -62,7 +66,7 @@ export function ProjectPoliciesSection({ companyId, projectId }: ProjectPolicies
           {archivedCount > 0 ? "Only archived policies in this project." : "No project policies yet."}
         </p>
       ) : (
-        <PolicyList policies={visible} onOpen={(policy) => setEditor({ open: true, policy })} />
+        <PolicyList policies={visible} onOpen={(policy) => setEditor({ open: true, policy })} label="Project policies" />
       )}
 
       <p className="text-xs text-muted-foreground">

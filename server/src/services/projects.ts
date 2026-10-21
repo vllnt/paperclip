@@ -1,6 +1,8 @@
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  companyPolicies,
+  documents,
   projects,
   projectGoals,
   goals,
@@ -945,16 +947,30 @@ export function projectService(db: Db) {
       return cleared;
     },
 
+    /**
+     * Deletes a project. Its policies go with it, together with their documents and revisions,
+     * so no policy text stays behind. Returns the deleted project and the keys of its removed policies.
+     */
     remove: (id: string) =>
-      db
-        .delete(projects)
-        .where(eq(projects.id, id))
-        .returning()
-        .then((rows) => {
-          const row = rows[0] ?? null;
-          if (!row) return null;
-          return { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) };
-        }),
+      db.transaction(async (tx) => {
+        const projectPolicies = await tx
+          .select({ key: companyPolicies.key, documentId: companyPolicies.documentId })
+          .from(companyPolicies)
+          .where(eq(companyPolicies.projectId, id));
+        const row = await tx
+          .delete(projects)
+          .where(eq(projects.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!row) return null;
+        if (projectPolicies.length > 0) {
+          await tx.delete(documents).where(inArray(documents.id, projectPolicies.map((policy) => policy.documentId)));
+        }
+        return {
+          project: { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) },
+          removedPolicyKeys: projectPolicies.map((policy) => policy.key),
+        };
+      }),
 
     listWorkspaces: async (projectId: string): Promise<ProjectWorkspace[]> => {
       const rows = await db
