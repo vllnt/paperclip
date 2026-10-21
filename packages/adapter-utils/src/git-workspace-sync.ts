@@ -1081,7 +1081,7 @@ export async function integrateImportedGitHead(input: {
   throw new Error(`Failed to integrate concurrent remote git history for ${input.importedHead.slice(0, 12)} after multiple retries.`);
 }
 
-/** How often, and how long apart, a reset retries while another git process holds the index. */
+/** How often, and how long apart, an index write retries while another git process holds the index. */
 const INDEX_LOCK_RETRY_ATTEMPTS = 10;
 const INDEX_LOCK_RETRY_DELAY_MS = 200;
 
@@ -1094,42 +1094,52 @@ async function localGitIndexLocked(localDir: string): Promise<boolean> {
   return fs.access(path.resolve(localDir, lockPath)).then(() => true, () => false);
 }
 
+/** The message, stderr and stdout of a failed git command, for an error that says what went wrong. */
+export function describeGitFailure(error: unknown): string {
+  return error && typeof error === "object"
+    ? [
+      (error as { message?: unknown }).message,
+      (error as { stderr?: unknown }).stderr,
+      (error as { stdout?: unknown }).stdout,
+    ].filter((value): value is string => typeof value === "string" && value.trim().length > 0).join("\n")
+    : String(error);
+}
+
+/**
+ * Runs a git command that writes the local index. While another git process
+ * holds the index for a moment, it waits for it, judged by its lock file,
+ * rather than fail; a lock released between the failure and that check gets
+ * one more try. Resolves with how long it waited for the lock.
+ */
+export async function runLocalGitIndexWrite(localDir: string, args: string[]): Promise<{ lockWaitMs: number }> {
+  let lockWaitMs = 0;
+  let retriedWithoutLock = false;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await runLocalGit(localDir, args, { timeout: 60_000, maxBuffer: 1024 * 1024 });
+      return { lockWaitMs };
+    } catch (error) {
+      if (attempt >= INDEX_LOCK_RETRY_ATTEMPTS) throw error;
+      if (await localGitIndexLocked(localDir)) {
+        await new Promise((resolve) => setTimeout(resolve, INDEX_LOCK_RETRY_DELAY_MS));
+        lockWaitMs += INDEX_LOCK_RETRY_DELAY_MS;
+      } else if (retriedWithoutLock) {
+        throw error;
+      } else {
+        retriedWithoutLock = true;
+      }
+    }
+  }
+}
+
 export async function resetLocalGitIndexToHead(input: {
   localDir: string;
   checkWorkingTreeClean?: boolean;
 }): Promise<void> {
   try {
-    let retriedWithoutLock = false;
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        await runLocalGit(input.localDir, ["reset", "--quiet", "HEAD", "--", "."], {
-          timeout: 60_000,
-          maxBuffer: 1024 * 1024,
-        });
-        break;
-      } catch (error) {
-        if (attempt >= INDEX_LOCK_RETRY_ATTEMPTS) throw error;
-        // Another git process holds the index for a moment: wait for it,
-        // judged by its lock file, rather than fail the restore. A lock
-        // released between the failure and this check gets one more try.
-        if (await localGitIndexLocked(input.localDir)) {
-          await new Promise((resolve) => setTimeout(resolve, INDEX_LOCK_RETRY_DELAY_MS));
-        } else if (retriedWithoutLock) {
-          throw error;
-        } else {
-          retriedWithoutLock = true;
-        }
-      }
-    }
+    await runLocalGitIndexWrite(input.localDir, ["reset", "--quiet", "HEAD", "--", "."]);
   } catch (error) {
-    const detail = error && typeof error === "object"
-      ? [
-        (error as { message?: unknown }).message,
-        (error as { stderr?: unknown }).stderr,
-        (error as { stdout?: unknown }).stdout,
-      ].filter((value): value is string => typeof value === "string" && value.trim().length > 0).join("\n")
-      : String(error);
-    throw new Error(`Failed to reset local git index to HEAD after workspace restore: ${detail}`);
+    throw new Error(`Failed to reset local git index to HEAD after workspace restore: ${describeGitFailure(error)}`);
   }
 
   const hasDiff = async (args: string[]) => {

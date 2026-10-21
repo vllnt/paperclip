@@ -60,25 +60,44 @@ deleted. Several runs can share one checkout.
   `prepareWorkspaceForSshExecution`. A change that lands locally while the copy
   is seeded is therefore never read as an edit the run made, and a file created
   in that window is never deleted.
-- **The index follows HEAD.** When the restore integrates the run's commits,
-  `integrateImportedGitHead` moves the branch ref only. The restore resets the
-  index to HEAD right after the ref moves, so the index follows HEAD even when
-  the file merge then fails. After the merge it checks out, from HEAD, each
-  tracked file that equals the blob the run committed but differs from the
-  integrated HEAD. A plain `git commit` on the checkout never deletes the run's
-  files. A reset that meets another git process's `index.lock` waits for it,
-  for about two seconds.
-- **A run that moved to another commit follows HEAD too.** A run that checks
-  out an older commit of the local history and commits nothing integrates
-  nothing, yet its copy holds that commit's files. When the run's HEAD differs
-  from the local HEAD, the restore realigns those files the same way, without
-  resetting the index. A run whose HEAD equals the local HEAD runs no hook, so
-  a read-only run skips the merge lock unless the local HEAD moved during the
-  run.
+- **A run that made no commit leaves Git alone.** The restore compares the
+  run's HEAD with the seed head, the local HEAD the copy was seeded from. When
+  they match, it writes the run's file edits only: it integrates nothing,
+  changes no index entry and realigns nothing. Whatever the host did with its
+  HEAD, index and branches during the run stays as it is: a commit, a
+  `git revert -n`, a branch switch, an amend, a `reset --soft`. A read-only
+  run that changed no file skips the merge lock.
+- **The index moves with HEAD, only where HEAD moved.** When the run
+  committed, `integrateImportedGitHead` moves the branch ref after the merge's
+  preflight and before its first write. The restore then brings the index
+  entries of the paths that this move changed to the new HEAD, in one git
+  command. Every other entry stays: a change staged by hand stays staged, and
+  so does the staged part of a partly staged file. A plain `git commit` on the
+  checkout never deletes the run's files.
+- **A failure before the first write moves nothing.** A merge that refuses
+  never moves the ref. When the index cannot follow, because another git
+  process kept `index.lock` for more than about two seconds, the ref goes back
+  with a compare-and-swap. HEAD, the index and the files then still agree, and
+  the next restore integrates again. Every index write waits for a
+  short-lived `index.lock`.
+- **The files the merge wrote follow HEAD.** Among the paths the merge wrote,
+  each tracked file that equals the run's commit but differs from the
+  integrated HEAD is a stale copy of history and is checked out from HEAD. A
+  tracked file that the merge removed for that reason comes back. This covers a
+  run that checks out an older commit and commits nothing. A path the merge did
+  not write is never touched.
+- **Each step logs its duration.** After the transfer, the run log gets one
+  line for each step: `[paperclip] Restore snapshot`, `integrate`, `index`
+  (with the time spent waiting for the index lock), `copy` and `realign`.
 - **Known edges.** A file the run edited after its last commit differs from the
-  run's committed blob, so on a true both-sides conflict the run's dirty file
-  wins. A path the merge deleted locally while the copy still has it stays
-  untracked. Symlinks and other non-regular files are not realigned.
+  run's commit, so on a true both-sides conflict the run's dirty file wins. On
+  a path that the run's commits changed, the index takes the new HEAD's
+  version, even when the host had staged a change there. A failure after the
+  first write (a copy or a realign error) leaves the ref moved. A run that
+  committed while the host switched branches is merged into the branch the
+  host has checked out. A path the merge deleted locally while the copy still
+  has it stays untracked. Symlinks and other non-regular files are not
+  realigned.
 
 The invariant is pinned by
 [`src/ssh-restore-primary-coherence.test.ts`](./src/ssh-restore-primary-coherence.test.ts).

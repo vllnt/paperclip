@@ -900,6 +900,7 @@ export async function prepareRemoteManagedRuntime(input: {
         remoteDir: workspaceRemoteDir,
         baselineSnapshot,
         restoreGitHistory: preparedWorkspace.gitBacked,
+        seedHead: seedPlan?.gitSnapshot?.headCommit,
         onProgress: input.onProgress,
       });
     }
@@ -974,6 +975,7 @@ export async function prepareRemoteManagedRuntime(input: {
           remoteDir: workspaceRemoteDir,
           baselineSnapshot,
           restoreGitHistory: preparedWorkspace.gitBacked,
+          seedHead: seedPlan?.gitSnapshot?.headCommit,
           onProgress,
         });
       }
