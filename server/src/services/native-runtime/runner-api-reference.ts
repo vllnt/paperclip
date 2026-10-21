@@ -872,5 +872,9 @@ export const runnerApiReference: Record<string, { section: string; description?:
   "GET /api/companies/{}/goals/progress": {
     "section": "A goal's linked work",
     "description": "Done, open and total tasks per goal, including the tasks of its sub-goals"
+  },
+  "GET /api/companies/{}/goals/focus": {
+    "section": "A goal's linked work",
+    "description": "The company's current focus: active short-horizon goals, nearest target date first, with progress and open milestones"
   }
 };

@@ -86,6 +86,20 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain("issue-1");
   });
 
+  it("lists the open tasks of one goal", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([{ id: "issue-1" }]));
+    vi.stubGlobal("fetch", fetchMock);
+    const goalId = "55555555-5555-4555-8555-555555555555";
+
+    await getTool("paperclipListIssues").execute({ goalId, status: "todo,in_progress" });
+
+    const [url] = fetchMock.mock.calls[0] as [string];
+    const parsed = new URL(String(url));
+    expect(parsed.pathname).toBe("/api/companies/11111111-1111-1111-1111-111111111111/issues");
+    expect(parsed.searchParams.get("goalId")).toBe(goalId);
+    expect(parsed.searchParams.get("status")).toBe("todo,in_progress");
+  });
+
   it("uses default agent id for checkout requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ id: "PAP-1135", status: "in_progress" }),

@@ -224,6 +224,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/decisions\/[^/?#%.\\]+\/cancel$/ },
   { method: "GET", path: /^\/api\/projects\/[^/]+$/ },
   { method: "GET", path: /^\/api\/goals\/[^/]+$/ },
+  // Goal reads: the company focus and each goal's task progress. A goal's tasks and routines come from
+  // the issue and routine lists with ?goalId=, which the rules above already admit. The id slot excludes
+  // ?, #, %, . and \ like the skill rules.
+  { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/goals\/(?:focus|progress)$/ },
 
   // Task-bound email actions. Company, inbox ownership, task/run authority,
   // and action policies are enforced by the controller; mailbox setup stays denied.
