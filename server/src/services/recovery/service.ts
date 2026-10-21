@@ -971,6 +971,11 @@ export function recoveryService(
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
     /**
+     * Records the usage that a run streamed before it ended with no adapter result. The watchdog
+     * fold calls it after it settled a run, and a failure never undoes the fold.
+     */
+    recordRunUsage?: (runId: string) => Promise<void>;
+    /**
      * The heartbeat policy reason (`wakeOnDemand` disabled, daily run/cost
      * cap) that would make an on-demand wake for this agent a skipped
      * receipt, or null when the agent can be woken now.
@@ -2512,10 +2517,12 @@ export function recoveryService(
       .then((rows) => rows[0]?.issuePrefix ?? "PAP");
   }
 
+  const recordRunUsage = deps.recordRunUsage;
   const watchdog = createActiveRunWatchdog(db, {
     suspicionThresholdMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
     criticalThresholdMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
     continueRearmMs: ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
+    onRunFolded: recordRunUsage ? (run) => recordRunUsage(run.id) : undefined,
   });
 
   async function buildRunOutputSilence(

@@ -9,8 +9,18 @@ This is the **run-log data path** in `AGENTS.md`. The rows stay in the instance 
 - Keys: run, company, agent, issue, project, routine. A row has no foreign key to the agent or the run, so it survives agent deletion.
 - Counts and closed values only. Text columns hold a closed value or a short identifier (`[a-z0-9_.:@/+-]`, at most 80 characters). The table never holds a prompt, context, stdout, stderr or other free text.
 - Token classes do not overlap. `input_tokens` is the fresh input only, `cache_read_tokens` is the cached part, and `output_tokens` is the output. Providers differ in what they report: OpenAI-family streams count the cached tokens inside the input, so for the recorded providers `openai` and `xai` the worker stores the reported input minus the cached part. The recorded provider label decides, not the model id: a Grok model that runs through `codex_local` is recorded as `openai` and follows the OpenAI rule. The `xai` label is expected only from the `grok_local` adapter. Anthropic streams report the cached tokens on top, so those counts are stored as reported. The stream and the provider decide this, not the adapter type: a `codex_local` run on an Anthropic model streams Anthropic counts. Claude `input_tokens` still includes the cache-creation tokens until a later slice splits them (`cache_write_tokens` is null).
-- `usage_quality` says how much to trust the token counts: `measured` (the provider reported them for this run, including the `codex_local` CLI, whose counts were checked to be per run), `declared` (a claim nobody has checked: the Codex app-server runner, another Codex adapter, or a cached count larger than the input of a provider that counts it inside the input), `derived` (the server subtracted a session baseline), or `missing` (the run reported none).
+- `usage_quality` says how much to trust the token counts: `measured` (the provider reported them for this run, including the `codex_local` CLI, whose counts were checked to be per run), `declared` (a claim nobody has checked: the Codex app-server runner, another Codex adapter, or a cached count larger than the input of a provider that counts it inside the input), `derived` (the server subtracted a session baseline, or read the usage back from the run log of a run that ended without an adapter result), or `missing` (the run reported none).
 - `schema_version` says which rules wrote the row.
+
+## Runs that end without an adapter result
+
+A server shutdown, a stop and the active-run watchdog fold end a run before its adapter prints the provider's final totals, so the run row would hold no usage. The server then reads the usage back from the run's own log, once, when the run turns terminal (for a shutdown: when the interrupted run is repaired on the next start).
+
+- The adapter parses its own stream (`parseRunLogUsage` on the server adapter module). `claude_local` takes the exact totals and the cost from a final `result` line when the log holds one. Otherwise it adds up the usage of each assistant message (one snapshot per message id) and marks the usage `partial`.
+- The run's `usage_json` gets `usageSource: "run_log"` and `partial: true|false`. The row derives as `derived`.
+- A partial count has no cost: the CLI prints the cost only in its final `result` line, and the server keeps no price table. Its cost event carries the tokens, `cost_status: "unpriced"` and 0 cents, so the daily cap counts a recovered run only where the log holds the cost.
+- A run that already holds usage (a normal finalization, or a self-handoff flush) is never overwritten. One conditional write claims the empty `usage_json`, so a recovery and a normal finalization cannot both record.
+- A run that never started an adapter has no log and no usage; it stays empty.
 
 ## How rows are written
 

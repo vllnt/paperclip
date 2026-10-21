@@ -36,6 +36,18 @@ export interface UsageSummary {
   cachedInputTokens?: number;
 }
 
+/**
+ * The usage a run streamed into its stdout log, read back after the run ended without an adapter
+ * result. `partial` is true when the stream stopped before the provider's final totals, so the
+ * counts are a lower bound.
+ */
+export interface AdapterRunLogUsage {
+  usage: UsageSummary;
+  costUsd: number | null;
+  model: string | null;
+  partial: boolean;
+}
+
 export type AdapterBillingType =
   | "api"
   | "subscription"
@@ -543,6 +555,13 @@ export interface ServerAdapterModule {
    * without knowing provider-specific credential paths or API shapes.
    */
   getQuotaWindows?: () => Promise<ProviderQuotaResult>;
+  /**
+   * Optional: read the usage that a run streamed into its stdout log. The host calls it for a run
+   * that ended with no adapter result (a restart, a stop, the watchdog fold), so the tokens it
+   * streamed still count. Receives the run's whole stdout text; returns null when the stream holds
+   * no usage. Must be pure and must not throw.
+   */
+  parseRunLogUsage?: (stdout: string) => AdapterRunLogUsage | null;
   /**
    * Optional: detect the currently configured model from local config files.
    * Returns the detected model/provider and the config source, or null if
