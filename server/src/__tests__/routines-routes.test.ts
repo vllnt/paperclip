@@ -934,7 +934,7 @@ describe("routine routes", () => {
       expect(mockRoutineService.update).not.toHaveBeenCalled();
     });
 
-    it("rejects a step condition (when) on create and update", async () => {
+    it("accepts a step condition (when) on create and update", async () => {
       mockAccessService.canUser.mockResolvedValue(true);
       const app = await createApp({
         type: "board",
@@ -945,7 +945,7 @@ describe("routine routes", () => {
       });
       const conditional = [
         { key: "first", title: "First", after: [] },
-        { key: "second", title: "Second", after: [{ step: "first", when: "done" }] },
+        { key: "second", title: "Second", after: [{ step: "first", when: "cancelled" }] },
       ];
 
       const patched = await request(app).patch(`/api/routines/${routineId}`).send({ steps: conditional });
@@ -953,10 +953,74 @@ describe("routine routes", () => {
         .post(`/api/companies/${companyId}/routines`)
         .send({ projectId, title: "Daily routine", assigneeAgentId: agentId, steps: conditional });
 
+      expect(patched.status).toBe(200);
+      expect(created.status).toBe(201);
+      expect(mockRoutineService.update).toHaveBeenCalledWith(
+        routineId,
+        expect.objectContaining({ steps: conditional }),
+        expect.anything(),
+      );
+      expect(mockRoutineService.create).toHaveBeenCalledWith(
+        companyId,
+        expect.objectContaining({ steps: conditional }),
+        expect.anything(),
+      );
+    });
+
+    it("rejects one predecessor named with two different conditions on create and update", async () => {
+      mockAccessService.canUser.mockResolvedValue(true);
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+      const conflicting = [
+        { key: "first", title: "First", after: [] },
+        {
+          key: "second",
+          title: "Second",
+          after: [
+            { step: "first", when: "done" },
+            { step: "first", when: "cancelled" },
+          ],
+        },
+      ];
+
+      const patched = await request(app).patch(`/api/routines/${routineId}`).send({ steps: conflicting });
+      const created = await request(app)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({ projectId, title: "Daily routine", assigneeAgentId: agentId, steps: conflicting });
+
       expect(patched.status).toBe(400);
       expect(created.status).toBe(400);
+      expect(JSON.stringify(patched.body)).toContain("more than once with different conditions");
       expect(mockRoutineService.update).not.toHaveBeenCalled();
       expect(mockRoutineService.create).not.toHaveBeenCalled();
+    });
+
+    it("rejects a step condition value other than done or cancelled", async () => {
+      mockAccessService.canUser.mockResolvedValue(true);
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+
+      const res = await request(app)
+        .patch(`/api/routines/${routineId}`)
+        .send({
+          steps: [
+            { key: "first", title: "First", after: [] },
+            { key: "second", title: "Second", after: [{ step: "first", when: "blocked" }] },
+          ],
+        });
+
+      expect(res.status).toBe(400);
+      expect(mockRoutineService.update).not.toHaveBeenCalled();
     });
   });
 });

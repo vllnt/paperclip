@@ -156,6 +156,38 @@ for (const viewport of VIEWPORTS) {
       );
       expect(problems).toEqual({ consoleErrors: [], failedRequests: [] });
     });
+
+    test("a user makes a step run only when another step is cancelled, saves, and finds the condition after a reload", async ({
+      page,
+      request,
+    }, testInfo) => {
+      const seed = await seedRoutine(request, `${viewport.name} condition`);
+      const problems = watchPageProblems(page);
+
+      await openSteps(page, seed);
+      const condition = page.getByRole("combobox", { name: "Condition on review for step 3" });
+      await expect(condition).toContainText("Wait until done");
+
+      await condition.click();
+      await page.getByRole("option", { name: "Only if cancelled" }).click();
+      await expect(condition).toContainText("Only if cancelled");
+      await expect(page.getByText(/Skipped: condition not met/)).toBeVisible();
+      await expectNoHorizontalScroll(page);
+      await page.screenshot({ path: testInfo.outputPath(`routine-steps-${viewport.name}-condition.png`) });
+
+      await page.getByRole("button", { name: "Save changes" }).click();
+      await expect(page.getByText(/unsaved change/)).toBeHidden();
+
+      await page.reload();
+      await expect(page.getByLabel(/^Key of step \d+$/)).toHaveCount(3);
+      await expect(page.getByRole("combobox", { name: "Condition on review for step 3" })).toContainText(
+        "Only if cancelled",
+      );
+      await expect(page.getByRole("combobox", { name: "Condition on implement for step 2" })).toContainText(
+        "Wait until done",
+      );
+      expect(problems).toEqual({ consoleErrors: [], failedRequests: [] });
+    });
   });
 }
 

@@ -1053,13 +1053,16 @@ export function routineStepConditionsBackstop(
   const limit = options.limit ?? ROUTINE_STEP_CONDITIONS_BACKSTOP_LIMIT;
   const root = alias(issues, "routine_step_root");
   let cursor: string | null = null;
+  // `issues.origin_run_id` is text and `routine_runs.id` is a uuid. Casting the issue side keeps the lookup on
+  // the primary key; the shape check means a malformed value joins nothing instead of failing every pass.
+  const originRunUuid = sql<string>`(case when ${issues.originRunId} ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then ${issues.originRunId}::uuid end)`;
 
   const candidates = (after: string | null) =>
     db
       .selectDistinct({ companyId: issues.companyId, rootIssueId: issues.parentId, routineRunId: issues.originRunId })
       .from(issues)
       .innerJoin(root, and(eq(root.id, issues.parentId), eq(root.companyId, issues.companyId)))
-      .innerJoin(routineRuns, and(eq(routineRuns.id, issues.originRunId), eq(routineRuns.companyId, issues.companyId)))
+      .innerJoin(routineRuns, and(eq(routineRuns.id, originRunUuid), eq(routineRuns.companyId, issues.companyId)))
       .where(
         and(
           eq(issues.originKind, "routine_step"),

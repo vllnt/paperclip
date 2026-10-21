@@ -1488,7 +1488,7 @@ Terminal states: `done`, `cancelled`
 | GET    | `/api/companies/:companyId/routines` | List routines in company; optional filters `q`, `assigneeAgentId`, `projectId`, `folderId` (`none`), `status`, `trigger` (`schedule`, `webhook`, `api`, `event`, `manual`) |
 | GET    | `/api/routines/:routineId` | Routine details including triggers |
 | POST   | `/api/companies/:companyId/routines` | Create routine (`assigneeAgentId` + `projectId` required; agents: own only; optional `steps`, sub-tasks each run creates, see `references/routines.md` Routine steps; CLI `routine create --steps-file <path>`; the response carries `warnings` for steps whose agent cannot take work now) |
-| PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign; `steps` replaces the list, CLI `routine update <id> --steps-file <path>`; `GET` returns `steps`; the response carries `warnings`) |
+| PATCH  | `/api/routines/:routineId` | Update routine (agents: own only, cannot reassign; `steps` replaces the list (an `after` entry is a step key or `{ step, when: "done"|"cancelled" }`, see `references/routines.md` Conditions on steps), CLI `routine update <id> --steps-file <path>`; `GET` returns `steps`; the response carries `warnings`) |
 | POST   | `/api/routines/:routineId/triggers` | Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`; `eventGrouping.issueMode: "event_issue"` starts the routine's steps on each task created, built-in Paperclip source only, see `references/routines.md` Event Triggers) |
 | PATCH  | `/api/routine-triggers/:triggerId` | Update trigger (e.g. disable, change cron) |
 | DELETE | `/api/routine-triggers/:triggerId` | Delete trigger |

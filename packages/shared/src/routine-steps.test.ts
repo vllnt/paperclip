@@ -362,6 +362,23 @@ describe("evaluateRoutineStepRun", () => {
     expect(evaluation.stalled).toBe(false);
   });
 
+  it("never skips a step whose block a person owns, and counts it as live work", () => {
+    const approved = evaluateRoutineStepRun(
+      gated,
+      { review: "done", merge: "blocked", rework: "blocked", join: "blocked" },
+      { heldByPeople: new Set(["rework"]) },
+    );
+    expect(approved).toEqual({ skip: [], release: {}, releaseFromRoot: [], stalled: false });
+
+    const chain = [
+      { key: "build", after: [] },
+      { key: "test", after: ["build"] },
+    ];
+    const statuses = { build: "cancelled", test: "blocked" };
+    expect(evaluateRoutineStepRun(chain, statuses).stalled).toBe(true);
+    expect(evaluateRoutineStepRun(chain, statuses, { heldByPeople: new Set(["test"]) }).stalled).toBe(false);
+  });
+
   it("does not release a cancelled step from the root when one of its outgoing edges is plain", () => {
     const steps = [
       { key: "a", after: [] },
