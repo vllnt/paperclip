@@ -39,14 +39,14 @@ export interface UpdatedPage<T> {
   cursor: string | null;
 }
 export type WalkEnd = "done" | "budget" | "stopped";
-export interface UpdatedWalk<T> {
+export interface UpdatedWalk<T extends { updatedAt: string }> {
   from: string | undefined;
   deadline: number;
   /** Null stops the walk (the company was disconnected). */
   fetchPage(since: string | undefined, page: number): Promise<UpdatedPage<T> | null>;
-  /** Handles one page; false means the deadline came first and the page is not finished. */
-  visit(items: T[]): Promise<boolean>;
-  /** Saves the place after a page is finished. */
+  /** Handles one page in order and returns how many of its items it finished: fewer than all when the deadline came first. */
+  visit(items: T[]): Promise<number>;
+  /** Saves the place after a page is finished, or after the last item finished when the deadline came mid-page. */
   commit(since: string): Promise<void>;
 }
 
@@ -57,16 +57,24 @@ export interface UpdatedWalk<T> {
  * share the cursor's time (no progress) turns to the next page.
  * @returns "done" at the end of the listing, "budget" at the deadline, "stopped" when `fetchPage` returned null.
  */
-export async function walkUpdated<T>(walk: UpdatedWalk<T>): Promise<WalkEnd> {
+export async function walkUpdated<T extends { updatedAt: string }>(walk: UpdatedWalk<T>): Promise<WalkEnd> {
   let since = walk.from, page = 1;
+  const later = (time: string | null): time is string => time !== null && (since === undefined || Date.parse(time) > Date.parse(since));
   for (;;) {
     if (Date.now() >= walk.deadline) return "budget";
     const result = await walk.fetchPage(since, page);
     if (!result) return "stopped";
-    if (!await walk.visit(result.items)) return "budget";
+    const finished = await walk.visit(result.items);
+    if (finished < result.items.length) {
+      // The finished items are the oldest of the page. Asking again from just before the last of them re-lists the items that
+      // share its time, so the next run goes on from there instead of redoing the page.
+      const last = newestUpdate(result.items.slice(0, finished));
+      if (later(last)) await walk.commit(last);
+      return "budget";
+    }
     const { cursor, nextPage } = result;
-    const advanced = cursor !== null && (since === undefined || Date.parse(cursor) > Date.parse(since));
-    if (cursor !== null && advanced) { since = cursor; await walk.commit(cursor); }
+    const advanced = later(cursor);
+    if (advanced) { since = cursor; await walk.commit(cursor); }
     if (nextPage === null) return "done";
     page = advanced ? 1 : nextPage;
   }

@@ -420,11 +420,11 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       },
       async visit(listed) {
         await recover(listed);
-        for (const remote of listed) {
-          if (Date.now() >= deadline) return false;
+        for (const [index, remote] of listed.entries()) {
+          if (Date.now() >= deadline) return index;
           await reconcileOne(remote);
         }
-        return true;
+        return listed.length;
       } });
     async function asked(): Promise<"done" | "budget"> {
       const mine = Object.entries(scope.queued).filter(([, item]) => item.repositoryId === repo.id).sort(([, a], [, b]) => a.at - b.at).slice(0, QUEUE_PER_REPOSITORY);
@@ -442,10 +442,12 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
       }
       return "done";
     }
-    // Publications that no listing showed a receipt for: a "ready" one is posted now; a "posting" one waits for its receipt.
-    async function publishRest() {
+    // Publications that no listing showed a receipt for: a "ready" one is posted now; a "posting" one waits for its receipt,
+    // which only a finished walk (`walked`) can rule out.
+    async function publishRest(walked: boolean) {
       for (const item of pending) {
-        if (recovered.has(item.issueId) || unresolved.has(item.issueId)) continue;
+        if (Date.now() >= deadline) return;
+        if (recovered.has(item.issueId) || unresolved.has(item.issueId) || (item.phase === "posting" && !walked)) continue;
         try { await reconcileOne(await publishPending(companyId, item, repo, auth, [])); recovered.add(item.issueId); }
         catch (error) { warn(error, repo.fullName); unresolved.add(item.issueId); }
       }
@@ -453,9 +455,10 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     return {
       async recent(): Promise<WalkEnd> {
         if (await asked() === "budget") return "budget";
-        if (cursor.head === undefined) return "done";
+        // A repository in its first full pass has no recent-changes walk yet (the pass is the walk); its ready publications go out now.
+        if (cursor.head === undefined) { await publishRest(false); return "done"; }
         const end = await walk(cursor.head, async since => { cursor.head = since; await saveCursor(); });
-        if (end === "done") await publishRest();
+        if (end === "done") await publishRest(true);
         return end;
       },
       async sweep(): Promise<WalkEnd> {

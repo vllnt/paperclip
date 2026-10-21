@@ -23,7 +23,7 @@ async function walk(rows: Row[], size: number, options: { from?: string; deadlin
   const list = listing(rows, size, options.edit);
   const visited: number[] = [], commits: string[] = [];
   const end = await walkUpdated<Row>({ from: options.from, deadline: options.deadline ?? Infinity, fetchPage: list.fetchPage,
-    async visit(items) { for (const item of items) { if (options.visitLimit !== undefined && visited.length >= options.visitLimit) return false; if (!visited.includes(item.id)) visited.push(item.id); } return true; },
+    async visit(items) { for (const [index, item] of items.entries()) { if (options.visitLimit !== undefined && visited.length >= options.visitLimit) return index; if (!visited.includes(item.id)) visited.push(item.id); } return items.length; },
     async commit(since) { commits.push(since); } });
   return { end, visited, commits, requests: list.requests };
 }
@@ -62,7 +62,7 @@ describe("walkUpdated", () => {
   it("moves past a page that holds no issue (only pull requests) by its cursor", async () => {
     const pages: Array<UpdatedPage<Row>> = [{ items: [], nextPage: 2, cursor: at(5) }, { items: [row(9, 6)], nextPage: null, cursor: at(6) }];
     const seen: Array<string | undefined> = [];
-    const end = await walkUpdated<Row>({ from: undefined, deadline: Infinity, commit: async () => {}, visit: async () => true,
+    const end = await walkUpdated<Row>({ from: undefined, deadline: Infinity, commit: async () => {}, visit: async items => items.length,
       async fetchPage(since) { seen.push(since); return pages[seen.length - 1] ?? { items: [], nextPage: null, cursor: null }; } });
     expect(end).toBe("done");
     expect(seen).toEqual([undefined, at(5)]);
@@ -79,13 +79,35 @@ describe("walkUpdated", () => {
     expect([...new Set([...first.visited, ...second.visited])].sort()).toEqual([1, 2, 3, 4, 5, 6]);
   });
 
+  it("saves the last finished issue when the deadline comes mid-page, so the next run does not redo the page", async () => {
+    const rows = Array.from({ length: 6 }, (_, index) => row(index + 1, index + 1));
+    const first = await walk(rows, 4, { visitLimit: 2 });
+    expect(first).toMatchObject({ end: "budget", visited: [1, 2], commits: [at(2)] });
+    const second = await walk(rows, 4, { from: first.commits.at(-1) });
+    expect(second.end).toBe("done");
+    expect(second.visited).toEqual([2, 3, 4, 5, 6]);
+  });
+
+  it("re-lists the unfinished issues that share the saved time after a mid-page deadline", async () => {
+    const rows = [row(1, 1), row(2, 2), row(3, 2), row(4, 2), row(5, 3)];
+    const first = await walk(rows, 5, { visitLimit: 2 });
+    expect(first).toMatchObject({ end: "budget", visited: [1, 2], commits: [at(2)] });
+    const second = await walk(rows, 5, { from: first.commits.at(-1) });
+    expect(second.visited).toEqual([2, 3, 4, 5]);
+  });
+
+  it("saves nothing when the deadline comes before the page's first issue", async () => {
+    const result = await walk([row(1, 1), row(2, 2)], 2, { visitLimit: 0 });
+    expect(result).toMatchObject({ end: "budget", visited: [], commits: [] });
+  });
+
   it("ends at once when the deadline has passed, and without a request", async () => {
     const result = await walk([row(1, 1)], 2, { deadline: Date.now() - 1 });
     expect(result).toMatchObject({ end: "budget", requests: [] });
   });
 
   it("stops when the page source says so", async () => {
-    const visit = vi.fn(async () => true);
+    const visit = vi.fn(async (items: Row[]) => items.length);
     expect(await walkUpdated<Row>({ from: undefined, deadline: Infinity, fetchPage: async () => null, visit, commit: async () => {} })).toBe("stopped");
     expect(visit).not.toHaveBeenCalled();
   });

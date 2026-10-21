@@ -223,6 +223,7 @@ describe("incremental GitHub task sync", () => {
   const minute = (n: number) => new Date(Date.parse("2026-10-04T12:00:00Z") + n * 60_000).toISOString();
   const edited = (id: number, at: number, patch: Partial<GitHubIssue> = {}) => issue(id, { ...patch, updatedAt: minute(at) });
   const queueKey = (scopeId = companyId) => ({ scopeKind: "company" as const, scopeId, namespace: "sync", stateKey: "queue" });
+  const pendingKey = { scopeKind: "company" as const, scopeId: companyId, namespace: "sync", stateKey: "pending" };
   /** Three issues that GitHub last changed at minutes 1 to 3, already imported. */
   async function synced() {
     const f = await fixture();
@@ -276,6 +277,37 @@ describe("incremental GitHub task sync", () => {
     expect(await f.native()).toHaveLength(250);
     expect(new Set((await f.native()).map(item => item.originId)).size).toBe(250);
   });
+  /** Moves the clock past the run's budget after the given number of imports. */
+  function budgetAfter(f: Awaited<ReturnType<typeof fixture>>, imports: (count: number) => boolean) {
+    const advance = skewClock(), create = f.h.ctx.issues.create.bind(f.h.ctx.issues);
+    let created = 0;
+    vi.spyOn(f.h.ctx.issues, "create").mockImplementation(async input => { const made = await create(input); if (imports(++created)) advance(130_000); return made; });
+  }
+  it("saves the place of a run that ends mid-page at the last issue it finished, so the next run does not redo the page", async () => {
+    const f = await fixture();
+    f.remote.clear();
+    for (let number = 1; number <= 150; number++) f.remote.set(number, edited(number, number));
+    budgetAfter(f, count => count === 50);
+    expect(await f.service.sync(companyId)).toMatchObject({ imported: 50, partial: true });
+    expect(await f.service.sync(companyId)).toMatchObject({ imported: 100, checked: 101, partial: false });
+    expect(f.list.mock.calls[1][5]?.since).toBe(resumeFrom(minute(50)));
+    expect(new Set((await f.native()).map(item => item.originId)).size).toBe(150);
+  });
+  it("posts a ready publication while the repository's first full pass still takes several runs", async () => {
+    const f = await fixture();
+    f.remote.clear();
+    for (let number = 1; number <= 250; number++) f.remote.set(number, edited(number, number));
+    const local = await f.h.ctx.issues.create({ companyId, title: "Write the docs", projectId: "p1" });
+    await f.h.ctx.state.set(pendingKey, { [local.id]: { issueId: local.id, repositoryId: repo.id, phase: "ready", title: local.title, body: "" } });
+    budgetAfter(f, count => count % 100 === 0);
+    expect(await f.service.sync(companyId)).toMatchObject({ partial: true });
+    expect(f.create).toHaveBeenCalledTimes(1);
+    expect(await f.h.ctx.state.get(pendingKey)).toEqual({});
+    expect(await f.service.sync(companyId)).toMatchObject({ partial: true });
+    expect(await f.service.sync(companyId)).toMatchObject({ partial: false });
+    expect(f.create).toHaveBeenCalledTimes(1);
+    expect(await f.native()).toHaveLength(251);
+  });
   it("pushes an edit made here that the host announced, without GitHub listing the issue again", async () => {
     const f = await synced();
     await editHere(f, 1, "Local title");
@@ -328,6 +360,8 @@ describe("incremental GitHub task sync", () => {
   it("reads every issue again after the settings are saved, so a new rule reaches all of them", async () => {
     const f = await synced();
     f.h.seed({ agents: [{ id: "a1", companyId, name: "Engineer", status: "idle" }] as any });
+    // The save comes after the last pass started; without this, a fast machine makes both happen in the same millisecond.
+    await new Promise(resolve => setTimeout(resolve, 5));
     await f.h.performAction("save-sync-settings", { settings: { enabled: true, rules: [{ ...rule, then: { ...rule.then, wake: false } }] } }, actor);
     await f.service.sync(companyId);
     expect(f.list.mock.calls.at(-1)?.[5]?.since).toBeUndefined();
