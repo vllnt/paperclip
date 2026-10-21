@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildPaperclipTaskMarkdown,
   mergeCoalescedContextSnapshot,
+  ROUTINE_TASK_SESSION_CLAIM_KEY,
+  ROUTINE_TASK_SESSION_CLAIM_RUN_KEY,
   summarizeHeartbeatRunContextSnapshot,
   summarizeHeartbeatRunListResultJson,
 } from "../services/heartbeat.js";
@@ -686,6 +688,44 @@ describe("mergeCoalescedContextSnapshot", () => {
     expect(merged.commentId).toBe("comment-1");
     expect(merged.wakeCommentId).toBe("comment-1");
     expect(merged.wakeCommentIds).toEqual(["comment-1"]);
+  });
+
+  describe("routine-session claim", () => {
+    const claim = (runId: string) => ({
+      [ROUTINE_TASK_SESSION_CLAIM_KEY]: "routine:routine-1",
+      [ROUTINE_TASK_SESSION_CLAIM_RUN_KEY]: runId,
+    });
+
+    it("keeps the target's claim when the incoming wake context carries another run's copy", () => {
+      const merged = mergeCoalescedContextSnapshot(
+        { issueId: "issue-1", ...claim("run-target") },
+        { issueId: "issue-1", wakeReason: "issue_commented", ...claim("run-source") },
+      );
+
+      expect(merged[ROUTINE_TASK_SESSION_CLAIM_KEY]).toBe("routine:routine-1");
+      expect(merged[ROUTINE_TASK_SESSION_CLAIM_RUN_KEY]).toBe("run-target");
+      expect(merged.wakeReason).toBe("issue_commented");
+    });
+
+    it("keeps the target's claim when the incoming wake context has none", () => {
+      const merged = mergeCoalescedContextSnapshot(
+        { issueId: "issue-1", ...claim("run-target") },
+        { issueId: "issue-1", wakeReason: "issue_commented" },
+      );
+
+      expect(merged[ROUTINE_TASK_SESSION_CLAIM_KEY]).toBe("routine:routine-1");
+      expect(merged[ROUTINE_TASK_SESSION_CLAIM_RUN_KEY]).toBe("run-target");
+    });
+
+    it("takes no claim from the incoming wake context when the target has none", () => {
+      const merged = mergeCoalescedContextSnapshot(
+        { issueId: "issue-1" },
+        { issueId: "issue-1", ...claim("run-source") },
+      );
+
+      expect(merged).not.toHaveProperty(ROUTINE_TASK_SESSION_CLAIM_KEY);
+      expect(merged).not.toHaveProperty(ROUTINE_TASK_SESSION_CLAIM_RUN_KEY);
+    });
   });
 });
 
