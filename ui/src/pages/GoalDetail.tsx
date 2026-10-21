@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useParams } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { goalsApi } from "../api/goals";
@@ -20,6 +20,7 @@ import { InlineEditor } from "../components/InlineEditor";
 import { EntityRow } from "../components/EntityRow";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { routineDetailHref } from "../components/RoutineContextualSidebar";
+import { RoutineComposerDialog } from "../components/RoutineComposerDialog";
 import { agentUrl, cn, issueUrl, projectUrl } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -72,6 +73,7 @@ export function GoalDetail() {
   const { setBreadcrumbs } = useBreadcrumbs();
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
+  const [composerOpen, setComposerOpen] = useState(false);
 
   const {
     data: goal,
@@ -299,7 +301,13 @@ export function GoalDetail() {
           )}
         </TabsContent>
 
-        <TabsContent value="routines" className="mt-4">
+        <TabsContent value="routines" className="mt-4 space-y-3">
+          <div className="flex items-center justify-start">
+            <Button size="sm" variant="outline" onClick={() => setComposerOpen(true)}>
+              <Plus className="h-3.5 w-3.5 mr-1.5" />
+              Routine
+            </Button>
+          </div>
           {(goalRoutines ?? []).length === 0 ? (
             <p className="text-sm text-muted-foreground">No routines for this goal.</p>
           ) : (
@@ -341,6 +349,14 @@ export function GoalDetail() {
           )}
         </TabsContent>
       </Tabs>
+
+      <RoutineComposerDialog
+        companyId={goal.companyId}
+        open={composerOpen}
+        onOpenChange={setComposerOpen}
+        initialDraft={{ goalId: goal.id }}
+        afterCreate="stay"
+      />
     </div>
   );
 }
