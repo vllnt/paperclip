@@ -268,6 +268,29 @@ npx paperclipai event-sources test <source-id> --file event.json
 npx paperclipai event-sources deliveries <source-id> [--status failed] [--limit 50] [--cursor <cursor>]
 ```
 
+## Eval Commands
+
+Company evals: a decision the company defines once (an input schema plus Jev questions) and any caller runs. Every call is recorded. See `doc/company-evals.md`.
+
+```sh
+npx paperclipai evals list --company-id <id> [--status published]
+npx paperclipai evals show <slug> --company-id <id>
+
+# Board only
+npx paperclipai evals create --company-id <id> --slug pr-needs-qa --title "Needs QA?" --when-to-use "..." --definition definition.json
+npx paperclipai evals edit <slug> --company-id <id> [--title "..."] [--when-to-use "..."] [--definition definition.json]
+npx paperclipai evals versions <slug> --company-id <id>
+npx paperclipai evals publish <slug> --company-id <id> [--version <n>]
+npx paperclipai evals archive <slug> --company-id <id>
+
+# Any caller (agents run the published version)
+npx paperclipai evals run <slug> --company-id <id> --input input.json [--issue-id <id>]
+npx paperclipai evals runs <slug> --company-id <id> [--outcome failed] [--mode live]
+npx paperclipai evals feedback <slug> <run-id> --company-id <id> --correct [--question <id>] [--note "..."]
+```
+
+A result is advice: do not use it as the only gate for an approval or a merge.
+
 ## Activity Commands
 
 ```sh

@@ -242,8 +242,10 @@ export function createPostgresEvalsRepository(db: Db): EvalsRepository {
       if (filter.outcome) conditions.push(eq(companyEvalRuns.outcome, filter.outcome));
       if (filter.mode) conditions.push(eq(companyEvalRuns.mode, filter.mode));
       if (query.after) {
+        // A bare Date cannot be sent as a parameter of raw SQL (the driver has no serializer for it),
+        // so the cursor time goes as ISO text and is cast here.
         conditions.push(
-          sql`(${companyEvalRuns.createdAt}, ${companyEvalRuns.id}) < (${new Date(query.after.at)}, ${query.after.id}::uuid)`,
+          sql`(${companyEvalRuns.createdAt}, ${companyEvalRuns.id}) < (${new Date(query.after.at).toISOString()}::timestamptz, ${query.after.id}::uuid)`,
         );
       }
       const rows = await db

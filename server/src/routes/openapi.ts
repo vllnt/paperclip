@@ -128,6 +128,16 @@ import {
   // Goal
   createGoalSchema,
   updateGoalSchema,
+  // Company evals
+  createCompanyEvalSchema,
+  createCompanyEvalVersionSchema,
+  listCompanyEvalRunsQuerySchema,
+  listCompanyEvalVersionsQuerySchema,
+  listCompanyEvalsQuerySchema,
+  publishCompanyEvalSchema,
+  putCompanyEvalFeedbackSchema,
+  runCompanyEvalSchema,
+  updateCompanyEvalSchema,
   // Company policy
   createCompanyPolicySchema,
   listCompanyPoliciesQuerySchema,
@@ -1429,6 +1439,14 @@ const AGENT_ONLY_OPERATIONS = new Set(
 );
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/evals",
+  "PATCH /api/companies/{companyId}/evals/{slug}",
+  "DELETE /api/companies/{companyId}/evals/{slug}",
+  "GET /api/companies/{companyId}/evals/{slug}/versions",
+  "POST /api/companies/{companyId}/evals/{slug}/versions",
+  "GET /api/companies/{companyId}/evals/{slug}/versions/{versionNumber}",
+  "POST /api/companies/{companyId}/evals/{slug}/publish",
+  "POST /api/companies/{companyId}/evals/{slug}/archive",
   "POST /api/companies/{companyId}/policies",
   "PATCH /api/companies/{companyId}/policies/{key}",
   "DELETE /api/companies/{companyId}/policies/{key}",
@@ -1686,6 +1704,7 @@ const INSTANCE_ADMIN_OPERATIONS = new Set([
 ]);
 
 const CREATED_OPERATIONS = new Set([
+  "POST /api/companies/{companyId}/evals",
   "POST /api/companies/{companyId}/policies",
   "POST /api/companies/{companyId}/event-sources",
   "POST /api/adapters/install",
@@ -5634,6 +5653,187 @@ registry.registerPath({
   description: "Newest first, at most 100. Each revision holds the title and body saved at that time.",
   request: { params: companyPolicyParams },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+// ─── Company evals ───────────────────────────────────────────────────────────
+
+const COMPANY_EVAL_GUIDANCE =
+  "A company eval is a decision the company defines once: a small input schema and one to eight Jev questions. " +
+  "Every save of the definition is a new immutable version, and every run is recorded. A result is advice: never use it " +
+  "as the only gate for a governed action. Board users author evals; agents list and read published evals, run them, " +
+  "read their own runs and mark them.";
+
+const companyEvalParams = z.object({ companyId: z.string(), slug: z.string() });
+const companyEvalRunParams = z.object({ companyId: z.string(), slug: z.string(), runId: z.string() });
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/evals",
+  tags: ["evals"],
+  summary: "List company evals",
+  description:
+    `${COMPANY_EVAL_GUIDANCE} Board users see draft and published evals (filter with \`status\`; \`archived\` lists the archived ones). ` +
+    "Agents see only published evals, with `whenToUse` and the published input schema. Cursor-paginated by slug.",
+  request: { params: z.object({ companyId: z.string() }), query: listCompanyEvalsQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/evals",
+  tags: ["evals"],
+  summary: "Create a company eval with its first version",
+  description:
+    `${COMPANY_EVAL_GUIDANCE} Board only. The slug is unique in the company and never changes. The eval starts as a draft; ` +
+    "publish a version to make it visible to agents. A duplicate slug returns 409 `eval_slug_taken`.",
+  request: { params: z.object({ companyId: z.string() }), body: jsonBody(createCompanyEvalSchema) },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/evals/{slug}",
+  tags: ["evals"],
+  summary: "Get a company eval",
+  description:
+    "Board users get the published and the latest version. Agents get a published eval only (a draft or archived eval returns 404), " +
+    "with `whenToUse` and the published input schema.",
+  request: { params: companyEvalParams },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/evals/{slug}",
+  tags: ["evals"],
+  summary: "Change the title or the when-to-use text of a company eval",
+  description: "Board only. The definition (input schema and questions) changes only through a new version.",
+  request: { params: companyEvalParams, body: jsonBody(updateCompanyEvalSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/companies/{companyId}/evals/{slug}",
+  tags: ["evals"],
+  summary: "Delete a company eval that was never published",
+  description:
+    "Board only. Deletes the eval with its versions and its try-it runs. An eval that was ever published returns 409 " +
+    "`eval_has_history`: archive it instead.",
+  request: { params: companyEvalParams },
+  responses: { 204: r.noContent, 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/evals/{slug}/versions",
+  tags: ["evals"],
+  summary: "List the versions of a company eval",
+  description: "Board only. Newest first, cursor-paginated by version number.",
+  request: { params: companyEvalParams, query: listCompanyEvalVersionsQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/evals/{slug}/versions",
+  tags: ["evals"],
+  summary: "Save a new version of a company eval",
+  description:
+    "Board only. 201 returns the new version. A definition equal to the latest version creates nothing and returns that " +
+    "version with 200. Two writers that save at once cannot take the same number: the loser gets 409 `eval_version_conflict`.",
+  request: { params: companyEvalParams, body: jsonBody(createCompanyEvalVersionSchema) },
+  responses: {
+    200: { ...r.ok(), description: "The definition equals the latest version; nothing was created" },
+    201: { ...r.ok(), description: "The new version" },
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/evals/{slug}/versions/{versionNumber}",
+  tags: ["evals"],
+  summary: "Get one version of a company eval",
+  description: "Board only.",
+  request: { params: z.object({ companyId: z.string(), slug: z.string(), versionNumber: z.string() }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/evals/{slug}/publish",
+  tags: ["evals"],
+  summary: "Publish a version of a company eval",
+  description:
+    "Board only. Publishes the given `versionNumber`, or the latest version when it is omitted. Agents run the published " +
+    "version. Publishing an archived eval restores it.",
+  request: { params: companyEvalParams, body: jsonBody(publishCompanyEvalSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/evals/{slug}/archive",
+  tags: ["evals"],
+  summary: "Archive a company eval",
+  description: "Board only. An archived eval keeps its runs and is hidden from agents.",
+  request: { params: companyEvalParams },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/evals/{slug}/runs",
+  tags: ["evals"],
+  summary: "Run a company eval with one input",
+  description:
+    `${COMPANY_EVAL_GUIDANCE} The input is checked against the version's input schema (at most 32 KiB), secret-shaped text in ` +
+    "its string values is masked, and one Jev call answers the questions. Every call is recorded. A Jev failure (`no_key`, " +
+    "`cap_exceeded`, `timeout`, `error`) is 200 with `outcome: failed` and a `failureReason`, never a guessed answer. An input " +
+    "that is too large or does not match the schema is 422 (`eval_input_too_large`, `eval_input_invalid`) with the `runId` of " +
+    "the rejected run. Agents run the published version; board users may pass `versionNumber` or `mode: try_it`. Pass `issueId` " +
+    "to link the run to an issue of the company.",
+  request: { params: companyEvalParams, body: jsonBody(runCompanyEvalSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/evals/{slug}/runs",
+  tags: ["evals"],
+  summary: "List the runs of a company eval",
+  description:
+    "Newest first, cursor-paginated. Filter by time (`from`, `to`), `versionNumber`, `agentId`, `projectId`, `outcome` and " +
+    "`mode`. Agents see only their own runs. The input is included until its retention ends.",
+  request: { params: companyEvalParams, query: listCompanyEvalRunsQuerySchema },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/evals/{slug}/runs/{runId}",
+  tags: ["evals"],
+  summary: "Get one run of a company eval with its feedback",
+  description: "Agents can read only their own runs.",
+  request: { params: companyEvalRunParams },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/companies/{companyId}/evals/{slug}/runs/{runId}/feedback",
+  tags: ["evals"],
+  summary: "Mark a run, or one of its questions, correct or incorrect",
+  description:
+    "One mark per author per run per question; a later mark by the same author replaces the earlier one. Agents can mark only " +
+    "their own runs. Only an answered run can get feedback.",
+  request: { params: companyEvalRunParams, body: jsonBody(putCompanyEvalFeedbackSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 // ─── Secrets ─────────────────────────────────────────────────────────────────

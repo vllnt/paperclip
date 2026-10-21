@@ -58,6 +58,13 @@ const VALIDATOR_CACHE_MAX = 500;
 const VERSION_APPEND_ATTEMPTS = 3;
 /** The marker hashed in place of an input that is too deeply nested to walk. */
 const TOO_DEEP_HASH_TEXT = "company-eval-input:too-deep";
+/**
+ * Redaction and hashing run on inputs up to this size (32 times the input cap). A larger input is
+ * rejected at once, so one request cannot make the server scan megabytes of text. Its hash is of a
+ * marker and the size, never of the raw text.
+ */
+const MAX_SCANNED_INPUT_BYTES = 32 * COMPANY_EVAL_LIMITS.maxInputBytes;
+const TOO_LARGE_HASH_TEXT = "company-eval-input:too-large";
 
 export interface EvalsServiceDeps {
   repo: EvalsRepository;
@@ -95,8 +102,20 @@ function isVersionCursor(value: unknown): value is { n: number } {
   return isPlainRecord(value) && typeof value.n === "number" && Number.isInteger(value.n);
 }
 
+const CURSOR_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CURSOR_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
+
+// A cursor is untrusted input. Its time and id go to the database as typed values, so a position
+// that is not a time and a UUID must be refused here, as a 400, and not fail later as a 500.
 function isRunCursor(value: unknown): value is RunCursor {
-  return isPlainRecord(value) && typeof value.at === "string" && typeof value.id === "string";
+  return (
+    isPlainRecord(value) &&
+    typeof value.at === "string" &&
+    CURSOR_TIME_PATTERN.test(value.at) &&
+    Number.isFinite(Date.parse(value.at)) &&
+    typeof value.id === "string" &&
+    CURSOR_UUID_PATTERN.test(value.id)
+  );
 }
 
 function readCursor<T extends Record<string, string | number>>(
@@ -493,6 +512,17 @@ export function createEvalsService(deps: EvalsServiceDeps) {
     }
 
     const inputBytes = utf8ByteLength(JSON.stringify(rawInput) ?? "null");
+    if (inputBytes > MAX_SCANNED_INPUT_BYTES) {
+      return reject(
+        rejectedRow({
+          reason: "input_too_large",
+          inputHash: runtime.sha256Hex(`${TOO_LARGE_HASH_TEXT}:${inputBytes}`),
+          inputBytes,
+          redactionCount: 0,
+        }),
+        { code: "eval_input_too_large", maxInputBytes: COMPANY_EVAL_LIMITS.maxInputBytes, inputBytes },
+      );
+    }
     // Redaction runs before the hash, so no row holds a hash of raw secret text, even a rejected one.
     const redacted = redactJsonStrings(rawInput, runtime.redactText);
     const inputHash = runtime.sha256Hex(canonicalJson(redacted.value));

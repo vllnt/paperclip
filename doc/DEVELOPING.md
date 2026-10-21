@@ -1552,6 +1552,11 @@ Environment overrides:
   the work inside this window. The default is `7`. A value of `0` disables the
   cooldown and restores immediate reaping. A negative or non-numeric value falls
   back to the default.
+- `PAPERCLIP_EVAL_INPUT_RETENTION_DAYS=<days>` sets how long a company eval run
+  keeps its secret-redacted input (`doc/company-evals.md`). After that the input
+  is cleared and only the hash and the size stay. The default is `30`. A value
+  of `0` stores no input. A negative or non-numeric value falls back to the
+  default. A changed value affects new runs only.
 - `PAPERCLIP_TMP_SWEEP_RUN_GRACE_MINUTES=<minutes>` sets how long after a run
   finished the temp sweep keeps its per-run temp entries in the OS temp
   directory (`paperclip-ssh-key-<runId>-*`, `paperclip-ssh-sync-back-<runId>-*`,

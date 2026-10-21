@@ -2,7 +2,7 @@ import { and, eq, gte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import { ISSUE_PRIORITIES, type IssuePriority } from "@paperclipai/shared";
-import { QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY } from "../modules/wake-queue/domain/deferred-wake-sweep.js";
+import { QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY } from "../modules/wake-queue/index.js";
 import { PLANNED_RESTART_RESUME_RETRY_REASON } from "./execution-recovery-attempt.js";
 
 /**

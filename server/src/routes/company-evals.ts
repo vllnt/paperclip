@@ -76,7 +76,6 @@ function readRunId(req: Request): string {
  */
 export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
   const router = Router();
-  const base = "/companies/:companyId/evals";
 
   async function record(
     req: Request,
@@ -95,7 +94,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     });
   }
 
-  router.get(base, async (req, res) => {
+  router.get("/companies/:companyId/evals", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -107,7 +106,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.post(base, validate(createCompanyEvalSchema), async (req, res) => {
+  router.post("/companies/:companyId/evals", validate(createCompanyEvalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -125,7 +124,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.get(`${base}/:slug`, async (req, res) => {
+  router.get("/companies/:companyId/evals/:slug", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -136,7 +135,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.patch(`${base}/:slug`, validate(updateCompanyEvalSchema), async (req, res) => {
+  router.patch("/companies/:companyId/evals/:slug", validate(updateCompanyEvalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -157,7 +156,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.delete(`${base}/:slug`, async (req, res) => {
+  router.delete("/companies/:companyId/evals/:slug", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -175,7 +174,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.get(`${base}/:slug/versions`, async (req, res) => {
+  router.get("/companies/:companyId/evals/:slug/versions", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -187,7 +186,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.post(`${base}/:slug/versions`, validate(createCompanyEvalVersionSchema), async (req, res) => {
+  router.post("/companies/:companyId/evals/:slug/versions", validate(createCompanyEvalVersionSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -208,7 +207,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.get(`${base}/:slug/versions/:versionNumber`, async (req, res) => {
+  router.get("/companies/:companyId/evals/:slug/versions/:versionNumber", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -219,7 +218,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.post(`${base}/:slug/publish`, validate(publishCompanyEvalSchema), async (req, res) => {
+  router.post("/companies/:companyId/evals/:slug/publish", validate(publishCompanyEvalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -237,7 +236,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.post(`${base}/:slug/archive`, async (req, res) => {
+  router.post("/companies/:companyId/evals/:slug/archive", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -255,7 +254,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.post(`${base}/:slug/runs`, validate(runCompanyEvalSchema), async (req, res) => {
+  router.post("/companies/:companyId/evals/:slug/runs", validate(runCompanyEvalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -274,7 +273,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.get(`${base}/:slug/runs`, async (req, res) => {
+  router.get("/companies/:companyId/evals/:slug/runs", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -286,7 +285,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.get(`${base}/:slug/runs/:runId`, async (req, res) => {
+  router.get("/companies/:companyId/evals/:slug/runs/:runId", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);
@@ -297,7 +296,7 @@ export function companyEvalRoutes(db: Db, evals: EvalsService): Router {
     }
   });
 
-  router.put(`${base}/:slug/runs/:runId/feedback`, validate(putCompanyEvalFeedbackSchema), async (req, res) => {
+  router.put("/companies/:companyId/evals/:slug/runs/:runId/feedback", validate(putCompanyEvalFeedbackSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     assertNotSkillTestScoped(req);

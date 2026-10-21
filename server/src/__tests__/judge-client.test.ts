@@ -451,3 +451,95 @@ describe("gateway transport (mocked AI SDK)", () => {
     expect(outcome.answers.size).toMatchObject({ score: null, abstained: true });
   });
 });
+
+describe("usage and cost of a call (company evals record them)", () => {
+  function transportWithUsage(extra: { usage?: { inputTokens?: number; outputTokens?: number }; costUsd?: number }): JudgeTransport {
+    return vi.fn(async () => ({
+      answers: { same_outcome: { type: "boolean" as const, probability: 0.9 } },
+      modelId: "typesafe-ai/jev-1.2",
+      confidence: {},
+      ...extra,
+    }));
+  }
+
+  it("returns the tokens and the gateway cost of a model call", async () => {
+    const client = createJudgeClient({
+      resolveApiKey: grantKey,
+      config,
+      usage: allowAll,
+      transportFor: () => transportWithUsage({ usage: { inputTokens: 412, outputTokens: 9 }, costUsd: 0.000017 }),
+    });
+    const outcome = await client.ask(request());
+    if (!outcome.ok) throw new Error("expected an answer");
+    expect(outcome.usage).toEqual({ inputTokens: 412, outputTokens: 9 });
+    expect(outcome.costUsd).toBe(0.000017);
+  });
+
+  it("leaves usage and cost out when the gateway reports none", async () => {
+    const client = createJudgeClient({ resolveApiKey: grantKey, config, usage: allowAll, transportFor: () => transportReturning(0.9) });
+    const outcome = await client.ask(request());
+    if (!outcome.ok) throw new Error("expected an answer");
+    expect(outcome).not.toHaveProperty("usage");
+    expect(outcome).not.toHaveProperty("costUsd");
+  });
+
+  it("reports no usage on a cache hit, where no model call was made", async () => {
+    const client = createJudgeClient({
+      resolveApiKey: grantKey,
+      config,
+      usage: allowAll,
+      transportFor: () => transportWithUsage({ usage: { inputTokens: 5, outputTokens: 1 }, costUsd: 0.1 }),
+    });
+    await client.ask(request());
+    const second = await client.ask(request());
+    if (!second.ok) throw new Error("expected an answer");
+    expect(second.cached).toBe(true);
+    expect(second).not.toHaveProperty("usage");
+    expect(second).not.toHaveProperty("costUsd");
+  });
+
+  it("reports no usage on a refusal", async () => {
+    sdk.decisionModel.mockReturnValue({});
+    const { Experimental_DecisionRefusalError: Refusal } = await import("ai");
+    sdk.decide.mockRejectedValue(new Refusal({ questionIds: ["same_outcome"], provider: "gateway", modelId: "typesafe-ai/jev-1.2" }));
+    const client = createJudgeClient({ resolveApiKey: grantKey, config, usage: allowAll });
+    const outcome = await client.ask(request());
+    if (!outcome.ok) throw new Error("a refusal is an abstain, not a failure");
+    expect(outcome).not.toHaveProperty("usage");
+    expect(outcome).not.toHaveProperty("costUsd");
+  });
+
+  it("reads token counts and the gateway cost from the SDK result", async () => {
+    sdk.decisionModel.mockReturnValue({});
+    sdk.decide.mockResolvedValue({
+      answers: { same_outcome: { type: "boolean", probability: 0.42 } },
+      usage: { inputTokens: 120, outputTokens: 4, totalTokens: 124 },
+      response: { modelId: "typesafe-ai/jev-1.2" },
+      providerMetadata: { gateway: { cost: "0.000005" } },
+    });
+    const result = await createGatewayTransport({ apiKey: "k", zeroDataRetention: false })({
+      state,
+      questions: { same_outcome: { type: "boolean", instructions: "Same result?" } },
+      signal: new AbortController().signal,
+    });
+    expect(result.usage).toEqual({ inputTokens: 120, outputTokens: 4 });
+    expect(result.costUsd).toBe(0.000005);
+  });
+
+  it("ignores token counts and costs that are negative, missing or not numbers", async () => {
+    sdk.decisionModel.mockReturnValue({});
+    sdk.decide.mockResolvedValue({
+      answers: { same_outcome: { type: "boolean", probability: 0.42 } },
+      usage: { inputTokens: -1, outputTokens: "many" },
+      response: { modelId: "typesafe-ai/jev-1.2" },
+      providerMetadata: { gateway: { cost: "free" } },
+    });
+    const result = await createGatewayTransport({ apiKey: "k", zeroDataRetention: false })({
+      state,
+      questions: { same_outcome: { type: "boolean", instructions: "Same result?" } },
+      signal: new AbortController().signal,
+    });
+    expect(result).not.toHaveProperty("usage");
+    expect(result).not.toHaveProperty("costUsd");
+  });
+});
