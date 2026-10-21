@@ -390,13 +390,31 @@ export const companySkillFileDetailSchema = z.object({
   editable: z.boolean(),
 });
 
+/** One `old → new` replacement; `old` must match the current file exactly once. */
+export const companySkillFileHunkSchema = z.object({
+  old: z.string().min(1),
+  new: z.string(),
+}).strict();
+
+/**
+ * Writes a skill file with either the full `content` or `hunks` applied to the
+ * current UTF-8 file. `expectedVersionId` is the optional base check.
+ */
 export const companySkillFileUpdateSchema = z.object({
   path: z.string().min(1),
-  content: z.string(),
+  content: z.string().optional(),
+  hunks: z.array(companySkillFileHunkSchema).min(1).max(100).optional(),
   encoding: z.enum(["utf8", "base64"]).optional(),
   executable: z.boolean().optional(),
   expectedVersionId: z.string().guid().nullable().optional(),
   idempotencyKey: z.string().min(1).max(240).optional(),
+}).superRefine((input, ctx) => {
+  if ((input.content === undefined) === (input.hunks === undefined)) {
+    ctx.addIssue({ code: "custom", path: ["content"], message: "Send exactly one of content or hunks" });
+  }
+  if (input.hunks !== undefined && input.encoding === "base64") {
+    ctx.addIssue({ code: "custom", path: ["encoding"], message: "Hunks apply only to UTF-8 text files" });
+  }
 });
 
 export const companySkillFileDeleteSchema = z.object({
