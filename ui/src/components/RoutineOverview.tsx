@@ -7,6 +7,7 @@ import type {
 } from "@paperclipai/shared";
 import { ISSUE_PRIORITIES, ISSUE_STATUSES } from "@paperclipai/shared";
 import { CalendarClock, Clock3, Play, Repeat, UserRound } from "lucide-react";
+import { isEventTrigger } from "@/api/eventSources";
 import { IssueRow } from "@/components/IssueRow";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -40,10 +41,25 @@ export function summarizeRoutineSchedule(triggers: RoutineTrigger[]): RoutineSch
 
   if (schedules.length === 0) {
     const webhooks = triggers.filter((trigger) => trigger.kind === "webhook" && trigger.enabled);
+    const events = triggers.filter((trigger) => isEventTrigger(trigger) && trigger.enabled);
+    if (webhooks.length > 0 && events.length > 0) {
+      return {
+        label: `${webhooks.length + events.length} active triggers`,
+        detail: "Runs on incoming requests and matching events",
+        nextRunAt: null,
+      };
+    }
     if (webhooks.length > 0) {
       return {
         label: `${webhooks.length} active webhook${webhooks.length === 1 ? "" : "s"}`,
         detail: "Runs on incoming requests",
+        nextRunAt: null,
+      };
+    }
+    if (events.length > 0) {
+      return {
+        label: `${events.length} active event trigger${events.length === 1 ? "" : "s"}`,
+        detail: "Runs on matching events",
         nextRunAt: null,
       };
     }
@@ -141,6 +157,14 @@ export function RoutineOverview() {
   const { routine, routineRuns, currentAssignee, hasLiveRun } = useRoutineDetail();
   const schedule = summarizeRoutineSchedule(routine.triggers);
   const hasWebhook = routine.triggers.some((trigger) => trigger.kind === "webhook" && trigger.enabled);
+  const hasEvent = routine.triggers.some((trigger) => isEventTrigger(trigger) && trigger.enabled);
+  const waitingOn = hasWebhook && hasEvent
+    ? { value: "On webhook delivery or event", detail: "Waiting for an incoming request or event" }
+    : hasWebhook
+      ? { value: "On webhook delivery", detail: "Waiting for an incoming request" }
+      : hasEvent
+        ? { value: "On matching event", detail: "Waiting for a matching event" }
+        : null;
   const sortedRuns = [...(routineRuns ?? [])].sort(
     (left, right) => new Date(right.triggeredAt).getTime() - new Date(left.triggeredAt).getTime(),
   );
@@ -175,8 +199,8 @@ export function RoutineOverview() {
         <OverviewFact
           icon={Clock3}
           label="Next run"
-          value={schedule.nextRunAt ? formatRoutineTimestamp(schedule.nextRunAt) : hasWebhook ? "On webhook delivery" : "Not scheduled"}
-          detail={schedule.nextRunAt ? "Scheduled" : hasWebhook ? "Waiting for an incoming request" : "Add or enable a schedule"}
+          value={schedule.nextRunAt ? formatRoutineTimestamp(schedule.nextRunAt) : waitingOn?.value ?? "Not scheduled"}
+          detail={schedule.nextRunAt ? "Scheduled" : waitingOn?.detail ?? "Add or enable a schedule"}
         />
         <OverviewFact
           icon={Play}
