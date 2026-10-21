@@ -48,7 +48,7 @@ Fields:
 | `title` | yes | Routine name |
 | `description` | no | Human-readable description of the routine |
 | `assigneeAgentId` | yes | Agent who receives each run |
-| `projectId` | yes | Project this routine belongs to |
+| `projectId` | no | Project this routine belongs to; list a project's routines with `?projectId=` |
 | `goalId` | no | Goal to link runs to |
 | `parentIssueId` | no | Parent issue for created run issues |
 | `priority` | no | `critical`, `high`, `medium` (default), `low` |
