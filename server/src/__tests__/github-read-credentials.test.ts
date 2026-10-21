@@ -10,6 +10,7 @@ import {
   connectionGrantDelegations,
   connectionGrants,
   createDb,
+  documents,
   externalObjectMentions,
   externalObjects,
   heartbeatRuns,
@@ -545,6 +546,117 @@ const REPOSITORY = "acme/app";
 
       expect(result).toMatchObject({ ok: false, errorCode: "github_token_missing" });
       expect(github.requests).toHaveLength(0);
+    });
+
+    describe("a mention in low-trust text", () => {
+      /** The object is mentioned by a comment or document of the issue with this trust, and by nothing else. */
+      async function mentionedBy(seeded: Seed, kind: "comment" | "document", disposition: "quarantined" | "promoted") {
+        const [object] = await db.insert(externalObjects).values({
+          companyId: seeded.companyId, providerKey: "github", objectType: "pull_request", externalId: "acme/app#pull/7",
+        }).returning();
+        const sourceTrust = { preset: LOW_TRUST_REVIEW_PRESET, disposition, sourceIssueId: seeded.issueId };
+        const sourceRecordId = randomUUID();
+        if (kind === "comment") {
+          await db.insert(issueComments).values({
+            id: sourceRecordId, companyId: seeded.companyId, issueId: seeded.issueId, body: "https://github.com/acme/app/pull/7", sourceTrust,
+          });
+        } else {
+          await db.insert(documents).values({
+            id: sourceRecordId, companyId: seeded.companyId, latestBody: "https://github.com/acme/app/pull/7", sourceTrust,
+          });
+        }
+        await db.insert(externalObjectMentions).values({
+          companyId: seeded.companyId, sourceIssueId: seeded.issueId, sourceKind: kind, sourceRecordId, objectId: object!.id,
+          providerKey: "github", objectType: "pull_request",
+        });
+        return object!;
+      }
+
+      /** A second agent and issue of the seeded company; its latest run acted for `responsibleUserId`. */
+      async function seedSibling(seeded: Seed, responsibleUserId: string): Promise<Seed> {
+        const agentId = randomUUID();
+        const issueId = randomUUID();
+        const runId = randomUUID();
+        await db.insert(agents).values({
+          id: agentId, companyId: seeded.companyId, name: "Sibling", role: "engineer", adapterType: "codex_local",
+        });
+        await db.insert(issues).values({ id: issueId, companyId: seeded.companyId, title: "Sibling", assigneeAgentId: agentId });
+        await db.insert(heartbeatRuns).values({
+          id: runId, companyId: seeded.companyId, agentId, status: "running", contextSnapshot: { issueId },
+        });
+        await initializeRunIdentity(db, { companyId: seeded.companyId, runId, responsibleUserId, cause: "instruction" });
+        return { companyId: seeded.companyId, agentId, issueId, runId };
+      }
+
+      it.each(["comment", "document"] as const)(
+        "gives an object that only a quarantined %s mentions no token, not even the company secret",
+        async (kind) => {
+          const seeded = await seed({ responsibleUserId: "A" });
+          await grant(seeded, "A");
+          const secretId = randomUUID();
+          vault.state.namedSecretIds.set("GITHUB_TOKEN", secretId);
+          vault.state.tokensBySecretId.set(secretId, "test-company-secret-token");
+          const object = await mentionedBy(seeded, kind, "quarantined");
+          const github = createFakeGitHubPullRequestApi(PULL_REQUEST);
+
+          const result = await resolver(github).resolve({ companyId: seeded.companyId, object });
+
+          expect(result).toMatchObject({ ok: false, liveness: "auth_required", errorCode: "github_token_missing" });
+          expect(github.requests).toHaveLength(0);
+        },
+      );
+
+      it.each(["comment", "document"] as const)(
+        "reads with the grant of a %s that was promoted, where the same text quarantined gets none",
+        async (kind) => {
+          const seeded = await seed({ responsibleUserId: "A" });
+          await grant(seeded, "A");
+          const object = await mentionedBy(seeded, kind, "promoted");
+          const github = createFakeGitHubPullRequestApi(PULL_REQUEST);
+
+          const result = await resolver(github).resolve({ companyId: seeded.companyId, object });
+
+          expect(result).toMatchObject({ ok: true });
+          for (const request of github.requests) expect(request.authorization).toBe("Bearer test-token-A");
+        },
+      );
+
+      it("does not let a quarantined comment of a newer issue choose the grant over an issue whose description mentions it", async () => {
+        const quarantined = await seed({ responsibleUserId: "A" });
+        await grant(quarantined, "A");
+        const trusted = await seedSibling(quarantined, "B");
+        await grant(trusted, "B");
+        const object = await mentionedBy(quarantined, "comment", "quarantined");
+        await db.insert(externalObjectMentions).values({
+          companyId: trusted.companyId, sourceIssueId: trusted.issueId, sourceKind: "description", objectId: object.id,
+          providerKey: "github", objectType: "pull_request",
+        });
+        // The quarantined issue is the newest one, so it would be tried first if its mention counted.
+        await db.update(issues).set({ updatedAt: new Date(Date.now() + 60_000) }).where(eq(issues.id, quarantined.issueId));
+        const github = createFakeGitHubPullRequestApi(PULL_REQUEST);
+
+        const result = await resolver(github).resolve({ companyId: trusted.companyId, object });
+
+        expect(result).toMatchObject({ ok: true });
+        expect(github.requests.length).toBeGreaterThan(0);
+        for (const request of github.requests) expect(request.authorization).toBe("Bearer test-token-B");
+      });
+
+      it("keeps an issue whose description mentions the object when one of its own comments does so in quarantine", async () => {
+        const seeded = await seed({ responsibleUserId: "A" });
+        await grant(seeded, "A");
+        const object = await mentionedBy(seeded, "comment", "quarantined");
+        await db.insert(externalObjectMentions).values({
+          companyId: seeded.companyId, sourceIssueId: seeded.issueId, sourceKind: "description", objectId: object.id,
+          providerKey: "github", objectType: "pull_request",
+        });
+        const github = createFakeGitHubPullRequestApi(PULL_REQUEST);
+
+        const result = await resolver(github).resolve({ companyId: seeded.companyId, object });
+
+        expect(result).toMatchObject({ ok: true });
+        for (const request of github.requests) expect(request.authorization).toBe("Bearer test-token-A");
+      });
     });
   });
 });

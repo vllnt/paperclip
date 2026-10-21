@@ -1,10 +1,11 @@
-import { and, desc, eq, isNotNull } from "drizzle-orm";
-import { externalObjectMentions, issues, type Db } from "@paperclipai/db";
+import { and, desc, eq, isNotNull, not } from "drizzle-orm";
+import { documents, externalObjectMentions, issueComments, issues, type Db } from "@paperclipai/db";
 import type { ExternalObjectCanonicalUrl } from "@paperclipai/shared";
 import { DEFAULT_GITHUB_TOKEN_SECRET_NAMES } from "./git-credentials.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { resolveGitHubIssueReadToken } from "./github-read-credentials.js";
 import { secretService } from "./secrets.js";
+import { isLowTrustQuarantinedSql } from "./source-trust.js";
 import type {
   ExternalObjectDetection,
   ExternalObjectDetector,
@@ -370,26 +371,55 @@ const MAX_IDENTITY_ISSUES = 3;
 /**
  * The agents that hold the issues which mention the object, newest issue first: a refresh reads
  * GitHub with the authority a run of one of them on that issue has.
+ *
+ * A mention in a low-trust quarantined comment or document does not count. Its text is not trusted
+ * to steer a higher-trust action, and choosing whose personal grant reads a repository is one. The
+ * issue's own trust is checked later, by resolveGitHubIssueReadToken, and covers its title and
+ * description.
+ *
+ * @returns `holders`: the agents of the trusted mentions. `onlyQuarantined`: no trusted mention, but
+ *   a quarantined one exists, so the object has no reader at all.
  */
 async function mentioningIssueAgents(db: Db, companyId: string, objectId: string) {
-  const rows = await db
+  const mentions = () => db
     .selectDistinct({ issueId: issues.id, agentId: issues.assigneeAgentId, updatedAt: issues.updatedAt })
     .from(externalObjectMentions)
     .innerJoin(issues, and(eq(issues.id, externalObjectMentions.sourceIssueId), eq(issues.companyId, externalObjectMentions.companyId)))
+    .leftJoin(issueComments, and(
+      eq(externalObjectMentions.sourceKind, "comment"),
+      eq(issueComments.id, externalObjectMentions.sourceRecordId),
+      eq(issueComments.companyId, externalObjectMentions.companyId),
+    ))
+    .leftJoin(documents, and(
+      eq(externalObjectMentions.sourceKind, "document"),
+      eq(documents.id, externalObjectMentions.sourceRecordId),
+      eq(documents.companyId, externalObjectMentions.companyId),
+    ));
+  const ofObject = and(
+    eq(externalObjectMentions.companyId, companyId),
+    eq(externalObjectMentions.objectId, objectId),
+    isNotNull(issues.assigneeAgentId),
+  );
+  const rows = await mentions()
     .where(and(
-      eq(externalObjectMentions.companyId, companyId),
-      eq(externalObjectMentions.objectId, objectId),
-      isNotNull(issues.assigneeAgentId),
+      ofObject,
+      not(isLowTrustQuarantinedSql(issueComments.sourceTrust)),
+      not(isLowTrustQuarantinedSql(documents.sourceTrust)),
     ))
     .orderBy(desc(issues.updatedAt))
     .limit(MAX_IDENTITY_ISSUES);
-  return rows.flatMap((row) => (row.agentId ? [{ issueId: row.issueId, agentId: row.agentId }] : []));
+  const holders = rows.flatMap((row) => (row.agentId ? [{ issueId: row.issueId, agentId: row.agentId }] : []));
+  if (holders.length > 0) return { holders, onlyQuarantined: false };
+  const [anyMention] = await mentions().where(ofObject).limit(1);
+  return { holders, onlyQuarantined: anyMention !== undefined };
 }
 
 /**
  * The credential a run on an issue that mentions the object would read the repository with (see
  * resolveGitHubIssueReadToken). An object that no assigned issue mentions has no such run: a company
- * secret then, as before. Throws when every issue's managed identity is unusable and none has a token.
+ * secret then, as before. An object that only quarantined text mentions has no token: low-trust
+ * text does not pick a credential, and it does not fall back to the company secret either. Throws
+ * when every issue's managed identity is unusable and none has a token.
  */
 async function defaultTokenProvider(
   db: Db,
@@ -397,8 +427,10 @@ async function defaultTokenProvider(
   secretNames: readonly string[],
   context: GitHubTokenContext,
 ) {
-  const holders = context.objectId ? await mentioningIssueAgents(db, companyId, context.objectId) : [];
-  if (holders.length === 0) return companySecretToken(db, companyId, secretNames);
+  const { holders, onlyQuarantined } = context.objectId
+    ? await mentioningIssueAgents(db, companyId, context.objectId)
+    : { holders: [], onlyQuarantined: false };
+  if (holders.length === 0) return onlyQuarantined ? null : companySecretToken(db, companyId, secretNames);
   let failure: unknown = null;
   for (const holder of holders) {
     try {
