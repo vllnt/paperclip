@@ -5,14 +5,20 @@ import {
   buildEventTriggerPayload,
   defaultEventDraft,
   describeEventMatch,
+  describeEventTrigger,
   eventDraftFromTrigger,
+  eventSourcePatch,
+  hasLabelFilter,
   newLabelPair,
   normalizeEventDraft,
   validateEventDraft,
   validateGroupKeyTemplate,
+  withLabelFilter,
 } from "./event-trigger";
 
 const SOURCE_ID = "3f0c5f6e-0000-4000-8000-000000000001";
+const BUILT_IN = { id: "3f0c5f6e-0000-4000-8000-0000000000aa", normalizer: "paperclip_v1" } as const;
+const GATUS = { id: SOURCE_ID, normalizer: "gatus" } as const;
 
 function validDraft() {
   return { ...defaultEventDraft(), sourceId: SOURCE_ID };
@@ -219,6 +225,141 @@ describe("normalizeEventDraft", () => {
     expect(draft.minSeverity).toBe("any");
     expect(draft.onRecovery).toBe("comment_and_wake");
     expect(draft.fallback).toBe(true);
+  });
+});
+
+describe("built-in Paperclip source", () => {
+  it("fixes event_issue, presets the event type and drops emitter, severity and fallback", () => {
+    const from = { ...validDraft(), sources: ["gatus"], types: ["disk.*"], minSeverity: "critical" as const, fallback: true };
+    const patch = eventSourcePatch(from, BUILT_IN);
+    expect(patch).toMatchObject({
+      sourceId: BUILT_IN.id,
+      sources: [],
+      types: ["issue.created"],
+      minSeverity: "any",
+      labels: [],
+      issueMode: "event_issue",
+      fallback: false,
+    });
+  });
+
+  it("changes nothing when the same source is chosen again", () => {
+    const draft = { ...defaultEventDraft(), ...eventSourcePatch(defaultEventDraft(), BUILT_IN) };
+    const edited = { ...draft, labels: [newLabelPair("created_by", ["user"])] };
+    expect(eventSourcePatch(edited, BUILT_IN)).toEqual({});
+  });
+
+  it("undoes the preset when the board moves to another source, so event_issue never reaches it", () => {
+    const onBuiltIn = {
+      ...defaultEventDraft(),
+      ...eventSourcePatch(defaultEventDraft(), BUILT_IN),
+      labels: [newLabelPair("created_by", ["user"])],
+    };
+    const patch = eventSourcePatch(onBuiltIn, GATUS);
+    expect(patch).toEqual({ sourceId: GATUS.id, types: [], labels: [], issueMode: "group" });
+    expect(eventSourcePatch(onBuiltIn, null)).toMatchObject({ sourceId: "", issueMode: "group" });
+  });
+
+  it("keeps the filters when the board moves between ordinary sources", () => {
+    const draft = { ...validDraft(), types: ["disk.*"] };
+    expect(eventSourcePatch(draft, { id: "other", normalizer: "generic_v1" })).toEqual({ sourceId: "other" });
+  });
+
+  it("builds an event_issue trigger with the default group settings and no fallback", () => {
+    const draft = {
+      ...defaultEventDraft(),
+      ...eventSourcePatch(defaultEventDraft(), BUILT_IN),
+      labels: [newLabelPair("created_by", ["user"]), newLabelPair("label_bug", ["true"])],
+      groupKey: "ignored",
+      cooldownMinutes: "7",
+    };
+    expect(buildEventTriggerPayload({ ...draft, fallback: true })).toEqual({
+      eventSourceId: BUILT_IN.id,
+      eventMatch: { types: ["issue.created"], labels: { created_by: "user", label_bug: "true" } },
+      eventGrouping: {
+        groupKey: DEFAULT_GROUP_KEY,
+        repeatCommentCooldownSec: 900,
+        rewakeOnSeverityIncrease: true,
+        onRecovery: "comment_and_wake",
+        issueMode: "event_issue",
+      },
+      fallback: false,
+    });
+  });
+
+  it("does not validate the hidden group settings", () => {
+    const draft = {
+      ...defaultEventDraft(),
+      ...eventSourcePatch(defaultEventDraft(), BUILT_IN),
+      groupKey: "{{nope}}",
+      cooldownMinutes: "",
+    };
+    expect(validateEventDraft(draft).valid).toBe(true);
+    expect(validateEventDraft({ ...draft, issueMode: "group" }).valid).toBe(false);
+  });
+
+  it("round-trips an event_issue trigger", () => {
+    const trigger = {
+      id: "t1",
+      kind: "event",
+      eventSourceId: BUILT_IN.id,
+      eventMatch: { types: ["issue.created"], labels: { created_by: "user" } },
+      eventGrouping: {
+        groupKey: DEFAULT_GROUP_KEY,
+        repeatCommentCooldownSec: 900,
+        rewakeOnSeverityIncrease: true,
+        onRecovery: "comment_and_wake",
+        issueMode: "event_issue",
+      },
+      fallback: false,
+    } as unknown as EventRoutineTrigger;
+    const draft = eventDraftFromTrigger(trigger);
+    expect(draft.issueMode).toBe("event_issue");
+    expect(buildEventTriggerPayload(draft)).toEqual({
+      eventSourceId: BUILT_IN.id,
+      eventMatch: trigger.eventMatch,
+      eventGrouping: trigger.eventGrouping,
+      fallback: false,
+    });
+  });
+
+  it("restores a saved event_issue draft and never a saved fallback with it", () => {
+    const draft = normalizeEventDraft({ sourceId: BUILT_IN.id, issueMode: "event_issue", fallback: true });
+    expect(draft.issueMode).toBe("event_issue");
+    expect(draft.fallback).toBe(false);
+  });
+
+  it("adds a label filter once and replaces the values of an existing one", () => {
+    const first = withLabelFilter([], "created_by", ["user"]);
+    expect(first.map((pair) => [pair.key, pair.values])).toEqual([["created_by", ["user"]]]);
+    const second = withLabelFilter(first, "created_by", ["agent"]);
+    expect(second).toHaveLength(1);
+    expect(second[0]?.values).toEqual(["agent"]);
+    expect(second[0]?.id).toBe(first[0]?.id);
+    expect(hasLabelFilter({ ...defaultEventDraft(), labels: second }, "created_by")).toBe(true);
+    expect(hasLabelFilter(defaultEventDraft(), "created_by")).toBe(false);
+  });
+});
+
+describe("describeEventTrigger", () => {
+  const base = {
+    id: "t1",
+    kind: "event",
+    eventSourceId: SOURCE_ID,
+    eventMatch: { types: ["issue.created"], labels: { created_by: "user" } },
+    fallback: false,
+  };
+
+  it("says where the steps go for an event_issue trigger", () => {
+    const trigger = { ...base, eventGrouping: { issueMode: "event_issue" } } as unknown as EventRoutineTrigger;
+    expect(describeEventTrigger(trigger)).toBe(
+      "issue.created · created_by=user · Steps attach to the created task",
+    );
+  });
+
+  it("keeps the plain filter line for a grouped trigger", () => {
+    const trigger = { ...base, eventGrouping: { issueMode: "group" } } as unknown as EventRoutineTrigger;
+    expect(describeEventTrigger(trigger)).toBe("issue.created · created_by=user");
   });
 });
 

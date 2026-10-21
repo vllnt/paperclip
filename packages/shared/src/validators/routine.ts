@@ -3,6 +3,7 @@ import { z } from "zod";
 import { automationWakeSettingsSchema } from "../automation-wake.js";
 import { routineNoopSkipSettingsSchema } from "../routine-noop-skip.js";
 import { routineGateSchema } from "../routine-gate.js";
+import { routineStepsSchema } from "../routine-steps.js";
 import {
   ISSUE_PRIORITIES,
   ROUTINE_ACTIVITY_GATE_POLICIES,
@@ -124,6 +125,8 @@ export const createRoutineSchema = z.object({
   activityGatePolicy: z.enum(ROUTINE_ACTIVITY_GATE_POLICIES).optional(),
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional().default([]),
+  /** Sub-tasks each run creates under its root issue. Agents and labels are checked by the service. */
+  steps: routineStepsSchema.optional(),
   env: envConfigSchema.optional().nullable(),
   automationWakeSettings: automationWakeSettingsSchema.optional(),
   routineNoopSkipSettings: routineNoopSkipSettingsSchema.optional(),
@@ -164,6 +167,8 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   responsibleUserId: z.string().nullable().default(null),
   // Present only on gated routines, so snapshots of every other routine keep their exact stored shape.
   gate: routineGateSchema.nullable().optional(),
+  /** Present only on routines with steps, for the same reason. */
+  steps: routineStepsSchema.optional(),
 }).strict();
 
 export const routineRevisionSnapshotTriggerV1Schema = z.object({
@@ -255,6 +260,8 @@ export const runRoutineSchema = z.object({
   executionWorkspaceId: z.string().guid().optional().nullable(),
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
+  /** Attach the routine's steps to this existing task instead of opening a new root task. */
+  targetIssueId: z.string().guid().optional().nullable(),
 });
 
 export type RunRoutine = z.infer<typeof runRoutineSchema>;

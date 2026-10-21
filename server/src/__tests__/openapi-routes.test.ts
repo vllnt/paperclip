@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
+import { MAX_ROUTINE_STEPS } from "@paperclipai/shared";
 import { COMPANY_IMPORT_TRANSFERS_ROUTE_PATH } from "@paperclipai/shared/company-import-transfer";
 import { errorHandler } from "../middleware/index.js";
 import { buildOpenApiSpec, CONVEX_PLUGIN_ACTIONS, CONVEX_PLUGIN_SCHEMAS, openApiRoutes } from "../routes/openapi.js";
@@ -302,6 +303,58 @@ describe("openapi routes", () => {
     }
   });
 
+  it("documents the built-in Paperclip event source, running steps on a task and step warnings", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    const { paths, components } = res.body;
+
+    const ensure = paths["/api/companies/{companyId}/event-sources/paperclip"].post;
+    expect(ensure["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    expect(ensure.responses["200"].content["application/json"].schema).toEqual({ $ref: "#/components/schemas/EventSource" });
+    expect(Object.keys(ensure.responses)).toEqual(expect.arrayContaining(["401", "403", "404"]));
+    expect(ensure.description).toContain("paperclip_v1");
+    const eventSource = components.schemas.EventSource.properties;
+    expect(eventSource.ingressUrl).toMatchObject({ type: "string", nullable: true });
+    expect(eventSource.normalizer.enum).toEqual(expect.arrayContaining(["generic_v1", "gatus", "paperclip_v1"]));
+    for (const [route, method] of [
+      ["/api/event-sources/{id}", "get"],
+      ["/api/event-sources/{id}", "patch"],
+    ] as const) {
+      expect(paths[route][method].responses["200"].content["application/json"].schema).toEqual({
+        $ref: "#/components/schemas/EventSource",
+      });
+    }
+
+    const issueMode = paths["/api/routines/{id}/triggers"].post.requestBody.content["application/json"].schema;
+    expect(JSON.stringify(issueMode)).toContain("event_issue");
+    for (const operation of [paths["/api/routines/{id}/triggers"].post, paths["/api/routine-triggers/{id}"].patch]) {
+      expect(operation.responses["403"]).toBeDefined();
+      expect(operation.description).toContain("event_issue");
+    }
+
+    const run = paths["/api/routines/{id}/run"].post;
+    expect(run.responses["202"]).toBeDefined();
+    expect(run.responses["200"]).toBeUndefined();
+    expect(Object.keys(run.responses)).toEqual(expect.arrayContaining(["403", "404", "409", "422"]));
+    const target = run.requestBody.content["application/json"].schema.properties.targetIssueId;
+    expect(target).toMatchObject({ type: "string", format: "uuid", nullable: true });
+    expect(run.description).toContain("targetIssueId");
+
+    expect(components.schemas.RoutineStepWarning).toMatchObject({
+      type: "object",
+      required: ["code", "stepKey", "agentId", "reason"],
+      properties: { code: { enum: ["step_agent_unavailable"] } },
+    });
+    for (const [route, method, status] of [
+      ["/api/companies/{companyId}/routines", "post", "201"],
+      ["/api/routines/{id}", "patch", "200"],
+      ["/api/routines/{id}/run", "post", "202"],
+    ] as const) {
+      const body = paths[route][method].responses[status].content["application/json"].schema;
+      expect(body.required, `${method} ${route}`).toContain("warnings");
+      expect(body.properties.warnings.items).toEqual({ $ref: "#/components/schemas/RoutineStepWarning" });
+    }
+  });
+
   it("documents exact failed-run selection and durable accepted retry responses", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
     const wake = res.body.paths["/api/agents/{id}/wakeup"].post;
@@ -366,6 +419,26 @@ describe("openapi routes", () => {
       required: false,
       schema: { type: "string", enum: ["schedule", "webhook", "api", "event", "manual"] },
     });
+    const routineBodyProperties = (operation: { requestBody: { content: Record<string, { schema: { properties: Record<string, unknown> } }> } }) =>
+      Object.keys(operation.requestBody.content["application/json"]!.schema.properties);
+    expect(routineBodyProperties(res.body.paths["/api/companies/{companyId}/routines"].post)).toContain("steps");
+    expect(routineBodyProperties(res.body.paths["/api/routines/{id}"].patch)).toContain("steps");
+    for (const operation of [
+      res.body.paths["/api/companies/{companyId}/routines"].post,
+      res.body.paths["/api/routines/{id}"].patch,
+    ]) {
+      const steps = operation.requestBody.content["application/json"].schema.properties.steps;
+      expect(steps.maxItems).toBe(MAX_ROUTINE_STEPS);
+      expect(steps.items.properties.after.maxItems).toBe(MAX_ROUTINE_STEPS);
+      expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["403", "404", "409", "422"]));
+    }
+    for (const operation of [
+      res.body.paths["/api/routines/{id}/run"].post,
+      res.body.paths["/api/routines/{id}/triggers"].post,
+      res.body.paths["/api/routine-triggers/{id}"].patch,
+    ]) {
+      expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["404", "409", "422"]));
+    }
     expect(res.body.paths["/api/companies"].get.responses["403"]).toBeDefined();
     expect(res.body.paths["/api/companies"].get.responses["400"]).toBeDefined();
     expect(

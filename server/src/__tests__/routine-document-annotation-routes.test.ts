@@ -119,8 +119,11 @@ function registerModuleMocks() {
     accessService: () => ({
       canUser: vi.fn(async () => true),
     }),
+    agentService: () => ({ getById: vi.fn() }),
     documentAnnotationService: () => mockAnnotationService,
+    issueService: () => ({ getById: vi.fn() }),
     logActivity: mockLogActivity,
+    projectService: () => ({ getById: vi.fn() }),
     routineService: () => mockRoutineService,
   }));
 }

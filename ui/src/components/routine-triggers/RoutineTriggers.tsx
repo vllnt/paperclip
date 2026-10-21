@@ -4,10 +4,15 @@ import { BellRing, CalendarClock, Plus, Webhook } from "lucide-react";
 import type { RoutineTrigger } from "@paperclipai/shared";
 import { useSearchParams } from "@/lib/router";
 import { routinesApi } from "@/api/routines";
-import { eventSourcesApi, isEventTrigger, type EventRoutineTrigger } from "@/api/eventSources";
+import {
+  eventSourcesApi,
+  isEventTrigger,
+  type EventRoutineTrigger,
+  type EventSource,
+} from "@/api/eventSources";
 import {
   buildEventTriggerPayload,
-  describeEventMatch,
+  describeEventTrigger,
   eventDraftFromTrigger,
   normalizeEventDraft,
   validateEventDraft,
@@ -269,7 +274,7 @@ export function RoutineTriggers() {
                     : trigger.kind === "api"
                       ? "Run through the API"
                       : isEventTrigger(trigger)
-                        ? describeEventMatch(trigger.eventMatch, trigger.fallback)
+                        ? describeEventTrigger(trigger)
                       : trigger.lastWebhookDelivery?.status === "rejected"
                         ? "Authentication failed · Check the key in your app"
                         : trigger.lastWebhookDelivery?.status === "received" &&
@@ -487,14 +492,25 @@ function TriggerSetup({
 }
 
 function useEventSources(companyId: string, enabled: boolean): EventSourcesState {
+  const client = useQueryClient();
   const { data, isLoading, isError } = useQuery({
     queryKey: queryKeys.eventSources.list(companyId),
     queryFn: () => eventSourcesApi.list(companyId),
     enabled,
   });
+  const ensureBuiltIn = useCallback(async () => {
+    const source = await eventSourcesApi.ensurePaperclip(companyId);
+    client.setQueryData<EventSource[]>(queryKeys.eventSources.list(companyId), (current) => [
+      ...(current ?? []).filter((item) => item.id !== source.id),
+      source,
+    ]);
+    void client.invalidateQueries({ queryKey: queryKeys.eventSources.list(companyId) });
+    return source;
+  }, [client, companyId]);
   return {
     sources: data ?? [],
     status: isError ? "error" : isLoading && enabled ? "loading" : "ready",
+    ensureBuiltIn,
   };
 }
 

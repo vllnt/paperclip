@@ -460,8 +460,11 @@ function sealedOptions(pushArgs) {
   return { flags, rest, leases, upstream, deleting, dryRun };
 }
 // A sealed push's whole environment: nothing of the checkout's own steering (GIT_DIR, GIT_EXEC_PATH, GIT_TRACE*, GIT_SSH,
-// object and index paths…) is carried over, only what a credentialed command needs.
-const SEALED_ENV = /^(LANG|LC_[A-Z_]+|TMPDIR|TMP|TEMP|SYSTEMROOT|COMSPEC|GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GH_HOST|GH_CONFIG_DIR|GIT_TERMINAL_PROMPT|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|GIT_SSH_COMMAND|SSH_AUTH_SOCK)$/;
+// object and index paths…) is carried over, only what a credentialed command needs. That includes the resolver settings
+// (RES_OPTIONS, LOCALDOMAIN, HOSTALIASES): a host whose container DNS works only over TCP sets RES_OPTIONS=use-vc, and without it
+// the sealed git cannot resolve the remote. They hold no secret, and git connects to the host of the URL it was given, whose
+// TLS certificate must match, so they cannot send the credential to another host.
+const SEALED_ENV = /^(LANG|LC_[A-Z_]+|TMPDIR|TMP|TEMP|SYSTEMROOT|COMSPEC|RES_OPTIONS|LOCALDOMAIN|HOSTALIASES|GH_TOKEN|GITHUB_TOKEN|PAPERCLIP_GIT_TOKEN|GH_HOST|GH_CONFIG_DIR|GIT_TERMINAL_PROMPT|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|GIT_SSH_COMMAND|SSH_AUTH_SOCK)$/;
 // ssh never uses an agent, a config file or a key of the host: GitHub traffic is HTTPS, and an ssh URL is not a way around that.
 const SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
 function sealedEnv(env, home, gitDir) {

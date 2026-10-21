@@ -7,11 +7,18 @@ import type {
   RoutineRevision,
   RoutineRun,
   RoutineRunSummary,
+  RoutineStepWarning,
   RoutineTrigger,
   RoutineTriggerSecretMaterial,
 } from "@paperclipai/shared";
 import { activityApi } from "./activity";
 import { api } from "./client";
+
+/** Routine create and update answer with the saved routine plus the non-blocking step warnings. */
+export type RoutineWriteResponse = Routine & { warnings: RoutineStepWarning[] };
+
+/** A started run, plus the step warnings of the routine at the time it ran. */
+export type RoutineRunResponse = RoutineRun & { warnings: RoutineStepWarning[] };
 
 export interface RoutineTriggerResponse {
   trigger: RoutineTrigger;
@@ -48,9 +55,10 @@ export const routinesApi = {
     return api.get<RoutineListItem[]>(`/companies/${companyId}/routines${query ? `?${query}` : ""}`);
   },
   create: (companyId: string, data: Record<string, unknown>) =>
-    api.post<Routine>(`/companies/${companyId}/routines`, data),
+    api.post<RoutineWriteResponse>(`/companies/${companyId}/routines`, data),
   get: (id: string) => api.get<RoutineDetail>(`/routines/${id}`),
-  update: (id: string, data: Record<string, unknown>) => api.patch<Routine>(`/routines/${id}`, data),
+  update: (id: string, data: Record<string, unknown>) =>
+    api.patch<RoutineWriteResponse>(`/routines/${id}`, data),
   listRevisions: (id: string) => api.get<RoutineRevision[]>(`/routines/${id}/revisions`),
   restoreRevision: (
     id: string,
@@ -70,7 +78,16 @@ export const routinesApi = {
   rotateTriggerSecret: (id: string) =>
     api.post<RotateRoutineTriggerResponse>(`/routine-triggers/${id}/rotate-secret`, {}),
   run: (id: string, data?: Record<string, unknown>) =>
-    api.post<RoutineRun>(`/routines/${id}/run`, data ?? {}),
+    api.post<RoutineRunResponse>(`/routines/${id}/run`, data ?? {}),
+  /**
+   * Attaches the routine's steps to an existing task instead of opening a new run task.
+   * `variables` fills the routine's required variables, as on any manual run.
+   */
+  runOnIssue: (id: string, targetIssueId: string, variables?: Record<string, string | number | boolean>) =>
+    api.post<RoutineRunResponse>(`/routines/${id}/run`, {
+      targetIssueId,
+      ...(variables && Object.keys(variables).length > 0 ? { variables } : {}),
+    }),
   activity: async (
     companyId: string,
     routineId: string,

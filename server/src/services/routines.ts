@@ -10,6 +10,7 @@ import {
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
 import { verifyBearerAuthorization, verifyGithubHmacSignature, verifyHmacSha256Signature } from "./webhook-auth.js";
 import { and, asc, desc, eq, exists, gt, ilike, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
+import { alias, QueryBuilder } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -57,6 +58,8 @@ import type {
   RoutineRevision,
   RoutineRevisionSnapshotV1,
   RoutineRunSummary,
+  RoutineStep,
+  RoutineStepsRunPayload,
   RoutineTrigger,
   RoutineTriggerSecretMaterial,
   RoutineVariable,
@@ -65,17 +68,24 @@ import type {
   UpdateRoutineTrigger,
 } from "@paperclipai/shared";
 import {
+  PAPERCLIP_INTERNAL_EVENT_NORMALIZER,
   ROUTINE_GATE_SKIP_REASON,
   ROUTINE_GATE_TRIGGER_INACTIVE_REASON,
   ROUTINE_GATE_UNAVAILABLE_REASON,
   ROUTINE_GATE_UNCHANGED_REASON,
   WORKSPACE_BRANCH_ROUTINE_VARIABLE,
+  eventGroupingSchema,
   getBuiltinRoutineVariableValues,
   extractRoutineVariableNames,
   interpolateRoutineTemplate,
   isValidRoutineDateString,
   normalizeAgentUrlKey,
+  isRoutineStepRunStalled,
   pluginOperationIssueOriginKind,
+  OPEN_ISSUE_STATUSES,
+  ROUTINE_STEPS_RUN_PAYLOAD_KEY,
+  readRoutineStepsRunPayload,
+  routineStepTemplateTexts,
   routineGateAppliesToSource,
   routineGatesEqual,
   routineRevisionSnapshotSchema,
@@ -104,6 +114,18 @@ import {
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
+import {
+  LIVE_HEARTBEAT_RUN_STATUSES,
+  ROUTINE_STEP_ACTOR_ID,
+  assertRoutineStepReferences,
+  attachRoutineStepsToIssue,
+  createRoutineRunIssues,
+  hasOpenRoutineSteps,
+  routineStartingStepAgentIds,
+  startAttachedRoutineSteps,
+  type AttachedRoutineSteps,
+  type RoutineStepsRequester,
+} from "./routine-steps.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
 import { createEventRoutineDispatcher, EventDispatchError } from "./event-sources/event-dispatch.js";
@@ -126,8 +148,66 @@ import {
 import { createGateWorker, type GateProcessContext, type GateWorkerHandlers } from "./routine-gates/worker.js";
 import type { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 
-const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
-const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
+/** Newest open roots of a routine with steps that are checked for a run that can still move. */
+const OPEN_STEP_ROOTS_CHECKED = 25;
+
+/**
+ * A trigger's grouping with the schema's defaults filled in, so a row saved without them compares equal
+ * to the same grouping read back from a revision. A value the schema refuses is compared as stored.
+ */
+function normalizedEventGrouping(grouping: unknown) {
+  if (grouping == null) return null;
+  const parsed = eventGroupingSchema.safeParse(grouping);
+  return parsed.success ? parsed.data : grouping;
+}
+
+/** Whether the root in the query has a step child, in the given status when one is given. */
+function rootHasStepIn(status?: string) {
+  const step = alias(issues, "root_step");
+  return exists(
+    new QueryBuilder()
+      .select({ one: sql`1` })
+      .from(step)
+      .where(
+        and(
+          eq(step.companyId, issues.companyId),
+          eq(step.parentId, issues.id),
+          eq(step.originKind, "routine_step"),
+          status ? eq(step.status, status) : undefined,
+        ),
+      ),
+  );
+}
+
+/**
+ * Whether the root in the query has a step. Only such a root stays live without a heartbeat run: an
+ * open task from before the routine had steps does not.
+ */
+function rootHasStep() {
+  return rootHasStepIn();
+}
+
+/**
+ * Whether the root in the query has a cancelled step. A run can stall only then (a cancelled step never
+ * unblocks its dependents), so a root without one is live without reading its steps.
+ */
+function rootHasCancelledStep() {
+  return rootHasStepIn("cancelled");
+}
+const APPEND_MODE_STEPS_MESSAGE = "Steps are not supported with append issue mode";
+const EVENT_ISSUE_SOURCE_MESSAGE =
+  'issueMode "event_issue" is only valid on the built-in Paperclip event source';
+const EVENT_ISSUE_STEPS_MESSAGE =
+  'issueMode "event_issue" attaches the routine\'s steps to the created task, so the routine needs at least one step';
+const EVENT_ISSUE_GATE_MESSAGE =
+  'A gate script that applies to event triggers cannot be combined with issueMode "event_issue": the steps start while the task is created';
+const INTERNAL_SOURCE_ISSUE_MODE_MESSAGE =
+  'Triggers on the built-in Paperclip event source must use issueMode "event_issue"';
+const INTERNAL_SOURCE_FALLBACK_MESSAGE = "Triggers on the built-in Paperclip event source cannot be fallbacks";
+const EVENT_ISSUE_BOARD_ONLY_MESSAGE =
+  'Only board users can create, enable, restore or change an issueMode "event_issue" trigger: it starts the routine\'s steps on every matching task of the company';
+const EVENT_ISSUE_STEPS_BOARD_ONLY_MESSAGE =
+  'Only board users can change the steps, the variables or the agent of a routine with an enabled issueMode "event_issue" trigger: its steps start on every matching task of the company';
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
@@ -255,6 +335,13 @@ async function resolveRoutineResponsibleUserId(db: Db, companyId: string, actorU
 }
 
 type Actor = { agentId?: string | null; userId?: string | null; runId?: string | null };
+
+/** The caller of a run as its step activity rows name it, or null when no one is known. */
+function stepsRequester(actor: Actor | undefined): RoutineStepsRequester | null {
+  if (actor?.agentId) return { actorType: "agent", actorId: actor.agentId, runId: actor.runId ?? null };
+  if (actor?.userId) return { actorType: "user", actorId: actor.userId, runId: actor.runId ?? null };
+  return null;
+}
 type RoutineRow = typeof routines.$inferSelect;
 type RoutineTriggerRow = typeof routineTriggers.$inferSelect;
 
@@ -386,6 +473,7 @@ function nextResultText(status: string, issueId?: string | null) {
   if (status === "skipped_gate") return "Skipped by the gate script";
   if (status === "skipped_gate_unchanged") return "Skipped because the gate output did not change";
   if (status === "skipped_gate_unavailable") return "Skipped because the gate script could not run";
+  if (status === "skipped_new_issue_budget") return "Skipped because the event source's new-issue budget is spent";
   if (status === "gating") return "Waiting for the gate script";
   if (status === "completed") return "Execution issue completed";
   if (status === "failed") return "Execution failed";
@@ -592,10 +680,24 @@ function resolveRoutineVariableValues(
   return resolved;
 }
 
-function mergeRoutineRunPayload(
+/**
+ * The keys a run uses to record its steps and the task it started them on belong to dispatch: a
+ * caller's payload never carries them, so a plain run cannot pass for a run on a task.
+ */
+const RESERVED_RUN_PAYLOAD_KEYS: readonly string[] = [ROUTINE_STEPS_RUN_PAYLOAD_KEY, "targetIssueId"];
+
+function withoutReservedRunPayloadKeys(
   payload: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | null | undefined {
+  if (!payload || !RESERVED_RUN_PAYLOAD_KEYS.some((key) => key in payload)) return payload;
+  return Object.fromEntries(Object.entries(payload).filter(([key]) => !RESERVED_RUN_PAYLOAD_KEYS.includes(key)));
+}
+
+function mergeRoutineRunPayload(
+  callerPayload: Record<string, unknown> | null | undefined,
   variables: Record<string, string | number | boolean>,
 ) {
+  const payload = withoutReservedRunPayloadKeys(callerPayload);
   if (Object.keys(variables).length === 0) return payload ?? null;
   if (!payload) return { variables };
   const existingVariables = isPlainRecord(payload.variables) ? payload.variables : {};
@@ -659,7 +761,8 @@ function readManagedRoutineIssueTemplate(defaultsJson: Record<string, unknown> |
 
 function routineUsesWorkspaceBranch(routine: typeof routines.$inferSelect) {
   return (routine.variables ?? []).some((variable) => variable.name === WORKSPACE_BRANCH_ROUTINE_VARIABLE)
-    || extractRoutineVariableNames([routine.title, routine.description]).includes(WORKSPACE_BRANCH_ROUTINE_VARIABLE);
+    || extractRoutineVariableNames([routine.title, routine.description, ...routineStepTemplateTexts(routine.steps)])
+      .includes(WORKSPACE_BRANCH_ROUTINE_VARIABLE);
 }
 
 function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSnapshotV1["routine"] {
@@ -684,6 +787,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     responsibleUserId: routine.responsibleUserId ?? null,
     // Only gated routines carry it, so snapshots of every other routine keep their stored shape.
     ...(routine.gate ? { gate: routine.gate } : {}),
+    ...(routine.steps?.length ? { steps: routine.steps } : {}),
   };
 }
 
@@ -1275,7 +1379,9 @@ export function routineService(
     return map;
   }
 
-  async function listLiveIssueByRoutineIds(companyId: string, routineIds: string[]) {
+  // stepRoutineIds: the listed routines that have steps. Only their runs can stay live through an open step
+  // root, so routines without steps never pay for the step-root lookups.
+  async function listLiveIssueByRoutineIds(companyId: string, routineIds: string[], stepRoutineIds: ReadonlySet<string>) {
     if (routineIds.length === 0) return new Map<string, RoutineListItem["activeIssue"]>();
     const executionBoundRows = await db
       .selectDistinctOn([issues.originId], {
@@ -1347,6 +1453,69 @@ export function routineService(
       for (const row of legacyRows) {
         if (!row.originId) continue;
         rowsByOriginId.set(row.originId, row);
+      }
+    }
+
+    const stillMissingRoutineIds = routineIds.filter(
+      (routineId) => stepRoutineIds.has(routineId) && !rowsByOriginId.has(routineId),
+    );
+    if (stillMissingRoutineIds.length > 0) {
+      const stepRootColumns = {
+        originId: issues.originId,
+        originRunId: issues.originRunId,
+        id: issues.id,
+        identifier: issues.identifier,
+        title: issues.title,
+        status: issues.status,
+        priority: issues.priority,
+        updatedAt: issues.updatedAt,
+      };
+      const openStepRoots = (ids: string[]) =>
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "routine_execution"),
+          inArray(issues.originId, ids),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          sql`jsonb_array_length(${routines.steps}) > 0`,
+          visibleIssueCondition(),
+          rootHasStep(),
+        );
+      const routineOfRoot = and(eq(routines.companyId, companyId), sql`${routines.id}::text = ${issues.originId}`);
+      // A run is stalled only when one of its steps is cancelled, so the newest root without a cancelled
+      // step is live whatever sits above it: no step is read for it.
+      const unaffectedRoots = await db
+        .selectDistinctOn([issues.originId], stepRootColumns)
+        .from(issues)
+        .innerJoin(routines, routineOfRoot)
+        .where(and(openStepRoots(stillMissingRoutineIds), not(rootHasCancelledStep())))
+        .orderBy(issues.originId, desc(issues.updatedAt), desc(issues.createdAt));
+      for (const row of unaffectedRoots) {
+        if (!row.originId) continue;
+        rowsByOriginId.set(row.originId, row);
+      }
+
+      const withoutLiveRoot = stillMissingRoutineIds.filter((routineId) => !rowsByOriginId.has(routineId));
+      if (withoutLiveRoot.length > 0) {
+        const cancelledStepRoots = db
+          .select({
+            ...stepRootColumns,
+            rank: sql<number>`row_number() over (partition by ${issues.originId} order by ${issues.updatedAt} desc, ${issues.createdAt} desc)`.as(
+              "rank",
+            ),
+          })
+          .from(issues)
+          .innerJoin(routines, routineOfRoot)
+          .where(and(openStepRoots(withoutLiveRoot), rootHasCancelledStep()))
+          .as("cancelled_step_roots");
+        const candidates = await db
+          .select()
+          .from(cancelledStepRoots)
+          .where(lte(cancelledStepRoots.rank, OPEN_STEP_ROOTS_CHECKED))
+          .orderBy(cancelledStepRoots.originId, desc(cancelledStepRoots.updatedAt));
+        for (const row of await withoutStalledStepRuns(db, companyId, candidates)) {
+          if (!row.originId || rowsByOriginId.has(row.originId)) continue;
+          rowsByOriginId.set(row.originId, row);
+        }
       }
     }
 
@@ -1497,7 +1666,7 @@ export function routineService(
           lte(activityLog.createdAt, now),
           sql`${activityLog.action} not in (${sql.join(ACTIVITY_GATE_IGNORED_ACTIONS.map((action) => sql`${action}`), sql`, `)})`,
           sql`not (
-            ${activityLog.actorId} in ('routine-scheduler', ${ROUTINE_GATE_ACTOR_ID})
+            ${activityLog.actorId} in ('routine-scheduler', ${ROUTINE_GATE_ACTOR_ID}, ${ROUTINE_STEP_ACTOR_ID})
             and (
               (${activityLog.details} ->> 'routineId') = ${routine.id}
               or (${activityLog.entityType} = 'routine' and ${activityLog.entityId} = ${routine.id})
@@ -1531,7 +1700,7 @@ export function routineService(
               and own_issue.id::text = own_run.context_snapshot ->> 'issueId'
             where own_run.company_id = ${routine.companyId}
               and own_run.id = ${activityLog.runId}
-              and own_issue.origin_kind = 'routine_execution'
+              and own_issue.origin_kind in ('routine_execution', 'routine_step')
               and own_issue.origin_id = ${routine.id}
           )`,
           projectScopeCondition,
@@ -1662,6 +1831,48 @@ export function routineService(
     );
   }
 
+  /**
+   * Keeps the roots a routine may still be running and drops the roots of step runs that cannot move
+   * on their own ({@link isRoutineStepRunStalled}): a cancelled step never unblocks its dependents, so
+   * without this the routine would stay live until someone cancelled the root. A root whose run
+   * recorded no steps is always kept. The dropped root and its steps stay open and visible.
+   */
+  async function withoutStalledStepRuns<T extends { originRunId: string | null }>(
+    executor: Db,
+    companyId: string,
+    roots: T[],
+  ): Promise<T[]> {
+    const runIds = roots.flatMap((root) => (root.originRunId ? [root.originRunId] : []));
+    if (runIds.length === 0) return roots;
+    const runs = await executor
+      .select({ id: routineRuns.id, triggerPayload: routineRuns.triggerPayload })
+      .from(routineRuns)
+      .where(and(eq(routineRuns.companyId, companyId), inArray(routineRuns.id, runIds)));
+    const recordedByRunId = new Map<string, RoutineStepsRunPayload>();
+    for (const run of runs) {
+      const recorded = readRoutineStepsRunPayload(run.triggerPayload);
+      if (recorded) recordedByRunId.set(run.id, recorded);
+    }
+    if (recordedByRunId.size === 0) return roots;
+
+    const stepIssueIds = [...recordedByRunId.values()].flatMap((recorded) => Object.values(recorded.stepIssueIds));
+    const statusRows = await executor
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, stepIssueIds)));
+    const statusById = new Map(statusRows.map((row) => [row.id, row.status]));
+    return roots.filter((root) => {
+      const recorded = root.originRunId ? recordedByRunId.get(root.originRunId) : undefined;
+      if (!recorded) return true;
+      const statusesByKey: Record<string, string> = {};
+      for (const [key, issueId] of Object.entries(recorded.stepIssueIds)) {
+        const status = statusById.get(issueId);
+        if (status) statusesByKey[key] = status;
+      }
+      return !isRoutineStepRunStalled(recorded.steps, statusesByKey);
+    });
+  }
+
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
@@ -1696,7 +1907,7 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
     if (executionBoundIssue) return executionBoundIssue;
 
-    return executor
+    const heartbeatBoundIssue = await executor
       .select()
       .from(issues)
       .innerJoin(
@@ -1720,6 +1931,34 @@ export function routineService(
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
+    if (heartbeatBoundIssue || !routine.steps?.length) return heartbeatBoundIssue;
+
+    const openRoot = and(
+      eq(issues.companyId, routine.companyId),
+      eq(issues.originKind, originKind),
+      eq(issues.originId, originId),
+      inArray(issues.status, OPEN_ISSUE_STATUSES),
+      visibleIssueCondition(),
+      rootHasStep(),
+      ...(fingerprintCondition ? [fingerprintCondition] : []),
+    );
+    const unaffectedRoot = await executor
+      .select()
+      .from(issues)
+      .where(and(openRoot, not(rootHasCancelledStep())))
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (unaffectedRoot) return unaffectedRoot;
+
+    const cancelledStepRoots = await executor
+      .select()
+      .from(issues)
+      .where(and(openRoot, rootHasCancelledStep()))
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(OPEN_STEP_ROOTS_CHECKED);
+    const [live] = await withoutStalledStepRuns(executor, routine.companyId, cancelledStepRoots);
+    return live ?? null;
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -1890,12 +2129,16 @@ export function routineService(
    */
   async function assertEventTriggerAllowed(
     routine: typeof routines.$inferSelect,
-    config: { eventSourceId: string; eventGrouping?: EventGrouping | null },
+    config: { eventSourceId: string; eventGrouping?: EventGrouping | null; fallback?: boolean },
     variables: RoutineVariable[] = routine.variables ?? [],
-    options: { allowArchivedSource?: boolean } = {},
+    options: { allowArchivedSource?: boolean; steps?: RoutineStep[]; gate?: RoutineGate | null } = {},
   ) {
     const source = await db
-      .select({ companyId: eventSources.companyId, archived: eventSources.archived })
+      .select({
+        companyId: eventSources.companyId,
+        archived: eventSources.archived,
+        normalizer: eventSources.normalizer,
+      })
       .from(eventSources)
       .where(eq(eventSources.id, config.eventSourceId))
       .then((rows) => rows[0] ?? null);
@@ -1906,7 +2149,18 @@ export function routineService(
     }
     assertEventCompatibleVariables(variables);
     const issueMode = config.eventGrouping?.issueMode;
+    const internalSource = source.normalizer === PAPERCLIP_INTERNAL_EVENT_NORMALIZER;
+    if (issueMode === "event_issue") {
+      if (!internalSource) throw unprocessable(EVENT_ISSUE_SOURCE_MESSAGE);
+      if ((options.steps ?? routine.steps ?? []).length === 0) throw unprocessable(EVENT_ISSUE_STEPS_MESSAGE);
+      const gate = options.gate === undefined ? routine.gate : options.gate;
+      if (routineGateAppliesToSource(gate, "event")) throw unprocessable(EVENT_ISSUE_GATE_MESSAGE);
+    } else if (internalSource) {
+      throw unprocessable(INTERNAL_SOURCE_ISSUE_MODE_MESSAGE);
+    }
+    if (internalSource && config.fallback) throw unprocessable(INTERNAL_SOURCE_FALLBACK_MESSAGE);
     if (issueMode && typeof issueMode === "object") {
+      if ((options.steps ?? routine.steps ?? []).length > 0) throw unprocessable(APPEND_MODE_STEPS_MESSAGE);
       if (!routine.assigneeAgentId) throw unprocessable("appendToIssueId requires the routine to have a default agent");
       const target = await db
         .select({ companyId: issues.companyId, assigneeAgentId: issues.assigneeAgentId })
@@ -1958,6 +2212,7 @@ export function routineService(
     return {
       assigneeAgentId,
       routineDescription: interpolateRoutineTemplate(routine.description, variables),
+      variables,
     };
   }
 
@@ -1971,6 +2226,8 @@ export function routineService(
     resolveResponsibleUserId: async (executor, routine) =>
       (await resolveLatestRevisionResponsibleUserId(executor, routine)) ?? routine.responsibleUserId ?? null,
     gateApplies: (routine) => routineGateAppliesToSource(routine.gate, "event"),
+    assertStepsCanStart: (routine, task, executor) =>
+      assertStartingStepAgentsAdmitted(executor, routine, routine.assigneeAgentId, task.projectId),
     onGating: (runId) => kickGate(runId),
   });
 
@@ -2020,6 +2277,86 @@ export function routineService(
   /** A gate runs code on the worker, so only a board user may set, change or remove one. */
   function assertCanChangeGate(actor: Actor) {
     if (!actor.userId) throw forbidden("Only board users can change a routine gate");
+  }
+
+  /**
+   * An `event_issue` trigger starts the routine's steps on every matching task of the company, including
+   * tasks of other agents and of people. Creating, enabling, restoring or changing one is a board decision;
+   * an agent may still disable, archive or relabel it.
+   */
+  function assertCanWriteEventIssueTrigger(actor: Actor) {
+    if (actor.agentId) throw forbidden(EVENT_ISSUE_BOARD_ONLY_MESSAGE);
+  }
+
+  /**
+   * Refuses an agent's trigger patch that switches on, brings back or changes what an `event_issue`
+   * trigger matches. Switching it off, archiving or relabelling it stays open to the agent.
+   */
+  function assertCanPatchEventIssueTrigger(
+    actor: Actor,
+    trigger: typeof routineTriggers.$inferSelect,
+    patch: UpdateRoutineTrigger,
+  ) {
+    if (trigger.kind !== "event") return;
+    const nextGrouping = patch.eventGrouping === undefined ? trigger.eventGrouping : patch.eventGrouping;
+    const eventIssue = trigger.eventGrouping?.issueMode === "event_issue" || nextGrouping?.issueMode === "event_issue";
+    const enabling = patch.enabled === true && !trigger.enabled;
+    const unarchiving = patch.archived === false && trigger.archived;
+    const touchesEventFields = patch.eventSourceId !== undefined
+      || patch.eventMatch !== undefined
+      || patch.eventGrouping !== undefined
+      || patch.fallback !== undefined;
+    if (eventIssue && (enabling || unarchiving || touchesEventFields)) assertCanWriteEventIssueTrigger(actor);
+  }
+
+  /** Whether the routine has an enabled, unarchived `event_issue` trigger. */
+  async function hasEnabledEventIssueTrigger(executor: Db, companyId: string, routineId: string) {
+    const rows = await executor
+      .select({ eventGrouping: routineTriggers.eventGrouping })
+      .from(routineTriggers)
+      .where(
+        and(
+          eq(routineTriggers.companyId, companyId),
+          eq(routineTriggers.routineId, routineId),
+          eq(routineTriggers.kind, "event"),
+          eq(routineTriggers.enabled, true),
+          eq(routineTriggers.archived, false),
+        ),
+      );
+    return rows.some((row) => row.eventGrouping?.issueMode === "event_issue");
+  }
+
+  /**
+   * While an `event_issue` trigger is on, the routine's steps start on every matching task of the
+   * company, so only a board user may change the steps, the variables whose defaults fill in their text,
+   * or the agent that runs a step without its own.
+   * Call it under the routine lock: trigger writes take that lock too, so the answer cannot go stale.
+   */
+  async function assertCanChangeEventIssueSteps(
+    executor: Db,
+    actor: Actor,
+    routine: {
+      id: string;
+      companyId: string;
+      steps: RoutineStep[] | null;
+      variables: RoutineVariable[] | null;
+      assigneeAgentId: string | null;
+    },
+    next: {
+      steps: RoutineStep[];
+      variables: RoutineVariable[];
+      assigneeAgentId: string | null;
+      enablesEventIssueTrigger?: boolean;
+    },
+  ) {
+    if (!actor.agentId) return;
+    const changed = !isDeepStrictEqual(routine.steps ?? [], next.steps)
+      || !isDeepStrictEqual(routine.variables ?? [], next.variables)
+      || (routine.assigneeAgentId ?? null) !== (next.assigneeAgentId ?? null);
+    if (!changed) return;
+    if (next.enablesEventIssueTrigger || (await hasEnabledEventIssueTrigger(executor, routine.companyId, routine.id))) {
+      throw forbidden(EVENT_ISSUE_STEPS_BOARD_ONLY_MESSAGE);
+    }
   }
 
   /** Finalizes a parked run only while it is still `gating`, so a late caller never overwrites a settled run. */
@@ -2243,6 +2580,10 @@ export function routineService(
           return false;
         });
     let reusedExistingRun = false;
+    const steps = managedRoutineBinding ? [] : (input.routine.steps ?? []);
+    const hasSteps = steps.length > 0;
+    /** Filled inside the transaction and acted on only after it commits. */
+    const stepsToStart: AttachedRoutineSteps[] = [];
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -2305,6 +2646,10 @@ export function routineService(
           if (input.rejectIdempotencyReplay) {
             throw conflict("Webhook replay detected");
           }
+          // That key started the steps on a task: this run is not a repeat of it.
+          if (existing.triggerPayload?.targetIssueId) {
+            throw conflict("This idempotency key was already used for a run of this routine on a task");
+          }
           reusedExistingRun = true;
           return existing;
         }
@@ -2356,6 +2701,7 @@ export function routineService(
         : {};
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
+      let attachedSteps: AttachedRoutineSteps | null = null;
       try {
         if (gated && gated.decision.action !== "wake") {
           // Exit 1 (skip) or a transport fault on a schedule: no issue, no wake, no tokens.
@@ -2514,32 +2860,52 @@ export function routineService(
 
         // So that no issue is committed only to be deleted; a refusal is recorded below exactly
         // like the same wake failure.
-        await assertWakeAdmitsAssignee(txDb, input.routine.companyId, assigneeAgentId, projectId);
+        const woken = hasSteps ? routineStartingStepAgentIds(steps, assigneeAgentId) : [assigneeAgentId];
+        for (const wokenAgentId of woken) {
+          await assertWakeAdmitsAssignee(txDb, input.routine.companyId, wokenAgentId, projectId);
+        }
+
+        const rootInput = {
+          projectId,
+          projectWorkspaceId,
+          goalId: input.routine.goalId,
+          parentId: input.routine.parentIssueId,
+          title,
+          description: issueDescription,
+          status: hasSteps ? "blocked" : "todo",
+          priority: input.routine.priority,
+          assigneeAgentId,
+          createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
+          createdByUserId: manualRunnerUserId,
+          responsibleUserId,
+          trustExplicitResponsibleUserId: true,
+          originKind: issueOriginKind,
+          originId: issueOriginId,
+          originRunId: createdRun.id,
+          originFingerprint: dispatchFingerprint,
+          billingCode: issueBillingCode,
+          executionWorkspaceId: input.executionWorkspaceId ?? null,
+          executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+          executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        };
 
         try {
-          createdIssue = await issueSvc.create(input.routine.companyId, {
-            projectId,
-            projectWorkspaceId,
-            goalId: input.routine.goalId,
-            parentId: input.routine.parentIssueId,
-            title,
-            description: issueDescription,
-            status: "todo",
-            priority: input.routine.priority,
-            assigneeAgentId,
-            createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
-            createdByUserId: manualRunnerUserId,
-            responsibleUserId,
-            trustExplicitResponsibleUserId: true,
-            originKind: issueOriginKind,
-            originId: issueOriginId,
-            originRunId: createdRun.id,
-            originFingerprint: dispatchFingerprint,
-            billingCode: issueBillingCode,
-            executionWorkspaceId: input.executionWorkspaceId ?? null,
-            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-            executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
-          });
+          if (hasSteps) {
+            const created = await createRoutineRunIssues({
+              tx: txDb,
+              issueSvc,
+              createRoot: (savepoint) => issueSvc.create(input.routine.companyId, rootInput, savepoint),
+              run: createdRun,
+              routine: input.routine,
+              steps,
+              defaultAssigneeAgentId: assigneeAgentId,
+              variables: allVariables,
+            });
+            createdIssue = created.root;
+            attachedSteps = created.attached;
+          } else {
+            createdIssue = await issueSvc.create(input.routine.companyId, rootInput);
+          }
         } catch (error) {
           const isOpenExecutionConflict =
             !!error &&
@@ -2584,17 +2950,21 @@ export function routineService(
           return updated ?? createdRun;
         }
 
-        // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
-        await queueIssueAssignmentWakeup({
-          heartbeat,
-          assignmentEvent: true,
-          issue: createdIssue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "routine.dispatch",
-          requestedByActorType: input.source === "schedule" ? "system" : undefined,
-          rethrowOnError: true,
-        });
+        if (attachedSteps) {
+          stepsToStart.push(attachedSteps);
+        } else {
+          // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
+          await queueIssueAssignmentWakeup({
+            heartbeat,
+            assignmentEvent: true,
+            issue: createdIssue,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "routine.dispatch",
+            requestedByActorType: input.source === "schedule" ? "system" : undefined,
+            rethrowOnError: true,
+          });
+        }
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,
@@ -2610,6 +2980,7 @@ export function routineService(
         }, txDb);
         return updated ?? createdRun;
       } catch (error) {
+        if (attachedSteps) throw error;
         if (createdIssue) {
           // The issue is committed outside this transaction because the wake reads and updates it
           // on its own connections, so it is deleted rather than rolled back. Its recovery actions
@@ -2634,6 +3005,13 @@ export function routineService(
       }
     });
 
+    for (const attached of stepsToStart) {
+      await startAttachedRoutineSteps(attached, {
+        heartbeat,
+        contextSource: "routine.dispatch",
+        requestedByActorType: input.source === "schedule" ? "system" : undefined,
+      });
+    }
     await recordDispatchOutcome(input.routine, run, reusedExistingRun, gated !== null);
     if (run.status === "gating" && !reusedExistingRun && !gated) kickGate(run.id);
     return withoutGateInternals(run);
@@ -2670,6 +3048,140 @@ export function routineService(
     if (!invokability.invokable) {
       throw conflict(invokability.message, { reason: invokability.reason, ...invokability.details });
     }
+  }
+
+  /**
+   * Refuses, before an existing task is touched, when the agent of a step that would start now could
+   * not be woken (see {@link assertWakeAdmitsAssignee}). Reads on `executor`, the attach savepoint.
+   * @param defaultAgentId The agent a step without `assigneeAgentId` runs as.
+   */
+  async function assertStartingStepAgentsAdmitted(
+    executor: Db,
+    routine: { companyId: string; steps: RoutineStep[] | null },
+    defaultAgentId: string | null,
+    projectId: string | null,
+  ) {
+    for (const agentId of routineStartingStepAgentIds(routine.steps ?? [], defaultAgentId)) {
+      await assertWakeAdmitsAssignee(executor, routine.companyId, agentId, projectId);
+    }
+  }
+
+  /**
+   * A manual or API run that puts the routine's steps under a task that already exists instead of
+   * opening a new run task. It shares {@link attachRoutineStepsToIssue}, and so its guards, with the
+   * event path. A task that is refused (404, 409 or 422) fails the call and leaves no run behind: the
+   * transaction rolls back with the run row and the steps. The concurrency policy, the unchanged-run
+   * skip and gates do not apply: the caller named the task, and the task row lock lets two starts on
+   * it take turns, so the second finds the first one's steps and is refused.
+   * @param input.idempotencyKey A caller's key: a repeat returns the run it made instead of attaching again.
+   */
+  async function runRoutineOnIssue(input: {
+    routine: typeof routines.$inferSelect;
+    targetIssueId: string;
+    source: "manual" | "api";
+    payload?: Record<string, unknown> | null;
+    variables?: Record<string, unknown> | null;
+    assigneeAgentId?: string | null;
+    idempotencyKey?: string | null;
+    actor?: Actor;
+  }) {
+    const { routine } = input;
+    const steps = routine.steps ?? [];
+    if (steps.length === 0) throw unprocessable("The routine has no steps to start on a task");
+    if (await getManagedRoutineBinding(routine)) {
+      throw unprocessable("Steps cannot be started on a task by a plugin-managed routine");
+    }
+    const defaultAssigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
+    const resolvedVariables = resolveRoutineVariableValues(routine.variables ?? [], input);
+    const allVariables = { ...getBuiltinRoutineVariableValues(), ...resolvedVariables };
+    const triggerPayload = {
+      ...(mergeRoutineRunPayload(input.payload, resolvedVariables) ?? {}),
+      targetIssueId: input.targetIssueId,
+    };
+    /** Filled inside the transaction and acted on only after it commits. */
+    const stepsToStart: AttachedRoutineSteps[] = [];
+    let reusedExistingRun = false;
+    const run = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      await tx.execute(
+        sql`select id from ${routines} where ${routines.id} = ${routine.id} and ${routines.companyId} = ${routine.companyId} for update`,
+      );
+      if (input.idempotencyKey) {
+        const existing = await txDb
+          .select()
+          .from(routineRuns)
+          .where(
+            and(
+              eq(routineRuns.companyId, routine.companyId),
+              eq(routineRuns.routineId, routine.id),
+              eq(routineRuns.source, input.source),
+              eq(routineRuns.idempotencyKey, input.idempotencyKey),
+              isNull(routineRuns.triggerId),
+            ),
+          )
+          .orderBy(desc(routineRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) {
+          if (existing.triggerPayload?.targetIssueId !== input.targetIssueId) {
+            throw conflict("This idempotency key was already used for a run of this routine on another task, or for a run without a task");
+          }
+          reusedExistingRun = true;
+          return existing;
+        }
+      }
+
+      const triggeredAt = new Date();
+      const responsibleUserId =
+        input.actor?.userId ??
+        (await resolveLatestRevisionResponsibleUserId(txDb, routine)) ??
+        routine.responsibleUserId ??
+        null;
+      const createdRun = await txDb
+        .insert(routineRuns)
+        .values({
+          companyId: routine.companyId,
+          routineId: routine.id,
+          triggerId: null,
+          source: input.source,
+          status: "received",
+          triggeredAt,
+          idempotencyKey: input.idempotencyKey ?? null,
+          triggerPayload,
+          routineRevisionId: routine.latestRevisionId,
+          responsibleUserId,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+      if (!createdRun) throw new Error("The routine run was not recorded");
+      const { root, attached } = await attachRoutineStepsToIssue({
+        tx: txDb,
+        issueSvc,
+        companyId: routine.companyId,
+        issueId: input.targetIssueId,
+        run: createdRun,
+        routine,
+        steps,
+        defaultAssigneeAgentId,
+        variables: allVariables,
+        assertCanStart: (task, executor) =>
+          assertStartingStepAgentsAdmitted(executor, routine, defaultAssigneeAgentId, task.projectId),
+        requestedBy: stepsRequester(input.actor),
+      });
+      stepsToStart.push(attached);
+      const updated = await finalizeRun(createdRun.id, { status: "issue_created", linkedIssueId: root.id }, txDb);
+      await updateRoutineTouchedState(
+        { routineId: routine.id, triggerId: null, triggeredAt, status: "issue_created", issueId: root.id },
+        txDb,
+      );
+      return updated ?? createdRun;
+    });
+
+    for (const attached of stepsToStart) {
+      await startAttachedRoutineSteps(attached, { heartbeat, contextSource: "routine.dispatch" });
+    }
+    await recordDispatchOutcome(routine, run, reusedExistingRun, false);
+    return withoutGateInternals(run);
   }
 
   /**
@@ -2862,7 +3374,11 @@ export function routineService(
       const [triggersByRoutine, latestRunByRoutine, activeIssueByRoutine, managedByRoutine] = await Promise.all([
         listTriggersForRoutineIds(companyId, routineIds),
         listLatestRunByRoutineIds(companyId, routineIds),
-        listLiveIssueByRoutineIds(companyId, routineIds),
+        listLiveIssueByRoutineIds(
+          companyId,
+          routineIds,
+          new Set(rows.filter((row) => row.steps.length > 0).map((row) => row.id)),
+        ),
         listManagedRoutineMetadata(routineIds),
       ]);
       return rows.map((row) => ({
@@ -3004,11 +3520,13 @@ export function routineService(
             strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
             fieldPath: "env",
           });
+      const steps = input.steps ?? [];
       const variables = syncRoutineVariablesWithTemplate(
-        [input.title, input.description],
+        [input.title, input.description, ...routineStepTemplateTexts(steps)],
         sanitizeRoutineVariableInputs(input.variables),
       );
       assertRoutineVariableDefinitions(variables);
+      await assertRoutineStepReferences(db, companyId, steps, input.assigneeAgentId ?? null);
       const gate = input.gate ?? null;
       if (gate) {
         assertCanChangeGate(actor);
@@ -3040,6 +3558,7 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             transientRetryPolicy: input.transientRetryPolicy ?? {},
             variables,
+            steps,
             env,
             gate,
             automationWakeSettings: input.automationWakeSettings ?? {},
@@ -3091,8 +3610,9 @@ export function routineService(
       const nextStatus = patch.assigneeAgentId === undefined
         ? requestedStatus
         : normalizeDraftRoutineStatus(requestedStatus, nextAssigneeAgentId);
+      const nextSteps = patch.steps === undefined ? existing.steps : patch.steps;
       const nextVariables = syncRoutineVariablesWithTemplate(
-        [nextTitle, nextDescription],
+        [nextTitle, nextDescription, ...routineStepTemplateTexts(nextSteps)],
         patch.variables === undefined ? existing.variables : sanitizeRoutineVariableInputs(patch.variables),
       );
       if (patch.projectId !== undefined) await assertProject(existing.companyId, nextProjectId);
@@ -3103,6 +3623,15 @@ export function routineService(
       if (patch.goalId) await assertGoal(existing.companyId, patch.goalId);
       if (patch.parentIssueId) await assertParentIssue(existing.companyId, patch.parentIssueId);
       assertRoutineVariableDefinitions(nextVariables);
+      const stepsChanged = patch.steps !== undefined && !isDeepStrictEqual(patch.steps, existing.steps);
+      const defaultAgentChanged =
+        patch.assigneeAgentId !== undefined && patch.assigneeAgentId !== existing.assigneeAgentId;
+      if (stepsChanged || defaultAgentChanged) {
+        await assertRoutineStepReferences(db, existing.companyId, nextSteps, nextAssigneeAgentId);
+      }
+      if (patch.steps?.length && (await getManagedRoutineBinding(existing))) {
+        throw unprocessable("Steps are not supported on plugin-managed routines");
+      }
       const nextGate = patch.gate === undefined ? existing.gate : patch.gate;
       // Re-checked only when the pin changed: an unrelated edit must not fail on a gate that predates it.
       if (!routineGatesEqual(existing.gate, nextGate)) {
@@ -3125,9 +3654,15 @@ export function routineService(
       if (enabledScheduleTriggers) {
         assertScheduleCompatibleVariables(nextVariables);
       }
-      if (patch.variables !== undefined || patch.title !== undefined || patch.description !== undefined) {
+      if (
+        patch.variables !== undefined ||
+        patch.title !== undefined ||
+        patch.description !== undefined ||
+        patch.steps !== undefined ||
+        patch.gate !== undefined
+      ) {
         const enabledEventTriggers = await db
-          .select({ id: routineTriggers.id })
+          .select({ eventGrouping: routineTriggers.eventGrouping })
           .from(routineTriggers)
           .where(
             and(
@@ -3136,10 +3671,22 @@ export function routineService(
               eq(routineTriggers.enabled, true),
               eq(routineTriggers.archived, false),
             ),
-          )
-          .limit(1)
-          .then((rows) => rows.length > 0);
-        if (enabledEventTriggers) assertEventCompatibleVariables(nextVariables);
+          );
+        if (enabledEventTriggers.length > 0) assertEventCompatibleVariables(nextVariables);
+        if (
+          stepsChanged &&
+          nextSteps.length > 0 &&
+          enabledEventTriggers.some((trigger) => typeof trigger.eventGrouping?.issueMode === "object")
+        ) {
+          throw unprocessable(APPEND_MODE_STEPS_MESSAGE);
+        }
+        if (
+          (patch.steps !== undefined || patch.gate !== undefined) &&
+          enabledEventTriggers.some((trigger) => trigger.eventGrouping?.issueMode === "event_issue")
+        ) {
+          if (nextSteps.length === 0) throw unprocessable(EVENT_ISSUE_STEPS_MESSAGE);
+          if (routineGateAppliesToSource(nextGate, "event")) throw unprocessable(EVENT_ISSUE_GATE_MESSAGE);
+        }
       }
       const responsibleUserId = await resolveRoutineResponsibleUserId(
         db,
@@ -3163,6 +3710,13 @@ export function routineService(
         if (patch.baseRevisionId && patch.baseRevisionId !== locked.latestRevisionId) {
           throw conflict("Routine was updated by someone else", {
             currentRevisionId: locked.latestRevisionId,
+          });
+        }
+        if (patch.steps !== undefined || patch.variables !== undefined || patch.assigneeAgentId !== undefined) {
+          await assertCanChangeEventIssueSteps(txDb, actor, locked, {
+            steps: patch.steps ?? locked.steps ?? [],
+            variables: patch.variables === undefined ? locked.variables : nextVariables,
+            assigneeAgentId: patch.assigneeAgentId === undefined ? locked.assigneeAgentId : patch.assigneeAgentId,
           });
         }
 
@@ -3215,6 +3769,7 @@ export function routineService(
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
           transientRetryPolicy: patch.transientRetryPolicy ?? locked.transientRetryPolicy,
           variables: nextVariables,
+          steps: nextSteps,
           env: nextEnv,
           gate: nextGate ?? null,
           runContextPolicy: patch.runContextPolicy === undefined ? locked.runContextPolicy : patch.runContextPolicy,
@@ -3294,6 +3849,7 @@ export function routineService(
             activityGateScope: candidate.activityGateScope,
             transientRetryPolicy: candidate.transientRetryPolicy,
             variables: candidate.variables,
+            steps: candidate.steps,
             env: candidate.env,
             gate: candidate.gate,
             runContextPolicy: candidate.runContextPolicy,
@@ -3354,7 +3910,12 @@ export function routineService(
       }
 
       if (input.kind === "event") {
-        await assertEventTriggerAllowed(routine, { eventSourceId: input.eventSourceId, eventGrouping: input.eventGrouping });
+        if (input.eventGrouping?.issueMode === "event_issue") assertCanWriteEventIssueTrigger(actor);
+        await assertEventTriggerAllowed(routine, {
+          eventSourceId: input.eventSourceId,
+          eventGrouping: input.eventGrouping,
+          fallback: input.fallback,
+        });
       }
 
       const { trigger, revision } = await db.transaction(async (tx) => {
@@ -3424,10 +3985,19 @@ export function routineService(
         const nextEventSourceId = patch.eventSourceId ?? existing.eventSourceId;
         const nextEventGrouping = patch.eventGrouping === undefined ? existing.eventGrouping : patch.eventGrouping;
         const enabling = patch.enabled === true && !existing.enabled;
-        if (nextEventSourceId && (enabling || patch.eventSourceId !== undefined || patch.eventGrouping !== undefined)) {
+        const nextFallback = patch.fallback ?? existing.fallback;
+        assertCanPatchEventIssueTrigger(actor, existing, patch);
+        if (
+          nextEventSourceId
+          && (enabling || patch.eventSourceId !== undefined || patch.eventGrouping !== undefined || patch.fallback === true)
+        ) {
           const routine = await getRoutineById(existing.routineId);
           if (!routine) throw notFound("Routine not found");
-          await assertEventTriggerAllowed(routine, { eventSourceId: nextEventSourceId, eventGrouping: nextEventGrouping });
+          await assertEventTriggerAllowed(routine, {
+            eventSourceId: nextEventSourceId,
+            eventGrouping: nextEventGrouping,
+            fallback: nextFallback,
+          });
         }
       }
 
@@ -3456,24 +4026,33 @@ export function routineService(
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existing.routineId} for update`);
+        // Every trigger write holds the routine lock, so this is the row the update replaces: the
+        // board-only check and the fields the patch leaves alone come from it, not from the read above.
+        const current = await txDb
+          .select()
+          .from(routineTriggers)
+          .where(eq(routineTriggers.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!current) return null;
+        assertCanPatchEventIssueTrigger(actor, current, patch);
         const [updated] = await txDb
           .update(routineTriggers)
           .set({
-            label: patch.label === undefined ? existing.label : patch.label,
-            enabled: patch.enabled ?? existing.enabled,
+            label: patch.label === undefined ? current.label : patch.label,
+            enabled: patch.enabled ?? current.enabled,
             ...(patch.setupPending === false ? { setupPending: false } : {}),
             ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
             cronExpression,
             timezone,
             nextRunAt,
-            signingMode: patch.signingMode === undefined ? existing.signingMode : patch.signingMode,
-            replayWindowSec: patch.replayWindowSec === undefined ? existing.replayWindowSec : patch.replayWindowSec,
-            ...(existing.kind === "event"
+            signingMode: patch.signingMode === undefined ? current.signingMode : patch.signingMode,
+            replayWindowSec: patch.replayWindowSec === undefined ? current.replayWindowSec : patch.replayWindowSec,
+            ...(current.kind === "event"
               ? {
-                eventSourceId: patch.eventSourceId ?? existing.eventSourceId,
-                eventMatch: patch.eventMatch === undefined ? existing.eventMatch : patch.eventMatch,
-                eventGrouping: patch.eventGrouping === undefined ? existing.eventGrouping : patch.eventGrouping,
-                fallback: patch.fallback ?? existing.fallback,
+                eventSourceId: patch.eventSourceId ?? current.eventSourceId,
+                eventMatch: patch.eventMatch === undefined ? current.eventMatch : patch.eventMatch,
+                eventGrouping: patch.eventGrouping === undefined ? current.eventGrouping : patch.eventGrouping,
+                fallback: patch.fallback ?? current.fallback,
               }
               : {}),
             updatedByAgentId: actor.agentId ?? null,
@@ -3588,6 +4167,23 @@ export function routineService(
       return rows.map(mapRoutineRevision);
     },
 
+    getRevision: async (routineId: string, revisionId: string): Promise<RoutineRevision | null> => {
+      const routine = await getRoutineById(routineId);
+      if (!routine) throw notFound("Routine not found");
+      const row = await db
+        .select()
+        .from(routineRevisions)
+        .where(
+          and(
+            eq(routineRevisions.companyId, routine.companyId),
+            eq(routineRevisions.routineId, routine.id),
+            eq(routineRevisions.id, revisionId),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+      return row ? mapRoutineRevision(row) : null;
+    },
+
     restoreRevision: async (
       routineId: string,
       revisionId: string,
@@ -3617,6 +4213,7 @@ export function routineService(
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      await assertRoutineStepReferences(db, existingRoutine.companyId, routineSnapshot.steps ?? [], routineSnapshot.assigneeAgentId);
       if (!routineGatesEqual(existingRoutine.gate, routineSnapshot.gate ?? null)) {
         assertCanChangeGate(actor);
         if (routineSnapshot.gate) {
@@ -3628,9 +4225,13 @@ export function routineService(
         if (!triggerSnapshot.eventSourceId) throw unprocessable("Event trigger snapshot has no event source");
         await assertEventTriggerAllowed(
           existingRoutine,
-          { eventSourceId: triggerSnapshot.eventSourceId, eventGrouping: triggerSnapshot.eventGrouping },
+          {
+            eventSourceId: triggerSnapshot.eventSourceId,
+            eventGrouping: triggerSnapshot.eventGrouping,
+            fallback: triggerSnapshot.fallback,
+          },
           routineSnapshot.variables,
-          { allowArchivedSource: true },
+          { allowArchivedSource: true, steps: routineSnapshot.steps ?? [], gate: routineSnapshot.gate ?? null },
         );
       }
 
@@ -3646,6 +4247,44 @@ export function routineService(
         if (locked.latestRevisionId === targetRevision.id) {
           throw conflict("Selected revision is already the latest revision", {
             currentRevisionId: locked.latestRevisionId,
+          });
+        }
+        if (actor.agentId) {
+          // Under the routine lock, which every trigger write takes, so the live triggers cannot change
+          // between this check and the restore below.
+          const restoredEventIssueTriggers = snapshot.triggers.filter(
+            (trigger) => trigger.kind === "event" && trigger.enabled && trigger.eventGrouping?.issueMode === "event_issue",
+          );
+          const liveTriggers = restoredEventIssueTriggers.length === 0
+            ? []
+            : await txDb
+              .select()
+              .from(routineTriggers)
+              .where(
+                and(
+                  eq(routineTriggers.companyId, locked.companyId),
+                  eq(routineTriggers.routineId, locked.id),
+                  inArray(routineTriggers.id, restoredEventIssueTriggers.map((trigger) => trigger.id)),
+                ),
+              );
+          const liveById = new Map(liveTriggers.map((trigger) => [trigger.id, trigger]));
+          for (const restored of restoredEventIssueTriggers) {
+            const live = liveById.get(restored.id);
+            const unchanged = live !== undefined
+              && live.kind === "event"
+              && live.enabled
+              && !live.archived
+              && live.eventSourceId === (restored.eventSourceId ?? null)
+              && live.fallback === (restored.fallback ?? false)
+              && isDeepStrictEqual(live.eventMatch ?? null, restored.eventMatch ?? null)
+              && isDeepStrictEqual(normalizedEventGrouping(live.eventGrouping), normalizedEventGrouping(restored.eventGrouping));
+            if (!unchanged) assertCanWriteEventIssueTrigger(actor);
+          }
+          await assertCanChangeEventIssueSteps(txDb, actor, locked, {
+            steps: routineSnapshot.steps ?? [],
+            variables: routineSnapshot.variables ?? [],
+            assigneeAgentId: routineSnapshot.assigneeAgentId ?? null,
+            enablesEventIssueTrigger: restoredEventIssueTriggers.length > 0,
           });
         }
 
@@ -3688,6 +4327,7 @@ export function routineService(
             activityGatePolicy: routineSnapshot.activityGatePolicy,
             activityGateScope: routineSnapshot.activityGateScope,
             variables: routineSnapshot.variables,
+            steps: routineSnapshot.steps ?? [],
             env: routineSnapshot.env,
             gate: routineSnapshot.gate ?? null,
             runContextPolicy: routineSnapshot.runContextPolicy ?? null,
@@ -3787,9 +4427,46 @@ export function routineService(
       const routine = await getRoutineById(id);
       if (!routine) throw notFound("Routine not found");
       if (routine.status === "archived") throw conflict("Routine is archived");
+      if (input.targetIssueId) {
+        if (input.triggerId) throw unprocessable("A run on a task cannot name a trigger");
+        if (
+          input.projectId
+          || input.projectWorkspaceId
+          || input.executionWorkspaceId
+          || input.executionWorkspacePreference
+          || input.executionWorkspaceSettings
+        ) {
+          throw unprocessable(
+            "A run on a task cannot take projectId, projectWorkspaceId or execution workspace fields: its steps go under the task",
+          );
+        }
+      }
       await assertProject(routine.companyId, input.projectId ?? null);
+      // Steps without their own agent go to the run's assignee, so an override hands them out like a
+      // step write does: an agent may only give them to itself. The check reads the routine row that
+      // the dispatch below uses, so a concurrent edit cannot add steps between the check and the run.
+      if (
+        actor?.agentId &&
+        routine.steps.length > 0 &&
+        input.assigneeAgentId &&
+        input.assigneeAgentId !== actor.agentId
+      ) {
+        throw forbidden("Agents can only assign routine steps to themselves");
+      }
       const assigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
       await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
+      if (input.targetIssueId) {
+        return runRoutineOnIssue({
+          routine,
+          targetIssueId: input.targetIssueId,
+          source: input.source,
+          payload: input.payload as Record<string, unknown> | null | undefined,
+          variables: input.variables as Record<string, unknown> | null | undefined,
+          assigneeAgentId: input.assigneeAgentId ?? null,
+          idempotencyKey: input.idempotencyKey,
+          actor,
+        });
+      }
       const trigger = input.triggerId ? await getTriggerById(input.triggerId) : null;
       if (trigger && trigger.routineId !== routine.id) throw forbidden("Trigger does not belong to routine");
       if (trigger && !trigger.enabled) throw conflict("Routine trigger is not active");
@@ -4251,6 +4928,7 @@ export function routineService(
       const issue = await db
         .select({
           id: issues.id,
+          companyId: issues.companyId,
           status: issues.status,
           originKind: issues.originKind,
           originRunId: issues.originRunId,
@@ -4267,7 +4945,7 @@ export function routineService(
           triggerPayload: routineRuns.triggerPayload,
         })
         .from(routineRuns)
-        .where(eq(routineRuns.id, issue.originRunId))
+        .where(and(eq(routineRuns.id, issue.originRunId), eq(routineRuns.companyId, issue.companyId)))
         .then((rows) => rows[0] ?? null);
       if (!run) return null;
       if (issue.status === "done") {
@@ -4292,6 +4970,16 @@ export function routineService(
             }
             : {}),
         });
+      }
+      if (issue.status === "blocked" && readRoutineStepsRunPayload(run.triggerPayload) !== null) {
+        if (await hasOpenRoutineSteps(db, issue.companyId, issue.id)) {
+          // Steps still open: the run is working, unless every one of them waits for a cancelled step.
+          const [stillMoving] = await withoutStalledStepRuns(db, issue.companyId, [{ originRunId: issue.originRunId }]);
+          if (stillMoving) return null;
+        } else {
+          const readiness = await issueSvc.getDependencyReadiness(issue.id);
+          if (readiness.allBlockersDone) return null;
+        }
       }
       if (issue.status === "blocked" || issue.status === "cancelled") {
         const failureReason = executionIssueTransientFailureReason(issue.status);

@@ -211,6 +211,48 @@ paperclipai pipelines set-automation \
 
 **Convention:** v1 "templates" version with the routine prompt plus the batch file below, not with the pipeline. The pipeline `guidance` document carries the durable rubric. This is the accepted divergence from the long-term template-on-pipeline shape.
 
+**Routine steps.** When the work behind a stage is itself a repeatable sequence (draft, review, then two checks in parallel), put the sequence on the routine as `steps` instead of describing it in the prompt. Each run then creates the run's task plus one validated sub-task per step, linked by blockers, and the usual wakes run them. The routine above becomes:
+
+```sh
+cat > /tmp/drafting-steps.json <<JSON
+[
+  { "key": "draft", "title": "Draft the content case" },
+  { "key": "review", "title": "Review the draft", "after": ["draft"] },
+  { "key": "links", "title": "Check links", "after": ["review"] },
+  { "key": "tone", "title": "Check tone", "after": ["review"] },
+  { "key": "ready", "title": "Suggest Drafting -> Assets", "after": ["links", "tone"] }
+]
+JSON
+
+paperclipai routine update "$DRAFTING_ROUTINE_ID" --steps-file /tmp/drafting-steps.json
+```
+
+Steps default to the routine's agent; set `assigneeAgentId` on a step to hand it to another agent. See [Routines](api/routines.md#routine-steps) for the step fields, review loops, and limits.
+
+**Steps on a task you already have.** A run opens its own task by default. To plan the steps on a task that exists, or on every task a person creates, start them there. Run the routine on one task:
+
+```sh
+paperclipai routine run "$DRAFTING_ROUTINE_ID" --target-issue "$ISSUE_IDENTIFIER"
+```
+
+Or start the steps on each new task that a person creates with the `bug` label, using the company's built-in Paperclip event source. Any routine with steps works; the drafting routine keeps the example short:
+
+```sh
+export PAPERCLIP_SOURCE_ID="$(
+  paperclipai event-sources ensure-paperclip -C "$PAPERCLIP_COMPANY_ID" --json | jq -r '.id'
+)"
+
+paperclipai routine trigger:create "$DRAFTING_ROUTINE_ID" --payload-json "$(jq -nc --arg source "$PAPERCLIP_SOURCE_ID" '{
+  kind: "event",
+  eventSourceId: $source,
+  eventMatch: { types: ["issue.created"], labels: { created_by: "user", label_bug: "true" } },
+  eventGrouping: { issueMode: "event_issue" },
+  fallback: false
+}')"
+```
+
+The steps become sub-tasks of that task. A task owned by an agent turns `blocked` until the steps finish; a task owned by a person keeps its status and only shows what it waits for. A task that is already in progress, has a run, or already has open steps is refused with `409`. Keep the `created_by` filter, or the trigger also fires for tasks that agents create. Warnings (for example a step whose agent is paused) print on stderr and never block the run. See [Start steps on a created task](api/event-sources.md#start-steps-on-a-created-task).
+
 ## Step 2: Trigger, Intake, And Gate
 
 A real system would start with a release-cut routine. Today, the routine fires on a timer or API trigger and creates an intake issue. On that issue, the agent writes a proposal document and asks the board for a checkbox confirmation.

@@ -1375,12 +1375,17 @@ describe("inbox helpers", () => {
     expect(getInboxKeyboardSelectionIndex(0, 3, "previous")).toBe(0);
   });
 
-  it("hides routine execution issues when the hide toggle is enabled", () => {
+  it("hides routine execution and routine step issues when the hide toggle is enabled", () => {
     const manualIssue = { ...makeIssue("manual", true), originKind: "manual" as const };
     const routineIssue = { ...makeIssue("routine", true), originKind: "routine_execution" as const };
+    const stepIssue = { ...makeIssue("step", true), originKind: "routine_step" as const };
 
-    expect(filterInboxIssues([manualIssue, routineIssue], false)).toEqual([manualIssue, routineIssue]);
-    expect(filterInboxIssues([manualIssue, routineIssue], true)).toEqual([manualIssue]);
+    expect(filterInboxIssues([manualIssue, routineIssue, stepIssue], false)).toEqual([
+      manualIssue,
+      routineIssue,
+      stepIssue,
+    ]);
+    expect(filterInboxIssues([manualIssue, routineIssue, stepIssue], true)).toEqual([manualIssue]);
   });
 
   it("groups mixed inbox items by type while preserving item order within each group", () => {

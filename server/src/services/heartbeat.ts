@@ -1,4 +1,11 @@
-import { RUN_CONTEXT_DEFAULTS, resolveCompanyEnvironmentDefault, resolveTransientRetryPolicy, type ResolvedTransientRetryPolicy } from "@paperclipai/shared";
+import {
+  ROUTINE_RUN_ISSUE_ORIGIN_KINDS,
+  RUN_CONTEXT_DEFAULTS,
+  isRoutineRunIssueOriginKind,
+  resolveCompanyEnvironmentDefault,
+  resolveTransientRetryPolicy,
+  type ResolvedTransientRetryPolicy,
+} from "@paperclipai/shared";
 import { issueIdEqualsText } from "./issue-id-match.js";
 import { loadRunContextSettings } from "./run-context-settings.js";
 import { externalObjectService } from "./external-objects.js";
@@ -37,7 +44,7 @@ import {
 } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
-import { hasWorkspaceRestoreFailure, type ExecutionBlocker } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, truncateAtGrapheme, type ExecutionBlocker } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
@@ -93,7 +100,14 @@ import {
   clearAdapterSteering,
   setAdapterSteeringHandle,
 } from "./adapter-steering.js";
-import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
+import {
+  executionFailureRetryCount,
+  executionRetryAttemptCount,
+  accountingForScheduledRetry,
+  PLANNED_RESTART_RESUME_MAX_ATTEMPTS,
+  PLANNED_RESTART_RESUME_RETRY_REASON,
+  PLANNED_RESTART_RESUME_WAKE_REASON,
+} from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
@@ -398,7 +412,7 @@ import {
   emitAgentTaskRunById,
 } from "./agent-task-run-telemetry.js";
 import { reportRunFailure } from "./run-failure-report.js";
-import { collectRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
+import { collectRunFailureSecretValues, redactRunFailureSecretValues, type RunFailureReportOptions } from "./run-failure-diagnostics.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
@@ -417,6 +431,7 @@ import {
   isExternalChatPresentationContext,
   mergeHeartbeatRunResultJson,
   readCompletedAssistantMessageCandidate,
+  readRunErrorSummary,
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
   summarizeRunErrorForModel,
@@ -506,6 +521,7 @@ import { scheduleBackgroundTaskRecheck } from "./background-task-recheck.js";
 import { isRetryableMonitorWakeBlock, monitorWakeRetryDelayMs } from "./issue-monitor-wake-block.js";
 import { hasActiveIssueWait } from "./issue-waits.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { inheritRoutineStepWorkspace } from "./routine-steps.js";
 import { orderQueuedRunsForClaim, selectAgentQueuedRuns } from "./queued-run-claim-order.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
@@ -714,7 +730,7 @@ import {
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
-import { remoteProcessStopRunEvent } from "./ssh-run-process-stop.js";
+import { remoteProcessStopRunEvent, remoteRunProcessesProvenStopped } from "./ssh-run-process-stop.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
   clearHeartbeatRunRuntimeStatus,
@@ -761,6 +777,43 @@ import {
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
+// A registered env value shorter than this is a flag or a number such as `1`,
+// not a credential. Masking it everywhere would rewrite the exit code in the
+// stored run error ("exited with code 1").
+const MIN_RUN_ERROR_SECRET_VALUE_CHARS = 4;
+// The most characters of an error that a run stores. The error text lands in the run row, the
+// wakeup, the agent's error reason and the live events, so an adapter's detail never grows them
+// without bound. The cut ends the text and keeps its first line, which carries the cause.
+const MAX_RUN_ERROR_CHARS = 8 * 1024;
+// The text rule's run time grows with the square of its input, and an adapter error can hold
+// megabytes of stderr. So the text rule reads only the stored bound plus this margin. A secret
+// that the margin cut splits sits at the end of the redacted window, so the margin is dropped
+// again before the stored cut: earlier secrets that redaction shortens cannot pull it in.
+// The margin is longer than a secret value that a text rule matches.
+const RUN_ERROR_REDACTION_MARGIN_CHARS = 4 * 1024;
+
+function sliceAtCodePoint(text: string, end: number): string {
+  const lastCode = end > 0 ? text.charCodeAt(end - 1) : 0;
+  return text.slice(0, lastCode >= 0xd800 && lastCode <= 0xdbff ? end - 1 : Math.max(end, 0));
+}
+
+function redactStoredRunError(
+  text: string,
+  failureSecretValues: readonly string[],
+  currentUserRedactionOptions?: CurrentUserRedactionOptions,
+): string {
+  // The registered values and the current user are exact matches, linear in the text, so they
+  // read all of it: a value of any length is masked before a cut can split it.
+  const exact = redactCurrentUserText(
+    redactRunFailureSecretValues(text, failureSecretValues),
+    currentUserRedactionOptions,
+  );
+  const window = MAX_RUN_ERROR_CHARS + RUN_ERROR_REDACTION_MARGIN_CHARS;
+  if (exact.length <= window) return truncateAtGrapheme(redactSensitiveText(exact), MAX_RUN_ERROR_CHARS);
+  const redacted = redactSensitiveText(sliceAtCodePoint(exact, window));
+  const kept = sliceAtCodePoint(redacted, redacted.length - RUN_ERROR_REDACTION_MARGIN_CHARS);
+  return truncateAtGrapheme(`${kept}…`, MAX_RUN_ERROR_CHARS);
+}
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -938,6 +991,15 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
+// Recorded on a restart-interrupted run whose remote stop has no stored proof.
+const RESTART_RESUME_SKIPPED_EVENT = {
+  eventType: "lifecycle",
+  stream: "system",
+  level: "warn",
+  message:
+    "Restart resume skipped: the remote processes of this run are not proven stopped; the ordinary bounded retry applies",
+  payload: { reason: "remote_stop_unproven" },
+} as const;
 function isTransientWorkspaceGitScanCode(code: string | null | undefined): boolean {
   return code === WORKSPACE_GIT_SCAN_ERROR_CODES.timeout || code === WORKSPACE_GIT_SCAN_ERROR_CODES.saturated;
 }
@@ -1346,7 +1408,7 @@ export function parseSandboxProviderPluginNotReadyFailureMessage(
   };
 }
 
-function isRetryableInteractionContinuationInfrastructureFailure(
+export function isRetryableInteractionContinuationInfrastructureFailure(
   run: Pick<
     typeof heartbeatRuns.$inferSelect,
     "error" | "errorCode" | "resultJson"
@@ -1363,11 +1425,12 @@ function isRetryableInteractionContinuationInfrastructureFailure(
     return false;
 
   const resultJson = parseObject(run.resultJson);
+  const error = readRunErrorSummary(run);
   return (
-    isSpawnLikeFailureMessage(run.error) ||
+    isSpawnLikeFailureMessage(error) ||
     isSpawnLikeFailureMessage(resultJson.errorMessage) ||
     isSpawnLikeFailureMessage(resultJson.message) ||
-    isSandboxProviderWorkerUnavailableFailureMessage(run.error) ||
+    isSandboxProviderWorkerUnavailableFailureMessage(error) ||
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.errorMessage) ||
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.message)
   );
@@ -3875,6 +3938,7 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
           and length(${heartbeatRuns.resultJson} ->> 'acpPendingToolCount') < 16
           then ${heartbeatRuns.resultJson} -> 'acpPendingToolCount' end,
         'errorFamily', left(${heartbeatRuns.resultJson} ->> 'errorFamily', 32),
+        'errorSummary', left(${heartbeatRuns.resultJson} ->> 'errorSummary', ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}),
         'finalResponseRecorded', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'finalResponseRecorded') = 'boolean'
           then ${heartbeatRuns.resultJson} -> 'finalResponseRecorded' end,
         'executionBeforeRestore', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'executionBeforeRestore') = 'object'
@@ -5784,13 +5848,15 @@ export function buildExplicitResumeSessionOverride(input: {
   resumeRunSessionParams?: Record<string, unknown> | null;
   taskSession: ResumeSessionRow | null;
   sessionCodec: AdapterSessionCodec;
+  /** Only a session the selected run created or saved, never the one it started from. */
+  ownSessionOnly?: boolean;
 }) {
   const resumeRunSessionIdAfter = truncateDisplayId(
     input.resumeRunSessionIdAfter,
   );
-  const resumeRunSessionIdBefore = truncateDisplayId(
-    input.resumeRunSessionIdBefore,
-  );
+  const resumeRunSessionIdBefore = input.ownSessionOnly
+    ? null
+    : truncateDisplayId(input.resumeRunSessionIdBefore);
   const desiredDisplayId = requiresCanonicalSessionIds(input.adapterType)
     ? isCanonicalSessionIdForAdapter(input.adapterType, resumeRunSessionIdAfter)
       ? resumeRunSessionIdAfter
@@ -13050,6 +13116,7 @@ export function heartbeatService(
     agent: typeof agents.$inferSelect,
     payload: Record<string, unknown> | null,
     taskKey: string | null,
+    opts: { ownSessionOnly?: boolean } = {},
   ) {
     const resumeFromRunId = readNonEmptyString(payload?.resumeFromRunId);
     if (!resumeFromRunId) return null;
@@ -13099,6 +13166,7 @@ export function heartbeatService(
         : null,
       taskSession: resumeTaskSession,
       sessionCodec,
+      ownSessionOnly: opts.ownSessionOnly,
     });
     if (!sessionOverride) return null;
 
@@ -15234,10 +15302,19 @@ export function heartbeatService(
     return { outcome: "retry_exhausted" as const, queuedRun: null };
   }
 
+  /**
+   * `resumeAfterRestart` is for a run that a server restart cut short and whose
+   * remote processes are proven stopped (`remoteRunProcessesProvenStopped`).
+   * Its retry is due now, resumes the same session and spends no failure retry.
+   * After three such resumes in a row, the ordinary bounded retry applies.
+   * A spent failure budget stays spent: such a run gets no resume, so a restart
+   * never opens new attempts for an incident that is already escalating.
+   */
   async function enqueueProcessLossRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
     now: Date,
+    opts: { resumeAfterRestart?: boolean } = {},
   ) {
     // Completion deliveries own their durable bounded retry and reply identity.
     // A second process-loss retry would compete for the same outbox input.
@@ -15248,6 +15325,22 @@ export function heartbeatService(
     // transient retries; process loss must not open a second retry budget.
     if (run.runtimeMode === "native" || await legacyExecutionNeedsReconciliationWithEvidence(db, run))
       return null;
+    if (
+      opts.resumeAfterRestart &&
+      executionRetryAttemptCount(run, BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON) <
+        BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS
+    ) {
+      const resumed = await scheduleBoundedRetryForRun(run, agent, {
+        now,
+        retryReason: PLANNED_RESTART_RESUME_RETRY_REASON,
+        wakeReason: PLANNED_RESTART_RESUME_WAKE_REASON,
+        maxAttempts: PLANNED_RESTART_RESUME_MAX_ATTEMPTS,
+        delayMs: 0,
+      });
+      if (resumed.outcome === "scheduled") return resumed.run;
+      // Only a used-up resume lane falls back. Any other refusal also binds the ordinary retry.
+      if (resumed.outcome !== "retry_exhausted") return null;
+    }
     const scheduled = await scheduleBoundedRetryForRun(run, agent, { now });
     return scheduled.outcome === "scheduled" ? scheduled.run : null;
   }
@@ -16160,7 +16253,15 @@ export function heartbeatService(
       failureReason: interrupted.error ?? undefined,
     });
 
-    const retry = await enqueueProcessLossRetry(interrupted, agent, now);
+    // The drain already stopped the local child. The resume needs proof that the
+    // remote side is stopped too: two processes must never share one session.
+    const resumeAfterRestart = await remoteRunProcessesProvenStopped(
+      db,
+      interrupted.companyId,
+      interrupted.id,
+    );
+    if (!resumeAfterRestart) await appendRunEvent(interrupted, RESTART_RESUME_SKIPPED_EVENT);
+    const retry = await enqueueProcessLossRetry(interrupted, agent, now, { resumeAfterRestart });
     if (!retry) {
       await releaseIssueExecutionAndPromote(interrupted);
     }
@@ -16673,7 +16774,7 @@ export function heartbeatService(
             and(
               eq(issues.id, input.issueId),
               eq(issues.companyId, input.companyId),
-              eq(issues.originKind, "routine_execution"),
+              inArray(issues.originKind, [...ROUTINE_RUN_ISSUE_ORIGIN_KINDS]),
             ),
           )
           .then((rows) => rows[0]?.policy ?? null)
@@ -16959,7 +17060,19 @@ export function heartbeatService(
       }
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
-    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    // A retry row skips enqueueWakeup, so a resume writes the session override
+    // that enqueueWakeup would have: the interrupted run's own session. A run
+    // that asked for a fresh session resumes only a session it created; without
+    // one, its retry starts fresh as the run would have.
+    const isRestartResume = retryReason === PLANNED_RESTART_RESUME_RETRY_REASON;
+    const restartResumeSession = isRestartResume
+      ? await resolveExplicitResumeSessionOverride(agent, { resumeFromRunId: run.id }, taskKey, {
+          ownSessionOnly: contextSnapshot.forceFreshSession === true,
+        })
+      : null;
+    const sessionBefore =
+      restartResumeSession?.sessionDisplayId ??
+      (await resolveSessionBeforeForWakeup(agent, taskKey));
     const interactionContinuationPayload =
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
         ? {
@@ -16999,6 +17112,18 @@ export function heartbeatService(
           : {}),
         ...(retryReason === AI_CONNECTION_BUSY_RETRY_REASON
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }
+          : {}),
+        ...(isRestartResume
+          ? { failureRetriesBeforePlannedRestart: executionFailureRetryCount(run) }
+          : {}),
+        ...(restartResumeSession
+          ? {
+              // The copied context may hold the previous run's session choice.
+              forceFreshSession: false,
+              resumeFromRunId: restartResumeSession.resumeFromRunId,
+              resumeSessionDisplayId: restartResumeSession.sessionDisplayId,
+              resumeSessionParams: restartResumeSession.sessionParams,
+            }
           : {}),
         ...(shouldQuarantineWorkspaceForRetry
           ? {
@@ -18165,7 +18290,7 @@ export function heartbeatService(
         .where(eq(companies.id, agent.companyId))
         .then((rows) => rows[0]?.settings ?? null),
       routine:
-        issue?.originKind === "routine_execution" && issue.originId
+        isRoutineRunIssueOriginKind(issue?.originKind) && issue?.originId
           ? await dbOrTx
               .select({ settings: routines.automationWakeSettings })
               .from(routines)
@@ -18663,7 +18788,7 @@ export function heartbeatService(
       status: run.status,
       errorCode: run.errorCode,
       errorFamily: readHeartbeatRunErrorFamily(run),
-      errorMessage: run.error,
+      errorMessage: readRunErrorSummary(run),
       retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       usefulWork,
     });
@@ -21103,6 +21228,13 @@ export function heartbeatService(
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
+  /**
+   * A legacy run of another boot id whose controller lease expired lost its
+   * server to a restart or a crash. It resumes on the same session when its
+   * remote processes are proven stopped. A live lease always wins, even across
+   * boots: during an overlapping deploy the old server still owns its runs and
+   * drains them itself.
+   */
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -21433,6 +21565,10 @@ export function heartbeatService(
       if (resumedRunIds.has(run.id)) continue;
       if (locallyTracked) continue;
       if (await hasLiveLegacyController(db, run)) continue;
+      const restartInterrupted =
+        run.runtimeMode === "legacy" &&
+        !!run.controllerBootId &&
+        run.controllerBootId !== legacyControllerBootId;
 
       // Apply staleness threshold to avoid false positives
       if (staleThresholdMs > 0) {
@@ -21563,10 +21699,23 @@ export function heartbeatService(
       const retryAgent = await getAgent(run.agentId);
       if (shouldRetry) {
         if (retryAgent) {
+          // The old server is gone, but its remote command may not be. Resume
+          // the session only when the stored evidence shows the stop.
+          const resumeAfterRestart =
+            restartInterrupted &&
+            (await remoteRunProcessesProvenStopped(
+              db,
+              finalizedRun.companyId,
+              finalizedRun.id,
+            ));
+          if (restartInterrupted && !resumeAfterRestart) {
+            await appendRunEvent(finalizedRun, RESTART_RESUME_SKIPPED_EVENT);
+          }
           retriedRun = await enqueueProcessLossRetry(
             finalizedRun,
             retryAgent,
             now,
+            { resumeAfterRestart },
           );
         }
       } else if (retryAgent) {
@@ -23232,6 +23381,13 @@ export function heartbeatService(
       let issueContext = issueId
         ? await getIssueExecutionContext(agent.companyId, issueId)
         : null;
+      if (issueId && issueContext) {
+        const inherited = await inheritRoutineStepWorkspace(db, agent.companyId, issueContext).catch((error) => {
+          logger.warn({ err: error, issueId }, "failed to inherit the workspace of a routine step's predecessor");
+          return false;
+        });
+        if (inherited) issueContext = await getIssueExecutionContext(agent.companyId, issueId);
+      }
       const issueDependencyReadiness = issueId
         ? await issuesSvc
             .listDependencyReadiness(agent.companyId, [issueId])
@@ -27723,6 +27879,45 @@ export function heartbeatService(
                       },
                     } : {}),
                     onSteeringReady: (handle) => setAdapterSteeringHandle(run.id, handle),
+                    // A run that ends before it returns (for example on a server restart)
+                    // still leaves its session for the retry. The final write below replaces it.
+                    onSessionCheckpoint: async (checkpoint) => {
+                      try {
+                        const next = resolveNextSessionState({
+                          adapterType: agent.adapterType,
+                          codec: sessionCodec,
+                          adapterResult: { exitCode: null, signal: null, timedOut: false, ...checkpoint },
+                          outcome: "succeeded",
+                          previousParams: previousSessionParams,
+                          previousDisplayId: runtimeForAdapter.sessionDisplayId,
+                          previousLegacySessionId: runtimeForAdapter.sessionId,
+                        });
+                        const sessionIdAfter = next.displayId ?? next.legacySessionId;
+                        if (!sessionIdAfter) return;
+                        const [stored] = await db
+                          .update(heartbeatRuns)
+                          .set({ sessionIdAfter, updatedAt: new Date() })
+                          .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "running")))
+                          .returning({ id: heartbeatRuns.id });
+                        if (!stored || !taskKey) return;
+                        await upsertTaskSession({
+                          companyId: agent.companyId,
+                          agentId: agent.id,
+                          adapterType: agent.adapterType,
+                          taskKey,
+                          sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+                            next.params,
+                            configuredModel,
+                            sessionConfigMetadata,
+                          ),
+                          sessionDisplayId: next.displayId,
+                          lastRunId: run.id,
+                          lastError: null,
+                        });
+                      } catch (err) {
+                        logger.warn({ err, runId: run.id }, "failed to store the early session checkpoint");
+                      }
+                    },
                     onCancellationReady: async () => {
                       await registerAdapterExecutionControl(run.id, executionControl);
                       const current = await getRun(run.id);
@@ -28136,16 +28331,36 @@ export function heartbeatService(
           usageBasis: adapterResult.usageBasis ?? null,
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
-        const runErrorMessage =
+        // Only the stored copies are redacted. The outcome, the error code and
+        // the quota reclassification above already read the adapter's raw result.
+        // The run's registered env and secret values go first, because an opaque
+        // value has no shape for the text rule to recognize. Every reader of the
+        // stored error (Inbox, live and plugin events, wakeup error, agent error
+        // reason) then sees the redacted text.
+        const failureSecretValues = readFailureReportSecrets().filter(
+          (value) => value.length >= MIN_RUN_ERROR_SECRET_VALUE_CHARS,
+        );
+        const redactRunError = (text: string) =>
+          redactStoredRunError(text, failureSecretValues, currentUserRedactionOptions);
+        // Classifiers read the adapter's short errorMessage. A failed run stores
+        // the adapter's fuller errorDetail when it has one, and keeps the short
+        // message in resultJson.errorSummary for classifiers that read it back.
+        const runErrorSummary =
           outcome === "cancelled"
-            ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
+            ? redactRunError(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
             : outcome === "succeeded"
               ? null
-              : redactCurrentUserText(
+              : redactRunError(
                   adapterResult.errorMessage ??
                     (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
-                  currentUserRedactionOptions,
                 );
+        const adapterErrorDetail =
+          outcome === "failed" || outcome === "timed_out"
+            ? readNonEmptyString(adapterResult.errorDetail)
+            : null;
+        const runErrorMessage = adapterErrorDetail
+          ? redactRunError(adapterErrorDetail)
+          : runErrorSummary;
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
         const runErrorCode =
@@ -28276,17 +28491,18 @@ export function heartbeatService(
                   ? {
                       backgroundTaskStopped: true,
                       backgroundTaskStopWarning: adapterResult.errorMessage
-                        ? redactCurrentUserText(adapterResult.errorMessage, currentUserRedactionOptions)
+                        ? redactRunError(adapterResult.errorMessage)
                         : null,
                     }
                   : {}),
+                ...(adapterErrorDetail ? { errorSummary: runErrorSummary } : {}),
                 configFreshness: configFreshnessResultMetadata,
               },
               errorFamily: adapterResult.errorFamily ?? null,
               retryNotBefore: adapterResult.retryNotBefore ?? null,
             }),
             errorCode: runErrorCode,
-            errorMessage: runErrorMessage,
+            errorMessage: runErrorSummary,
           }),
           adapterResult.summary ?? null,
           ), runErrorCode, runErrorMessage),

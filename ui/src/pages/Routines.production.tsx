@@ -16,6 +16,7 @@ import { useToastActions } from "../context/ToastContext";
 import { buildMarkdownMentionOptions } from "../lib/company-members";
 import { cn } from "../lib/utils";
 import { queryKeys } from "../lib/queryKeys";
+import { agentNameMap, stepWarningsToast } from "../lib/routine-step-warnings";
 import { groupBy } from "../lib/groupBy";
 import { createIssueDetailLocationState } from "../lib/issueDetailBreadcrumb";
 import { collectLiveIssueIds } from "../lib/liveIssueIds";
@@ -602,8 +603,10 @@ export function Routines() {
     onMutate: ({ id }) => {
       setRunningRoutineId(id);
     },
-    onSuccess: async (_, { id }) => {
+    onSuccess: async (run, { id }) => {
       setRunDialogRoutine(null);
+      const warningToast = stepWarningsToast(run.warnings, agentNameMap(agents));
+      if (warningToast) pushToast(warningToast);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.list(selectedCompanyId!) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(id) }),

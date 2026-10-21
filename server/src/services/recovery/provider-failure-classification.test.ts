@@ -5,6 +5,7 @@ import {
   PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
   classifyAdapterFailureForRecovery,
   classifyContinuationFailure,
+  resolveStrandedRecoveryCause,
 } from "./service.js";
 import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery.js";
 
@@ -177,5 +178,54 @@ describe("classifyAdapterFailureForRecovery", () => {
       resultJson: { errorFamily: "transient_upstream" } };
     expect(classifyAdapterFailureForRecovery(run)).toEqual({ kind: "configuration_incomplete" });
     expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
+  });
+});
+
+// A failed run stores a fuller error (the short message plus a stderr tail) and
+// keeps the short message in resultJson.errorSummary. Recovery classifies by the
+// short message, so a limit or credential phrase that only the stderr tail shows
+// must not change the verdict. A row written before the summary existed has no
+// errorSummary, and its error is the short message.
+describe("recovery classification reads the run's short error summary", () => {
+  const SHORT = "Agent exited with code 1: Tool execution failed";
+  const withTail = (line: string) => `${SHORT}\nLast lines of stderr:\n${line}`;
+  const QUOTA_LINE = "You've hit your usage limit. Try again at 4:30 PM (UTC).";
+  const CONFIG_LINE = "API key is not set";
+
+  it.each([
+    ["a usage-limit phrase", QUOTA_LINE],
+    ["a missing-credential phrase", CONFIG_LINE],
+  ])("does not classify by %s that only the stderr tail shows", (_name, line) => {
+    const run = {
+      errorCode: "adapter_failed",
+      error: withTail(line),
+      resultJson: { errorSummary: SHORT },
+    };
+
+    expect(classifyAdapterFailureForRecovery(run)).toBeNull();
+    expect(resolveStrandedRecoveryCause(run as never)).toBe("stranded_assigned_issue");
+  });
+
+  it("still classifies an old row that has no errorSummary by its stored error", () => {
+    const now = new Date("2026-07-15T20:00:00.000Z");
+    const quota = { errorCode: "adapter_failed", error: QUOTA_LINE, resultJson: null };
+    const config = { errorCode: "adapter_failed", error: CONFIG_LINE, resultJson: {} };
+
+    expect(classifyAdapterFailureForRecovery(quota, now)).toMatchObject({ kind: "provider_quota" });
+    expect(resolveStrandedRecoveryCause(quota as never)).toBe("provider_quota");
+    expect(classifyAdapterFailureForRecovery(config)).toEqual({ kind: "configuration_incomplete" });
+  });
+
+  it("classifies by a limit phrase in the short summary itself", () => {
+    const now = new Date("2026-07-15T20:00:00.000Z");
+    const summary = "Claude run failed: You've hit your limit · resets 2:30am (UTC)";
+    const run = {
+      errorCode: "adapter_failed",
+      error: withTail("unrelated stderr line"),
+      resultJson: { errorSummary: summary },
+    };
+
+    expect(classifyAdapterFailureForRecovery(run, now)).toMatchObject({ kind: "provider_quota", parsedResetTime: true });
+    expect(resolveStrandedRecoveryCause(run as never)).toBe("provider_quota");
   });
 });

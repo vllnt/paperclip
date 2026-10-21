@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, type ReactNode } from "react";
+import { act, useState, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { EventSource } from "@/api/eventSources";
@@ -259,4 +259,139 @@ it("keeps the event settings when saving and exiting", async () => {
   expect(onSaveExit).toHaveBeenCalledWith(
     expect.objectContaining({ kind: "event", event: expect.objectContaining({ sourceId: SOURCE_ID }) }),
   );
+});
+
+// --- Built-in Paperclip source ---------------------------------------------
+
+const BUILT_IN_ID = "3f0c5f6e-0000-4000-8000-0000000000aa";
+const builtInSource = {
+  id: BUILT_IN_ID,
+  name: "Paperclip (built-in)",
+  enabled: true,
+  archived: false,
+  normalizer: "paperclip_v1",
+  ingressUrl: null,
+} as EventSource;
+
+/** Holds the source list the way the routine page does, so the built-in source appears once ensured. */
+function BuiltInHarness({
+  ensure,
+  onFinish,
+}: {
+  ensure: () => Promise<EventSource>;
+  onFinish: (draft: TriggerDraft) => void;
+}) {
+  const [sources, setSources] = useState<EventSource[]>(eventSources.sources);
+  return (
+    <RoutineTriggerWizard
+      initialDraft={{ ...defaultTriggerDraft, kind: "event", step: 1, availableStep: 1 }}
+      routineTitle="Triage new tasks"
+      routineId="routine-1"
+      eventSources={{
+        status: "ready",
+        sources,
+        ensureBuiltIn: async () => {
+          const source = await ensure();
+          setSources((current) => [...current, source]);
+          return source;
+        },
+      }}
+      onSaveExit={() => {}}
+      onFinish={onFinish}
+    />
+  );
+}
+
+async function renderBuiltIn(ensure: () => Promise<EventSource>) {
+  const onFinish = vi.fn();
+  await act(async () => root.render(<BuiltInHarness ensure={ensure} onFinish={onFinish} />));
+  return { onFinish };
+}
+
+async function chooseBuiltIn() {
+  const select = field("Event source") as HTMLSelectElement;
+  const option = [...select.options].find((item) => item.textContent?.startsWith("Paperclip (built-in)"));
+  if (!option) throw new Error("No built-in source option");
+  await setValue(select, option.value);
+}
+
+it("sets up the built-in Paperclip source on first use and presets the trigger for it", async () => {
+  const ensure = vi.fn().mockResolvedValue(builtInSource);
+  const { onFinish } = await renderBuiltIn(ensure);
+  expect(container.textContent).toContain("Emitters");
+
+  await chooseBuiltIn();
+  expect(ensure).toHaveBeenCalledTimes(1);
+  expect((field("Event source") as HTMLSelectElement).value).toBe(BUILT_IN_ID);
+  expect(container.textContent).toContain("issue.created");
+  expect(container.textContent).not.toContain("Emitters");
+  expect(container.textContent).not.toContain("Minimum severity");
+  expect(container.textContent).not.toContain("Fallback trigger");
+
+  // Without a created_by filter, agent-created tasks start the routine too, and the board is told.
+  expect(container.textContent).toContain("Without a created_by filter");
+  await act(async () => button("Only tasks created by a person").click());
+  expect((container.querySelector('input[aria-label="Label 1 name"]') as HTMLInputElement).value).toBe("created_by");
+  expect(container.textContent).not.toContain("Without a created_by filter");
+
+  await act(async () => button("Continue").click());
+  expect(container.textContent).toContain("Review the trigger");
+  const mode = [...container.querySelectorAll<HTMLButtonElement>('[role="radio"]')];
+  expect(mode).toHaveLength(1);
+  expect(mode[0]!.textContent).toContain("Attach the steps to the created task");
+  expect(mode[0]!.disabled).toBe(true);
+  expect(container.textContent).not.toContain("Group key");
+  expect(container.textContent).toContain("A task assigned to an agent becomes blocked");
+
+  await act(async () => button("Add event trigger").click());
+  expect(onFinish).toHaveBeenCalledTimes(1);
+  expect(onFinish.mock.calls[0]![0].event).toMatchObject({
+    sourceId: BUILT_IN_ID,
+    issueMode: "event_issue",
+    types: ["issue.created"],
+    fallback: false,
+    labels: [expect.objectContaining({ key: "created_by", values: ["user"] })],
+  });
+});
+
+it("uses an existing built-in source without creating it again", async () => {
+  const ensure = vi.fn().mockResolvedValue(builtInSource);
+  await act(async () =>
+    root.render(
+      <RoutineTriggerWizard
+        initialDraft={{ ...defaultTriggerDraft, kind: "event", step: 1, availableStep: 1 }}
+        routineTitle="Triage new tasks"
+        routineId="routine-1"
+        eventSources={{ status: "ready", sources: [builtInSource, ...eventSources.sources], ensureBuiltIn: ensure }}
+        onSaveExit={() => {}}
+        onFinish={() => {}}
+      />,
+    ),
+  );
+  const select = field("Event source") as HTMLSelectElement;
+  expect([...select.options].filter((item) => item.textContent?.startsWith("Paperclip (built-in)"))).toHaveLength(1);
+  await setValue(select, BUILT_IN_ID);
+  expect(ensure).not.toHaveBeenCalled();
+  expect(container.textContent).not.toContain("Emitters");
+});
+
+it("undoes the built-in preset when the board picks another source", async () => {
+  const { onFinish } = await renderBuiltIn(vi.fn().mockResolvedValue(builtInSource));
+  await chooseBuiltIn();
+  await setValue(field("Event source") as HTMLSelectElement, SOURCE_ID);
+  expect(container.textContent).toContain("Emitters");
+  expect(container.textContent).toContain("Fallback trigger");
+
+  await act(async () => button("Continue").click());
+  expect(container.textContent).toContain("Group repeated alerts");
+  expect(container.textContent).toContain("One issue per alert group");
+  await act(async () => button("Add event trigger").click());
+  expect(onFinish.mock.calls[0]![0].event).toMatchObject({ sourceId: SOURCE_ID, issueMode: "group", types: [] });
+});
+
+it("shows why the built-in source could not be set up and keeps the choice open", async () => {
+  await renderBuiltIn(vi.fn().mockRejectedValue(new Error("Event sources are managed by the board.")));
+  await chooseBuiltIn();
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("managed by the board");
+  expect((field("Event source") as HTMLSelectElement).value).toBe("");
 });
