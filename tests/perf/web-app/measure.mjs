@@ -7,6 +7,19 @@
  *
  * Every run uses a fresh browser context (cold HTTP cache, no service worker),
  * throttles CPU/network over CDP, and reports medians across runs.
+ *
+ * Read-only run on a deployed instance (plan section 14):
+ *   PERF_TOKEN=... node tests/perf/web-app/measure.mjs --base https://<host> --seed prod-seed.json \
+ *     --auth-env PERF_TOKEN --read-only --profiles desktop
+ * `--auth-env` names an environment variable whose value is sent as a bearer token,
+ * only on requests to the --base origin; it is never printed or written. `--read-only`
+ * answers every non-GET request to that origin with an empty 200 in the browser, so the
+ * page writes nothing, and counts them. Both block the service worker, because a
+ * service worker's requests bypass the browser-side routing. With `--auth-env` the live
+ * socket is answered in the browser (see `mockedSockets`), so live updates are not
+ * measured this way; compare such numbers only with numbers measured the same way.
+ * A seed file may set `readyText` per page key (a regular expression source) for
+ * pages whose ready text differs from the fixture's.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -23,6 +36,12 @@ const PREFIX = SEED.prefix;
 
 const PROFILES = {
   desktop: { viewport: { width: 1440, height: 900 } },
+  // A fast laptop on a remote link: the `wan` link without its CPU slowdown, so
+  // network cost and CPU cost can be told apart.
+  laptop: {
+    viewport: { width: 1440, height: 900 },
+    net: { latency: 40, down: (50 * 1024 * 1024) / 8, up: (10 * 1024 * 1024) / 8 },
+  },
   wan: {
     viewport: { width: 1440, height: 900 },
     cpu: 2,
@@ -42,10 +61,11 @@ const PROFILES = {
 };
 
 const viewKey = `paperclip:issues-view:${SEED.companyId}`;
+const issueKeyText = new RegExp(`${SEED.issuePrefix ?? PREFIX}-\\d+`);
 const PAGES = [
   { key: "dashboard", url: `/${PREFIX}/dashboard` },
-  { key: "tasks-list", url: `/${PREFIX}/issues`, storage: { [viewKey]: { viewMode: "list" } }, readyText: /PER-\d+/ },
-  { key: "tasks-board", url: `/${PREFIX}/issues`, storage: { [viewKey]: { viewMode: "board" } }, readyText: /PER-\d+/ },
+  { key: "tasks-list", url: `/${PREFIX}/issues`, storage: { [viewKey]: { viewMode: "list" } }, readyText: issueKeyText },
+  { key: "tasks-board", url: `/${PREFIX}/issues`, storage: { [viewKey]: { viewMode: "board" } }, readyText: issueKeyText },
   { key: "issue-long", url: `/${PREFIX}/issues/${SEED.featured.long.identifier}`, readyText: new RegExp(SEED.featured.long.identifier) },
   { key: "issue-short", url: `/${PREFIX}/issues/${SEED.featured.short.identifier}`, readyText: new RegExp(SEED.featured.short.identifier) },
   { key: "agents", url: `/${PREFIX}/agents/all`, readyText: /Agent \d\d/ },
@@ -54,6 +74,14 @@ const PAGES = [
   { key: "audit", url: `/${PREFIX}/company/activity` },
   { key: "settings", url: `/${PREFIX}/company/settings` },
 ];
+for (const page of PAGES) {
+  const override = SEED.readyText?.[page.key];
+  if (override !== undefined) page.readyText = override === null ? undefined : new RegExp(override);
+}
+const AUTH_TOKEN = args["auth-env"] ? process.env[args["auth-env"]] : null;
+if (args["auth-env"] && !AUTH_TOKEN) throw new Error(`environment variable ${args["auth-env"]} is empty`);
+const READ_ONLY = Boolean(args["read-only"]);
+const ROUTED = Boolean(AUTH_TOKEN) || READ_ONLY;
 
 const INIT_SCRIPT = `(() => {
   const p = (window.__perf = { fcp: null, lcp: null, lcpInfo: null, shifts: [], longTasks: [], events: [], lastMutation: 0 });
@@ -168,7 +196,41 @@ async function measureRun(browser, spec, profileName, runIndex) {
     isMobile: profile.mobile ?? false,
     hasTouch: profile.mobile ?? false,
     deviceScaleFactor: 1,
+    // h2-proxy.mjs serves a self-signed certificate. Chrome refuses to register a
+    // service worker from such an origin and logs an error, so block it there; a cold
+    // load in a fresh context gets nothing from the worker anyway.
+    ignoreHTTPSErrors: BASE.startsWith("https:"),
+    serviceWorkers: BASE.startsWith("https:") || ROUTED ? "block" : "allow",
   });
+  const blockedWrites = [];
+  if (ROUTED) {
+    const origin = new URL(BASE).origin;
+    await context.route(
+      (url) => url.origin === origin,
+      (route) => {
+        const req = route.request();
+        if (READ_ONLY && req.method() !== "GET" && req.method() !== "HEAD") {
+          blockedWrites.push(`${req.method()} ${normalizeRoute(req.url())}`);
+          return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+        }
+        return route.continue(AUTH_TOKEN ? { headers: { ...req.headers(), authorization: `Bearer ${AUTH_TOKEN}` } } : undefined);
+      },
+    );
+  }
+  // A browser websocket cannot carry the bearer token, and the live-events socket
+  // accepts only a session cookie or an agent key, so with --auth-env every socket
+  // would fail with 403 and reconnect. Answer it in the browser instead: it opens and
+  // stays silent, like a live socket with no events. Counted in `mockedSockets`.
+  let mockedSockets = 0;
+  if (AUTH_TOKEN) {
+    const host = new URL(BASE).host;
+    await context.routeWebSocket(
+      (url) => url.host === host,
+      () => {
+        mockedSockets += 1;
+      },
+    );
+  }
   await context.addInitScript(INIT_SCRIPT);
   if (spec.storage) {
     await context.addInitScript((entries) => {
@@ -304,6 +366,8 @@ async function measureRun(browser, spec, profileName, runIndex) {
     apiBytes: sumBytes(api),
     totalBytes: sumBytes(beforeSettle),
     wsFrames: ws.frames,
+    blockedWrites,
+    mockedSockets,
     consoleErrors,
     apiCalls: api.map((r) => ({
       route: `${r.method} ${normalizeRoute(r.url)}`,
@@ -365,6 +429,7 @@ function summarize(results) {
       domNodes: m((r) => r.domNodes),
       heapMB: m((r) => r.heapMB),
       consoleErrors: rs.reduce((s, r) => s + r.consoleErrors.length, 0),
+      blockedWrites: rs.reduce((s, r) => s + r.blockedWrites.length, 0),
       api: [...routeStats.entries()]
         .map(([route, s]) => ({
           route,
