@@ -93,6 +93,8 @@ export const listRoutinesQuerySchema = z.object({
   /** A folder id, or `none` for routines in no folder. */
   folderId: z.union([z.literal("none"), z.string().guid()]).optional(),
   projectId: z.string().guid().optional(),
+  /** Routines linked to this goal; sub-goals are not included. */
+  goalId: z.string().guid().optional(),
   status: z.enum(ROUTINE_STATUSES).optional(),
   /** A routine matches a trigger kind when it has a non-archived trigger of that kind; `manual` means it has none. */
   trigger: z.enum(ROUTINE_LIST_TRIGGER_FILTERS).optional(),

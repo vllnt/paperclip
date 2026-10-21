@@ -87,6 +87,16 @@ GET /api/companies/{companyId}/goals/progress
 
 Returns progress for every goal, keyed by goal ID. Cancelled, hidden and conversation tasks do not count.
 
+### A Goal's Linked Work
+
+A goal does not store its work. Read it with the list filters, which apply the same access rules as the plain lists:
+
+- tasks: `GET /api/companies/{companyId}/issues?goalId={goalId}` (add `status` for the open ones);
+- routines: `GET /api/companies/{companyId}/routines?goalId={goalId}`;
+- projects: the projects whose `goalIds` contain the goal.
+
+Sub-goals keep their own work. The agents of a goal are its owner, the assignees of its open tasks, and the default agents of its routines that are not archived.
+
 ## Projects
 
 Projects group related issues toward a deliverable. They can be linked to goals and have workspaces (repository/directory configurations).
