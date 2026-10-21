@@ -90,7 +90,7 @@ use the run's identity and the plugin writes as its App.
   without a connection fall back to the App; `"fail"` stops it.
 - **`app`**: the one person (`userLogin`) who authorized the company's own
   GitHub App. Writes use that person's GitHub App user token; reads use the
-  App's installation. GitHub limits the user token to the App's installation
+  App's installations. GitHub limits the user token to the App's installations
   and permissions, so the fence also holds for a captured token. Every action
   writes as the user and nothing ever falls back to the App bot.
 
@@ -113,7 +113,7 @@ writes off never hands runs back to a host or bot credential.
 
 | Operation | Credential |
 |---|---|
-| Read (`fetch`, `clone`, `gh pr view`, `gh api` GET…) | Read-only installation token for one fenced repository, or for all fenced repositories when the command names none (GraphQL, search). Either carries org Projects read when the installation grants it. Cached 50 minutes. |
+| Read (`fetch`, `clone`, `gh pr view`, `gh api` GET…) | Read-only installation token for one fenced repository, or, when the command names none (GraphQL, search), for the fenced repositories of one installation (see Fence check). Either carries org Projects read when the installation grants it. Cached 50 minutes. |
 | Local command (`status`, `commit`, `rebase`…), or a git command that only reaches local paths | No token: only the person's commit identity, plus the signing key for commit-creating commands. |
 | Write | The user token, after the gates below. |
 
@@ -750,13 +750,23 @@ against one base cannot be retargeted to `main` before its merge; GraphQL
 **Opt-in release of protected paths (`agentMergeablePaths`).** An instance administrator can release some protected files for agent merges in chosen repositories, through the GitHub plugin's company config. The setting is a list of entries `{ repository, allow, exclude }`. `repository` is `owner/name`, matched exactly and without regard to case. `allow` lists paths under `.github/` (for example `.github/**`). `exclude` lists paths that stay refused. The default is an empty list, which behaves as before. The config is read at every merge from the plugin config only, never from the pull request head or a repository file, and the host validates it when it is saved. A protected file is released only when `allow` covers it and no `exclude` does. One file that is not released keeps the refusal for the whole pull request, and the refusal lists only the files that are not released. A rename counts both names. Whatever the config says, these are never released: the CODEOWNERS paths (`CODEOWNERS`, `.github/CODEOWNERS`, `docs/CODEOWNERS`), the control paths (`paperclip/**`, `scripts/**`, `ROADMAP.md`, `data/company/strategy/**`), the tiers paths, and any path that is not in its normal form (a `.`, `..` or empty segment). A repository with a tiers file on its base branch cannot opt in at all. A repository in the control list without a tiers file opts in like any other repository, with its own entry and for `.github/**` only; its control paths stay refused. An `allow` entry that names CODEOWNERS or reaches outside `.github/` is refused when the config is saved, and an entry that is not valid at the moment of a merge is dropped whole and releases nothing. Every other check is unchanged: the exact head SHA, the file list read again after the head, auto-merge and the merge queue, the admin-merge rules and the rest of the write-identity gates. The merge evidence records `releasedProtectedFiles` (at most 100, with `releasedProtectedFilesCount`) and `releasedBy: "config:agentMergeablePaths"`. A file-name exclusion is a speed bump, not a boundary: a new workflow file or a local action can still reach production. The boundary is GitHub's environment protection (required reviewers) on the deployment.
 
 **Fence check.** At authorization, on save and hourly (from the sync job), the
-plugin compares what the user token reaches with the policy: the user, exactly
-one App installation with selected repositories equal to
-`installationRepositories` (default: the write allowlist), and installation
-permissions, and the App's own permissions (which include account
-permissions such as SSH keys that a user token carries), equal to
-`installationPermissions` (`statuses` write, `administration` and `secrets` are
-never accepted). Each fenced repository is also pinned by its GitHub ID at
+plugin compares what the user token reaches with the policy: the user, and
+every App installation the token reaches. Each installation must belong to one
+of the company's allowed owners, not be suspended, be set to selected
+repositories and hold at least one fenced repository, and together they must
+list exactly `installationRepositories` (default: the write allowlist; at most
+250). Each installation's permissions, and the App's own permissions (which
+include account permissions such as SSH keys that a user token carries), must
+equal `installationPermissions` (`statuses` write, `administration` and
+`secrets` are never accepted), except that an installation on a personal
+account must hold no `organization_*` permission: GitHub grants those only on
+organizations. A read token is minted from the installation of the repository
+it names; a read that names none (GraphQL, search) covers the fenced
+repositories of the installation holding the most of them (then the lowest
+ID), and sees nothing of the other installations: name the repository with
+`-R` to read them. A policy with more than 100 repositories cannot be read by a
+release before this limit was raised; rolling back to one stops the company's
+managed GitHub access until the policy is trimmed. Each fenced repository is also pinned by its GitHub ID at
 the first good check: a name that later reaches another repository (deleted
 and recreated, or renamed over), or that the user token and the App see as
 different repositories, is drift. Saving the policy (or authorizing again)
