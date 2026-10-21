@@ -20,6 +20,28 @@ vi.mock("../services/issue-assignment-wakeup.js", async (importOriginal) => {
   return { ...actual, queueIssueAssignmentWakeup: vi.fn(async () => undefined) };
 });
 
+// A board change that lands after the route has read the routine and checked the caller, and before the
+// service reads the routine again. The step runs once, just before the next `runRoutine` call.
+const raceBeforeService = vi.hoisted(() => ({ step: null as (() => Promise<void>) | null }));
+vi.mock("../services/routines.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/routines.js")>();
+  return {
+    ...actual,
+    routineService: (...args: Parameters<typeof actual.routineService>) => {
+      const service = actual.routineService(...args);
+      return {
+        ...service,
+        runRoutine: async (...runArgs: Parameters<typeof service.runRoutine>) => {
+          const step = raceBeforeService.step;
+          raceBeforeService.step = null;
+          await step?.();
+          return service.runRoutine(...runArgs);
+        },
+      };
+    },
+  };
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -31,6 +53,43 @@ if (!embeddedPostgresSupport.supported) {
 
 function step(key: string, after: string[] = [], extra: Partial<RoutineStep> = {}): RoutineStep {
   return { key, title: `Step ${key}`, after, ...extra };
+}
+
+const lowTrustPermissions = (companyId: string, projectIds: string[]) => ({
+  authorizationPolicy: {
+    trustPreset: LOW_TRUST_REVIEW_PRESET,
+    trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, companyId, projectIds },
+  },
+});
+
+/** The policy that makes every assignment to the agent, the task or the project fail. */
+const blockAssignmentPolicy = {
+  authorizationPolicy: {
+    assignmentPolicy: { mode: "protected" },
+    protectedAgent: { blockAssignment: true, blockReason: "Release owner only" },
+    managedBy: "permissions-extension",
+  },
+};
+
+/**
+ * The database as the routes see it, with a step just before the first transaction opens: after
+ * everything a request reads to check the caller and to prepare its run, and before the run takes its
+ * locks. That is where a board change races the run. The step runs once.
+ */
+function racingDb(real: ReturnType<typeof createDb>, step: () => Promise<void>): ReturnType<typeof createDb> {
+  let pending: (() => Promise<void>) | null = step;
+  return new Proxy(real, {
+    get(target, prop) {
+      const value: unknown = Reflect.get(target, prop, target);
+      if (prop !== "transaction") return typeof value === "function" ? value.bind(target) : value;
+      return async (...args: Parameters<typeof real.transaction>) => {
+        const next = pending;
+        pending = null;
+        await next?.();
+        return target.transaction(...args);
+      };
+    },
+  });
 }
 
 describeEmbeddedPostgres("running a routine on an existing task", () => {
@@ -126,17 +185,17 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
     const childrenOf = (taskId: string) =>
       db.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.parentId, taskId)));
     const runsOf = (routineId: string) => db.select().from(routineRuns).where(eq(routineRuns.routineId, routineId));
-    return { ...company, projectId, leadId, builderId, reviewerId, createRoutine, newTask, childrenOf, runsOf, issueSvc };
+    return { ...company, projectId, leadId, builderId, reviewerId, createRoutine, newTask, childrenOf, runsOf, issueSvc, routineSvc };
   }
 
-  function appFor(actor: Record<string, unknown>) {
+  function appFor(actor: Record<string, unknown>, routeDb: ReturnType<typeof createDb> = db) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
       Object.assign(req, { actor });
       next();
     });
-    app.use("/api", routineRoutes(db));
+    app.use("/api", routineRoutes(routeDb));
     app.use(errorHandler);
     return app;
   }
@@ -506,13 +565,6 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
   });
 
   describe("for an agent", () => {
-    const lowTrustPermissions = (companyId: string, projectIds: string[]) => ({
-      authorizationPolicy: {
-        trustPreset: LOW_TRUST_REVIEW_PRESET,
-        trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, companyId, projectIds },
-      },
-    });
-
     it("starts the steps on a task the agent may change", async () => {
       const s = await seed();
       const routine = await s.createRoutine();
@@ -655,6 +707,105 @@ describeEmbeddedPostgres("running a routine on an existing task", () => {
 
       expect(response.status).toBe(403);
       expect(await s.childrenOf(task.id)).toEqual([]);
+    });
+  });
+
+  describe("when a board change races the run", () => {
+    const operatorFor = async (s: Awaited<ReturnType<typeof seed>>) => {
+      await db.insert(companyMemberships).values({
+        companyId: s.companyId,
+        principalType: "user",
+        principalId: "operator-user",
+        status: "active",
+        membershipRole: "operator",
+      });
+      return { type: "board", userId: "operator-user", source: "session", isInstanceAdmin: false, companyIds: [s.companyId] };
+    };
+
+    it("refuses an agent when the board moves the task out of its boundary after the route's check", async () => {
+      const s = await seed();
+      const elsewhereId = await s.newProject("Elsewhere");
+      const guardedId = await s.newAgent("Guarded", { permissions: lowTrustPermissions(s.companyId, [s.projectId]) });
+      const routine = await s.createRoutine({
+        assigneeAgentId: guardedId,
+        steps: [step("build"), step("review", ["build"])],
+      });
+      const quiet = await s.newTask({ assigneeAgentId: null });
+      const moved = await s.newTask({ assigneeAgentId: null });
+      const movedAway = () => db.update(issues).set({ projectId: elsewhereId }).where(eq(issues.id, moved.id)).then(() => undefined);
+
+      const control = await request(appFor(agentActor(s.companyId, guardedId)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: quiet.id });
+      const raced = await request(appFor(agentActor(s.companyId, guardedId), racingDb(db, movedAway)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: moved.id });
+
+      expect(control.status).toBe(202);
+      expect(raced.status).toBe(403);
+      expect(await s.childrenOf(moved.id)).toEqual([]);
+      expect(await s.runsOf(routine.id)).toHaveLength(1);
+      const [after] = await db.select().from(issues).where(eq(issues.id, moved.id));
+      expect(after).toMatchObject({ status: "todo", projectId: elsewhereId });
+    });
+
+    it("refuses a board member when the task starts blocking a step's agent after the route's check", async () => {
+      const s = await seed();
+      const operator = await operatorFor(s);
+      const routine = await s.createRoutine();
+      const guarded = await s.newTask();
+      const blocked = () =>
+        db.update(issues).set({ executionPolicy: blockAssignmentPolicy as never }).where(eq(issues.id, guarded.id)).then(() => undefined);
+
+      const raced = await request(appFor(operator, racingDb(db, blocked)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: guarded.id });
+
+      expect(raced.status).toBe(403);
+      expect(await s.childrenOf(guarded.id)).toEqual([]);
+      expect(await s.runsOf(routine.id)).toEqual([]);
+    });
+
+    it("refuses a run whose steps went to a blocked agent in an edit after the route's check", async () => {
+      const s = await seed();
+      const operator = await operatorFor(s);
+      const protectedId = await s.newAgent("Protected", { permissions: blockAssignmentPolicy });
+      const routine = await s.createRoutine();
+      const task = await s.newTask();
+      raceBeforeService.step = async () => {
+        await s.routineSvc.update(routine.id, { steps: [step("build", [], { assigneeAgentId: protectedId })] } as never, {
+          userId: "board-user",
+        });
+      };
+
+      const raced = await request(appFor(operator)).post(`/api/routines/${routine.id}/run`).send({ targetIssueId: task.id });
+
+      expect(raced.status).toBe(403);
+      expect(await s.childrenOf(task.id)).toEqual([]);
+      expect(await s.runsOf(routine.id)).toEqual([]);
+      const [after] = await db.select().from(issues).where(eq(issues.id, task.id));
+      expect(after).toMatchObject({ status: "todo", assigneeAgentId: s.leadId });
+    });
+
+    it("answers 409 when the routine changed after the service read it, and the same request then succeeds", async () => {
+      const s = await seed();
+      const routine = await s.createRoutine();
+      const task = await s.newTask();
+      const edited = () =>
+        s.routineSvc.update(routine.id, { title: "Release check, renamed" } as never, { userId: "board-user" }).then(() => undefined);
+
+      const raced = await request(appFor(boardActor(s.companyId), racingDb(db, edited)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: task.id });
+      const retried = await request(appFor(boardActor(s.companyId)))
+        .post(`/api/routines/${routine.id}/run`)
+        .send({ targetIssueId: task.id });
+
+      expect(raced.status).toBe(409);
+      expect(raced.body.error).toContain("changed while the run was starting");
+      expect(retried.status).toBe(202);
+      expect(await s.childrenOf(task.id)).toHaveLength(2);
+      expect(await s.runsOf(routine.id)).toHaveLength(1);
     });
   });
 

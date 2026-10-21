@@ -221,8 +221,9 @@ export function routineRoutes(
       assigneeUserId: string | null;
       status: string;
     },
+    decider: Pick<ReturnType<typeof accessService>, "decide"> = access,
   ) {
-    return access.decide({
+    return decider.decide({
       actor: req.actor,
       action,
       resource: {
@@ -273,26 +274,31 @@ export function routineRoutes(
    * decision on the task, and the `tasks:assign` decision under the task for each agent the steps go to.
    * Board users with company access may change every task, but the task or its project can still block
    * an assignment for them, so the `tasks:assign` decision applies to every actor.
+   *
+   * The route asks it twice. The first ask, on the rows it just read, refuses a caller early, before any
+   * guard of the attach can tell that caller the state of a task it may not see. The second ask is the
+   * one that counts: the attach calls it under the task and routine locks, with the locked rows and a
+   * `decider` on its own transaction, so a board change after the first ask cannot get past it.
    * @throws HttpError 404 when the task is missing, hidden or in another company; 403 when an agent may
    * not change it, or the actor may not assign the steps under it.
    */
   async function assertCanStartStepsOnTask(
     req: Request,
     routine: { companyId: string; assigneeAgentId: string | null; steps?: RoutineStep[] | null },
-    taskId: string,
+    task: (Parameters<typeof decideOnTask>[2] & { hiddenAt: Date | null }) | null,
     runAssigneeAgentId: string | null,
+    decider: Pick<ReturnType<typeof accessService>, "decide"> = access,
   ) {
-    const task = await issues.getById(taskId);
     if (!task || task.companyId !== routine.companyId || task.hiddenAt) throw notFound("Task not found");
     if (req.actor.type === "agent") {
-      const decision = await decideOnTask(req, "issue:mutate", task);
+      const decision = await decideOnTask(req, "issue:mutate", task, decider);
       if (!decision.allowed) throw forbidden("This agent may not change the task", { issueId: task.id });
     }
     const defaultAgentId = runAssigneeAgentId ?? routine.assigneeAgentId;
     const stepAgentIds = new Set((routine.steps ?? []).map((step) => step.assigneeAgentId ?? defaultAgentId));
     for (const assigneeAgentId of stepAgentIds) {
       const scope = { projectId: task.projectId, parentIssueId: task.id, assigneeAgentId, assigneeUserId: null };
-      const assign = await access.decide({
+      const assign = await decider.decide({
         actor: req.actor,
         action: "tasks:assign",
         resource: { type: "issue", companyId: task.companyId, issueId: null, ...scope },
@@ -845,11 +851,21 @@ export function routineRoutes(
       throw forbidden("Agents can only assign routine steps to themselves");
     }
     const targetIssueId: string | null = req.body.targetIssueId ?? null;
-    if (targetIssueId) await assertCanStartStepsOnTask(req, routine, targetIssueId, assigneeOverride);
-    const run = await svc.runRoutine(routine.id, req.body, {
+    if (targetIssueId) {
+      await assertCanStartStepsOnTask(req, routine, await issues.getById(targetIssueId), assigneeOverride);
+    }
+    const runner = {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
-    });
+    };
+    // The checks above read the task and the routine before the attach locks them, and a board change
+    // can land in between. The service asks again under the locks, on the rows it locked.
+    const run = targetIssueId
+      ? await svc.runRoutine(routine.id, req.body, runner, {
+          authorizeOnTask: ({ routine: locked, task, executor }) =>
+            assertCanStartStepsOnTask(req, locked, task, assigneeOverride, accessService(executor)),
+        })
+      : await svc.runRoutine(routine.id, req.body, runner);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: routine.companyId,

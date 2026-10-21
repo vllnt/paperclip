@@ -124,6 +124,7 @@ import {
   routineStartingStepAgentIds,
   startAttachedRoutineSteps,
   type AttachedRoutineSteps,
+  type RoutineStepTargetIssue,
   type RoutineStepsRequester,
 } from "./routine-steps.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -344,6 +345,19 @@ function stepsRequester(actor: Actor | undefined): RoutineStepsRequester | null 
 }
 type RoutineRow = typeof routines.$inferSelect;
 type RoutineTriggerRow = typeof routineTriggers.$inferSelect;
+
+/**
+ * A caller's permission check for a run on a task. The run calls it once it holds the locks of the
+ * company's issue counter, the routine and the task, and has checked that the routine is still the
+ * revision it read. So it decides on the task as locked and on the routine whose steps the run starts,
+ * and a board change cannot land between the check and the attach. It reads on `executor`, the
+ * transaction of the run; throw to refuse the run.
+ */
+export type RoutineRunOnTaskAuthorizer = (input: {
+  routine: RoutineRow;
+  task: RoutineStepTargetIssue;
+  executor: Db;
+}) => Promise<void>;
 
 const ROUTINE_DESCRIPTION_DOCUMENT_KEY = "description" as const;
 
@@ -3074,6 +3088,10 @@ export function routineService(
    * skip and gates do not apply: the caller named the task, and the task row lock lets two starts on
    * it take turns, so the second finds the first one's steps and is refused.
    * @param input.idempotencyKey A caller's key: a repeat returns the run it made instead of attaching again.
+   * @param input.authorize The caller's permission check, run under the locks (see
+   * {@link RoutineRunOnTaskAuthorizer}). A routine that has a newer revision than `input.routine`
+   * once it is locked is refused with 409, so the check and the steps both use the revision the
+   * caller read.
    */
   async function runRoutineOnIssue(input: {
     routine: typeof routines.$inferSelect;
@@ -3084,8 +3102,9 @@ export function routineService(
     assigneeAgentId?: string | null;
     idempotencyKey?: string | null;
     actor?: Actor;
+    authorize?: RoutineRunOnTaskAuthorizer;
   }) {
-    const { routine } = input;
+    const { routine, authorize } = input;
     const steps = routine.steps ?? [];
     if (steps.length === 0) throw unprocessable("The routine has no steps to start on a task");
     if (await getManagedRoutineBinding(routine)) {
@@ -3103,9 +3122,21 @@ export function routineService(
     let reusedExistingRun = false;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
-      await tx.execute(
-        sql`select id from ${routines} where ${routines.id} = ${routine.id} and ${routines.companyId} = ${routine.companyId} for update`,
-      );
+      // `routine` was read before this transaction, and so were the caller's own checks. A routine
+      // edit that landed in between has a new revision, and the steps and the agents they go to
+      // would no longer be the ones that the caller was cleared for.
+      const lockedRoutine = await tx
+        .select({ latestRevisionId: routines.latestRevisionId })
+        .from(routines)
+        .where(and(eq(routines.id, routine.id), eq(routines.companyId, routine.companyId)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!lockedRoutine) throw notFound("Routine not found");
+      if (lockedRoutine.latestRevisionId !== routine.latestRevisionId) {
+        throw conflict("The routine changed while the run was starting; send the run again", {
+          currentRevisionId: lockedRoutine.latestRevisionId,
+        });
+      }
       if (input.idempotencyKey) {
         const existing = await txDb
           .select()
@@ -3164,6 +3195,7 @@ export function routineService(
         steps,
         defaultAssigneeAgentId,
         variables: allVariables,
+        authorize: authorize && ((task, executor) => authorize({ routine, task, executor })),
         assertCanStart: (task, executor) =>
           assertStartingStepAgentsAdmitted(executor, routine, defaultAssigneeAgentId, task.projectId),
         requestedBy: stepsRequester(input.actor),
@@ -4423,7 +4455,16 @@ export function routineService(
       return result;
     },
 
-    runRoutine: async (id: string, input: RunRoutine, actor?: Actor) => {
+    /**
+     * @param options.authorizeOnTask The caller's permission check for a run on a task
+     * (`input.targetIssueId`); see {@link RoutineRunOnTaskAuthorizer}. A run without a task ignores it.
+     */
+    runRoutine: async (
+      id: string,
+      input: RunRoutine,
+      actor?: Actor,
+      options: { authorizeOnTask?: RoutineRunOnTaskAuthorizer } = {},
+    ) => {
       const routine = await getRoutineById(id);
       if (!routine) throw notFound("Routine not found");
       if (routine.status === "archived") throw conflict("Routine is archived");
@@ -4465,6 +4506,7 @@ export function routineService(
           assigneeAgentId: input.assigneeAgentId ?? null,
           idempotencyKey: input.idempotencyKey,
           actor,
+          authorize: options.authorizeOnTask,
         });
       }
       const trigger = input.triggerId ? await getTriggerById(input.triggerId) : null;
