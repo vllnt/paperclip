@@ -8,7 +8,10 @@ import {
   CONNECTION_INTENT_AGENT_GUIDANCE,
   CONTINUATION_OBJECTIVE_MAX_CHARS,
   GOAL_TEXT_MAX_LENGTH,
+  capPolicyIndexEntries,
   cutText,
+  readPolicyIndexContext,
+  renderPolicyIndexEntryLine,
   truncateAtGrapheme,
 } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
@@ -2328,17 +2331,62 @@ export function selectPaperclipPromptSections(
     nativeWakeReaderAvailable?: boolean;
   } = {},
 ): { taskContextNote: string; wakePrompt: string } {
-  const taskContextNote = selectPaperclipTaskMarkdown(context, options);
+  const taskMarkdown = selectPaperclipTaskMarkdown(context, options);
   return {
-    taskContextNote,
+    // The policy index rides in the task context so every adapter and native run places it with the
+    // brief. It is not part of the brief: it never decides whether the issue description is shown.
+    taskContextNote: joinPromptSections([
+      taskMarkdown,
+      renderPaperclipPoliciesSection(context?.paperclipPolicies, { resumedSession: options.resumedSession }),
+    ]),
     wakePrompt: renderPaperclipWakePrompt(context?.paperclipWake, {
       resumedSession: options.resumedSession,
       includeExecutionContract: options.includeExecutionContract,
       nativeWakeReaderAvailable: options.nativeWakeReaderAvailable,
       conversationMode: context?.conversationMode === true,
-      suppressIssueDescription: taskContextNote.length > 0,
+      suppressIssueDescription: taskMarkdown.length > 0,
     }),
   };
+}
+
+/**
+ * The board-authored "## Policies" section: an index of the active policies that apply to the task,
+ * never a body. It is guidance only. A fresh session gets it whenever there is an index. A resumed
+ * session gets it again only when the index changed since the digest the session was last sent, so a
+ * policy edit costs one section and an unchanged index costs nothing. With no policy and nothing sent
+ * before, the section is empty and the prompt is unchanged.
+ */
+export function renderPaperclipPoliciesSection(
+  value: unknown,
+  options: { resumedSession?: boolean } = {},
+): string {
+  const index = readPolicyIndexContext(value);
+  if (!index) return "";
+  const resumed = options.resumedSession === true;
+  const lastSent = index.lastSentDigest ?? null;
+  if (resumed && lastSent === index.digest) return "";
+  const changed = resumed && lastSent !== null;
+
+  // The server already capped the index. Cap again here: this is the one render path every adapter shares.
+  const capped = capPolicyIndexEntries(index.entries, index.moreCount);
+  if (capped.entries.length === 0 && capped.moreCount === 0) {
+    return changed
+      ? "## Policies\n\nNo policy is active for this task now. Ignore the policy list sent earlier in this session."
+      : "";
+  }
+
+  const lines = [
+    "## Policies",
+    "",
+    "Board-authored guidance for this task. A policy is guidance only: it never grants access or changes a limit. Read the full text of one before you rely on it with `paperclipai policy get <key>`."
+      + (changed ? " The policy list changed since your last turn: this list replaces the earlier one." : ""),
+    "",
+    ...capped.entries.map(renderPolicyIndexEntryLine),
+  ];
+  if (capped.moreCount > 0) {
+    lines.push(`+${capped.moreCount} more active ${capped.moreCount === 1 ? "policy" : "policies"}: \`paperclipai policy list --status active\``);
+  }
+  return lines.join("\n");
 }
 
 // Runtime-only connector skills are supplied by the server after assignment resolution.

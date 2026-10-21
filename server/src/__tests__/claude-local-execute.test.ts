@@ -1570,6 +1570,105 @@ describe("claude execute", () => {
     }
   }, 15_000);
 
+  it("keeps the prompt bundle, the instructions and the resume when the policy index changes", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-policies-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    const instructionsPath = path.join(root, "runs", "run-1", "live", "AGENTS.md");
+    const paperclipHome = path.join(root, "paperclip-home");
+    const captures = [1, 2, 3].map((n) => path.join(root, `capture-${n}.json`));
+    const logs: string[] = [];
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(path.dirname(instructionsPath), { recursive: true });
+    await fs.writeFile(instructionsPath, "You are managed instructions.\n", "utf8");
+    await writeFakeClaudeCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+
+    const index = (key: string, digest: string, lastSentDigest: string | null) => ({
+      entries: [{ state: "active", key, title: `Title of ${key}`, summary: `Summary of ${key}.`, scope: "company", via: "scope" }],
+      moreCount: 0,
+      digest,
+      lastSentDigest,
+    });
+    const runWith = (n: number, paperclipPolicies: unknown, sessionParams: Record<string, unknown> | null) =>
+      execute({
+        runId: `run-${n}`,
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: { sessionId: null, sessionParams, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          instructionsFilePath: instructionsPath,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: captures[n - 1] },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: { paperclipPolicies },
+        authToken: "run-jwt-token",
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+        },
+      });
+    const read = async (n: number) => JSON.parse(await fs.readFile(captures[n - 1], "utf8")) as CapturePayload;
+    const resumeParams = (result: Awaited<ReturnType<typeof runWith>>) =>
+      sessionCodec.deserialize(sessionCodec.serialize(result.sessionParams ?? null));
+
+    try {
+      const first = await runWith(1, index("first-rule", "digest-a", null), null);
+      expect(first.exitCode).toBe(0);
+      // The board edits a policy between the turns: the index changed and the session was told digest-a.
+      const second = await runWith(2, index("second-rule", "digest-b", "digest-a"), resumeParams(first));
+      expect(second.exitCode).toBe(0);
+      // Nothing changed: the session already holds digest-b.
+      const third = await runWith(3, index("second-rule", "digest-b", "digest-b"), resumeParams(second));
+      expect(third.exitCode).toBe(0);
+
+      const [capture1, capture2, capture3] = [await read(1), await read(2), await read(3)];
+      expect(capture1.prompt).toContain("## Policies");
+      expect(capture1.prompt).toContain("first-rule");
+      expect(capture2.prompt).toContain("second-rule");
+      expect(capture2.prompt).toContain("this list replaces the earlier one");
+      expect(capture3.prompt).not.toContain("## Policies");
+
+      // The session resumed every time, on the same prompt bundle.
+      for (const capture of [capture2, capture3]) {
+        expect(capture.argv).toContain("--resume");
+        expect(capture.addDir).toBe(capture1.addDir);
+      }
+      expect(second.sessionParams?.promptBundleKey).toBe(first.sessionParams?.promptBundleKey);
+      expect(third.sessionParams?.promptBundleKey).toBe(first.sessionParams?.promptBundleKey);
+      expect(logs.join("")).not.toContain("will not be resumed");
+
+      // No policy text reached the instructions, their file or the bundle.
+      expect(capture1.instructionsContents).toContain("You are managed instructions.");
+      for (const capture of [capture1, capture2, capture3]) {
+        expect(capture.instructionsContents ?? "").not.toMatch(/Policies|first-rule|second-rule/);
+      }
+      expect(await fs.readFile(instructionsPath, "utf8")).toBe("You are managed instructions.\n");
+      expect(capture2.skillEntries).toEqual(capture1.skillEntries);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("resumes a Claude session when each run reads the same instructions from its own copy", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-copies-"));
     const workspace = path.join(root, "workspace");

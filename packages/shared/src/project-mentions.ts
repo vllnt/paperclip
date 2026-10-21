@@ -1,9 +1,12 @@
+import { COMPANY_POLICY_KEY_MAX_LENGTH, COMPANY_POLICY_KEY_PATTERN } from "./constants.js";
+
 export const PROJECT_MENTION_SCHEME = "project://";
 export const AGENT_MENTION_SCHEME = "agent://";
 export const USER_MENTION_SCHEME = "user://";
 export const SKILL_MENTION_SCHEME = "skill://";
 export const ROUTINE_MENTION_SCHEME = "routine://";
 export const PIPELINE_MENTION_SCHEME = "pipeline://";
+export const POLICY_MENTION_SCHEME = "policy://";
 
 const HEX_COLOR_RE = /^[0-9a-f]{6}$/i;
 const HEX_COLOR_SHORT_RE = /^[0-9a-f]{3}$/i;
@@ -15,6 +18,7 @@ const USER_MENTION_LINK_RE = /\[[^\]]*]\((user:\/\/[^)\s]+)\)/gi;
 const SKILL_MENTION_LINK_RE = /\[[^\]]*]\((skill:\/\/[^)\s]+)\)/gi;
 const ROUTINE_MENTION_LINK_RE = /\[[^\]]*]\((routine:\/\/[^)\s]+)\)/gi;
 const PIPELINE_MENTION_LINK_RE = /\[[^\]]*]\((pipeline:\/\/[^)\s]+)\)/gi;
+const POLICY_MENTION_LINK_RE = /\[[^\]]*]\((policy:\/\/[^)\s]+)\)/gi;
 const AGENT_ICON_NAME_RE = /^[a-z0-9-]+$/i;
 const SKILL_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/i;
 
@@ -39,6 +43,10 @@ export interface ParsedSkillMention {
 
 export interface ParsedRoutineMention {
   routineId: string;
+}
+
+export interface ParsedPolicyMention {
+  key: string;
 }
 
 export interface ParsedPipelineMention {
@@ -230,6 +238,33 @@ export function parsePipelineMentionHref(href: string): ParsedPipelineMention | 
   return { pipelineId, stageKey };
 }
 
+export function buildPolicyMentionHref(key: string): string {
+  return `${POLICY_MENTION_SCHEME}${key.trim()}`;
+}
+
+/**
+ * A policy mention names a policy by its key. A key is a lowercase slug, so a mention with capitals
+ * names the same policy as its lowercase form. A malformed key, with a space, a slash or a symbol,
+ * is not a mention.
+ */
+export function parsePolicyMentionHref(href: string): ParsedPolicyMention | null {
+  if (!href.startsWith(POLICY_MENTION_SCHEME)) return null;
+
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    return null;
+  }
+
+  if (url.protocol !== "policy:") return null;
+
+  const key = `${url.hostname}${url.pathname}`.replace(/^\/+/, "").trim().toLowerCase();
+  if (key.length > COMPANY_POLICY_KEY_MAX_LENGTH || !COMPANY_POLICY_KEY_PATTERN.test(key)) return null;
+
+  return { key };
+}
+
 export function extractProjectMentionIds(markdown: string): string[] {
   if (!markdown) return [];
   const ids = new Set<string>();
@@ -288,6 +323,18 @@ export function extractRoutineMentionIds(markdown: string): string[] {
     if (parsed) ids.add(parsed.routineId);
   }
   return [...ids];
+}
+
+export function extractPolicyMentionKeys(markdown: string): string[] {
+  if (!markdown) return [];
+  const keys = new Set<string>();
+  const re = new RegExp(POLICY_MENTION_LINK_RE);
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(markdown)) !== null) {
+    const parsed = parsePolicyMentionHref(match[1]);
+    if (parsed) keys.add(parsed.key);
+  }
+  return [...keys];
 }
 
 export function extractPipelineMentions(markdown: string): ParsedPipelineMention[] {

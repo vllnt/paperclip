@@ -661,6 +661,11 @@ import {
   isResolvedInteractionContinuationWakeContext,
 } from "../modules/run-dispatch/index.js";
 import {
+  POLICY_INDEX_SESSION_DIGEST_KEY,
+  createPolicyIndexResolver,
+  readPolicyIndexSessionDigest,
+} from "../modules/policy-index/index.js";
+import {
   AUTOMATION_WAKE_COALESCED_PAYLOAD_KEY,
   AUTOMATION_WAKE_REASON_SET,
   buildAutomationWakeCoalescedState,
@@ -6459,6 +6464,8 @@ const SESSION_CONFIG_CATEGORIES_KEY = "__paperclipConfigCategories";
 const SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY =
   "__paperclipConfigCategoryFingerprints";
 const PAPERCLIP_SESSION_METADATA_KEYS = new Set([
+  // Server-owned and never read by an adapter. It is not part of the config fingerprint above.
+  POLICY_INDEX_SESSION_DIGEST_KEY,
   SESSION_AI_CREDENTIAL_IDENTITY_KEY,
   SESSION_CONFIGURED_MODEL_KEY,
   SESSION_CONFIG_FINGERPRINT_KEY,
@@ -7030,7 +7037,7 @@ function isPathInsideRoot(input: { rootPath: string; filePath: string }) {
   );
 }
 
-function resolveRootBoundInstructionsFingerprintPath(input: {
+export function resolveRootBoundInstructionsFingerprintPath(input: {
   instructionsFilePath: string | null;
   instructionsRootPath: string | null;
   instructionsEntryFile: string | null;
@@ -7467,14 +7474,16 @@ function readConfiguredModelFromAdapterConfig(
   return readNonEmptyString(adapterConfig?.model);
 }
 
-function attachPaperclipSessionMetadataToSessionParams(
+export function attachPaperclipSessionMetadataToSessionParams(
   sessionParams: Record<string, unknown> | null | undefined,
   configuredModel: string | null,
   configMetadata?: EffectiveRunSessionConfigMetadata | null,
+  policiesLastSentDigest?: string | null,
 ) {
-  if (!configuredModel && !configMetadata) return sessionParams ?? null;
+  if (!configuredModel && !configMetadata && !policiesLastSentDigest) return sessionParams ?? null;
   const next = { ...(sessionParams ?? {}) };
   if (configuredModel) next[SESSION_CONFIGURED_MODEL_KEY] = configuredModel;
+  if (policiesLastSentDigest) next[POLICY_INDEX_SESSION_DIGEST_KEY] = policiesLastSentDigest;
   if (configMetadata) {
     if (configMetadata.aiCredentialIdentity) next[SESSION_AI_CREDENTIAL_IDENTITY_KEY] = configMetadata.aiCredentialIdentity;
     next[SESSION_CONFIG_FINGERPRINT_KEY] = configMetadata.fingerprint;
@@ -10296,6 +10305,9 @@ export function heartbeatService(
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
+  const policyIndexResolver = createPolicyIndexResolver(db, {
+    onSourceError: (source, err) => logger.warn({ err, source }, "a policy mention source could not be read"),
+  });
   const treeControlSvc = issueTreeControlService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const environmentsSvc = environmentService(db);
@@ -25337,6 +25349,37 @@ export function heartbeatService(
             ),
           ),
         );
+      // The policy index is runtime-only: always replace it, caller wake data cannot supply one. A resumed
+      // session is told only what changed, so the digest it was last sent comes from its stored params. An
+      // explicit resume names another session, so the task session's digest does not apply to it.
+      delete context.paperclipPolicies;
+      const previousPoliciesDigest =
+        explicitResumeSessionParams ||
+        isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId)
+          ? null
+          : readPolicyIndexSessionDigest(taskSessionForRun?.sessionParamsJson);
+      let policiesDigestForSession: string | null = previousPoliciesDigest;
+      if (issueRef) {
+        try {
+          const committedInstructions = resolveRootBoundInstructionsFingerprintPath({
+            instructionsFilePath: readNonEmptyString(runtimeConfig.instructionsFilePath),
+            instructionsRootPath: readNonEmptyString(runtimeConfig.instructionsRootPath),
+            instructionsEntryFile: readNonEmptyString(runtimeConfig.instructionsEntryFile),
+          });
+          const policyIndex = await policyIndexResolver.resolve({
+            companyId: agent.companyId,
+            projectId: issueRef.projectId ?? null,
+            issue: { id: issueRef.id, title: issueRef.title, description: issueRef.description ?? null },
+            instructionsFilePath: committedInstructions.filePath ?? undefined,
+            skillKeys: runtimeSkillEntries.map((entry) => entry.key),
+          });
+          context.paperclipPolicies = { ...policyIndex, lastSentDigest: previousPoliciesDigest };
+          policiesDigestForSession = policyIndex.digest;
+        } catch (err) {
+          // Policies are guidance. A failed index costs this run its list, never the run.
+          logger.warn({ err, runId: run.id }, "failed to build the policy index for the run");
+        }
+      }
       // Legacy plugins can consume the existing context field on a known-fresh
       // dispatch. Built-ins also load lazily if their resume attempt fails.
       if (agent.adapterType !== "paperclip_runner" && !previousSessionParams && getFreshSessionHandoff) {
@@ -28293,6 +28336,7 @@ export function heartbeatService(
                           },
                           configuredModel,
                           sessionConfigMetadata,
+                          policiesDigestForSession,
                         )!;
                       const displayId =
                         snapshot.providerSessionId ?? snapshot.sessionId;
@@ -28579,6 +28623,7 @@ export function heartbeatService(
                             next.params,
                             configuredModel,
                             sessionConfigMetadata,
+                            policiesDigestForSession,
                           ),
                           sessionDisplayId: next.displayId,
                           lastRunId: run.id,
@@ -29681,6 +29726,7 @@ export function heartbeatService(
                     nextSessionState.params,
                     configuredModel,
                     sessionConfigMetadata,
+                    policiesDigestForSession,
                   ),
                 sessionDisplayId: nextSessionState.displayId,
                 lastRunId: finalizedRun.id,
@@ -30052,6 +30098,8 @@ export function heartbeatService(
                   previousSessionParams,
                   configuredModel,
                   sessionConfigMetadata,
+                  // A failed run re-saves the session it started with: keep what that session was last told.
+                  previousPoliciesDigest,
                 ),
               sessionDisplayId:
                 goalCheckpointSession.current?.displayId ??
