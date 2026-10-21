@@ -1475,7 +1475,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
           suppressHtmlProcessing
           placeholder={placeholder}
           readOnly={readOnly}
-          onChange={(rawNext) => {
+          onChange={(rawNext, initialMarkdownNormalize) => {
             if (readOnly) return;
             // Reverse the editor-only rewrites: blockquotes the exporter escaped
             // as `\>` (so a `>`-prefixed line the user typed survives even when
@@ -1502,6 +1502,17 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
                 ref.current?.setMarkdown(editorValue);
                 return;
               }
+            }
+            // On import MDXEditor re-serializes the value it was handed: another
+            // bullet marker, spacing, emphasis style. That is the editor's own
+            // spelling of the same document, not an edit, so the parent keeps the
+            // value it stored. A form that compares against the saved value would
+            // otherwise open dirty. The editor only clears the flag on its first
+            // update, which an empty document never has, so the first keystroke of
+            // an empty editor still reaches the parent.
+            if (initialMarkdownNormalize && editorValue.trim() !== "") {
+              latestValueRef.current = editorValue;
+              return;
             }
             // `latestValueRef` is compared against `editorValue`, so it has to
             // hold editor space; storing `next` would make every edit containing
