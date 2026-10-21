@@ -1705,6 +1705,56 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it("admits the issue wait route and nothing next to it", () => {
+    const allowed: Array<{ method: string; path: string }> = [
+      { method: "POST", path: "/api/issues/6c75cff9-f7cf-4745-a84c-4ddf8eea7e76/wait" },
+      { method: "POST", path: "/api/issues/PAP-224/wait" },
+    ];
+    for (const request of allowed) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
+      expect(
+        authorizeSandboxCallbackBridgeRequestWithRoutes(request, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST),
+      ).toBeNull();
+    }
+
+    const denied: Array<{ method: string; path: string }> = [
+      { method: "GET", path: "/api/issues/issue-1/wait" },
+      { method: "PUT", path: "/api/issues/issue-1/wait" },
+      { method: "PATCH", path: "/api/issues/issue-1/wait" },
+      { method: "DELETE", path: "/api/issues/issue-1/wait" },
+      { method: "POST", path: "/api/issues/issue-1/wait/x" },
+      { method: "POST", path: "/api/issues/issue-1/wait/" },
+      { method: "POST", path: "/api/issues/issue-1/x/wait" },
+      { method: "POST", path: "/api/issues//wait" },
+      // The monitor routes next to it stay denied: only `wait` is admitted.
+      { method: "POST", path: "/api/issues/issue-1/monitor/check-now" },
+      { method: "DELETE", path: "/api/issues/issue-1/monitor" },
+      // queue_v1 forwards the raw path: no encoded, dot, query, fragment or backslash segment may ride on the rule.
+      { method: "POST", path: "/api/issues/issue-1/wait?in=10m" },
+      { method: "POST", path: "/api/issues/issue-1/wait#x" },
+      { method: "POST", path: "/api/issues/issue-1?/wait" },
+      { method: "POST", path: "/api/issues/issue-1#/wait" },
+      { method: "POST", path: "/api/issues/issue-1%2fx/wait" },
+      { method: "POST", path: "/api/issues/issue-1/wait%2fx" },
+      { method: "POST", path: "/api/issues/issue-1%2fwait" },
+      { method: "POST", path: "/api/issues/issue-1/%77ait" },
+      { method: "POST", path: "/api/issues/..%2Fissue-1/wait" },
+      { method: "POST", path: "/api/issues/../wait" },
+      { method: "POST", path: "/api/issues/./wait" },
+      { method: "POST", path: "/api/issues/%2e%2e/wait" },
+      { method: "POST", path: "/api/issues/issue.1/wait" },
+      { method: "POST", path: "/api/issues/issue-1\\x/wait" },
+    ];
+    for (const request of denied) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
+        `Route not allowed: ${request.method} ${request.path}`,
+      );
+      expect(
+        authorizeSandboxCallbackBridgeRequestWithRoutes(request, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST),
+      ).toBe(`Route not allowed: ${request.method} ${request.path}`);
+    }
+  });
+
   it("admits listing, uploads and downloads on the default queue route list", () => {
     const attachmentRequests: Array<{ method: string; path: string }> = [
       { method: "GET", path: "/api/issues/issue-1/attachments" },
