@@ -1266,17 +1266,19 @@ describe("claude execute", () => {
     expect(calls).toBe(2);
   });
 
-  it("allows remote session resumes when saved cwd is the host workspace", () => {
+  it("resumes a session only in the host workspace it was saved with", () => {
     expect(claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd: "/host/workspace",
-      effectiveExecutionCwd: "/remote/workspace",
-      executionTargetIsRemote: true,
+      hostCwd: "/host/workspace",
     })).toBe(true);
     expect(claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd: "/host/workspace",
-      effectiveExecutionCwd: "/remote/workspace",
-      executionTargetIsRemote: false,
+      hostCwd: "/host/other-workspace",
     })).toBe(false);
+    expect(claudeSessionCwdMatchesExecutionTarget({
+      runtimeSessionCwd: "",
+      hostCwd: "/host/workspace",
+    })).toBe(true);
   });
 
   it("reuses a stable Paperclip-managed Claude prompt bundle across equivalent runs", async () => {
@@ -1557,6 +1559,96 @@ describe("claude execute", () => {
       expect(after.argv).not.toContain("--resume");
       expect(after.prompt).toContain("Follow the paperclip heartbeat.");
       expect(logs.join("")).toContain("will not be resumed with");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("resumes a Claude session when each run reads the same instructions from its own copy", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-copies-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    const capturePath1 = path.join(root, "capture-1.json");
+    const capturePath2 = path.join(root, "capture-2.json");
+    const instructionsPath1 = path.join(root, "runs", "run-1", "live", "AGENTS.md");
+    const instructionsPath2 = path.join(root, "runs", "run-2", "live", "AGENTS.md");
+    const paperclipHome = path.join(root, "paperclip-home");
+    const logs: string[] = [];
+    await fs.mkdir(workspace, { recursive: true });
+    for (const instructionsPath of [instructionsPath1, instructionsPath2]) {
+      await fs.mkdir(path.dirname(instructionsPath), { recursive: true });
+      await fs.writeFile(instructionsPath, "You are managed instructions.\n", "utf8");
+    }
+    await writeFakeClaudeCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+
+    const runWith = (runId: string, instructionsFilePath: string, capturePath: string, sessionParams: Record<string, unknown> | null) =>
+      execute({
+        runId,
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          instructionsFilePath,
+          env: {
+            PAPERCLIP_TEST_CAPTURE_PATH: capturePath,
+          },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+        },
+      });
+
+    try {
+      const first = await runWith("run-1", instructionsPath1, capturePath1, null);
+      expect(first.exitCode).toBe(0);
+      const second = await runWith(
+        "run-2",
+        instructionsPath2,
+        capturePath2,
+        sessionCodec.deserialize(sessionCodec.serialize(first.sessionParams ?? null)),
+      );
+      expect(second.exitCode).toBe(0);
+      expect(second.errorMessage).toBeNull();
+
+      const capture1 = JSON.parse(await fs.readFile(capturePath1, "utf8")) as CapturePayload;
+      const capture2 = JSON.parse(await fs.readFile(capturePath2, "utf8")) as CapturePayload;
+      expect(capture1.instructionsContents).toContain(`The above agent instructions were loaded from ${instructionsPath1}.`);
+      expect(capture2.argv).toContain("--resume");
+      expect(capture2.argv).toContain("11111111-1111-4111-8111-111111111111");
+      expect(second.sessionParams?.promptBundleKey).toBe(first.sessionParams?.promptBundleKey);
+      // The resumed session still holds run-1's instructions path, so the prompt names this run's copy.
+      expect(capture2.prompt).toContain(`Resolve any relative file references from ${path.dirname(instructionsPath2)}/.`);
+      expect(capture1.prompt).not.toContain("Resolve any relative file references");
+      expect(logs.join("")).not.toContain("will not be resumed");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
