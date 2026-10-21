@@ -17305,7 +17305,12 @@ export function heartbeatService(
     const quotaHeldUntil = storedAgentForQuota
       ? await harnessFallback.heldUntil(storedAgentForQuota, now, await resolveRunProfileForRun(run, storedAgentForQuota))
       : null;
-    const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
+    // A run the daily cap cancelled cannot start again before the cap window resets.
+    const dailyCapResetsAt =
+      run.errorCode === "heartbeat.daily_run_limit" || run.errorCode === "heartbeat.daily_cost_limit"
+        ? currentUtcDayWindow(run.finishedAt ?? now).end
+        : null;
+    const notBefore = [transientRetryNotBefore, quotaHeldUntil, dailyCapResetsAt, opts?.notBefore ?? null]
       .filter((value): value is Date => value !== null)
       .reduce<Date | null>((latest, value) => (!latest || value > latest ? value : latest), null);
     const notBeforeSchedule =
@@ -19163,6 +19168,8 @@ export function heartbeatService(
    * `countedDailyRuns`, and nowhere else.
    *
    * Counted: runs started in the day that are not queued or waiting to retry.
+   * A run that a harness fallback re-dispatched or a restart resume continued
+   * is charged on its successor instead, so the pair counts once.
    * `providerQuotaBeforeUsefulAction` is the part of them that failed on a
    * provider quota before any useful action; `countedDailyRuns` decides how
    * many of those the cap forgives.
@@ -19194,6 +19201,13 @@ export function heartbeatService(
         where fallback_successor.company_id = ${heartbeatRuns.companyId}
           and fallback_successor.retry_of_run_id = ${heartbeatRuns.id}
           and fallback_successor.scheduled_retry_reason = ${HARNESS_FALLBACK_RETRY_REASON}
+      )`,
+      // A run that a server restart cut short is charged once, on its resume.
+      sql`not exists (
+        select 1 from heartbeat_runs resume_successor
+        where resume_successor.company_id = ${heartbeatRuns.companyId}
+          and resume_successor.retry_of_run_id = ${heartbeatRuns.id}
+          and resume_successor.scheduled_retry_reason = ${PLANNED_RESTART_RESUME_RETRY_REASON}
       )`,
       ...(options.agentId ? [eq(heartbeatRuns.agentId, options.agentId)] : []),
       ...(options.excludeRunId ? [sql`${heartbeatRuns.id} <> ${options.excludeRunId}`] : []),
