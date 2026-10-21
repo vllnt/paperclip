@@ -62,6 +62,13 @@ describe("activity formatting", () => {
     expect(formatActivityVerb("heartbeat.deferred_wake_held")).toBe("is holding a deferred wake on");
   });
 
+  it("names a deferred wake the sweep closed, and why", () => {
+    expect(formatActivityVerb("heartbeat.deferred_wake_closed", { reason: "superseded" })).toBe(
+      "closed a superseded deferred wake on",
+    );
+    expect(formatActivityVerb("heartbeat.deferred_wake_closed")).toBe("closed a deferred wake on");
+  });
+
   it("formats reviewer activity using agent names", () => {
     const details = {
       addedParticipants: [

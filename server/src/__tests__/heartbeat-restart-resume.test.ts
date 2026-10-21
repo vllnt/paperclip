@@ -389,7 +389,7 @@ describeEmbeddedPostgres("heartbeat restart resume", () => {
         (run) => {
           const issueId = (run.contextSnapshot as { issueId?: string } | null)?.issueId;
           return issueId
-            ? { priority: priorities.get(issueId), inProgress: false, dependencyReady: true }
+            ? { priority: priorities.get(issueId), inProgress: false, dependencyReady: true, routineRunsFirst: false }
             : null;
         },
         new Date(),

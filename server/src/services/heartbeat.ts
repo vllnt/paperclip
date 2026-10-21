@@ -675,6 +675,9 @@ import {
   selectDeferredWakesToPromote,
   selfReblockWakeWindowStart,
   sweepPromotionBudget,
+  COALESCIBLE_PARKED_WAKE_REASONS,
+  decideDeferredWakeDisposition,
+  QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY,
   WakeQueueApplicationError,
   type IssueSnapshot as WakeQueueIssueSnapshot,
   type OrphanedDeferredWakeRow,
@@ -1040,10 +1043,10 @@ const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const DEFERRED_WAKE_HELD_ACTION = "heartbeat.deferred_wake_held";
 /** A wake the sweep keeps parked this long after it was requested gets one held activity entry. */
 const DEFERRED_WAKE_HELD_NOTICE_MS = 10 * 60 * 1000;
+/** A parked wake the sweep closes instead of running, recorded on its issue with the reason. */
+const DEFERRED_WAKE_CLOSED_ACTION = "heartbeat.deferred_wake_closed";
 type DeferredWakeHeldReason =
-  /** The agent has no free run slot. */
-  | "no_free_run_slot"
-  /** The pass budget ran out, or an older wake of the same issue went first. */
+  /** The pass or per-agent budget ran out, or an older wake of the same issue went first. */
   | "waiting_for_turn"
   | "agent_not_invokable"
   | "budget_stop"
@@ -10184,6 +10187,9 @@ function deferredWakeCountersForCompany(companyId: string): DeferredWakeSweepCou
       examined: 0,
       promoted: 0,
       retired: 0,
+      superseded: 0,
+      keptForHandoff: 0,
+      coalesced: 0,
       stillDeferred: 0,
       skippedHeld: 0,
       skippedPauseHold: 0,
@@ -17299,7 +17305,12 @@ export function heartbeatService(
     const quotaHeldUntil = storedAgentForQuota
       ? await harnessFallback.heldUntil(storedAgentForQuota, now, await resolveRunProfileForRun(run, storedAgentForQuota))
       : null;
-    const notBefore = [transientRetryNotBefore, quotaHeldUntil, opts?.notBefore ?? null]
+    // A run the daily cap cancelled cannot start again before the cap window resets.
+    const dailyCapResetsAt =
+      run.errorCode === "heartbeat.daily_run_limit" || run.errorCode === "heartbeat.daily_cost_limit"
+        ? currentUtcDayWindow(run.finishedAt ?? now).end
+        : null;
+    const notBefore = [transientRetryNotBefore, quotaHeldUntil, dailyCapResetsAt, opts?.notBefore ?? null]
       .filter((value): value is Date => value !== null)
       .reduce<Date | null>((latest, value) => (!latest || value > latest ? value : latest), null);
     const notBeforeSchedule =
@@ -19157,6 +19168,8 @@ export function heartbeatService(
    * `countedDailyRuns`, and nowhere else.
    *
    * Counted: runs started in the day that are not queued or waiting to retry.
+   * A run that a harness fallback re-dispatched or a restart resume continued
+   * is charged on its successor instead, so the pair counts once.
    * `providerQuotaBeforeUsefulAction` is the part of them that failed on a
    * provider quota before any useful action; `countedDailyRuns` decides how
    * many of those the cap forgives.
@@ -19188,6 +19201,13 @@ export function heartbeatService(
         where fallback_successor.company_id = ${heartbeatRuns.companyId}
           and fallback_successor.retry_of_run_id = ${heartbeatRuns.id}
           and fallback_successor.scheduled_retry_reason = ${HARNESS_FALLBACK_RETRY_REASON}
+      )`,
+      // A run that a server restart cut short is charged once, on its resume.
+      sql`not exists (
+        select 1 from heartbeat_runs resume_successor
+        where resume_successor.company_id = ${heartbeatRuns.companyId}
+          and resume_successor.retry_of_run_id = ${heartbeatRuns.id}
+          and resume_successor.scheduled_retry_reason = ${PLANNED_RESTART_RESUME_RETRY_REASON}
       )`,
       ...(options.agentId ? [eq(heartbeatRuns.agentId, options.agentId)] : []),
       ...(options.excludeRunId ? [sql`${heartbeatRuns.id} <> ${options.excludeRunId}`] : []),
@@ -22044,8 +22064,8 @@ export function heartbeatService(
       await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
-      await startNextQueuedRunForAgent(run.agentId);
       await redeliverDeferredWakesForAgent(run.agentId);
+      await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
     }
@@ -22177,8 +22197,9 @@ export function heartbeatService(
   }
 
   const countersForCompany = deferredWakeCountersForCompany;
-  // The completion trigger runs after a run frees a slot. Promotion queues a run
-  // whose start calls `startNextQueuedRunForAgent` again, so one pass per agent.
+  // The completion trigger runs when a run frees a slot, before the slot is
+  // filled. A promoted run can finish and fire the trigger again, so one pass
+  // per agent.
   const deferredWakeCompletionPassesInFlight = new Set<string>();
 
   /**
@@ -22325,7 +22346,7 @@ export function heartbeatService(
       eq(agentWakeupRequests.companyId, candidate.companyId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
     ));
-    if (!wake) return "retired" as const;
+    if (!wake) return { outcome: "retired" as const, runId: null };
     // The context rides inside the receipt's payload; hand it back as the
     // wake's context so the successor run is built as the original would be.
     const { [DEFERRED_WAKE_CONTEXT_KEY]: deferredContext, ...payload } = parseObject(wake.payload);
@@ -22336,7 +22357,9 @@ export function heartbeatService(
       // A parked receipt's own reason is the deferral; the wake's reason is in its context.
       reason: readNonEmptyString(context.wakeReason) ?? wake.reason,
       payload,
-      contextSnapshot: context,
+      // The queue measures the run's wait from the original request, so a
+      // wake that sat parked keeps its place among the agent's queued runs.
+      contextSnapshot: { ...context, [QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY]: wake.requestedAt.toISOString() },
       requestedByActorType: (wake.requestedByActorType ?? undefined) as WakeupOptions["requestedByActorType"],
       requestedByActorId: wake.requestedByActorId,
       redeliverDeferredWake: true,
@@ -22345,8 +22368,56 @@ export function heartbeatService(
       .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.id, candidate.wakeId));
-    if (!after || after.status === "deferred_issue_execution") return "stillDeferred" as const;
-    return after.runId ? ("promoted" as const) : ("retired" as const);
+    if (!after || after.status === "deferred_issue_execution") return { outcome: "stillDeferred" as const, runId: null };
+    return after.runId
+      ? { outcome: "promoted" as const, runId: after.runId }
+      : { outcome: "retired" as const, runId: null };
+  }
+
+  /**
+   * Closes a superseded orphaned parked wake, which the sweep must not run,
+   * and records why on its issue, in one transaction under the issue row lock,
+   * which serializes it with admission.
+   *
+   * @returns Whether this call closed the wake; `false` when another writer moved
+   * or touched it first, or a superseded wake's agent holds the issue again.
+   */
+  async function closeSupersededParkedWake(wake: OrphanedDeferredWakeRow) {
+    const error = "Superseded: the issue is no longer assigned to this agent. This wake will not run.";
+    const publications: ActivityPublication[] = [];
+    const closed = await db.transaction(async (tx) => {
+      const txDb = tx as unknown as Db;
+      const now = new Date();
+      const closedWake = await wakeQueue.closeDeferredWake({
+        companyId: wake.companyId,
+        wakeId: wake.wakeId,
+        issueId: wake.issueId,
+        observedUpdatedAt: wake.observedUpdatedAt,
+        supersededAgentId: wake.agentId,
+        error,
+        now,
+      }, txDb);
+      if (!closedWake) return false;
+      await logActivity(txDb, {
+        companyId: wake.companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        agentId: wake.agentId,
+        action: DEFERRED_WAKE_CLOSED_ACTION,
+        entityType: "issue",
+        entityId: wake.issueId,
+        details: {
+          wakeId: wake.wakeId,
+          reason: "superseded",
+          wakeReason: wake.wakeReason,
+          parkedSince: wake.requestedAt.toISOString(),
+          issueAssigneeAgentId: wake.issueAssigneeAgentId,
+        },
+      }, publications);
+      return true;
+    });
+    for (const publication of publications) publishActivity(publication);
+    return closed;
   }
 
   /**
@@ -22355,10 +22426,15 @@ export function heartbeatService(
    * paths clear that lock without the drain (the stale-lock sweeper, the
    * claim-time stale-run cancel, a reaped holder), and the older recovery only
    * saw comment-shaped wakes of an agent that had already run the issue. This
-   * finds every wake whose open issue has no lock and no live run, skips held
-   * work, and re-delivers in priority then FIFO order, at most one per issue
-   * and one per free agent slot, and at most `DEFERRED_WAKE_SWEEP_MAX_PER_PASS`
-   * per pass so a backlog drains over several passes instead of one burst.
+   * finds every wake whose open issue has no lock and no live run, closes the
+   * ones that must not run (an assignee wake whose agent lost the issue), skips
+   * held work, and re-delivers the rest
+   * in priority then FIFO order: at most one per issue,
+   * `DEFERRED_WAKE_SWEEP_MAX_PER_AGENT_PER_PASS` per agent and
+   * `DEFERRED_WAKE_SWEEP_MAX_PER_PASS` per pass, so a backlog drains over
+   * several passes instead of one burst. A busy agent does not hold a wake
+   * back: the promoted run joins the agent's queue, which admits it into a
+   * free slot by how long it has waited since its request.
    * Idempotent: an optimistic claim on the wake and the issue-locked admission
    * mean concurrent passes can start at most one run per wake.
    */
@@ -22374,6 +22450,9 @@ export function heartbeatService(
       scanned: 0,
       promoted: 0,
       retired: 0,
+      superseded: 0,
+      keptForHandoff: 0,
+      coalesced: 0,
       stillDeferred: 0,
       skippedHeld: 0,
       skippedPauseHold: 0,
@@ -22413,41 +22492,68 @@ export function heartbeatService(
       counters.lastExaminedAt = now;
     }
 
-    // Agent facts for the whole batch: the agents, each company's org rows for
-    // the invokability chain, and each agent's running count, in three reads.
-    const agentIds = [...new Set(orphans.map((orphan) => orphan.agentId))];
-    const agentRows = await db.select().from(agents).where(inArray(agents.id, agentIds));
+    // Close what must not run before anything is chosen: an assignee wake
+    // whose agent no longer holds the issue. One that carries saved input stays
+    // parked for the new assignee's admission to adopt, at the back of the
+    // recheck window. Every other wake runs, however long it waited.
+    const runnableOrphans: OrphanedDeferredWakeRow[] = [];
+    const keptForHandoff: OrphanedDeferredWakeRow[] = [];
+    for (const orphan of orphans) {
+      const disposition = decideDeferredWakeDisposition(orphan);
+      if (disposition === "promote") {
+        runnableOrphans.push(orphan);
+        continue;
+      }
+      if (disposition === "keptForHandoff") {
+        keptForHandoff.push(orphan);
+        continue;
+      }
+      const counters = countersForCompany(orphan.companyId);
+      try {
+        if (await closeSupersededParkedWake(orphan)) {
+          result.superseded += 1;
+          counters.superseded += 1;
+        }
+      } catch (err) {
+        result.failed += 1;
+        counters.failed += 1;
+        logger.warn({ err, queueId: orphan.wakeId }, "failed to close a superseded parked deferred wake");
+      }
+    }
+    if (keptForHandoff.length > 0) {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        inArray(agentWakeupRequests.id, keptForHandoff.map((orphan) => orphan.wakeId)),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      for (const orphan of keptForHandoff) countersForCompany(orphan.companyId).keptForHandoff += 1;
+      result.keptForHandoff = keptForHandoff.length;
+    }
+
+    // Agent facts for the whole batch: the agents and each company's org rows
+    // for the invokability chain. A busy agent does not hold a wake back: the
+    // promoted run waits in the agent's queue, whose claim enforces
+    // `maxConcurrentRuns`.
+    const agentIds = [...new Set(runnableOrphans.map((orphan) => orphan.agentId))];
+    const agentRows = agentIds.length > 0
+      ? await db.select().from(agents).where(inArray(agents.id, agentIds))
+      : [];
     const agentById = new Map(agentRows.map((row) => [row.id, row]));
     const orgRowsByCompany = new Map<string, AgentOrgRow[]>();
     for (const companyId of new Set(agentRows.map((row) => row.companyId))) {
       orgRowsByCompany.set(companyId, await listCompanyAgentOrgRows(companyId));
     }
-    const runningRows = await db
-      .select({ agentId: heartbeatRuns.agentId, running: sql<number>`count(*)::int` })
-      .from(heartbeatRuns)
-      .where(and(inArray(heartbeatRuns.agentId, agentIds), eq(heartbeatRuns.status, "running")))
-      .groupBy(heartbeatRuns.agentId);
-    const runningByAgent = new Map(runningRows.map((row) => [row.agentId, Number(row.running)]));
 
-    const freeSlotsByAgent = new Map<string, number>();
     const notInvokableAgentIds = new Set<string>();
     for (const agentId of agentIds) {
       const agent = agentById.get(agentId);
       if (!agent) continue;
       const invokable = evaluateAgentInvokability(toAgentOrgRow(agent), orgRowsByCompany.get(agent.companyId) ?? [])
         .invokable;
-      if (!invokable) {
-        notInvokableAgentIds.add(agentId);
-        continue;
-      }
-      freeSlotsByAgent.set(
-        agentId,
-        Math.max(0, parseHeartbeatPolicy(agent).maxConcurrentRuns - (runningByAgent.get(agentId) ?? 0)),
-      );
+      if (!invokable) notInvokableAgentIds.add(agentId);
     }
     // A wake of an agent that cannot run waits for it. Move those wakes to the
     // back of the recheck window in one write, so they cannot crowd out others.
-    const notInvokableWakes = orphans.filter((orphan) => notInvokableAgentIds.has(orphan.agentId));
+    const notInvokableWakes = runnableOrphans.filter((orphan) => notInvokableAgentIds.has(orphan.agentId));
     if (notInvokableWakes.length > 0) {
       await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
         inArray(agentWakeupRequests.id, notInvokableWakes.map((orphan) => orphan.wakeId)),
@@ -22456,27 +22562,23 @@ export function heartbeatService(
       for (const orphan of notInvokableWakes) countersForCompany(orphan.companyId).skippedNotInvokable += 1;
       result.skippedNotInvokable = notInvokableWakes.length;
     }
-    // Why each examined wake stays parked this pass; promoted wakes are removed.
+    // Why each examined wake stays parked this pass; promoted and closed wakes are removed.
     const heldReasons = new Map<string, { reason: DeferredWakeHeldReason; blocker: ExecutionBlocker | null }>(
-      orphans.map((orphan) => [
+      runnableOrphans.map((orphan) => [
         orphan.wakeId,
         {
-          reason: notInvokableAgentIds.has(orphan.agentId)
-            ? "agent_not_invokable"
-            : (freeSlotsByAgent.get(orphan.agentId) ?? 0) === 0
-              ? "no_free_run_slot"
-              : "waiting_for_turn",
+          reason: notInvokableAgentIds.has(orphan.agentId) ? "agent_not_invokable" : "waiting_for_turn",
           blocker: null,
         },
       ]),
     );
 
     // Without them, an issue is served through its oldest wake that can run now.
-    const invokableOrphans = orphans.filter((orphan) => !notInvokableAgentIds.has(orphan.agentId));
-    const selected = selectDeferredWakesToPromote(invokableOrphans, freeSlotsByAgent, {
+    const invokableOrphans = runnableOrphans.filter((orphan) => !notInvokableAgentIds.has(orphan.agentId));
+    const selected = selectDeferredWakesToPromote(invokableOrphans, {
       maxTotal: sweepPromotionBudget(opts.maxPromotions),
     });
-    // An eligible issue the pass did not select waits for a free slot or the next pass.
+    // An eligible issue the pass did not select waits for the next pass.
     const eligibleIssuesByCompany = new Map<string, Set<string>>();
     for (const orphan of invokableOrphans) {
       const issuesOfCompany = eligibleIssuesByCompany.get(orphan.companyId) ?? new Set<string>();
@@ -22545,13 +22647,37 @@ export function heartbeatService(
           heldReasons.set(candidate.wakeId, { reason: "budget_stop", blocker: null });
           continue;
         }
-        const outcome = await redeliverDeferredWake(candidate);
+        // Only wakes requested before the promotion started may be folded into
+        // its run. `requested_at` is a database time, so the start mark comes
+        // from the database clock too.
+        const promotionStartedAt = await db
+          .select({ now: sql<string>`clock_timestamp()` })
+          .from(agents)
+          .where(eq(agents.id, candidate.agentId))
+          .limit(1)
+          .then((rows) => (rows[0] ? new Date(rows[0].now) : new Date()));
+        const { outcome, runId } = await redeliverDeferredWake(candidate);
         result[outcome] += 1;
         counters[outcome] += 1;
         if (outcome === "stillDeferred") {
           heldReasons.set(candidate.wakeId, { reason: "admission_deferred", blocker: null });
         } else {
           heldReasons.delete(candidate.wakeId);
+        }
+        if (runId) {
+          // The promoted run will see the issue as it is now, so the agent's
+          // other parked signal wakes on it are folded into that run.
+          const folded = await wakeQueue.coalesceParkedSignalWakesIntoRun({
+            companyId: candidate.companyId,
+            agentId: candidate.agentId,
+            issueId: candidate.issueId,
+            runId,
+            reasons: COALESCIBLE_PARKED_WAKE_REASONS,
+            requestedAtLte: promotionStartedAt,
+            now: new Date(),
+          });
+          result.coalesced += folded.length;
+          counters.coalesced += folded.length;
         }
       } catch (err) {
         result.failed += 1;
@@ -22579,8 +22705,11 @@ export function heartbeatService(
 
   /**
    * Run-completion trigger: a run just freed one of this agent's slots, so
-   * promote its oldest (priority-aware) orphaned deferred wake now instead of
-   * waiting for the periodic sweep. Best effort; the periodic sweep is the net.
+   * queue its oldest (priority-aware) orphaned deferred wakes now instead of
+   * waiting for the periodic sweep. Callers run it before
+   * `startNextQueuedRunForAgent`, so the freed slot goes to the agent's
+   * longest-waiting work, parked or queued. Best effort; the periodic sweep is
+   * the net.
    */
   async function redeliverDeferredWakesForAgent(agentId: string) {
     if (deferredWakeCompletionPassesInFlight.has(agentId)) return;
@@ -23191,8 +23320,18 @@ export function heartbeatService(
           id: issues.id,
           status: issues.status,
           priority: issues.priority,
+          // A routine's execution and step issues carry its slot priority.
+          routineSlotPriority: routines.slotPriority,
         })
         .from(issues)
+        .leftJoin(
+          routines,
+          and(
+            eq(routines.companyId, issues.companyId),
+            inArray(issues.originKind, ["routine_execution", "routine_step"]),
+            sql`${routines.id}::text = ${issues.originId}`,
+          ),
+        )
         .where(
           queuedIssueIds.length > 0
             ? and(
@@ -23216,6 +23355,7 @@ export function heartbeatService(
             inProgress: issue?.status === "in_progress",
             dependencyReady:
               dependencyReadiness.get(issueId)?.isDependencyReady ?? true,
+            routineRunsFirst: issue?.routineSlotPriority === "first",
           };
         },
         new Date(),
@@ -30258,8 +30398,8 @@ export function heartbeatService(
               logger.warn({ err, runId: run.id }, "failed to deliver settled tool reviews after execution cleanup");
             });
         }
-        await startNextQueuedRunForAgent(run.agentId);
         await redeliverDeferredWakesForAgent(run.agentId);
+        await startNextQueuedRunForAgent(run.agentId);
       }
     }
   }
@@ -33757,8 +33897,8 @@ export function heartbeatService(
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
-        await startNextQueuedRunForAgent(run.agentId);
         await redeliverDeferredWakesForAgent(run.agentId);
+        await startNextQueuedRunForAgent(run.agentId);
       }
       return cancelled;
     } finally {

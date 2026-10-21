@@ -273,6 +273,25 @@ The change is additive and cheap: PostgreSQL stores the constant default in the 
 
 If another migration takes number 0315 first, renumber this one and run `pnpm db:generate` again, as the migration checklist above says.
 
+## Restart resume successor index (migration 0317)
+
+`0317_perpetual_silhouette.sql` builds `heartbeat_runs_restart_resume_successor_idx`, a partial index on `heartbeat_runs (company_id, retry_of_run_id)` where `scheduled_retry_reason = 'planned_restart_resume'`. The daily run count uses it to charge a run that a restart cut short once, on its resume, as `heartbeat_runs_harness_fallback_successor_idx` does for a harness fallback.
+
+The build reads only heap columns, never the `context_snapshot` TOAST that the 0313 and 0314 builds read, so it takes about one sequential scan of the `heartbeat_runs` heap:
+
+```sql
+SELECT pg_size_pretty(pg_relation_size('heartbeat_runs'));
+```
+
+It holds a SHARE lock on `heartbeat_runs` until the migration commits: reads continue, but inserts and updates of runs wait. On a large instance, build the index before you deploy, without blocking writes, and check that the build succeeded:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "heartbeat_runs_restart_resume_successor_idx" ON "heartbeat_runs" USING btree ("company_id","retry_of_run_id") WHERE "heartbeat_runs"."scheduled_retry_reason" = 'planned_restart_resume';
+SELECT indexrelid::regclass, indisvalid FROM pg_index WHERE indexrelid = 'heartbeat_runs_restart_resume_successor_idx'::regclass;
+```
+
+The `true` and `false` results mean the same as for the run issue indexes above, and the same deadlock warning applies. Rolling back to the previous image keeps starting: older code does not use the index.
+
 ## Cloud runtime identity singleton
 
 The private `instance_settings` row whose singleton key is

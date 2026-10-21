@@ -381,3 +381,20 @@ POST /api/routines/{routineId}/triggers
 - Effect: the steps are attached to the new task in the create request, before its assignee is woken. The assignee is not woken for the task; the steps without predecessors are. An agent-owned task becomes `blocked` until the steps finish. A refused task (for example one already in progress) records `failed_permanent` on the delivery and the task gets its normal wake, unless it already has open routine steps from another run: then the assignee stays asleep. When the source's `maxNewIssuesPerHour` is spent the delivery is `storm_folded` (note `new_issue_budget_spent`), nothing is attached, and the task gets its normal wake.
 
 **Manual run on a task.** For a routine with `steps`, add `"targetIssueId": "<taskId>"` (a UUID) to put the steps under that existing task instead of opening a new one. The answer is `202` with the run (`linkedIssueId` is the task) and `warnings`. You need to manage the routine (agents: your own routines) and be allowed to update the task (`403` otherwise). You also need the right to assign each step's agent under the task, which the task or its project can block (`403`), and as an agent you can name only yourself as `assigneeAgentId` (`403` otherwise). A second run on a task whose first run's steps are still open is refused with `409`; once those steps are closed you can run it on the task again. Do not send `triggerId`, `projectId`, `projectWorkspaceId` or execution workspace fields with it (`422`). Reusing an `idempotencyKey` from a run on another task, or from a run without a task, answers `409`, and so does the reverse. A step that starts at once needs an agent that can be woken (`409` otherwise). The permission checks run again under the task and routine locks, so a board change that lands while the run starts is refused (`403`); an edit of the routine in that time answers `409` "The routine changed while the run was starting": send the same request again. Other errors are `404`, `409` and `422` as described under "Steps on a task that exists". CLI: `paperclipai routine run <routineId> --target-issue <uuid-or-identifier>`.
+
+---
+
+## Slot Priority
+
+`slotPriority` controls where the routine's runs wait when its agent already has as many runs as it can start at once. Set it on create or update (`"slotPriority": "first"`). It defaults to `normal`.
+
+| Value | Behaviour |
+|-------|-----------|
+| `normal` **(default)** | Runs wait in the agent's queue by issue priority and age, like its other work |
+| `first` | Runs on the routine's run task and step sub-tasks start at the agent's next free slot, before its other queued runs. Runs whose issue has unresolved blockers still go last |
+
+Use `first` for a scheduled routine that must not wait behind a long queue, such as an hourly health check. Changing it does not create a revision, and restoring a revision leaves it as it is.
+
+- **Only the board sets `first`.** It reorders the queue of every agent that serves the routine's runs, so a board user with `tasks:assign` must set it. As an agent you get `403` when you set `first` on a routine that is not already `first`, even on your own routine: ask the board. You can still set it back to `normal`. While your routine is `first`, adding triggers or starting more runs pushes the other queued work of every agent it serves further back, so ask the board before you make it run more often.
+- **Your other runs can wait.** Aging (one priority level per 30 minutes waited) works within each group only. While a `first` routine keeps runs queued, the agent's other runs wait, however long they have waited.
+- **Which issues.** It applies to the issues the routine files under its own id (origin `routine_execution` or `routine_step`). A plugin-managed routine that files its runs under the plugin's own origin, or another origin id, keeps the usual order.

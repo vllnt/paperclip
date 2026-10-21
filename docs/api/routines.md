@@ -34,7 +34,8 @@ POST /api/companies/{companyId}/routines
   "priority": "medium",
   "status": "active",
   "concurrencyPolicy": "coalesce_if_active",
-  "catchUpPolicy": "skip_missed"
+  "catchUpPolicy": "skip_missed",
+  "slotPriority": "normal"
 }
 ```
 
@@ -55,6 +56,7 @@ Fields:
 | `steps` | no | Ordered sub-tasks each run creates under the run's task. See [Routine Steps](#routine-steps). Default `[]` (no steps) |
 | `concurrencyPolicy` | no | Behaviour when a run fires while a previous one is still active |
 | `catchUpPolicy` | no | Behaviour for missed scheduled runs |
+| `slotPriority` | no | Where the routine's runs wait in the agent's queue: `normal` (default) or `first` |
 
 **Concurrency policies:**
 
@@ -70,6 +72,19 @@ Fields:
 |-------|-----------|
 | `skip_missed` (default) | Missed scheduled runs are dropped |
 | `enqueue_missed_with_cap` | Missed runs are enqueued up to an internal cap |
+
+**Slot priorities:**
+
+| Value | Behaviour |
+|-------|-----------|
+| `normal` (default) | The routine's runs wait in the agent's queue in the usual order (issue priority, then age) |
+| `first` | When the agent has a free run slot, the routine's queued runs (on its run task and step sub-tasks) start before the agent's other queued runs. Runs whose issue has unresolved blockers still go last |
+
+The slot priority is queue tuning, not routine content: changing it does not create a revision, and restoring a revision leaves it as it is.
+
+- **Who can set `first`.** Only a board user with the `tasks:assign` permission, because `first` reorders the queue of every agent that serves the routine's runs, step agents included. An agent that sets `first` on a routine that is not already `first` gets `403`, even on its own routine. Anyone who can manage the routine can set it back to `normal`. Sending `first` while the routine is already `first` writes nothing, so an update built from a stale copy of the routine cannot restore `first` after the board lowered it. The routine's owner still controls how often it runs (triggers, concurrency policy, manual runs), so choose `first` only for a routine whose triggers you trust; the `routine.created` and `routine.updated` activity entries record the slot priority that was set.
+- **No aging across the groups.** Aging (one priority level per 30 minutes waited) applies within each group. While a `first` routine keeps runs queued, the agent's other runs wait, however long they have waited. Use `first` for short, infrequent runs.
+- **Which issues.** It applies to the issues the routine files under its own id (origin `routine_execution` or `routine_step`). A plugin-managed routine whose plugin files its runs under the plugin's own origin, or under another origin id, keeps the usual order.
 
 ## Update Routine
 

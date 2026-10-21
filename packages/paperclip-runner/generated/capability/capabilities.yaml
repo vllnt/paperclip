@@ -1460,6 +1460,15 @@
       "expectedMockState": "operation_result"
     },
     {
+      "id": "skill:skills/paperclip/references/routines.md:387",
+      "kind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L387:slot-priority",
+      "heading": "Slot Priority",
+      "primaryDisposition": "control_plane_owned",
+      "semanticOperation": "runtime_reconciliation",
+      "expectedMockState": "runtime_decision_record"
+    },
+    {
       "id": "skill:skills/paperclip/references/workflows.md:1",
       "kind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/workflows.md#L1:paperclip-workflow-playbooks",

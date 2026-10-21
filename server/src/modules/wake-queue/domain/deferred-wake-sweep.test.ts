@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   compareDeferredWakes,
+  decideDeferredWakeDisposition,
+  DEFERRED_WAKE_SWEEP_MAX_PER_AGENT_PER_PASS,
   DEFERRED_WAKE_SWEEP_MAX_PER_PASS,
   issuePriorityRank,
   selectDeferredWakesToPromote,
@@ -23,7 +25,6 @@ function wake(
 }
 
 const ids = (wakes: readonly OrphanedDeferredWake[]) => wakes.map((entry) => entry.wakeId);
-const slots = (entries: Record<string, number>) => new Map(Object.entries(entries));
 
 describe("sweepPromotionBudget", () => {
   it("bounds a pass to the cap, so the first pass after a deploy cannot start a burst of runs", () => {
@@ -45,8 +46,7 @@ describe("sweepPromotionBudget", () => {
     while (remaining.size > 0) {
       const pass = selectDeferredWakesToPromote(
         backlog.filter((entry) => remaining.has(entry.wakeId)),
-        slots({ "agent-a": 1_000 }),
-        { maxTotal: sweepPromotionBudget() },
+        { maxTotal: sweepPromotionBudget(), maxPerAgent: 1_000 },
       );
       expect(pass.length).toBeGreaterThan(0);
       expect(pass.length).toBeLessThanOrEqual(DEFERRED_WAKE_SWEEP_MAX_PER_PASS);
@@ -99,29 +99,40 @@ describe("selectDeferredWakesToPromote", () => {
         wake("critical-new", { minutesAgo: 2, priority: "critical" }),
         wake("medium-new", { minutesAgo: 5 }),
       ],
-      slots({ "agent-a": 10 }),
+      { maxPerAgent: 10 },
     );
     expect(ids(selected)).toEqual(["critical-new", "medium-old", "medium-new", "low-old"]);
   });
 
-  it("gives an agent at most its free slots", () => {
+  it("does not hold a busy agent's wakes back: promotion queues a run, the queue claim enforces the slots", () => {
+    // Before, an agent whose slots were full (as they always are while it has
+    // queued work) never had a wake promoted: its queued runs took each freed slot.
     const selected = selectDeferredWakesToPromote(
-      [wake("one", { minutesAgo: 30 }), wake("two", { minutesAgo: 20 }), wake("three", { minutesAgo: 10 })],
-      slots({ "agent-a": 2 }),
+      [wake("busy-1", { agent: "agent-busy", minutesAgo: 30 }), wake("busy-2", { agent: "agent-busy", minutesAgo: 20 })],
     );
-    expect(ids(selected)).toEqual(["one", "two"]);
+    expect(ids(selected)).toEqual(["busy-1", "busy-2"]);
   });
 
-  it("budgets each agent separately and leaves a full or unknown agent parked", () => {
+  it("caps one agent's share of a pass, so its backlog cannot fill the pass", () => {
+    expect(DEFERRED_WAKE_SWEEP_MAX_PER_AGENT_PER_PASS).toBe(3);
+    const backlog = Array.from({ length: 10 }, (_, index) =>
+      wake(`a${index}`, { agent: "agent-a", minutesAgo: 100 - index }));
+    const selected = selectDeferredWakesToPromote(
+      [...backlog, wake("b-young", { agent: "agent-b", minutesAgo: 1 })],
+      { maxTotal: sweepPromotionBudget() },
+    );
+    expect(ids(selected)).toEqual(["a0", "a1", "a2", "b-young"]);
+  });
+
+  it("budgets each agent separately", () => {
     const selected = selectDeferredWakesToPromote(
       [
         wake("a1", { agent: "agent-a", minutesAgo: 30 }),
         wake("b1", { agent: "agent-b", minutesAgo: 25 }),
-        wake("full", { agent: "agent-full", minutesAgo: 20 }),
-        wake("unknown", { agent: "agent-unknown", minutesAgo: 15 }),
         wake("a2", { agent: "agent-a", minutesAgo: 10 }),
+        wake("b2", { agent: "agent-b", minutesAgo: 5 }),
       ],
-      slots({ "agent-a": 1, "agent-b": 1, "agent-full": 0 }),
+      { maxPerAgent: 1 },
     );
     expect(ids(selected)).toEqual(["a1", "b1"]);
   });
@@ -133,32 +144,31 @@ describe("selectDeferredWakesToPromote", () => {
         wake("oldest", { issue: "issue-1", minutesAgo: 40 }),
         wake("middle", { issue: "issue-1", minutesAgo: 20 }),
       ],
-      slots({ "agent-a": 10 }),
+      { maxPerAgent: 10 },
     );
     expect(ids(selected)).toEqual(["oldest"]);
   });
 
-  it("never serves an issue through a younger wake when the oldest wake's agent is full", () => {
-    // The drain promotes the issue's oldest wake whoever asked, so waking the
-    // issue through agent-b's younger wake would start agent-a's wake over its cap.
+  it("never serves an issue through a younger wake when the oldest wake's agent used its share", () => {
     const selected = selectDeferredWakesToPromote(
       [
-        wake("oldest-full-agent", { agent: "agent-full", issue: "issue-1", minutesAgo: 40 }),
-        wake("younger-free-agent", { agent: "agent-b", issue: "issue-1", minutesAgo: 5 }),
+        wake("a-first", { agent: "agent-a", issue: "issue-0", minutesAgo: 50 }),
+        wake("a-oldest-on-issue", { agent: "agent-a", issue: "issue-1", minutesAgo: 40 }),
+        wake("b-younger-on-issue", { agent: "agent-b", issue: "issue-1", minutesAgo: 5 }),
       ],
-      slots({ "agent-full": 0, "agent-b": 3 }),
+      { maxPerAgent: 1 },
     );
-    expect(selected).toEqual([]);
+    expect(ids(selected)).toEqual(["a-first"]);
   });
 
-  it("does not spend a slot on an issue it skips", () => {
+  it("does not spend an agent's share on an issue it skips", () => {
     const selected = selectDeferredWakesToPromote(
       [
         wake("shadowed", { issue: "issue-1", minutesAgo: 5 }),
         wake("head", { issue: "issue-1", minutesAgo: 30 }),
         wake("other-issue", { issue: "issue-2", minutesAgo: 10 }),
       ],
-      slots({ "agent-a": 2 }),
+      { maxPerAgent: 2 },
     );
     expect(ids(selected)).toEqual(["head", "other-issue"]);
   });
@@ -166,7 +176,6 @@ describe("selectDeferredWakesToPromote", () => {
   it("honours a total cap", () => {
     const selected = selectDeferredWakesToPromote(
       [wake("one", { minutesAgo: 30 }), wake("two", { minutesAgo: 20 }), wake("three", { minutesAgo: 10 })],
-      slots({ "agent-a": 5 }),
       { maxTotal: 1 },
     );
     expect(ids(selected)).toEqual(["one"]);
@@ -174,13 +183,54 @@ describe("selectDeferredWakesToPromote", () => {
 
   it("does not mutate its inputs", () => {
     const candidates = [wake("late", { minutesAgo: 1 }), wake("early", { minutesAgo: 9 })];
-    const budget = slots({ "agent-a": 1 });
-    selectDeferredWakesToPromote(candidates, budget);
+    selectDeferredWakesToPromote(candidates);
     expect(ids(candidates)).toEqual(["late", "early"]);
-    expect(budget.get("agent-a")).toBe(1);
   });
 
   it("returns nothing for no candidates", () => {
-    expect(selectDeferredWakesToPromote([], slots({ "agent-a": 3 }))).toEqual([]);
+    expect(selectDeferredWakesToPromote([])).toEqual([]);
+  });
+});
+
+describe("decideDeferredWakeDisposition", () => {
+  const facts = (input: { wakeReason?: string | null; assignee?: string | null; carriesSavedInput?: boolean } = {}) => ({
+    agentId: "agent-a",
+    wakeReason: input.wakeReason === undefined ? "issue_assigned" : input.wakeReason,
+    issueAssigneeAgentId: input.assignee === undefined ? "agent-a" : input.assignee,
+    carriesSavedInput: input.carriesSavedInput ?? false,
+  });
+
+  it("promotes a wake for the current assignee", () => {
+    expect(decideDeferredWakeDisposition(facts())).toBe("promote");
+  });
+
+  it("supersedes an assignee wake whose agent no longer holds the issue", () => {
+    for (const wakeReason of ["issue_assigned", "issue_commented", "issue_reopened_via_comment", "issue_continuation_needed"]) {
+      expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: "agent-b" }))).toBe("superseded");
+    }
+    expect(decideDeferredWakeDisposition(facts({ assignee: null }))).toBe("superseded");
+  });
+
+  it("keeps a former assignee's wake that carries saved input parked for the handoff instead of closing it", () => {
+    for (const wakeReason of ["issue_commented", "issue_reopened_via_comment", "issue_assigned"]) {
+      expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: "agent-b", carriesSavedInput: true }))).toBe(
+        "keptForHandoff",
+      );
+    }
+    expect(decideDeferredWakeDisposition(facts({ wakeReason: "issue_commented", carriesSavedInput: true }))).toBe("promote");
+  });
+
+  it("supersedes a former assignee's saved-input wake when no agent holds the issue, so it is never parked for good", () => {
+    for (const wakeReason of ["issue_commented", "issue_reopened_via_comment", "issue_assigned"]) {
+      expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: null, carriesSavedInput: true }))).toBe(
+        "superseded",
+      );
+    }
+  });
+
+  it("still delivers a wake that addresses a non-assignee on purpose", () => {
+    for (const wakeReason of ["issue_comment_mentioned", "execution_review_requested", "approval_approved", null]) {
+      expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: "agent-b" }))).toBe("promote");
+    }
   });
 });
