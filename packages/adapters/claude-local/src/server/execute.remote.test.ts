@@ -237,6 +237,7 @@ describe("claude remote execution", () => {
     cleanupDirs.push(rootDir);
     const workspaceDir = path.join(rootDir, "workspace");
     await mkdir(workspaceDir, { recursive: true });
+    const logs: string[] = [];
 
     await execute({
       runId: "run-ssh-no-resume",
@@ -251,7 +252,7 @@ describe("claude remote execution", () => {
         sessionId: "12345678-1234-4abc-9def-123456789012",
         sessionParams: {
           sessionId: "12345678-1234-4abc-9def-123456789012",
-          cwd: "/remote/workspace",
+          cwd: workspaceDir,
         },
         sessionDisplayId: "12345678-1234-4abc-9def-123456789012",
         taskKey: null,
@@ -259,6 +260,8 @@ describe("claude remote execution", () => {
       config: {
         engine: "cli",
         command: "claude",
+        // A model with no minimum CLI version, so the run makes one CLI call.
+        model: "claude-sonnet-5",
       },
       context: {
         paperclipWorkspace: {
@@ -278,12 +281,15 @@ describe("claude remote execution", () => {
           strictHostKeyChecking: true,
         },
       },
-      onLog: async () => {},
+      onLog: async (_stream, chunk) => {
+        logs.push(chunk);
+      },
     });
 
     expect(runChildProcess).toHaveBeenCalledTimes(1);
     const call = runChildProcess.mock.calls[0] as unknown as [string, string, string[]] | undefined;
     expect(call?.[2]).not.toContain("--resume");
+    expect(logs.join("")).toContain("was saved without a remote execution identity");
   });
 
   it("resumes saved Claude sessions for remote SSH execution when the remote identity matches", async () => {
