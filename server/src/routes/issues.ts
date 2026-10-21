@@ -1,6 +1,8 @@
 import { capGoalTextForAgents, heartbeatContextGoal, readCompanyFocusForIssue } from "../services/goal-focus.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
+import { ROUTINE_STEP_SEND_BACK_CAP_REACHED, routineStepSendBackRequestSchema } from "@paperclipai/shared";
+import { sendBackRoutineStep } from "../services/routine-step-send-back.js";
 import {
   PULL_REQUEST_WAIT_MONITOR_SERVICE_NAME,
   issueWaitRequestSchema,
@@ -13250,6 +13252,86 @@ export function issueRoutes(
         comment: result.comment,
         wakeQueued,
       });
+    },
+  );
+
+  router.post(
+    "/issues/:id/routine-step/send-back",
+    validate(routineStepSendBackRequestSchema),
+    async (req, res) => {
+      const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+      if (!issue) return;
+      if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      const actor = getActorInfo(req);
+      if (actor.actorType === "agent" && !actor.agentId) throw forbidden("Agent authentication required");
+      const outcome = await sendBackRoutineStep(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        toStepKey: req.body.toStepKey,
+        comment: req.body.comment,
+        actor:
+          actor.actorType === "agent" && actor.agentId
+            ? { actorType: "agent", agentId: actor.agentId, runId: actor.runId }
+            : { actorType: "user", userId: actor.actorId },
+      });
+      const { result, comment } = outcome;
+      try {
+        await issueReferencesSvc.syncComment(comment.id);
+        await externalObjectsSvc.syncCommentSafely(comment.id);
+      } catch (err) {
+        logger.warn({ err, issueId: outcome.issue.id, commentId: comment.id }, "failed to sync a routine step send-back comment");
+      }
+      if (result.outcome === "cap_reached") {
+        res.status(409).json({
+          error: `Step "${result.fromStepKey}" has sent work back to "${result.toStepKey}" ${result.rounds} times, its limit; the board decides how to go on`,
+          details: { code: ROUTINE_STEP_SEND_BACK_CAP_REACHED, escalated: true, ...result },
+        });
+        return;
+      }
+      const target = outcome.issue;
+      if (target.assigneeAgentId) {
+        // Not issue_assigned: that reason starts a fresh session, and the target's agent must resume its own.
+        const sendBack = {
+          routineRunId: result.routineRunId,
+          fromStepKey: result.fromStepKey,
+          toStepKey: result.toStepKey,
+          fromIssueId: result.fromIssueId,
+          rounds: result.rounds,
+          maxSendBacks: result.maxSendBacks,
+        };
+        try {
+          await heartbeat.wakeup(target.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_reopened_via_comment",
+            idempotencyKey: `routine-step-send-back:${result.routineRunId}:${comment.id}`,
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            payload: {
+              issueId: target.id,
+              commentId: comment.id,
+              mutation: "comment",
+              reopenedFrom: "done",
+              routineStepSendBack: sendBack,
+            },
+            contextSnapshot: {
+              issueId: target.id,
+              taskId: target.id,
+              commentId: comment.id,
+              wakeCommentId: comment.id,
+              source: "routine_step.send_back",
+              wakeReason: "issue_reopened_via_comment",
+              reopenedFrom: "done",
+              routineStepSendBack: sendBack,
+            },
+          });
+        } catch (err) {
+          // The target is todo and assigned, so the stranded-issue sweep picks it up.
+          logger.warn({ err, issueId: target.id }, "failed to wake the target of a routine step send-back");
+        }
+      }
+      res.json(result);
     },
   );
 

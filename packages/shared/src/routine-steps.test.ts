@@ -1,14 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_ROUTINE_STEP_MAX_SEND_BACKS,
   MAX_ROUTINE_STEPS,
   ROUTINE_STEPS_RUN_PAYLOAD_KEY,
+  countRoutineStepSendBackRounds,
   isRoutineRunIssueOriginKind,
   isRoutineStepRunStalled,
   orderRoutineStepsTopologically,
   readRoutineStepsRunPayload,
   routineStartingSteps,
+  routineStepAncestorKeys,
+  routineStepSendBackLoopKeys,
+  routineStepSendBackRequestSchema,
+  routineStepMaxSendBacks,
   routineStepTemplateTexts,
   routineStepsSchema,
+  type RoutineStepSendBack,
 } from "./routine-steps.js";
 import {
   createRoutineSchema,
@@ -259,8 +266,11 @@ describe("readRoutineStepsRunPayload", () => {
     stepIssueIds: { a: "22222222-2222-4222-8222-222222222222" },
   };
 
-  it("reads what a run recorded", () => {
-    expect(readRoutineStepsRunPayload({ [ROUTINE_STEPS_RUN_PAYLOAD_KEY]: recorded })).toEqual(recorded);
+  it("reads what a run recorded; a run from before send-back has none", () => {
+    expect(readRoutineStepsRunPayload({ [ROUTINE_STEPS_RUN_PAYLOAD_KEY]: recorded })).toEqual({
+      ...recorded,
+      sendBacks: [],
+    });
   });
 
   it("returns null for a run without steps or with a malformed record", () => {
@@ -280,5 +290,94 @@ describe("running a routine on a task", () => {
 
   it("refuses a target that is not a UUID", () => {
     expect(runRoutineSchema.safeParse({ targetIssueId: "PAP-12" }).success).toBe(false);
+  });
+});
+
+describe("send back", () => {
+  const node = (key: string, after: string[] = []) => ({ key, after });
+  const chain = [node("implement"), node("review", ["implement"]), node("qa", ["review"]), node("docs", ["implement"])];
+
+  it("finds the steps a step waits for and the steps that wait for it", () => {
+    expect([...routineStepAncestorKeys(chain, "qa")].sort()).toEqual(["implement", "review"]);
+    expect(routineStepAncestorKeys(chain, "implement").size).toBe(0);
+    expect(routineStepAncestorKeys(chain, "missing").size).toBe(0);
+  });
+
+  it("runs only the loop again: the steps between the target and the sender, and the sender", () => {
+    expect(routineStepSendBackLoopKeys(chain, "qa", "implement")).toEqual(["review", "qa"]);
+    expect(routineStepSendBackLoopKeys(chain, "qa", "review")).toEqual(["qa"]);
+    const diamond = [node("a"), node("b", ["a"]), node("c", ["a"]), node("d", ["b", "c"]), node("e", ["a"])];
+    expect(routineStepSendBackLoopKeys(diamond, "d", "a")).toEqual(["b", "c", "d"]);
+  });
+
+  it("requires a target and a comment and trims the comment", () => {
+    expect(routineStepSendBackRequestSchema.parse({ toStepKey: "implement", comment: "  Fix the test  " })).toEqual({
+      toStepKey: "implement",
+      comment: "Fix the test",
+    });
+    expect(routineStepSendBackRequestSchema.safeParse({ toStepKey: "implement", comment: "   " }).success).toBe(false);
+    expect(routineStepSendBackRequestSchema.safeParse({ toStepKey: "Implement!", comment: "x" }).success).toBe(false);
+    expect(routineStepSendBackRequestSchema.safeParse({ toStepKey: "implement", comment: "x", extra: 1 }).success).toBe(
+      false,
+    );
+  });
+
+  it("accepts sendBackTo naming a step the step waits for, directly or not", () => {
+    expect(issueMessages([step("implement"), step("review", ["implement"]), step("qa", ["review"], { sendBackTo: ["implement", "review"] })])).toEqual(
+      [],
+    );
+  });
+
+  it("refuses sendBackTo naming itself, a later step, a parallel step, an unknown step or a step twice", () => {
+    const base = [step("a"), step("b", ["a"]), step("c", ["a"])];
+    expect(issueMessages([step("a", [], { sendBackTo: ["b"] }), base[1], base[2]])).toEqual([
+      'Step "a" can only send work back to a step it waits for; "b" is not one',
+    ]);
+    expect(issueMessages([base[0], step("b", ["a"], { sendBackTo: ["b"] }), base[2]])).toEqual([
+      'Step "b" can only send work back to a step it waits for; "b" is not one',
+    ]);
+    expect(issueMessages([base[0], step("b", ["a"], { sendBackTo: ["c"] }), base[2]])).toEqual([
+      'Step "b" can only send work back to a step it waits for; "c" is not one',
+    ]);
+    expect(issueMessages([base[0], step("b", ["a"], { sendBackTo: ["zz"] }), base[2]])).toEqual([
+      'Step "b" can only send work back to a step it waits for; "zz" is not one',
+    ]);
+    expect(issueMessages([base[0], step("b", ["a"], { sendBackTo: ["a", "a"] }), base[2]])).toEqual([
+      'Step "b" names "a" twice in sendBackTo',
+    ]);
+  });
+
+  it("bounds maxSendBacks and defaults it", () => {
+    expect(issueMessages([step("a"), step("b", ["a"], { sendBackTo: ["a"], maxSendBacks: 0 })])).toHaveLength(1);
+    expect(issueMessages([step("a"), step("b", ["a"], { sendBackTo: ["a"], maxSendBacks: 11 })])).toHaveLength(1);
+    expect(issueMessages([step("a"), step("b", ["a"], { sendBackTo: ["a"], maxSendBacks: 10 })])).toEqual([]);
+    expect(routineStepMaxSendBacks({})).toBe(DEFAULT_ROUTINE_STEP_MAX_SEND_BACKS);
+    expect(routineStepMaxSendBacks({ maxSendBacks: 5 })).toBe(5);
+  });
+
+  it("counts the agent rounds on one edge since the last board send-back on it", () => {
+    const entry = (
+      actorType: "agent" | "user",
+      overrides: Partial<RoutineStepSendBack> = {},
+    ): RoutineStepSendBack => ({
+      fromStepKey: "qa",
+      toStepKey: "implement",
+      actorType,
+      actorId: actorType === "agent" ? AGENT_ID : "user-1",
+      commentId: null,
+      at: "2026-10-21T00:00:00.000Z",
+      outcome: "sent_back",
+      ...overrides,
+    });
+    expect(countRoutineStepSendBackRounds([], "qa", "implement")).toBe(0);
+    expect(countRoutineStepSendBackRounds([entry("agent"), entry("agent")], "qa", "implement")).toBe(2);
+    expect(countRoutineStepSendBackRounds([entry("agent"), entry("user"), entry("agent")], "qa", "implement")).toBe(1);
+    expect(
+      countRoutineStepSendBackRounds(
+        [entry("agent"), entry("agent", { toStepKey: "review" }), entry("agent", { outcome: "cap_reached" })],
+        "qa",
+        "implement",
+      ),
+    ).toBe(1);
   });
 });

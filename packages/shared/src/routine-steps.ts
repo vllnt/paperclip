@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { routineStepIssueFieldsSchema } from "./validators/issue.js";
+import { multilineTextSchema } from "./validators/text.js";
 
 /** Most steps one routine may define; the same cap as the child-issue helper. */
 export const MAX_ROUTINE_STEPS = 25;
@@ -26,11 +27,20 @@ const routineStepKeySchema = z
   .trim()
   .regex(ROUTINE_STEP_KEY_PATTERN, "Step keys are lowercase letters, digits, hyphens and underscores (max 40)");
 
+/** Rounds a step may send work back on one edge when it sets no `maxSendBacks`. */
+export const DEFAULT_ROUTINE_STEP_MAX_SEND_BACKS = 2;
+/** The highest `maxSendBacks` a step may set. */
+export const MAX_ROUTINE_STEP_SEND_BACKS = 10;
+
 export const routineStepSchema = routineStepIssueFieldsSchema
   .extend({
     key: routineStepKeySchema,
     title: z.string().trim().min(1).max(200),
     after: z.array(routineStepKeySchema).max(MAX_ROUTINE_STEPS).default([]),
+    /** Earlier steps (ones this step waits for, directly or not) that this step may send work back to. */
+    sendBackTo: z.array(routineStepKeySchema).max(MAX_ROUTINE_STEPS).optional(),
+    /** Most agent send-backs on each `sendBackTo` edge; {@link DEFAULT_ROUTINE_STEP_MAX_SEND_BACKS} when unset. */
+    maxSendBacks: z.number().int().min(1).max(MAX_ROUTINE_STEP_SEND_BACKS).optional(),
   })
   .strict();
 export type RoutineStep = z.infer<typeof routineStepSchema>;
@@ -38,6 +48,53 @@ export type RoutineStep = z.infer<typeof routineStepSchema>;
 /** Keys of the steps that must finish before `step` starts, in the order they were written. */
 export function routineStepPredecessorKeys(step: Pick<RoutineStep, "after">): string[] {
   return [...new Set(step.after)];
+}
+
+/**
+ * Keys of every step that `key` waits for, directly or through other steps.
+ * @returns an empty set for an unknown key; unknown keys inside `after` are skipped.
+ */
+export function routineStepAncestorKeys(
+  steps: ReadonlyArray<Pick<RoutineStep, "key" | "after">>,
+  key: string,
+): Set<string> {
+  const byKey = new Map(steps.map((step) => [step.key, step]));
+  const ancestors = new Set<string>();
+  const pending = [...(byKey.get(key)?.after ?? [])];
+  while (pending.length > 0) {
+    const next = pending.pop();
+    if (next === undefined || ancestors.has(next) || !byKey.has(next)) continue;
+    ancestors.add(next);
+    pending.push(...(byKey.get(next)?.after ?? []));
+  }
+  return ancestors;
+}
+
+/**
+ * The steps that run again when `fromKey` sends work back to `toKey`, in written order, besides the
+ * target itself: every step that waits for `toKey` and that `fromKey` waits for, plus `fromKey`. A step
+ * on a parallel branch, one that waits for `toKey` but not on the way to `fromKey`, is not part of it.
+ * @example
+ * // implement -> review -> qa, and implement -> docs
+ * routineStepSendBackLoopKeys(steps, "qa", "implement"); // ["review", "qa"]
+ */
+export function routineStepSendBackLoopKeys(
+  steps: ReadonlyArray<Pick<RoutineStep, "key" | "after">>,
+  fromKey: string,
+  toKey: string,
+): string[] {
+  const beforeSender = routineStepAncestorKeys(steps, fromKey);
+  return steps
+    .filter(
+      (step) =>
+        step.key === fromKey || (beforeSender.has(step.key) && routineStepAncestorKeys(steps, step.key).has(toKey)),
+    )
+    .map((step) => step.key);
+}
+
+/** The rounds cap on each send-back edge of `step`. */
+export function routineStepMaxSendBacks(step: Pick<RoutineStep, "maxSendBacks">): number {
+  return step.maxSendBacks ?? DEFAULT_ROUTINE_STEP_MAX_SEND_BACKS;
 }
 
 /**
@@ -162,13 +219,96 @@ export const routineStepsSchema = z
       orderRoutineStepsTopologically(steps);
     } catch {
       ctx.addIssue({ code: "custom", message: "Routine steps contain a cycle" });
+      return;
     }
+    steps.forEach((step, index) => {
+      if (!step.sendBackTo?.length) return;
+      const earlier = routineStepAncestorKeys(steps, step.key);
+      const seen = new Set<string>();
+      step.sendBackTo.forEach((entry, entryIndex) => {
+        const path = [index, "sendBackTo", entryIndex];
+        if (seen.has(entry)) {
+          ctx.addIssue({ code: "custom", path, message: `Step "${step.key}" names "${entry}" twice in sendBackTo` });
+        } else if (!earlier.has(entry)) {
+          ctx.addIssue({
+            code: "custom",
+            path,
+            message: `Step "${step.key}" can only send work back to a step it waits for; "${entry}" is not one`,
+          });
+        }
+        seen.add(entry);
+      });
+    });
   });
+
+/** One send-back recorded on a run: who sent the work from which step to which, and what came of it. */
+export const routineStepSendBackSchema = z.object({
+  fromStepKey: z.string(),
+  toStepKey: z.string(),
+  actorType: z.enum(["agent", "user"]),
+  actorId: z.string(),
+  /** The comment on the target (`sent_back`) or on the sending step (`cap_reached`). */
+  commentId: z.string().guid().nullable(),
+  at: z.string(),
+  /** `sent_back` reopened the target; `cap_reached` was refused and handed the sending step to the board. */
+  outcome: z.enum(["sent_back", "cap_reached"]),
+});
+export type RoutineStepSendBack = z.infer<typeof routineStepSendBackSchema>;
+
+/**
+ * Agent send-backs on one edge that count toward its cap: those after the last board send-back on
+ * the edge, because a human decision resets the count as it does for review rounds.
+ */
+export function countRoutineStepSendBackRounds(
+  sendBacks: ReadonlyArray<RoutineStepSendBack>,
+  fromStepKey: string,
+  toStepKey: string,
+): number {
+  let rounds = 0;
+  for (const entry of sendBacks) {
+    if (entry.fromStepKey !== fromStepKey || entry.toStepKey !== toStepKey || entry.outcome !== "sent_back") continue;
+    rounds = entry.actorType === "user" ? 0 : rounds + 1;
+  }
+  return rounds;
+}
+
+/** Body of `POST /issues/{id}/routine-step/send-back`, sent for the step that sends its work back. */
+export const routineStepSendBackRequestSchema = z
+  .object({
+    /** The earlier step that takes the work back; one of the sending step's `sendBackTo`. */
+    toStepKey: routineStepKeySchema,
+    /** What the earlier step must fix. Posted on it, or on the sending step when the cap refuses. */
+    comment: multilineTextSchema.pipe(z.string().trim().min(1, "Say what to fix").max(20_000)),
+  })
+  .strict();
+export type RoutineStepSendBackRequest = z.infer<typeof routineStepSendBackRequestSchema>;
+
+/** The 409 code of a send-back that the rounds cap refused. */
+export const ROUTINE_STEP_SEND_BACK_CAP_REACHED = "send_back_cap_reached";
+
+/** What a send-back did; the body of its 200 and the `details` of its cap 409. */
+export interface RoutineStepSendBackResult {
+  outcome: RoutineStepSendBack["outcome"];
+  routineRunId: string;
+  fromStepKey: string;
+  toStepKey: string;
+  fromIssueId: string;
+  toIssueId: string;
+  /** Agent send-backs on this edge that count toward the cap, this one included when it was sent. */
+  rounds: number;
+  maxSendBacks: number;
+  /** The steps set back to `blocked`: the loop without its target. Empty when the cap refused. */
+  reblockedIssueIds: string[];
+  /** The comment posted on the target, or on the sending step when the cap refused. */
+  commentId: string;
+}
 
 /** What a run with steps records in its trigger payload, so the run stays self-contained. */
 export const routineStepsRunPayloadSchema = z.object({
   steps: z.array(routineStepSchema),
   stepIssueIds: z.record(z.string(), z.string().guid()),
+  /** Send-backs of the run, oldest first. Runs from before send-back have none. */
+  sendBacks: z.array(routineStepSendBackSchema).default([]),
 });
 export type RoutineStepsRunPayload = z.infer<typeof routineStepsRunPayloadSchema>;
 

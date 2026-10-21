@@ -353,7 +353,7 @@ export async function createRoutineRunIssues<TRoot extends RoutineRunRoot>(
     // rows and checks the company's blockers for cycles while the issue-counter lock is held.
     await issueSvc.addBlockedByIssueIds(root.id, root.companyId, Object.values(stepIssueIds), savepoint);
 
-    const recorded: RoutineStepsRunPayload = { steps, stepIssueIds };
+    const recorded: RoutineStepsRunPayload = { steps, stepIssueIds, sendBacks: [] };
     await savepoint
       .update(routineRuns)
       .set({
