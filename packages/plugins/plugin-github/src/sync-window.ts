@@ -23,9 +23,15 @@ export const QUEUE_LIMIT = 500;
  */
 export const QUEUE_PER_REPOSITORY = 20;
 export const QUEUE_SHARE = 0.3;
-/** An issue that failed is looked at again after 1, 2, 4 and 8 minutes; after this many failures only the full pass looks at it. */
-export const QUEUE_ATTEMPTS = 5;
+/**
+ * An issue that failed is looked at again after 1, 2, 4, 8 and 16 minutes, then every 30 minutes; after this many failures
+ * (about 2.5 hours, longer than most agent runs that hold a task) only the full pass looks at it.
+ */
+export const QUEUE_ATTEMPTS = 10;
 export const QUEUE_RETRY_MS = 60_000;
+export const QUEUE_RETRY_MAX_MS = 1_800_000;
+/** An ask for an issue whose repository is neither linked nor tracked is dropped once it is this old: one catalog read that missed a repository keeps its asks. */
+export const QUEUE_ORPHAN_MS = 3_600_000;
 /** An issue in a repository that no project links is only fetched one by one: at most this many per run, none more often than this. */
 export const TRACKED_PER_RUN = 10;
 export const TRACKED_RECHECK_MS = 300_000;

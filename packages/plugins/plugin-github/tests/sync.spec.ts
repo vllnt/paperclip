@@ -343,13 +343,13 @@ describe("incremental GitHub task sync", () => {
     await editHere(f, 1, "Local title");
     f.update.mockRejectedValue(new GitHubError(403));
     const advance = skewClock(), looks: number[] = [];
-    for (let minute = 0; minute < 20; minute++) {
+    for (let minute = 0; minute < 160; minute++) {
       f.get.mockClear();
       await f.service.sync(companyId);
       if (f.get.mock.calls.length) looks.push(minute);
       advance(60_000);
     }
-    expect(looks).toEqual([0, 1, 3, 7, 15]);
+    expect(looks).toEqual([0, 1, 3, 7, 15, 31, 61, 91, 121, 151]);
     expect(await f.h.ctx.state.get(queueKey())).toEqual({});
   });
   it("gives the issues that keep failing only a share of the run, so GitHub's changes still sync", async () => {
@@ -381,6 +381,12 @@ describe("incremental GitHub task sync", () => {
     await f.h.ctx.state.set(queueKey(), Object.fromEntries(Array.from({ length: QUEUE_LIMIT }, (_, index) => [String(1000 + index), { repositoryId: 99, number: index + 1, at: 0 }])));
     await f.service.sync(companyId);
     expect(await f.h.ctx.state.get(queueKey())).toEqual({});
+    // A repository that one catalog read missed keeps a recent ask.
+    const recent = { "2000": { repositoryId: 99, number: 1, at: Date.now() } };
+    await f.h.ctx.state.set(queueKey(), recent);
+    await f.service.sync(companyId);
+    expect(await f.h.ctx.state.get(queueKey())).toEqual(recent);
+    await f.h.ctx.state.set(queueKey(), {});
     await editHere(f, 2, "Local title");
     await f.service.sync(companyId);
     expect(f.remote.get(2)?.title).toBe("Local title");

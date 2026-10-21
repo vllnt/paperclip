@@ -4,8 +4,8 @@ import { GitHubClient, GitHubError } from "./github.js";
 import { boardScope } from "./setup.js";
 import type { PluginWriteRequest } from "./write-identity.js";
 import { nativeGitHubReady } from "./native-github.js";
-import { JOB_BUDGET_MS, HEAD_MARGIN_MS, QUEUE_ATTEMPTS, QUEUE_LIMIT, QUEUE_PER_REPOSITORY, QUEUE_RETRY_MS, QUEUE_SHARE, RUN_BUDGET_MS, SYNC_PAGE_SIZE,
-  TRACKED_PER_RUN, TRACKED_RECHECK_MS, currentSweep, resumeFrom, validTime, walkUpdated, type RepoCursor, type WalkEnd } from "./sync-window.js";
+import { JOB_BUDGET_MS, HEAD_MARGIN_MS, QUEUE_ATTEMPTS, QUEUE_LIMIT, QUEUE_ORPHAN_MS, QUEUE_PER_REPOSITORY, QUEUE_RETRY_MAX_MS, QUEUE_RETRY_MS, QUEUE_SHARE,
+  RUN_BUDGET_MS, SYNC_PAGE_SIZE, TRACKED_PER_RUN, TRACKED_RECHECK_MS, currentSweep, resumeFrom, validTime, walkUpdated, type RepoCursor, type WalkEnd } from "./sync-window.js";
 import { PLUGIN_ID, type AutomationRule, type ConnectionState, type GitHubIssue, type Repository, type SyncReport, type SyncSettings, type TaskRepository, type TaskRepositories } from "./contracts.js";
 
 const ORIGIN = `plugin:${PLUGIN_ID}:issue` as const;
@@ -385,7 +385,9 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
     return changeQueue(companyId, queue => {
       if (queue[id] && queue[id].at !== taken?.at) return;
       if (attempts >= QUEUE_ATTEMPTS) delete queue[id];
-      else if (queue[id] || Object.keys(queue).length < QUEUE_LIMIT) queue[id] = { repositoryId: item.repositoryId, number: item.number, at: Date.now() + QUEUE_RETRY_MS * 2 ** (attempts - 1), attempts };
+      else if (queue[id] || Object.keys(queue).length < QUEUE_LIMIT) {
+        queue[id] = { repositoryId: item.repositoryId, number: item.number, at: Date.now() + Math.min(QUEUE_RETRY_MS * 2 ** (attempts - 1), QUEUE_RETRY_MAX_MS), attempts };
+      }
     });
   }
   /**
@@ -493,11 +495,11 @@ export function registerSync(ctx: PluginContext, github: GitHubClient, credentia
   /** Issues of repositories that no project links are fetched one by one, a few per run, and at once when edited here. */
   async function syncTracked(companyId: string, linked: Repository[], scope: RunScope): Promise<"done" | "stopped"> {
     const tracked = (await ctx.state.get(key(companyId, "standalone")) as Tracked | null) ?? {};
+    const now = Date.now(), checked = (item: Tracked[string]) => Date.parse(validTime(item.checkedAt) ?? "") || 0;
     // An ask for an issue whose repository is neither linked nor tracked any more has no lane to take it: it would hold its
     // place in the queue for ever, and a full queue drops new asks.
     await settle(companyId, scope.queued, ...Object.entries(scope.queued)
-      .filter(([githubId, item]) => !tracked[githubId] && !linked.some(repo => repo.id === item.repositoryId)).map(([githubId]) => githubId));
-    const now = Date.now(), checked = (item: Tracked[string]) => Date.parse(validTime(item.checkedAt) ?? "") || 0;
+      .filter(([githubId, item]) => item.at < now - QUEUE_ORPHAN_MS && !tracked[githubId] && !linked.some(repo => repo.id === item.repositoryId)).map(([githubId]) => githubId));
     const due = Object.entries(tracked).filter(([githubId, item]) => !linked.some(repo => repo.id === item.repositoryId)
       && (scope.queued[githubId] || now - checked(item) >= TRACKED_RECHECK_MS)).sort(([, a], [, b]) => checked(a) - checked(b)).slice(0, TRACKED_PER_RUN);
     let end: "done" | "stopped" = "done";
