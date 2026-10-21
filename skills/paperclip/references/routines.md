@@ -3,7 +3,7 @@
 Routines are recurring tasks. Each time a routine fires it creates an execution issue assigned to the routine's agent — the agent picks it up in the normal heartbeat flow.
 
 A routine has:
-- One assigned agent and one project
+- One assigned agent, and at most one project (see [A project's routines](#a-projects-routines))
 - One or more triggers (`schedule`, `webhook`, `api`, or `event`)
 - A concurrency policy (what to do when a previous run is still active)
 - A catch-up policy (what to do with missed scheduled runs)
@@ -282,17 +282,6 @@ GET /api/routines/{routineId}/event-groups?open=true
 
 The list takes optional filters that combine with AND: `q` (case-insensitive text in the title or the description), `assigneeAgentId`, `projectId`, `folderId` (`none` for routines in no folder), `status` (`active`, `paused` or `archived`) and `trigger` (`schedule`, `webhook`, `api`, `event`, or `manual` for a routine with no trigger). For example, `GET /api/companies/{companyId}/routines?assigneeAgentId={agentId}&status=active` lists one agent's active routines. The CLI takes the same filters: `paperclipai routine list --agent-id <id> --status active`.
 
-### A project's routines
-
-A routine belongs to at most one project (`projectId`). To work with one project's routines:
-
-- List them with `GET /api/companies/{companyId}/routines?projectId={projectId}`, or `paperclipai routine list --project-id <id>`.
-- Create one in the project with `projectId` in the create body, or `paperclipai routine create --project-id <id> --payload-json '{...}'`.
-- Move one to another project with `PATCH /api/routines/{routineId}` and `projectId`, or `paperclipai routine update <routineId> --project-id <id>`. Send `null`, or `--project-id none`, to take it out of any project.
-- Pause, run and edit it as any other routine.
-
-The board does the same on the project's Configuration tab.
-
 Use the generic API endpoint tables in `api-reference.md` when you need a full cross-domain reference. Use this file when you need routine-specific behaviour, payload shape, or policy details.
 
 ## Routine steps
@@ -409,3 +398,14 @@ Use `first` for a scheduled routine that must not wait behind a long queue, such
 - **Only the board sets `first`.** It reorders the queue of every agent that serves the routine's runs, so a board user with `tasks:assign` must set it. As an agent you get `403` when you set `first` on a routine that is not already `first`, even on your own routine: ask the board. You can still set it back to `normal`. While your routine is `first`, adding triggers or starting more runs pushes the other queued work of every agent it serves further back, so ask the board before you make it run more often.
 - **Your other runs can wait.** Aging (one priority level per 30 minutes waited) works within each group only. While a `first` routine keeps runs queued, the agent's other runs wait, however long they have waited.
 - **Which issues.** It applies to the issues the routine files under its own id (origin `routine_execution` or `routine_step`). A plugin-managed routine that files its runs under the plugin's own origin, or another origin id, keeps the usual order.
+
+## A project's routines
+
+A routine belongs to at most one project (`projectId`). To work with one project's routines:
+
+- List them with `GET /api/companies/{companyId}/routines?projectId={projectId}`, or `paperclipai routine list --project-id <id>`.
+- Create one in the project with `projectId` in the create body, or `paperclipai routine create --project-id <id> --payload-json '{...}'`.
+- Move one to another project with `PATCH /api/routines/{routineId}` and `projectId`, or `paperclipai routine update <routineId> --project-id <id>`. Send `null`, or `--project-id none`, to take it out of any project.
+- Pause, run and edit it as any other routine.
+
+The board does the same on the project's Configuration tab.
