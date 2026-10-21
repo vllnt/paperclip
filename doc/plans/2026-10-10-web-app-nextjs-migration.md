@@ -1,7 +1,7 @@
 # Web app migration to Next.js, measured route by route
 
 Date: 2026-10-10
-Status: Approved for execution on 2026-10-20 (maintainer). The plan check against `main` of that day is section 12, the slice order and acceptance checks are section 13, and the baseline protocol is section 14. Where those sections correct an earlier section, they win: the version pin of section 4.3 is one such case.
+Status: Approved for execution on 2026-10-20 (maintainer). The plan check against `main` of that day is section 12, the slice order and acceptance checks are section 13, and the baseline protocol is section 14. The second plan check (2026-10-21) is section 15: it replaces the landing order of section 6.4 and maps every route to its slice. Where a later section corrects an earlier one, the later one wins: the version pin of section 4.3 is one such case.
 Branch: `docs/web-app-speed-nextjs-plan`
 Evidence base: `doc/plans/2026-10-10-web-app-speed-nextjs-plan.md` (same pull request, fact-checked). It holds the route inventory, the B0 and B1 numbers, the boot waterfall and the constraints. This plan does not repeat them; it cites them as "speed plan, section N".
 
@@ -416,7 +416,72 @@ The goal is a before and after for every slice, so the before has to exist befor
 
 Baseline status on 2026-10-20: not recorded. Blocked on an authenticated browser session for the production instance (section 14, first bullet). The local `main` baseline comes with H1.
 
-## Appendix A. Sources outside the repository
+## 15. Plan check against `main` (2026-10-21)
+
+Checked at `origin/main` `2785c614c`, 46 commits after the check of section 12 (`1a94022f0`). Pull request states come from `gh pr list`; release dates from the npm registry; advisories from the advisory lists of `vercel/next.js` and `facebook/react`.
+
+### 15.1 Findings
+
+| # | Item | `main` or the outside world today | Effect |
+|---|---|---|---|
+| 1 | Files that M0 and M0b edit | Since `1a94022f0`, `ui/src/App.tsx`, `ui/src/main.tsx`, `Layout.tsx`, `ProductionLayout.tsx`, both sidebars, `ui/vite.config.ts`, `ui/package.json`, the `Dockerfile` and `server/src/index.ts` did not change. `server/src/app.ts` gained one line (`eventSources` passed to the routes). `App.tsx` still has 274 `<Route>` elements; `createServer` is still at `server/src/index.ts:935` and `listen` at `:1005` | The anchors of section 12.2 hold |
+| 2 | #115's backend harness (section 12.1, row 3) | #340 added `tests/perf/backend/`: `fault-proxy.mjs`, `faults.mjs` (F1, F4, statement census), `prod-readonly.mjs`, `lib/server.mjs` (starts a checkout's server and waits for health), `lib/stats.mjs` (paired-difference interval of the median) and `lib/census.mjs`. It has no one-second sampler (`probe-preload.mjs`) and no open-loop load runner (`run.mjs`) | H still builds its own CPU and resident-memory sampler (row 3 of section 12.1 stands). It imports `lib/server.mjs` and `lib/stats.mjs` instead of writing them again |
+| 3 | Next.js release | No Next.js advisory was published after 2026-10-14. `16.4.1` (2026-10-14T17:43:55Z) fixes the three advisories of that day and clears the 7-day cooldown at 2026-10-21T17:43:55Z. `16.4.2` (2026-10-15T20:57:24Z) has bug fixes only (Turbopack and turbo-tasks backports) and clears it at 2026-10-22T20:57:24Z | The pin is the newest 16.4.x past the cooldown on install day: `16.4.1` for an install before 2026-10-22T20:57Z, `16.4.2` after it |
+| 4 | React Server Components advisories | New since section 12: GHSA-xqc2-xf4c-x3h3 (critical, remote code execution in React Server Components) and GHSA-h3gv-c5rc-p453 (high, denial of service in Server Functions), both published 2026-10-14T17:08Z. They affect `react-server-dom-*` up to 19.2.8 and 19.3.0, fixed in 19.2.9 and 19.3.1. `next@16.4.1` vendors the canary `19.3.0-canary-278794d7-20261002` and patches its compiled `react-server-dom-turbopack` in place (commit "[react] Improve Server Component transport protocol" in `v16.4.0...v16.4.1`, 12 files under `packages/next/src/compiled/react-server-dom-turbopack/`) | M0 confirms the fix in the installed files and names it in its pull request. The lockfile has no `react-server-dom-*` package today; the `react` and `react-dom` 19.2.8 of `ui/package.json` serve tooling only (section 4.3) |
+| 5 | Free disk on the build host | 6,013 MiB at 12:40Z and about 4,000 MiB at 12:46Z, below the floor of open question 1 (9,000 MiB) | The M0 install waits for the floor. No image is built on the build host: the image rows of section 8 (Memory, Start, Image and CI) run on a CI runner, in a job that builds the base and the head on the same runner (section 15.4) |
+| 6 | Production checks without a cookie session (section 14, first bullet) | The production UI checks of 2026-10-21 sent a board key as an `Authorization` header on every browser request, and the pages rendered with data. The live-events socket accepts only agent keys, so live updates are not part of such a check | Item 6 of section 13.1 and the production baseline run this way. A production number is compared only with a number measured the same way, and the live socket rows of section 8 run locally only |
+| 7 | The open pull requests | None of the 11 open pull requests touches `ui/`. Five sessions are building UI on branches that are not yet pull requests (section 15.2) | Section 15.2 replaces section 6.4 |
+
+### 15.2 Landing order (replaces section 6.4)
+
+#95 was closed without a merge and #119 merged, so their rows of section 6.4 are gone. Each later pull request merges `main` into its branch (no rebase, no force push). The coordinator of the parallel work sets the merge order of the pull requests that share files.
+
+| Work | Files it shares with this plan | Order |
+|---|---|---|
+| H (harness) | `tests/perf/web-app/` and one CI workflow for the image rows; no runtime code | first; anytime, normal lane |
+| The Inbox and Decisions merge (new tabs `inbox/decide`, `inbox/alerts`, `inbox/archived`; `decisions` and `decisions/queues/:key` become redirects to `inbox/decide`; one sidebar row) | `ui/src/App.tsx`, `Sidebar.tsx`, `Sidebar.production.tsx`, `MobileBottomNav.tsx`, `ui/src/pages/Inbox.tsx` | before M0; M0 merges `main` after it |
+| Project routines and goal pages (routines on the project page; Tasks, Routines and Agents tabs on the goal page) | `ui/src/pages/ProjectDetail.tsx`, `Routines.tsx`, `GoalDetail.tsx`; no route change known | independent of M0 to M0c; the pages move in M6 and M7 |
+| Policies (a company Policies page, a project Policies section) | a new route in `App.tsx`, a sidebar row, `ProjectDetail.tsx` | before M0: a React Router route plus a row in section 15.3; after M0b: a segment (section 6.3) |
+| Databases (`databases`, `databases/:databaseId`, a row page; a `BOARD_ROUTE_ROOTS` entry and unprefixed redirects) | `App.tsx`, both sidebars, `ui/src/lib/company-routes.ts` | as Policies |
+| Routine step editor (loop back) | `ui/src/pages/RoutineDetail.tsx` | independent; moves in M7 |
+| The Node 24.22.1 security update | `Dockerfile` (base image line) | independent; M0 merges `main` after it |
+| M0, then M0b | `server/src/index.ts`, `server/src/app.ts`, `ui/src/main.tsx`, `ui/src/App.tsx`, both shells, `Dockerfile`, `ui/package.json`, `pnpm-lock.yaml` | after the Inbox and Decisions merge; one risky slice per deploy window (section 12.1, row 6) |
+| Backend on Effect, slices that touch `server/src/index.ts` or `server/src/app.ts` | the server start | after M0, building on it |
+
+### 15.3 Every route and the slice that moves it
+
+MF removes the catch-all, so every pattern of `App.tsx` has a slice. Paths are under `/:companyPrefix/` unless marked; "redirect" rows move with their target and become server `redirect()` calls. A new page from section 15.2 joins the slice of its group. The `route-smoke.mjs` probe (H) reads the patterns from `App.tsx`, so a route that no row names shows up in its output.
+
+| Slice | Segments |
+|---|---|
+| M1 | `issues` (board and list); redirects `issues/{all,active,backlog,done,recent}`, `tasks` |
+| M2 | `issues/:issueId`; `tests/perf/long-thread` (perf page) |
+| M3 | `dashboard`, `dashboard/live`; the index redirect to `dashboard` |
+| M4 | `inbox/*` (with the new `decide`, `alerts`, `archived` tabs), `decisions`, `decisions/queues/:key`, `approvals/*`, `review-queue` |
+| M5 | `agents/*` (list, detail, runs, run transcript), `chats`, `chats/:agentRef`, `org` |
+| M6 | `projects/*` (with the routines, goals and policies sections), `workspaces`, `execution-workspaces/*` |
+| M7 | `activity`, `activity/{runs,costs,budgets,timeline}`, `timeline`; redirects `audit/*`, `runs`, `costs`, `budgets`; `routines`, `routines/:routineId`, `routines/:routineId/:section` (with the step editor); `goals`, `goals/:goalId`; `learnings` |
+| M8 | `company/*` (settings, members, invites, export, import, secrets and the rest), `company/settings/instance/*`, `instance/settings/adapters`, `companies`, `onboarding`; redirects `settings`, `settings/*`, `tools`, `tools/:tab`; the company Policies page (new) |
+| M9 | `apps/*`, `plugins/:pluginId`, `:pluginRoutePath/*` (client-rendered), `skills/*`, `artifacts`, `cases/*`, `pipelines/*`, `status`, `status/:cardId`, redirects `status-cards/*`; `board-chat`, `search`, `u/:userSlug`; `databases/*` (new) |
+| M10 | unprefixed: `auth`, `invite/:token`, `oauth-handoff`, `board-claim/:token`, `cli-auth/:id`, `chat-identity/confirm`, `onboarding`, every unprefixed redirect (`UnprefixedBoardRedirect`, `LegacySettingsRedirect`, `CompanyRootRedirect`), the two not-found pages; developer pages `design-guide`, `dev/task-chat-lab`, `ux-lab/*`, unprefixed `tests/perf/long-thread` (client-only) |
+
+### 15.4 Image rows on a CI runner, and what each risky slice needs from the operator
+
+- **Image rows.** H adds a workflow that a pull request runs only when it carries the `perf-image` label. On one hosted runner it builds the production target of the base commit and of the head, one after the other with the same cache settings. It records the uncompressed size (`docker image inspect`) and the build time of each. Then it runs each image with `--memory 2g --memory-swap 2g` and the compose `NODE_OPTIONS` against a throwaway database: `start-timer.mjs` (process start to `/api/health` `ok` and to the first UI 200), 10 parallel cold loads, 5 restarts, `OOMKilled` from `docker inspect`, and the startup peak from `VmHWM`. The JSON goes to the job summary and an artifact, and `gate.mjs` reads it. Two runs on one runner are compared, never numbers from two runners. It changes neither the release workflow nor `deploy/`.
+- **What the operator of the production instance checks for each risky slice** (M0, M0b, M0c, MF), before and after its merge:
+  - the deploy check: `GET /` answers 200 next to `/api/health`. Section 12.1, row 5 keeps the release workflow as it is, so this is a step of the operator's deploy script or of the slice's production smoke test;
+  - the new `ui` field of `/api/health` (`starting`, `ready`, `failed`) and HTTP 503 while the UI has failed. The container health check reads only the status code. The operator confirms that the deploy script rolls back on that 503, which is what open question 11 relies on;
+  - the ingress: no cache directive applies to the app, and one HTML response and one `?_rsc=` response through the ingress carry `Cache-Control: private, no-store` and a `Vary` with `Cookie`;
+  - memory: which metric drives `resourceCapacity.level` (section 12.3, last bullet), and the container's resident memory before and after, since the memory row of section 8 is measured on the CI runner, not on the production host.
+
+### 15.5 The M0 install, step by step
+
+1. Measure free disk right before the install. It must be at least 9,000 MiB plus the install's size.
+2. Install `next` at the pin of section 15.1, row 3, and `@tailwindcss/postcss@4.3.3` (the locked `tailwindcss` version; published 2026-07-16, past the cooldown), both exact.
+3. Measure free disk right after. Below 9,000 MiB: stop, and keep the lockfile change out of any merge until the floor is back.
+4. The M0 pull request records both disk numbers, the two versions with their registry dates, the advisory check of section 15.1, rows 3 and 4, and the vendored-React check.
+
+ Sources outside the repository
 
 - Next.js custom server (docs version 16.4.0): https://nextjs.org/docs/app/guides/custom-server
 - Next.js linking and navigating, native History API, `loading.tsx` prefetch (docs version 16.4.0): https://nextjs.org/docs/app/getting-started/linking-and-navigating
