@@ -4,7 +4,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CONNECTION_INTENT_AGENT_GUIDANCE, CONTINUATION_OBJECTIVE_MAX_CHARS, cutText } from "@paperclipai/shared";
+import {
+  CONNECTION_INTENT_AGENT_GUIDANCE,
+  CONTINUATION_OBJECTIVE_MAX_CHARS,
+  GOAL_TEXT_MAX_LENGTH,
+  cutText,
+  truncateAtGrapheme,
+} from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
@@ -548,6 +554,13 @@ type PaperclipWakeIssue = {
   status: string | null;
   workMode: string | null;
   priority: string | null;
+  /** The task's own goal; an agent reads the rest of it with `GET /api/goals/:id`. */
+  goal: PaperclipWakeIssueGoal | null;
+};
+
+type PaperclipWakeIssueGoal = {
+  id: string;
+  title: string;
 };
 
 type PaperclipWakeExecutionPrincipal = {
@@ -938,7 +951,22 @@ function normalizePaperclipWakeIssue(
     status,
     workMode,
     priority,
+    goal: normalizePaperclipWakeIssueGoal(issue.goal),
   };
+}
+
+/**
+ * The task's goal as the wake text shows it. The title is user input on one prompt line, so control
+ * characters and line breaks become spaces, and it is cut like every goal text an agent reads.
+ */
+function normalizePaperclipWakeIssueGoal(value: unknown): PaperclipWakeIssueGoal | null {
+  const goal = parseObject(value);
+  const id = asString(goal.id, "").trim();
+  const title = truncateAtGrapheme(
+    asString(goal.title, "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim(),
+    GOAL_TEXT_MAX_LENGTH,
+  );
+  return id && title ? { id, title } : null;
 }
 
 function normalizePaperclipWakeComment(
@@ -2702,6 +2730,9 @@ function renderPaperclipWakePromptBody(
   }
   if (normalized.issue?.priority) {
     lines.push(`- issue priority: ${normalized.issue.priority}`);
+  }
+  if (normalized.issue?.goal) {
+    lines.push(`- issue goal: ${normalized.issue.goal.title} (goal id ${normalized.issue.goal.id})`);
   }
   const issueDescription = normalized.issue?.description ?? null;
   // Resume deltas skip the description: the session already received the brief
