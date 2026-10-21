@@ -39,16 +39,22 @@ export function medianIntervalRank(n, coverage = 0.95) {
   return best;
 }
 
+/** The least number of pairs a gated row is decided on (plan section 8). */
+export const MIN_PAIRS = 10;
+
 /**
  * Decides a gated row from paired differences (percent, positive = worse),
  * as section 8 of the plan states: pass when the upper end of the 95%
  * interval of the median is at most the threshold, fail when the lower end
- * is above it, inconclusive otherwise.
+ * is above it, inconclusive otherwise. Fewer than `MIN_PAIRS` pairs are
+ * inconclusive, even where an interval exists (it does from 6 pairs).
  */
 export function decideRow(differences, thresholdPercent) {
   const n = differences.length;
   const k = medianIntervalRank(n);
-  if (k === 0) return { n, verdict: "inconclusive", reason: "too few pairs", median: median(differences) };
+  if (n < MIN_PAIRS || k === 0) {
+    return { n, verdict: "inconclusive", reason: `fewer than ${MIN_PAIRS} pairs`, median: median(differences) };
+  }
   const sorted = [...differences].sort((a, b) => a - b);
   const low = sorted[k - 1];
   const high = sorted[n - k];
@@ -62,7 +68,7 @@ export function pairsNeeded(aaDifferences, thresholdPercent) {
   const mean = aaDifferences.reduce((sum, value) => sum + value, 0) / n;
   const variance = aaDifferences.reduce((sum, value) => sum + (value - mean) ** 2, 0) / Math.max(1, n - 1);
   const sd = Math.sqrt(variance);
-  return { sd, needed: Math.max(10, Math.ceil(((3.5 * sd) / thresholdPercent) ** 2)) };
+  return { sd, needed: Math.max(MIN_PAIRS, Math.ceil(((3.5 * sd) / thresholdPercent) ** 2)) };
 }
 
 /** (candidate - base) as a percent of base. */

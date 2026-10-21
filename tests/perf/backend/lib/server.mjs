@@ -37,8 +37,23 @@ const secret = () => randomBytes(32).toString("hex");
  *   readyTimeoutMs?: number,
  * }} options
  */
-export async function startServer({ checkout, databaseUrl, migrationUrl, mode, cloudTenantToken, readyTimeoutMs = 180_000 }) {
+export async function startServer(options) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-perf-f4-"));
+  const started = { child: null, exit: null };
+  try {
+    return await launch(home, started, options);
+  } catch (error) {
+    // The caller has no handle to `stop()` on a failed start: stop the child and remove the home here.
+    if (started.child && started.child.exitCode === null && started.child.signalCode === null) {
+      started.child.kill("SIGKILL");
+      await started.exit;
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function launch(home, started, { checkout, databaseUrl, migrationUrl, mode, cloudTenantToken, readyTimeoutMs = 180_000 }) {
   const port = await freePort();
   const env = {
     PATH: process.env.PATH,
@@ -81,11 +96,12 @@ export async function startServer({ checkout, databaseUrl, migrationUrl, mode, c
     // The home is the working directory, so the server finds no config file of a checkout.
     { cwd: home, env, stdio: ["ignore", "pipe", "pipe"] },
   );
+  started.child = child;
   const log = { budgetWarnings: [], errors: 0, tail: [] };
   const exit = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal, at: Date.now() })));
+  started.exit = exit;
   let exited = null;
   exit.then((value) => { exited = value; });
-  let buffered = "";
   const onLine = (line) => {
     log.tail.push(line);
     if (log.tail.length > 40) log.tail.shift();
@@ -98,21 +114,24 @@ export async function startServer({ checkout, databaseUrl, migrationUrl, mode, c
       // Not a log line.
     }
   };
-  const onData = (chunk) => {
-    buffered += chunk.toString("utf8");
-    const lines = buffered.split("\n");
-    buffered = lines.pop();
-    for (const line of lines) onLine(line);
+  // One buffer per stream: chunks of stdout and stderr interleave, and a shared buffer would merge two lines.
+  const lineReader = () => {
+    let buffered = "";
+    return (chunk) => {
+      buffered += chunk.toString("utf8");
+      const lines = buffered.split("\n");
+      buffered = lines.pop();
+      for (const line of lines) onLine(line);
+    };
   };
-  child.stdout.on("data", onData);
-  child.stderr.on("data", onData);
+  child.stdout.on("data", lineReader());
+  child.stderr.on("data", lineReader());
 
   const url = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + readyTimeoutMs;
   for (;;) {
     if (exited) throw new Error(`server exited during start (${JSON.stringify(exited)}): ${log.tail.slice(-10).join("\n")}`);
     if (Date.now() > deadline) {
-      child.kill("SIGKILL");
       throw new Error(`server not ready in ${readyTimeoutMs} ms: ${log.tail.slice(-10).join("\n")}`);
     }
     try {
@@ -132,7 +151,9 @@ export async function startServer({ checkout, databaseUrl, migrationUrl, mode, c
     async stop() {
       if (!exited) {
         child.kill("SIGTERM");
-        const done = await Promise.race([exit, sleep(30_000).then(() => null)]);
+        let killTimer;
+        const done = await Promise.race([exit, new Promise((resolve) => { killTimer = setTimeout(() => resolve(null), 30_000); })]);
+        clearTimeout(killTimer);
         if (!done) {
           child.kill("SIGKILL");
           await exit;

@@ -1,9 +1,14 @@
 // node --test tests/perf/backend/harness.test.mjs
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { after, before, describe, it } from "node:test";
 
 import { startFaultProxy } from "./fault-proxy.mjs";
+import { analyzeRoute, dashboardRows, listRows } from "./lib/census.mjs";
+import { startServer } from "./lib/server.mjs";
 import { decideRow, medianIntervalRank, pairsNeeded } from "./lib/stats.mjs";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -83,9 +88,125 @@ describe("stats", () => {
     assert.equal(decideRow([1, 2], 5).verdict, "inconclusive");
   });
 
+  it("decides nothing on fewer than 10 pairs, even where an interval exists", () => {
+    // 6 pairs is the least that has a 95% interval; the plan decides a row on 10 or more.
+    const eight = [-10, -9, -8, -7, -6, -5, -4, -3];
+    assert.equal(medianIntervalRank(8) > 0, true);
+    assert.equal(decideRow(eight, 5).verdict, "inconclusive");
+    assert.equal(decideRow([...eight, -2], 5).verdict, "inconclusive");
+    assert.equal(decideRow([...eight, -2, -1], 5).verdict, "pass");
+  });
+
   it("asks for at least 10 pairs", () => {
     assert.equal(pairsNeeded([0, 0, 0], 5).needed, 10);
     assert.ok(pairsNeeded([-10, 10, -10, 10], 5).needed > 10);
+  });
+});
+
+describe("census", () => {
+  const sizes = [10, 100];
+  const route = (statements, rows, agents = { 10: 1, 100: 10 }) => analyzeRoute({ sizes, statements, rows, agents });
+
+  it("counts the rows of a list, of a wrapper and of the dashboard counters", () => {
+    assert.equal(listRows([1, 2, 3]), 3);
+    assert.equal(listRows({ items: [1, 2], nextCursor: null, totalCount: 9 }), 2);
+    assert.equal(listRows({ count: 4 }), 0);
+    assert.equal(listRows(null), 0);
+    const dashboard = { agents: { active: 2, running: 1, paused: 0, error: 0 }, tasks: { open: 7, inProgress: 3, blocked: 1, done: 5 }, runActivity: [] };
+    assert.equal(dashboardRows(dashboard), 3 + 7 + 5);
+    assert.equal(dashboardRows(undefined), 0);
+  });
+
+  it("reads a flat count over growing rows as not N+1 shaped", () => {
+    const result = route({ 10: 12, 100: 12.2 }, { 10: 10, 100: 100 });
+    assert.equal(result.status, "measured");
+    assert.equal(result.nPlusOneShaped, false);
+  });
+
+  it("flags a count that grows by a statement per returned row", () => {
+    const result = route({ 10: 12, 100: 102 }, { 10: 10, 100: 100 });
+    assert.equal(result.nPlusOneShaped, true);
+    assert.equal(result.perReturnedRow, 1);
+  });
+
+  it("flags a statement per agent although the issues outnumber the agents ten to one", () => {
+    // 9 more agents, 9 more statements: 0.1 a row, 1 an agent.
+    const result = route({ 10: 12, 100: 21 }, { 10: 10, 100: 100 });
+    assert.equal(result.perReturnedRow, 0.1);
+    assert.equal(result.perAgent, 1);
+    assert.equal(result.nPlusOneShaped, true);
+  });
+
+  it("marks a route unmeasured, not clean, when its response does not grow", () => {
+    const result = route({ 10: 3, 100: 3 }, { 10: 0, 100: 0 });
+    assert.equal(result.status, "unmeasured");
+    assert.equal(result.nPlusOneShaped, null);
+    assert.equal(route({ 10: 3, 100: 3 }, { 10: 50, 100: 50 }).status, "unmeasured");
+  });
+
+  it("marks every route unmeasured with a single size", () => {
+    const result = analyzeRoute({ sizes: [10], statements: { 10: 5 }, rows: { 10: 10 }, agents: { 10: 1 } });
+    assert.equal(result.status, "unmeasured");
+    assert.equal(result.nPlusOneShaped, null);
+  });
+});
+
+describe("server launcher", () => {
+  let tmp;
+  let previousTmpdir;
+  before(() => {
+    // The launcher makes its home under os.tmpdir(): use a private one to see what it leaves.
+    previousTmpdir = process.env.TMPDIR;
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "perf-launcher-test-"));
+    process.env.TMPDIR = tmp;
+  });
+  after(() => {
+    process.env.TMPDIR = previousTmpdir;
+    if (previousTmpdir === undefined) delete process.env.TMPDIR;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  /** A stand-in checkout whose `server/src/index.ts` is `source`. */
+  function fakeCheckout(source) {
+    const dir = fs.mkdtempSync(path.join(tmp, "checkout-"));
+    fs.mkdirSync(path.join(dir, "server/node_modules/tsx/dist"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "server/node_modules/tsx/dist/loader.mjs"), "");
+    fs.mkdirSync(path.join(dir, "server/src"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "server/src/index.ts"), source);
+    return dir;
+  }
+  const homes = () => fs.readdirSync(tmp).filter((name) => name.startsWith("paperclip-perf-f4-"));
+  const options = (checkout, extra = {}) => ({ checkout, databaseUrl: "postgres://unused", migrationUrl: "postgres://unused", mode: "local_trusted", ...extra });
+
+  it("removes its home when the server exits during the start", async () => {
+    const checkout = fakeCheckout("process.exit(3);");
+    await assert.rejects(startServer(options(checkout)), /server exited during start/);
+    assert.deepEqual(homes(), []);
+  });
+
+  it("stops the server and removes its home when it is not ready in time", async () => {
+    const checkout = fakeCheckout("setInterval(() => {}, 1000);");
+    await assert.rejects(startServer(options(checkout, { readyTimeoutMs: 1_500 })), /not ready in 1500 ms/);
+    assert.deepEqual(homes(), []);
+  });
+
+  it("keeps the lines of stdout and stderr apart when their chunks interleave", async () => {
+    const checkout = fakeCheckout(`
+      const http = require("node:http");
+      process.stdout.write('{"level":40,"time":1,"msg":"database retry budget re');
+      process.stderr.write('{"level":50,"time":2,"msg":"boom"}\\n');
+      setTimeout(() => process.stdout.write('fused retries","refusedRetries":3}\\n'), 100);
+      http.createServer((req, res) => res.end(JSON.stringify({ status: "ok" }))).listen(Number(process.env.PORT), "127.0.0.1");
+    `);
+    const server = await startServer(options(checkout));
+    try {
+      await until(() => server.log.budgetWarnings.length === 1, 5_000);
+      assert.deepEqual(server.log.budgetWarnings, [{ time: 1, refusedRetries: 3 }]);
+      assert.equal(server.log.errors, 1);
+    } finally {
+      await server.stop();
+    }
+    assert.deepEqual(homes(), []);
   });
 });
 

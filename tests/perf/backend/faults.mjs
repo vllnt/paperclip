@@ -5,8 +5,8 @@
  *   `retryIdempotentDatabaseOperation` at a fixed call rate (open loop) while a
  *   chaos loop ends the database backends every 25 ms for a set length, and a
  *   slow-failure case in which a TCP proxy stalls every connection for 3 s and
- *   then resets it. Two or more helper versions ("arms") run in interleaved
- *   trials against one embedded Postgres.
+ *   then resets it (once per predicate). Two or more helper versions ("arms")
+ *   run in interleaved trials against one embedded Postgres.
  *
  * Run with the tsx loader of a checkout whose dependencies are installed:
  *
@@ -21,7 +21,9 @@
  * Options (defaults in brackets): --rates [20,77], --lengths ms [300,1000,3000],
  * --trials [10], --predicates [default,wide], --steady ms [10000], --tail ms
  * [5000], --stall ms [3000] (0 skips the slow-failure case), --query
- * ["select pg_sleep(0.003)"].
+ * ["select pg_sleep(0.003)"]. An arm file must export
+ * `retryIdempotentDatabaseOperation`, and `isTransientDatabaseError` when the
+ * wide predicate runs.
  *
  *   F4, route level: the server of each arm's checkout behind the proxy,
  *   under the dashboard load, through a flap and a blackout (`f4`, see README).
@@ -36,6 +38,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
 import { startFaultProxy } from "./fault-proxy.mjs";
+import { analyzeRoute, dashboardRows, listRows } from "./lib/census.mjs";
 import { startServer } from "./lib/server.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -57,19 +60,37 @@ function errorCode(error) {
   return error instanceof Error ? error.name : typeof error;
 }
 
+function describeError(error) {
+  return error instanceof Error ? (error.stack ?? error.message) : String(error);
+}
+
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+const PREDICATES = ["default", "wide"];
+
 /**
  * Before #301, the repository patch of postgres.js 3.4.9 did not handle a
  * failed array-type fetch on a new connection, so a backend that died while a
  * connection started raised an unhandled rejection. The server exits on one;
  * the harness counts them instead, per trial, so a checkout from before #301
  * can still be measured. With #301 the count should be 0.
+ *
+ * Only F1 installs the handler. In F4 and the census the harness process owns
+ * no database pool that a fault can reach, so a rejection there is a harness
+ * bug and must end the run, not be counted.
  */
-const unhandled = { count: 0, codes: {} };
-process.on("unhandledRejection", (reason) => {
-  unhandled.count += 1;
-  const code = errorCode(reason);
-  unhandled.codes[code] = (unhandled.codes[code] ?? 0) + 1;
-});
+function countUnhandledRejections() {
+  const unhandled = { count: 0, codes: {} };
+  process.on("unhandledRejection", (reason) => {
+    unhandled.count += 1;
+    const code = errorCode(reason);
+    unhandled.codes[code] = (unhandled.codes[code] ?? 0) + 1;
+  });
+  return unhandled;
+}
 
 const CHAOS_APPLICATION = "perf-chaos";
 const TERMINATE_SQL = `select pg_terminate_backend(pid) from pg_stat_activity
@@ -88,44 +109,48 @@ async function chaosLoop(control, untilMs) {
  * One trial: steady calls, a fault, then a tail. Returns the calls that
  * started during the fault.
  */
-async function runTrial({ arm, predicate, rate, faultMs, kind, steadyMs, tailMs, connectionString, control, proxy, createDb, sql, query }) {
+async function runTrial({ arm, predicate, rate, faultMs, kind, steadyMs, tailMs, connectionString, control, proxy, createDb, sql, query, unhandled }) {
   arm.module.resetDatabaseRetryBudget?.();
   const url = kind === "stall"
     ? connectionString.replace(/:(\d+)\//, `:${proxy.port}/`)
     : connectionString;
   const db = createDb(url);
-  const options = predicate === "wide" ? { isTransient: arm.module.isTransientDatabaseError } : {};
-  const statement = sql.raw(query);
-  const calls = [];
-  const start = performance.now() + 50;
-  const faultStart = start + steadyMs;
-  const faultEnd = faultStart + faultMs;
-  const total = Math.floor(((steadyMs + faultMs + tailMs) * rate) / 1000);
-  const unhandledBefore = unhandled.count;
-  const fault = sleep(faultStart - performance.now()).then(() => {
-    if (kind === "stall") return proxy.setMode("stall", { stallMs: faultMs });
-    return chaosLoop(control, faultEnd);
-  });
-  for (let index = 0; index < total; index += 1) {
-    await sleep(start + (index * 1000) / rate - performance.now());
-    const startedAt = performance.now();
-    const call = { startedAt, inFault: startedAt >= faultStart && startedAt < faultEnd };
-    calls.push(call);
-    call.done = arm.module.retryIdempotentDatabaseOperation(() => db.execute(statement), options).then(
-      () => { call.ok = true; },
-      (error) => { call.ok = false; call.code = errorCode(error); },
-    ).finally(() => { call.durationMs = performance.now() - startedAt; });
+  try {
+    const options = predicate === "wide" ? { isTransient: arm.module.isTransientDatabaseError } : {};
+    const statement = sql.raw(query);
+    const calls = [];
+    const start = performance.now() + 50;
+    const faultStart = start + steadyMs;
+    const faultEnd = faultStart + faultMs;
+    const total = Math.floor(((steadyMs + faultMs + tailMs) * rate) / 1000);
+    const unhandledBefore = unhandled.count;
+    const fault = sleep(faultStart - performance.now()).then(() => {
+      if (kind === "stall") return proxy.setMode("stall", { stallMs: faultMs });
+      return chaosLoop(control, faultEnd);
+    });
+    for (let index = 0; index < total; index += 1) {
+      await sleep(start + (index * 1000) / rate - performance.now());
+      const startedAt = performance.now();
+      const call = { startedAt, inFault: startedAt >= faultStart && startedAt < faultEnd };
+      calls.push(call);
+      call.done = arm.module.retryIdempotentDatabaseOperation(() => db.execute(statement), options).then(
+        () => { call.ok = true; },
+        (error) => { call.ok = false; call.code = errorCode(error); },
+      ).finally(() => { call.durationMs = performance.now() - startedAt; });
+    }
+    await fault;
+    await Promise.all(calls.map((call) => call.done));
+    return {
+      total: calls.length,
+      unhandledRejections: unhandled.count - unhandledBefore,
+      outsideFailures: calls.filter((call) => !call.inFault && !call.ok).length,
+      inFault: calls.filter((call) => call.inFault).map(({ ok, code, durationMs }) => ({ ok, code, durationMs })),
+    };
+  } finally {
+    // Also on a thrown trial: the next case must start with a closed pool and a passing proxy.
+    await db.$client.end({ timeout: 1 }).catch(() => undefined);
+    if (kind === "stall") await proxy.setMode("pass");
   }
-  await fault;
-  await Promise.all(calls.map((call) => call.done));
-  await db.$client.end({ timeout: 1 });
-  if (kind === "stall") await proxy.setMode("pass");
-  return {
-    total: calls.length,
-    unhandledRejections: unhandled.count - unhandledBefore,
-    outsideFailures: calls.filter((call) => !call.inFault && !call.ok).length,
-    inFault: calls.filter((call) => call.inFault).map(({ ok, code, durationMs }) => ({ ok, code, durationMs })),
-  };
 }
 
 function summarize(trials) {
@@ -162,11 +187,6 @@ async function f1(argv) {
     },
   });
   if (!values.arm || values.arm.length < 1) throw new Error("--arm name=/abs/path/database-retry.ts is required");
-  const arms = [];
-  for (const spec of values.arm) {
-    const [name, file] = spec.split("=");
-    arms.push({ name, file: path.resolve(file), module: await import(pathToFileURL(path.resolve(file)).href) });
-  }
   const list = (value) => value.split(",").filter(Boolean).map((item) => item.trim());
   const rates = list(values.rates).map(Number);
   const lengths = list(values.lengths).map(Number);
@@ -175,6 +195,21 @@ async function f1(argv) {
   const steadyMs = Number(values.steady);
   const tailMs = Number(values.tail);
   const stallMs = Number(values.stall);
+  for (const predicate of predicates) {
+    if (!PREDICATES.includes(predicate)) throw new Error(`--predicates: unknown predicate "${predicate}" (use ${PREDICATES.join(" and ")})`);
+  }
+  const arms = [];
+  for (const spec of values.arm) {
+    const [name, file] = spec.split("=");
+    const module = await import(pathToFileURL(path.resolve(file)).href);
+    // A missing export must stop the run: "wide" would silently run the default predicate.
+    const needed = ["retryIdempotentDatabaseOperation", ...(predicates.includes("wide") ? ["isTransientDatabaseError"] : [])];
+    for (const exported of needed) {
+      if (typeof module[exported] !== "function") throw new Error(`arm ${name} (${file}) does not export ${exported}`);
+    }
+    arms.push({ name, file: path.resolve(file), module });
+  }
+  const unhandled = countUnhandledRejections();
 
   const { startEmbeddedPostgresTestDatabase, createDb } = await importFromServer("@paperclipai/db");
   const { sql } = await importFromServer("drizzle-orm");
@@ -187,51 +222,63 @@ async function f1(argv) {
   });
   const targetPort = Number(new URL(database.connectionString).port);
   const proxy = await startFaultProxy({ targetPort });
+  // The slow-failure case runs once per predicate: the default predicate does
+  // not retry the reset that ends a stall, so only the wide one can show what
+  // a retry costs there.
   const cases = [];
   for (const rate of rates) {
     for (const predicate of predicates) {
       for (const faultMs of lengths) cases.push({ kind: "terminate", rate, predicate, faultMs });
+      if (stallMs > 0) cases.push({ kind: "stall", rate, predicate, faultMs: stallMs });
     }
-    if (stallMs > 0) cases.push({ kind: "stall", rate, predicate: "default", faultMs: stallMs });
   }
   const results = [];
-  const startedAt = new Date().toISOString();
+  const report = {
+    kind: "f1",
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    node: process.version,
+    arms: arms.map(({ name, file }) => ({ name, file })),
+    settings: { rates, lengths, predicates, trials, steadyMs, tailMs, stallMs, query: values.query },
+    results,
+  };
+  // Rewritten after every case: a failure after an hour must not lose the cases before it.
+  const writeReport = () => writeJson(values.out, report);
   try {
     for (const testCase of cases) {
-      const byArm = new Map(arms.map((arm) => [arm.name, []]));
-      for (let trial = 0; trial < trials; trial += 1) {
-        const order = trial % 2 === 0 ? arms : [...arms].reverse();
-        for (const arm of order) {
-          const result = await runTrial({
-            ...testCase, arm, steadyMs, tailMs, control, proxy, createDb, sql,
-            connectionString: database.connectionString, query: values.query,
-          });
-          byArm.get(arm.name).push(result);
+      const label = `F1 ${testCase.kind} rate=${testCase.rate} predicate=${testCase.predicate} fault=${testCase.faultMs}ms`;
+      try {
+        const byArm = new Map(arms.map((arm) => [arm.name, []]));
+        for (let trial = 0; trial < trials; trial += 1) {
+          const order = trial % 2 === 0 ? arms : [...arms].reverse();
+          for (const arm of order) {
+            const result = await runTrial({
+              ...testCase, arm, steadyMs, tailMs, control, proxy, createDb, sql, unhandled,
+              connectionString: database.connectionString, query: values.query,
+            });
+            byArm.get(arm.name).push(result);
+          }
         }
+        const summary = { ...testCase, arms: Object.fromEntries([...byArm].map(([name, list]) => [name, summarize(list)])) };
+        results.push(summary);
+        const line = Object.entries(summary.arms)
+          .map(([name, s]) => `${name} ${(s.share * 100).toFixed(1)}% (${s.failed}/${s.started}, longest ${Math.round(s.longestMs)} ms, codes ${JSON.stringify(s.codes)})`)
+          .join(" | ");
+        process.stderr.write(`${label}: ${line}\n`);
+      } catch (error) {
+        results.push({ ...testCase, error: describeError(error) });
+        process.stderr.write(`${label}: FAILED ${describeError(error)}\n`);
+        process.exitCode = 1;
       }
-      const summary = { ...testCase, arms: Object.fromEntries([...byArm].map(([name, list]) => [name, summarize(list)])) };
-      results.push(summary);
-      const line = Object.entries(summary.arms)
-        .map(([name, s]) => `${name} ${(s.share * 100).toFixed(1)}% (${s.failed}/${s.started}, longest ${Math.round(s.longestMs)} ms, codes ${JSON.stringify(s.codes)})`)
-        .join(" | ");
-      process.stderr.write(`F1 ${testCase.kind} rate=${testCase.rate} predicate=${testCase.predicate} fault=${testCase.faultMs}ms: ${line}\n`);
+      writeReport();
     }
   } finally {
     await control.end({ timeout: 1 });
     await proxy.close();
     await database.cleanup();
   }
-  const report = {
-    kind: "f1",
-    startedAt,
-    finishedAt: new Date().toISOString(),
-    node: process.version,
-    arms: arms.map(({ name, file }) => ({ name, file })),
-    settings: { rates, lengths, predicates, trials, steadyMs, tailMs, stallMs, query: values.query },
-    results,
-  };
-  fs.mkdirSync(path.dirname(values.out), { recursive: true });
-  fs.writeFileSync(values.out, `${JSON.stringify(report, null, 2)}\n`);
+  report.finishedAt = new Date().toISOString();
+  writeReport();
   process.stderr.write(`F1 report: ${values.out}\n`);
 }
 
@@ -296,7 +343,12 @@ async function seedAuth(url, token) {
 
 /**
  * The `wake` server: local_trusted, so no actor lookup runs. Every assignment
- * assigns an unassigned `todo` issue, so each 2xx answer must queue one wake.
+ * assigns an unassigned `todo` issue, so each 2xx answer must leave one
+ * `issue-assignment:` wake row. The agent has `wakeOnDemand: false`, so that
+ * row is a `skipped` receipt, not a queued wake; the key is the same. It is
+ * also the key of a board actor's request: a system-requested wake coalesces
+ * and takes `execution-wait:<digest>` (`coalesceExecutionWait` in
+ * `heartbeat.ts`), which this match would read as 0%.
  */
 async function seedWake(url, assignments) {
   const company = await must(request(url, "POST", "/api/companies", { body: { name: "Perf F4" } }), "seed company");
@@ -332,8 +384,10 @@ async function seedWake(url, assignments) {
  * The background is bursty, so the idle rate is taken over 10 s and each
  * route needs enough samples for its window to average the bursts out.
  * `settleMs` waits for work that a route does after its response (the wake).
+ * `rowsOf` reads, per route, the rows of its last response: a flat count only
+ * says something when the response had more rows to build.
  */
-async function statementCensus(proxy, senders, samples, settleMs = {}) {
+async function statementCensus(proxy, senders, samples, { settleMs = {}, rowsOf = {} } = {}) {
   // The first request of a user runs the full actor sync; keep it out of the count.
   for (const send of Object.values(senders)) await send();
   proxy.resetStats();
@@ -341,18 +395,21 @@ async function statementCensus(proxy, senders, samples, settleMs = {}) {
   await sleep(10_000);
   const idlePerMs = proxy.stats().statements / (performance.now() - idleStarted);
   const routes = {};
+  const rowsReturned = {};
   for (const [name, send] of Object.entries(senders)) {
     proxy.resetStats();
     const started = performance.now();
+    let last = null;
     for (let index = 0; index < samples; index += 1) {
-      const response = await send();
-      if (response.status >= 300) throw new Error(`census ${name}: HTTP ${response.status}`);
+      last = await send();
+      if (last.status >= 300) throw new Error(`census ${name}: HTTP ${last.status}`);
     }
     await sleep(settleMs[name] ?? 0);
     const statements = proxy.stats().statements - idlePerMs * (performance.now() - started);
     routes[name] = Math.max(0, statements / samples);
+    if (rowsOf[name]) rowsReturned[name] = rowsOf[name](last?.json);
   }
-  return { idleStatementsPerSecond: idlePerMs * 1000, statementsPerRequest: routes };
+  return { idleStatementsPerSecond: idlePerMs * 1000, statementsPerRequest: routes, rowsReturned };
 }
 
 /** Sends `send()` at a fixed rate from `startAt` to `endAt` (open loop) and records each request. */
@@ -469,7 +526,7 @@ async function runF4({ arm, config, phases, rates, censusSamples, importers }) {
     const assignments = Math.ceil((rates.assign * totalMs) / 1000) + censusSamples + 10;
     const senders = config === "auth" ? await seedAuth(server.url, token) : await seedWake(server.url, assignments);
     // The wake is delivered after the assignment's response.
-    const census = await statementCensus(proxy, senders, censusSamples, { assign: 1_000 });
+    const census = await statementCensus(proxy, senders, censusSamples, { settleMs: { assign: 1_000 } });
     const records = [];
     const startAt = performance.now() + 200;
     const endAt = startAt + totalMs;
@@ -536,58 +593,79 @@ async function f4(argv) {
   const { startEmbeddedPostgresTestDatabase } = await importFromServer("@paperclipai/db");
   const importers = { startEmbeddedPostgresTestDatabase, postgres: dbRequire("postgres") };
   const runs = [];
-  const startedAt = new Date().toISOString();
-  for (let pair = 0; pair < pairs; pair += 1) {
-    const order = pair % 2 === 0 ? arms : [...arms].reverse();
-    for (const config of configs) {
-      for (const arm of order) {
-        const run = { pair, ...(await runF4({ arm, config, phases, rates, censusSamples: Number(values.census), importers })) };
-        runs.push(run);
-        for (const phase of run.phases) {
-          const routes = Object.entries(phase.routes)
-            .map(([name, route]) => `${name} ${route.failed}/${route.requests} failed, longest ${route.longestMs} ms${route.wakeShare == null ? "" : `, woken ${(route.wakeShare * 100).toFixed(1)}%`}`)
-            .join("; ");
-          process.stderr.write(`F4 pair=${pair} ${config} ${arm.name} ${phase.name}: ${phase.statements} statements (bound ${phase.statementBound}), peak open ${phase.peakOpen}, peak in flight ${phase.peakInFlight}, refused ${phase.refusedRetries}; ${routes}\n`);
-        }
-        if (run.serverExit) process.stderr.write(`F4 pair=${pair} ${config} ${arm.name}: the server exited during the run ${JSON.stringify(run.serverExit)}\n`);
-      }
-    }
-  }
   const report = {
     kind: "f4",
-    startedAt,
-    finishedAt: new Date().toISOString(),
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
     node: process.version,
     arms,
     settings: { configs, pairs, phases, rates, flap: F4_FLAP, wakeSettleMs: F4_WAKE_SETTLE_MS, censusSamples: Number(values.census) },
     runs,
   };
-  fs.mkdirSync(path.dirname(values.out), { recursive: true });
-  fs.writeFileSync(values.out, `${JSON.stringify(report, null, 2)}\n`);
+  // Rewritten after every run: a failure after an hour must not lose the runs before it.
+  const writeReport = () => writeJson(values.out, report);
+  for (let pair = 0; pair < pairs; pair += 1) {
+    const order = pair % 2 === 0 ? arms : [...arms].reverse();
+    for (const config of configs) {
+      for (const arm of order) {
+        try {
+          const run = { pair, ...(await runF4({ arm, config, phases, rates, censusSamples: Number(values.census), importers })) };
+          runs.push(run);
+          for (const phase of run.phases) {
+            const routes = Object.entries(phase.routes)
+              .map(([name, route]) => `${name} ${route.failed}/${route.requests} failed, longest ${route.longestMs} ms${route.wakeShare == null ? "" : `, woken ${(route.wakeShare * 100).toFixed(1)}%`}`)
+              .join("; ");
+            process.stderr.write(`F4 pair=${pair} ${config} ${arm.name} ${phase.name}: ${phase.statements} statements (bound ${phase.statementBound}), peak open ${phase.peakOpen}, peak in flight ${phase.peakInFlight}, refused ${phase.refusedRetries}; ${routes}\n`);
+          }
+          if (run.serverExit) process.stderr.write(`F4 pair=${pair} ${config} ${arm.name}: the server exited during the run ${JSON.stringify(run.serverExit)}\n`);
+        } catch (error) {
+          runs.push({ pair, arm: arm.name, config, error: describeError(error) });
+          process.stderr.write(`F4 pair=${pair} ${config} ${arm.name}: FAILED ${describeError(error)}\n`);
+          process.exitCode = 1;
+        }
+        writeReport();
+      }
+    }
+  }
+  report.finishedAt = new Date().toISOString();
+  writeReport();
   process.stderr.write(`F4 report: ${values.out}\n`);
 }
 
-/** Routes of the census (the read routes of the production B0, plan section 4.7). {c} = company id, {i} = issue id. */
+/**
+ * Routes of the census (the read routes of the production B0, plan section 4.7)
+ * and how to count the rows of a response. {c} = company id, {i} = issue id.
+ */
 const CENSUS_ROUTES = [
-  ["dashboard", "/api/companies/{c}/dashboard"],
-  ["sidebar-badges", "/api/companies/{c}/sidebar-badges"],
-  ["live-runs", "/api/companies/{c}/live-runs"],
-  ["activity", "/api/companies/{c}/activity"],
-  ["heartbeat-runs", "/api/companies/{c}/heartbeat-runs?limit=200"],
-  ["agents", "/api/companies/{c}/agents"],
-  ["skills", "/api/companies/{c}/skills"],
-  ["attention", "/api/companies/{c}/attention"],
-  ["issues-default", "/api/companies/{c}/issues"],
-  ["issues-compact", "/api/companies/{c}/issues?view=compact&limit=100"],
-  ["issue-by-id", "/api/issues/{i}"],
-  ["issue-comments", "/api/issues/{i}/comments"],
+  ["dashboard", "/api/companies/{c}/dashboard", dashboardRows],
+  ["sidebar-badges", "/api/companies/{c}/sidebar-badges", listRows],
+  ["live-runs", "/api/companies/{c}/live-runs", listRows],
+  ["activity", "/api/companies/{c}/activity", listRows],
+  ["heartbeat-runs", "/api/companies/{c}/heartbeat-runs?limit=200", listRows],
+  ["agents", "/api/companies/{c}/agents", listRows],
+  ["skills", "/api/companies/{c}/skills", listRows],
+  ["attention", "/api/companies/{c}/attention", listRows],
+  ["issues-default", "/api/companies/{c}/issues", listRows],
+  ["issues-compact", "/api/companies/{c}/issues?view=compact&limit=100", listRows],
+  ["issue-by-id", "/api/issues/{i}", listRows],
+  ["issue-comments", "/api/issues/{i}/comments", listRows],
 ];
 
-/** A company with `size` issues, two comments each, and one agent per ten issues that the issues are assigned to. */
+// The agent create route allows 30 a minute per actor and company.
+const CENSUS_AGENTS_PER_ISSUES = 10;
+const CENSUS_MAX_SIZE = 30 * CENSUS_AGENTS_PER_ISSUES;
+
+/**
+ * A company with `size` issues, two comments each, one agent per ten issues
+ * that the issues are assigned to, and `size` comments in all on the last
+ * issue (the target of the two issue routes). Skills, runs, approvals and
+ * thread interactions are not created: the routes that depend on them show
+ * `unmeasured` unless their response grows anyway.
+ */
 async function seedCensus(url, size) {
   const company = await must(request(url, "POST", "/api/companies", { body: { name: `Perf census ${size}` } }), "seed company");
   const agents = [];
-  for (let index = 0; index < Math.max(1, Math.round(size / 10)); index += 1) {
+  for (let index = 0; index < Math.max(1, Math.round(size / CENSUS_AGENTS_PER_ISSUES)); index += 1) {
     agents.push(await must(request(url, "POST", `/api/companies/${company.id}/agents`, {
       body: {
         name: `Perf census agent ${index}`,
@@ -598,26 +676,38 @@ async function seedCensus(url, size) {
       },
     }), "seed agent"));
   }
+  const comment = (issueId, index) => must(request(url, "POST", `/api/issues/${issueId}/comments`, { body: { body: `[perf] comment ${index}` } }), "seed comment");
   let issue = null;
+  let comments = 0;
   for (let index = 0; index < size; index += 1) {
     issue = await must(request(url, "POST", `/api/companies/${company.id}/issues`, {
       body: { title: `[perf] census ${index}`, status: "todo", assigneeAgentId: agents[index % agents.length].id },
     }), "seed issue");
-    for (let comment = 0; comment < 2; comment += 1) {
-      await must(request(url, "POST", `/api/issues/${issue.id}/comments`, { body: { body: `[perf] comment ${comment}` } }), "seed comment");
+    for (let number = 0; number < 2; number += 1) {
+      await comment(issue.id, number);
+      comments += 1;
     }
   }
-  return Object.fromEntries(CENSUS_ROUTES.map(([name, route]) => [
-    name,
-    () => request(url, "GET", route.replace("{c}", company.id).replace("{i}", issue.id)),
-  ]));
+  for (let number = 2; number < size; number += 1) {
+    await comment(issue.id, number);
+    comments += 1;
+  }
+  return {
+    senders: Object.fromEntries(CENSUS_ROUTES.map(([name, route]) => [
+      name,
+      () => request(url, "GET", route.replace("{c}", company.id).replace("{i}", issue.id)),
+    ])),
+    rowsOf: Object.fromEntries(CENSUS_ROUTES.map(([name, , rows]) => [name, rows])),
+    seeded: { issues: size, agents: agents.length, comments },
+  };
 }
 
 /**
  * The per-route statement census (plan step 2b, section 14.5): the statements
  * one healthy request of each route sends, at two or more data sizes, on a
- * local_trusted server behind the fault proxy in pass mode. A route whose
- * count grows with the number of issues reads as N+1 shaped.
+ * local_trusted server behind the fault proxy in pass mode, with the rows each
+ * response returned. A route reads as N+1 shaped when its count grows with
+ * its rows; a route whose rows do not grow is `unmeasured`.
  */
 async function census(argv) {
   const { values } = parseArgs({
@@ -630,8 +720,37 @@ async function census(argv) {
     },
   });
   const sizes = values.sizes.split(",").map(Number).filter((size) => size > 0).sort((a, b) => a - b);
+  if (sizes.length < 2) throw new Error("--sizes needs two sizes or more");
+  if (sizes.at(-1) > CENSUS_MAX_SIZE) throw new Error(`--sizes above ${CENSUS_MAX_SIZE} need more than 30 agents, the agent creation limit of a minute`);
   const { startEmbeddedPostgresTestDatabase } = await importFromServer("@paperclipai/db");
   const bySize = {};
+  const errors = [];
+  const report = {
+    kind: "census",
+    finishedAt: null,
+    node: process.version,
+    checkout: path.resolve(values.checkout),
+    settings: { sizes, samples: Number(values.samples), commentsPerIssue: 2, commentsOnTargetIssue: "size", issuesPerAgent: CENSUS_AGENTS_PER_ISSUES },
+    idleStatementsPerSecond: {},
+    seeded: {},
+    routes: {},
+    errors,
+  };
+  // Routes are read from the sizes that finished, and the report is rewritten
+  // after each size: a failure at the last size must not lose the others.
+  const writeReport = () => {
+    const done = sizes.filter((size) => bySize[size]);
+    const pick = (read) => Object.fromEntries(done.map((size) => [size, read(bySize[size])]));
+    report.idleStatementsPerSecond = pick((result) => result.idleStatementsPerSecond);
+    report.seeded = pick((result) => result.seeded);
+    report.routes = Object.fromEntries(CENSUS_ROUTES.map(([name]) => [name, analyzeRoute({
+      sizes: done,
+      statements: pick((result) => result.statementsPerRequest[name]),
+      rows: pick((result) => result.rowsReturned[name]),
+      agents: pick((result) => result.seeded.agents),
+    })]));
+    writeJson(values.out, report);
+  };
   for (const size of sizes) {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-perf-census-");
     const proxy = await startFaultProxy({ targetPort: Number(new URL(database.connectionString).port) });
@@ -643,34 +762,29 @@ async function census(argv) {
         migrationUrl: database.connectionString,
         mode: "local_trusted",
       });
-      bySize[size] = await statementCensus(proxy, await seedCensus(server.url, size), Number(values.samples));
+      const { senders, rowsOf, seeded } = await seedCensus(server.url, size);
+      bySize[size] = { ...(await statementCensus(proxy, senders, Number(values.samples), { rowsOf })), seeded };
       process.stderr.write(`census size=${size}: ${JSON.stringify(Object.fromEntries(Object.entries(bySize[size].statementsPerRequest).map(([name, count]) => [name, Math.round(count * 10) / 10])))}\n`);
+    } catch (error) {
+      errors.push({ size, error: describeError(error) });
+      process.stderr.write(`census size=${size}: FAILED ${describeError(error)}\n`);
+      process.exitCode = 1;
     } finally {
       await server?.stop();
       await proxy.close();
       await database.cleanup();
     }
+    writeReport();
   }
-  const [small, large] = [sizes[0], sizes.at(-1)];
-  const routes = Object.fromEntries(CENSUS_ROUTES.map(([name]) => {
-    const counts = Object.fromEntries(sizes.map((size) => [size, bySize[size].statementsPerRequest[name]]));
-    // Extra statements per extra issue between the smallest and the largest size.
-    const perIssue = large > small ? (counts[large] - counts[small]) / (large - small) : null;
-    return [name, { statementsPerRequest: counts, perIssue, nPlusOneShaped: perIssue !== null && perIssue >= 0.5 }];
-  }));
-  const report = {
-    kind: "census",
-    finishedAt: new Date().toISOString(),
-    node: process.version,
-    checkout: path.resolve(values.checkout),
-    settings: { sizes, samples: Number(values.samples), commentsPerIssue: 2, issuesPerAgent: 10 },
-    idleStatementsPerSecond: Object.fromEntries(sizes.map((size) => [size, bySize[size].idleStatementsPerSecond])),
-    routes,
-  };
-  fs.mkdirSync(path.dirname(values.out), { recursive: true });
-  fs.writeFileSync(values.out, `${JSON.stringify(report, null, 2)}\n`);
-  for (const [name, route] of Object.entries(routes)) {
-    process.stderr.write(`census ${name}: ${sizes.map((size) => `${size}: ${route.statementsPerRequest[size]?.toFixed(1)}`).join(", ")}; per issue ${route.perIssue?.toFixed(2)}${route.nPlusOneShaped ? " (N+1 shaped)" : ""}\n`);
+  report.finishedAt = new Date().toISOString();
+  writeReport();
+  for (const [name, route] of Object.entries(report.routes)) {
+    const sizesDone = Object.keys(route.statementsPerRequest);
+    const counts = sizesDone.map((size) => `${size}: ${route.statementsPerRequest[size]?.toFixed(1)} (${route.rowsReturned[size]} rows)`).join(", ");
+    const verdict = route.status === "measured"
+      ? `per returned row ${route.perReturnedRow.toFixed(2)}, per agent ${route.perAgent?.toFixed(2)}${route.nPlusOneShaped ? " (N+1 shaped)" : ""}`
+      : `unmeasured (${route.reason})`;
+    process.stderr.write(`census ${name}: ${counts}; ${verdict}\n`);
   }
   process.stderr.write(`census report: ${values.out}\n`);
 }
