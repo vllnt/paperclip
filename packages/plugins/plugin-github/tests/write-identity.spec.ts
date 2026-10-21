@@ -198,6 +198,8 @@ async function appFixture(options: { revoked?: () => boolean; config?: Record<st
     refresh: "unset", issued: 0, revoked: false,
     installation: { id: 101, repository_selection: "selected", permissions: { ...permissions } as Record<string, string> },
     installationRepos: names.map(name => `Anthm-FR/${name}`),
+    /** More installations of the App that the user token reaches, with the repositories each lists. */
+    moreInstallations: [] as Array<{ installation: Record<string, any>; repos: string[] }>,
     /** Repository IDs GitHub reports to the user (by lowercase full name); none by default. */
     installationRepoIds: {} as Record<string, number>,
     pr: { state: "open", head: { sha: "a".repeat(40) }, base: { ref: "main", sha: "c".repeat(40) } } as Record<string, any>,
@@ -261,7 +263,10 @@ async function appFixture(options: { revoked?: () => boolean; config?: Record<st
     if (path === "/user" && user) return { data: { login: "agent-owner", id: Number(USER_ID) } as any, next: false };
     // The board's personal Projects token (a PAT) for the same person.
     if (path === "/user" && auth === "value-pat") return { data: { login: "agent-owner", id: Number(USER_ID) } as any, next: false };
-    if (path.startsWith("/user/installations?") && user) return { data: { installations: [github.installation] } as any, next: false };
+    if (path.startsWith("/user/installations?") && user) return { data: { installations: [github.installation, ...github.moreInstallations.map(more => more.installation)] } as any, next: false };
+    const more = /^\/user\/installations\/(\d+)\/repositories\?/.exec(path);
+    const listed = more && user ? github.moreInstallations.find(entry => String(entry.installation.id) === more[1]) : undefined;
+    if (listed) return { data: { repositories: listed.repos.map(full_name => ({ full_name, id: github.installationRepoIds[full_name.toLowerCase()] })) } as any, next: false };
     if (path.startsWith("/user/installations/101/repositories?") && user) return { data: { repositories: github.installationRepos.map(full_name => ({ full_name, id: github.installationRepoIds[full_name.toLowerCase()] })) } as any, next: false };
     if (/^\/repos\/anthm-fr\/(songtrivia|anthm-fr)\/pulls\/7$/.test(path)) {
       github.prReads += 1;
@@ -302,7 +307,7 @@ async function appFixture(options: { revoked?: () => boolean; config?: Record<st
     expect(await action("user-authorization.poll")).toMatchObject({ status: "pending" });
     vi.setSystemTime(Date.now() + 6_000);
     const result = await action("user-authorization.poll");
-    expect(result).toMatchObject({ status: "authorized", login: "agent-owner", userId: USER_ID, fence: { ok: true, installationId: 101 } });
+    expect(result).toMatchObject({ status: "authorized", login: "agent-owner", userId: USER_ID, fence: { ok: true, installationIds: [101] } });
     return result;
   }
   const policy = async () => (await h.performAction<any>("write-identity.get", { companyId: "anthm" }, admin)).policy;
@@ -401,6 +406,93 @@ describe("GitHub write identity: App user (anthm)", () => {
     // A write the fence cannot check is refused; org Projects writes name no repository.
     expect(await f.decide({ repository: null, access: "write", action: "other", privileged: [] })).toMatchObject({ unavailable: expect.stringContaining("Name the repository") });
     expect(await f.decide({ repository: null, access: "write", action: "project", privileged: [] })).toMatchObject({ credential: { login: "agent-owner" } });
+  });
+
+  describe("several installations", () => {
+    // A second organization and the person's own account, each with the App installed on selected repositories.
+    const { organization_projects: _orgProjects, ...personal } = permissions;
+    const more = [
+      { id: 40, name: "tools", fullName: "Anthm-Labs/tools", url: "https://github.com/Anthm-Labs/tools", installationId: 102, owner: "Anthm-Labs", ownerId: 2, private: true, permissions },
+      { id: 41, name: "notes", fullName: "agent-owner/notes", url: "https://github.com/agent-owner/notes", installationId: 103, owner: "agent-owner", ownerId: Number(USER_ID), private: true, permissions: personal },
+    ];
+    const allOwners = [{ id: 1, login: "Anthm-FR" }, { id: 2, login: "Anthm-Labs" }, { id: Number(USER_ID), login: "agent-owner" }];
+    async function several(owners = allOwners) {
+      const f = await appFixture();
+      vi.mocked(f.client.catalog).mockImplementation(async id => ({ app: { id, slug: "anthm-agents", name: "anthm-agents", permissions: f.github.appPermissions },
+        installations: [
+          { id: 101, login: "Anthm-FR", accountId: 1, accountType: "Organization" as const, suspended: false, permissions },
+          { id: 102, login: "Anthm-Labs", accountId: 2, accountType: "Organization" as const, suspended: false, permissions },
+          { id: 103, login: "agent-owner", accountId: Number(USER_ID), accountType: "User" as const, suspended: false, permissions: personal },
+        // The catalog sorts by name, so another owner's repository can come first.
+        ], repositories: [...more, ...repos], warnings: [], truncated: false }));
+      await f.h.ctx.state.set({ scopeKind: "company", scopeId: "anthm", namespace: "connection", stateKey: "allowed-owners" }, owners);
+      f.github.moreInstallations = [
+        { installation: { id: 102, repository_selection: "selected", target_type: "Organization", permissions: { ...permissions } }, repos: ["Anthm-Labs/tools"] },
+        { installation: { id: 103, repository_selection: "selected", target_type: "User", permissions: { ...personal } }, repos: ["agent-owner/notes"] },
+      ];
+      const policy = { ...anthmPolicy, allowedRepositories: [...anthmPolicy.allowedRepositories, "Anthm-Labs/tools", "agent-owner/notes"],
+        installationRepositories: [...anthmPolicy.installationRepositories, "Anthm-Labs/tools", "agent-owner/notes"] };
+      await f.setPolicy(policy);
+      await f.action("user-authorization.start");
+      vi.setSystemTime(Date.now() + 6_000);
+      const result = await f.action("user-authorization.poll");
+      return { ...f, result };
+    }
+
+    it("passes the fence when every installation is an allowed owner's, on selected repositories, with the approved permissions", async () => {
+      const f = await several();
+      expect(f.result).toMatchObject({ status: "authorized", fence: { ok: true, installationIds: [101, 102, 103] } });
+      // Writes reach each installation's fenced repositories as the person.
+      for (const name of ["Anthm-FR/songtrivia", "Anthm-Labs/tools", "agent-owner/notes"]) {
+        expect(await f.write(name), name).toMatchObject({ identity: "user", credential: { login: "agent-owner" } });
+      }
+      // Reads use a read-only token of the repository's own installation; a personal account has no org Projects.
+      await f.read("Anthm-Labs/tools");
+      expect(f.scoped).toHaveBeenLastCalledWith(APP, "value-a-key", 102, expect.objectContaining({ contents: "read", organization_projects: "read" }), [40]);
+      await f.read("agent-owner/notes");
+      expect(f.scoped).toHaveBeenLastCalledWith(APP, "value-a-key", 103, expect.objectContaining({ contents: "read", metadata: "read" }), [41]);
+      expect(f.scoped.mock.calls.at(-1)![3]).not.toHaveProperty("organization_projects");
+      // A read naming no repository covers the installation holding the most fenced repositories, whatever the catalog order.
+      await f.read(null);
+      expect(f.scoped).toHaveBeenLastCalledWith(APP, "value-a-key", 101, expect.objectContaining({ organization_projects: "read", contents: "read" }),
+        ["Anthm-FR/anthm-fr", "Anthm-FR/linkzic", "Anthm-FR/nextdle", "Anthm-FR/songtrivia", "Anthm-FR/wordzic"]);
+    });
+
+    it("refuses the fence for an installation whose owner the company does not allow", async () => {
+      const f = await several(allOwners.filter(owner => owner.login !== "Anthm-Labs"));
+      expect(f.result).toMatchObject({ fence: { ok: false, reason: expect.stringMatching(/installation 102 is not one of the company's allowed owners/) } });
+      expect(await f.write("Anthm-FR/songtrivia")).toMatchObject({ unavailable: expect.any(String) });
+    });
+
+    it.each([
+      ["an installation on all repositories", (g: any) => { g.moreInstallations[0].installation.repository_selection = "all"; }, /installation 102 covers all repositories/],
+      ["a permission the policy did not approve", (g: any) => { g.moreInstallations[1].installation.permissions.administration = "write"; }, /installation 103 permissions differ: administration: write \(approved none\)/],
+      ["an organization missing an approved permission", (g: any) => { delete g.moreInstallations[0].installation.permissions.organization_projects; }, /installation 102 permissions differ: organization_projects: none \(approved write\)/],
+      ["statuses write on one installation", (g: any) => { g.moreInstallations[1].installation.permissions.statuses = "write"; }, /installation 103 holds statuses write/],
+      ["a repository outside the fence", (g: any) => { g.moreInstallations[0].repos.push("Anthm-Labs/secret"); }, /extra: anthm-labs\/secret/],
+      ["a fenced repository no installation lists", (g: any) => { g.moreInstallations[1].repos = []; }, /missing: agent-owner\/notes/],
+      ["a personal account holding an organization permission", (g: any) => { g.moreInstallations[1].installation.permissions.organization_projects = "write"; }, /installation 103 permissions differ: organization_projects: write \(approved none\)/],
+      ["an installation of unknown account type, compared as an organization", (g: any) => { delete g.moreInstallations[1].installation.target_type; }, /installation 103 permissions differ: organization_projects: none \(approved write\)/],
+      ["a suspended installation", (g: any) => { g.moreInstallations[0].installation.suspended_at = "2026-10-21T00:00:00Z"; }, /installation 102 is suspended/],
+      ["an installation holding no fenced repository", (g: any) => { g.moreInstallations[0].repos.push("agent-owner/notes"); g.moreInstallations[1].repos = []; }, /installation 103 holds no fenced repository/],
+    ])("drift check across installations: %s turns writes off", async (_label, drift, reason) => {
+      const f = await several();
+      expect(f.result).toMatchObject({ fence: { ok: true } });
+      drift(f.github);
+      vi.setSystemTime(Date.now() + 61 * 60_000);
+      await f.h.runJob("github-sync");
+      expect((await f.policy()).enabled).toBe(false);
+      const status = await f.h.performAction<any>("user-authorization.status", { companyId: "anthm" }, actors("anthm").member);
+      expect(status.authorization.fence).toMatchObject({ ok: false, reason: expect.stringMatching(reason) });
+      expect(await f.write("anthm-fr/songtrivia")).toMatchObject({ unavailable: expect.any(String) });
+    });
+  });
+
+  it("accepts a fence of up to 250 repositories", async () => {
+    const f = await appFixture();
+    const many = Array.from({ length: 250 }, (_, index) => `Anthm-FR/repo-${index}`);
+    expect(await f.setPolicy({ ...anthmPolicy, installationRepositories: many, allowedRepositories: many.slice(0, 150) })).toMatchObject({ policy: { userSource: "app" } });
+    await expect(f.setPolicy({ ...anthmPolicy, installationRepositories: [...many, "Anthm-FR/one-more"] })).rejects.toThrow("at most 250");
   });
 
   it("keeps release and tag pushes off by default, and other privileged actions per toggle", async () => {

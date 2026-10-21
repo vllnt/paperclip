@@ -30,9 +30,9 @@ export interface FenceStatus {
   clockSkewSeconds?: number;
   /** When writes first paused on a transient failure, while they still do. */
   pausedSince?: string;
-  installationId?: number;
+  /** Every App installation the user token reaches, by ID. */
+  installationIds?: number[];
   repositories?: string[];
-  permissions?: Record<string, string>;
   /**
    * Repository IDs by name, pinned at the first good check: a fenced name that
    * later points at another repository (deleted and recreated, or renamed) is drift.

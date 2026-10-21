@@ -8,9 +8,9 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 
 ## Baseline Counts
 
-- Skill/reference headings: 170
+- Skill/reference headings: 171
 - Eval cases: 106 across 16 groups
-- Total normative rows: 276
+- Total normative rows: 277
 - Legacy MCP aliases folded into normative rows: 42
 
 | Eval group | Cases |
@@ -205,6 +205,7 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/references/routines.md:reading-routines-and-runs:274 | optional_agent_tool | skills/paperclip/references/routines.md:274 |
 | skill:skills/paperclip/references/routines.md:routine-steps:287 | optional_agent_tool | skills/paperclip/references/routines.md:287 |
 | skill:skills/paperclip/references/routines.md:slot-priority:387 | optional_agent_tool | skills/paperclip/references/routines.md:387 |
+| skill:skills/paperclip/references/routines.md:a-project-s-routines:402 | optional_agent_tool | skills/paperclip/references/routines.md:402 |
 | skill:skills/paperclip/references/workflows.md:paperclip-workflow-playbooks:1 | optional_agent_tool | skills/paperclip/references/workflows.md:1 |
 | skill:skills/paperclip/references/workflows.md:project-setup-ceo-manager:7 | optional_agent_tool | skills/paperclip/references/workflows.md:7 |
 | skill:skills/paperclip/references/workflows.md:openclaw-invite-ceo:22 | optional_agent_tool | skills/paperclip/references/workflows.md:22 |

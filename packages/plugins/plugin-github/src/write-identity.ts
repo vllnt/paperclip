@@ -313,11 +313,13 @@ export function registerWriteIdentity(
   }
 
   /**
-   * A read-only installation token for one fenced repository, or for all of
-   * them when the command names none (GraphQL, search). Either carries org
-   * Projects read when the installation grants it: `gh project` runs inside a
-   * checkout, which names its repository. Cached for 50 minutes; installation
-   * tokens last one hour.
+   * A read-only installation token for one fenced repository, or, when the
+   * command names none (GraphQL, search), for the fenced repositories of one
+   * installation: the one holding the most of them, then the lowest ID. A
+   * token covers one installation, so such a read never sees the others.
+   * Either carries org Projects read when the installation grants it:
+   * `gh project` runs inside a checkout, which names its repository. Cached for
+   * 50 minutes; installation tokens last one hour.
    */
   async function readToken(companyId: string, current: GitHubWriteIdentityPolicy, repository: string | null): Promise<string> {
     const catalog = await loadCatalog(companyId);
@@ -325,14 +327,16 @@ export function registerWriteIdentity(
     const readable = catalog.repositories.filter(repo => fence.includes(repo.fullName.toLowerCase()));
     const targets = repository ? readable.filter(repo => repo.fullName.toLowerCase() === repository) : readable;
     if (!targets.length) throw new Denied(repository ? `${repository} is outside this company's GitHub fence.` : "No fenced repository is available to the company's GitHub App.");
-    const installationId = targets[0]!.installationId;
+    const counts = new Map<number, number>();
+    for (const repo of targets) counts.set(repo.installationId, (counts.get(repo.installationId) ?? 0) + 1);
+    const installationId = [...counts].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0]![0];
     const scoped = targets.filter(repo => repo.installationId === installationId);
     const ids = scoped.map(repo => repo.id).sort((a, b) => a - b);
     const version = policyVersion(companyId);
     const key = `${version}:${companyId}:${installationId}:${repository ? ids[0] : "*"}`;
     const cached = readTokens.get(key);
     if (cached && cached.expires > githubNow()) return cached.token;
-    const granted = catalog.installations.find(installation => installation.id === installationId)?.permissions ?? targets[0]!.permissions ?? {};
+    const granted = catalog.installations.find(installation => installation.id === installationId)?.permissions ?? scoped[0]!.permissions ?? {};
     const permissions: Record<string, string> = { metadata: "read" };
     for (const name of READ_PERMISSIONS) if (granted[name]) permissions[name] = "read";
     if (granted.organization_projects) permissions.organization_projects = "read";
@@ -381,8 +385,9 @@ export function registerWriteIdentity(
 
   /**
    * Compares what the user token can reach at GitHub with the policy:
-   * the user, the one installation, its repository selection, repositories and
-   * permissions. Any difference turns writes off (fail closed). So does a
+   * the user, and for every App installation it reaches, the owner, the
+   * repository selection and permissions; together they list exactly the fenced
+   * repositories. Any difference turns writes off (fail closed). So does a
    * revocation GitHub confirmed; a 401 alone is not one (VLL-1192).
    */
   async function checkFence(companyId: string): Promise<FenceStatus> {
@@ -402,32 +407,42 @@ export function registerWriteIdentity(
         return { items: response.data.installations ?? [], next: response.next };
       }, "App installations");
       const catalog = await loadCatalog(companyId);
-      const installation = installations[0];
       const problems: string[] = [];
       if (login.toLowerCase() !== current.userLogin?.toLowerCase() || String(user.id) !== state.userId) problems.push(`the token belongs to ${login || "an unknown account"}, not ${current.userLogin}`);
-      if (installations.length !== 1 || !installation) problems.push(`the token reaches ${installations.length} App installations; expected exactly one`);
+      if (!installations.length) problems.push("the token reaches no App installation");
       else {
-        if (!catalog.installations.some(candidate => candidate.id === installation.id)) problems.push(`installation ${installation.id} is not one of the company's allowed owners`);
-        if (installation.repository_selection !== "selected") problems.push("the installation covers all repositories; select only the fenced ones");
-        const permissions = (installation.permissions ?? {}) as Record<string, string>;
-        if (permissions.statuses && permissions.statuses !== "read") problems.push("the App holds statuses write and could forge required checks");
         const approved = current.installationPermissions ?? {};
-        const differences = [...new Set([...Object.keys(permissions), ...Object.keys(approved)])].sort()
-          .filter(name => permissions[name] !== approved[name]).map(name => `${name}: ${permissions[name] ?? "none"} (approved ${approved[name] ?? "none"})`);
-        if (differences.length) problems.push(`installation permissions differ: ${differences.join(", ")}`);
+        const differ = (held: Record<string, string>, wanted: Record<string, string>) => [...new Set([...Object.keys(held), ...Object.keys(wanted)])].sort()
+          .filter(name => held[name] !== wanted[name]).map(name => `${name}: ${held[name] ?? "none"} (approved ${wanted[name] ?? "none"})`);
+        const fenced = gitHubInstallationRepositories(current);
+        // Every installation the token reaches is checked: each one is a set of repositories the person's token can write to.
+        const listed: Array<{ name: string; id: number | null }> = [];
+        for (const installation of installations) {
+          const at = `installation ${installation.id}`;
+          if (!catalog.installations.some(candidate => candidate.id === installation.id)) problems.push(`${at} is not one of the company's allowed owners`);
+          if (installation.suspended_at) problems.push(`${at} is suspended`);
+          if (installation.repository_selection !== "selected") problems.push(`${at} covers all repositories; select only the fenced ones`);
+          const permissions = (installation.permissions ?? {}) as Record<string, string>;
+          if (permissions.statuses && permissions.statuses !== "read") problems.push(`${at} holds statuses write and could forge required checks`);
+          // GitHub grants organization permissions only on an organization: an installation on a personal account must hold none.
+          const personal = (installation.target_type ?? installation.account?.type) === "User";
+          const expected = personal ? Object.fromEntries(Object.entries(approved).filter(([name]) => !name.startsWith("organization_"))) : approved;
+          const differences = differ(permissions, expected);
+          if (differences.length) problems.push(`${at} permissions differ: ${differences.join(", ")}`);
+          const own = await allPages(async page => {
+            const response = await asUser<{ repositories?: Array<{ full_name?: unknown; id?: unknown }> }>(`/user/installations/${installation.id}/repositories?per_page=100&page=${page}`);
+            return { items: (response.data.repositories ?? []).map(repo => ({ name: typeof repo.full_name === "string" ? repo.full_name.toLowerCase() : "(unnamed)", id: Number.isSafeInteger(repo.id) ? Number(repo.id) : null })), next: response.next };
+          }, "installation repositories");
+          // An installation without a fenced repository would still carry its organization permissions to the token.
+          if (!own.some(repo => fenced.includes(repo.name))) problems.push(`${at} holds no fenced repository`);
+          listed.push(...own);
+        }
         // The App's own permissions include account permissions (for example SSH or GPG keys)
         // that a user token carries beyond the installation; they must match the approved set too.
-        const appPermissions = (catalog.app.permissions ?? {}) as Record<string, string>;
-        const appDifferences = [...new Set([...Object.keys(appPermissions), ...Object.keys(approved)])].sort()
-          .filter(name => appPermissions[name] !== approved[name]).map(name => `${name}: ${appPermissions[name] ?? "none"} (approved ${approved[name] ?? "none"})`);
+        const appDifferences = differ((catalog.app.permissions ?? {}) as Record<string, string>, approved);
         if (appDifferences.length) problems.push(`App permissions differ: ${appDifferences.join(", ")}`);
-        const listed = await allPages(async page => {
-          const response = await asUser<{ repositories?: Array<{ full_name?: unknown; id?: unknown }> }>(`/user/installations/${installation.id}/repositories?per_page=100&page=${page}`);
-          return { items: (response.data.repositories ?? []).map(repo => ({ name: typeof repo.full_name === "string" ? repo.full_name.toLowerCase() : "(unnamed)", id: Number.isSafeInteger(repo.id) ? Number(repo.id) : null })), next: response.next };
-        }, "installation repositories");
         const repositories = listed.map(repo => repo.name);
-        const expected = gitHubInstallationRepositories(current);
-        const extra = repositories.filter(name => !expected.includes(name)), missing = expected.filter(name => !repositories.includes(name));
+        const extra = repositories.filter(name => !fenced.includes(name)), missing = fenced.filter(name => !repositories.includes(name));
         if (extra.length || missing.length) problems.push(`installation repositories differ from the fence${extra.length ? `; extra: ${extra.join(", ")}` : ""}${missing.length ? `; missing: ${missing.join(", ")}` : ""}`);
         // The fence is by name; the repository behind a name is pinned by ID (GitHub's view through the user and the App must agree).
         const pinned = state.fence?.repositoryIds ?? {};
@@ -439,7 +454,7 @@ export function registerWriteIdentity(
           if (pinned[repo.name] !== undefined && pinned[repo.name] !== repo.id) problems.push(`${repo.name} is now a different repository (ID ${repo.id}, was ${pinned[repo.name]})`);
           else if (app && app.id !== repo.id) problems.push(`${repo.name} has ID ${repo.id} for the user but ${app.id} for the App`);
         }
-        status = { ok: problems.length === 0, checkedAt, installationId: Number(installation.id), repositories: repositories.sort(), permissions,
+        status = { ok: problems.length === 0, checkedAt, installationIds: installations.map(installation => Number(installation.id)).sort((a, b) => a - b), repositories: repositories.sort(),
           repositoryIds: problems.length ? { ...ids, ...pinned } : { ...pinned, ...ids }, ...(problems.length ? { reason: problems.join("; ") } : {}) };
       }
       status ??= { ok: false, checkedAt, reason: problems.join("; ") };

@@ -441,6 +441,8 @@ export const queryKeys = {
       ["issues", "file-resources", issueId, "availability", refKeys] as const,
   },
   routines: {
+    /** The prefix of every routine list of a company, whatever its project or filters. */
+    all: (companyId: string) => ["routines", companyId] as const,
     list: (companyId: string, filters?: { projectId?: string | null; q?: string | null; assigneeAgentId?: string | null; folderId?: string | null; status?: string | null; trigger?: string | null }) => {
       const { projectId, ...rest } = filters ?? {};
       const narrowing = Object.fromEntries(Object.entries(rest).filter(([, value]) => value));

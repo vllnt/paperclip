@@ -1,10 +1,11 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "../src/manifest.js";
 import { register } from "../src/worker.js";
 import { seedConnection } from "./connection.js";
 import { GitHubClient, GitHubError } from "../src/github.js";
 import { matchingRule, mergeSnapshots, validateSettings } from "../src/sync.js";
+import { QUEUE_LIMIT, QUEUE_RETRY_MS, resumeFrom } from "../src/sync-window.js";
 import type { AutomationRule, GitHubIssue } from "../src/contracts.js";
 const companyId = "c1";
 const actor = { companyId, actor: { type: "user" as const, userId: "u1", companyId, agentId: null, runId: null } };
@@ -19,13 +20,20 @@ async function fixture() {
   const remote = new Map<number, GitHubIssue>([[1, issue(1)]]);
   const client = new GitHubClient();
   const catalog = vi.spyOn(client, "catalog").mockResolvedValue({ app: { id: "12", slug: "app", name: "App" }, installations: [], repositories: [repo], warnings: [], truncated: false });
-  const list = vi.spyOn(client, "issues").mockImplementation(async () => ({ issues: [...remote.values()], nextPage: null, repository: repo.fullName }));
+  /** GitHub's listing: only what changed since `since`, oldest change first, in pages. */
+  const list = vi.spyOn(client, "issues").mockImplementation(async (_id, _pem, _repo, page, _state, options = {}) => {
+    const since = options.since ? Date.parse(options.since) : 0, size = options.perPage ?? 50;
+    const rows = [...remote.values()].filter(row => Date.parse(row.updatedAt) >= since).sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt) || a.number - b.number);
+    if (options.direction !== "asc") rows.reverse();
+    const issues = rows.slice((page - 1) * size, page * size);
+    return { issues, nextPage: page * size < rows.length ? page + 1 : null, repository: repo.fullName, cursor: issues.map(row => row.updatedAt).sort().at(-1) ?? null };
+  });
   const get = vi.spyOn(client, "getIssue").mockImplementation(async (_id, _pem, _repo, number) => { if (!remote.has(number)) throw new GitHubError(404); return remote.get(number)!; });
   const create = vi.spyOn(client, "createIssue").mockImplementation(async (_id, _pem, _repo, input) => { const next = issue(100 + remote.size, { title: input.title, body: input.body }); remote.set(next.number, next); return next; });
   const update = vi.spyOn(client, "updateIssue").mockImplementation(async (_id, _pem, _repo, number, input) => {
     const current = remote.get(number)!;
     const next = { ...current, ...(input.title !== undefined ? { title: input.title } : {}), ...(input.body !== undefined ? { body: input.body } : {}),
-      ...(input.state ? { state: input.state, stateReason: input.state_reason } : {}), updatedAt: "2026-10-04T12:01:00Z" };
+      ...(input.state ? { state: input.state, stateReason: input.state_reason } : {}), updatedAt: new Date(Math.max(...[...remote.values()].map(row => Date.parse(row.updatedAt))) + 60_000).toISOString() };
     remote.set(number, next); return next;
   });
   await seedConnection(h, companyId, "12");
@@ -208,5 +216,271 @@ describe("publication and automation", () => {
     expect(() => validateSettings({ enabled: true, rules: [{ ...rule, if: {} }] })).toThrow("IF");
     expect(() => validateSettings({ enabled: true, rules: [{ ...rule, then: { wake: true } }] })).toThrow("agent");
     expect(mergeSnapshots({ title: "A", body: "B", state: "open" }, { title: "C", body: "B", state: "open" }, { title: "A", body: "D", state: "open" })).toEqual({ toLocal: { body: "D" }, toRemote: { title: "C" }, conflicts: [] });
+  });
+});
+
+describe("incremental GitHub task sync", () => {
+  const minute = (n: number) => new Date(Date.parse("2026-10-04T12:00:00Z") + n * 60_000).toISOString();
+  const edited = (id: number, at: number, patch: Partial<GitHubIssue> = {}) => issue(id, { ...patch, updatedAt: minute(at) });
+  const queueKey = (scopeId = companyId) => ({ scopeKind: "company" as const, scopeId, namespace: "sync", stateKey: "queue" });
+  const pendingKey = { scopeKind: "company" as const, scopeId: companyId, namespace: "sync", stateKey: "pending" };
+  /** Three issues that GitHub last changed at minutes 1 to 3, already imported. */
+  async function synced() {
+    const f = await fixture();
+    f.remote.clear();
+    for (const number of [1, 2, 3]) f.remote.set(number, edited(number, number));
+    await f.service.sync(companyId);
+    const natives = await f.native();
+    const task = (number: number) => natives.find(item => item.originId === String(number))!;
+    f.list.mockClear(); f.get.mockClear();
+    return { ...f, task };
+  }
+  /** An edit made here: the task changes, and the host announces it. */
+  async function editHere(f: Awaited<ReturnType<typeof synced>>, number: number, title: string) {
+    const task = f.task(number);
+    await f.h.ctx.issues.update(task.id, { title }, companyId);
+    await f.h.emit("issue.updated", { id: task.id }, { companyId, actorType: "user", entityId: task.id });
+  }
+  /** Moves the clock the sync reads, as time that passed between two runs. */
+  function skewClock() {
+    const real = Date.now.bind(Date); let skew = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => real() + skew);
+    return (milliseconds: number) => { skew += milliseconds; };
+  }
+  afterEach(() => vi.restoreAllMocks());
+
+  it("lists only what changed since the last run and reads no other issue", async () => {
+    const f = await synced();
+    const quiet = await f.service.sync(companyId);
+    expect(f.list).toHaveBeenCalledTimes(1);
+    expect(f.list.mock.calls[0][5]).toEqual({ direction: "asc", perPage: 100, since: resumeFrom(minute(3)) });
+    expect(quiet).toMatchObject({ imported: 0, updated: 0, checked: 1, partial: false });
+    expect(f.get).not.toHaveBeenCalled();
+    expect(f.update).not.toHaveBeenCalled();
+    f.remote.set(2, edited(2, 5, { title: "Changed on GitHub" }));
+    expect(await f.service.sync(companyId)).toMatchObject({ updated: 1, checked: 2 });
+    expect((await f.native()).map(item => item.title).sort()).toEqual(["Changed on GitHub", "Issue 1", "Issue 3"]);
+  });
+  it("ends a run at its time budget with its place saved, and the next run goes on from there", async () => {
+    const f = await fixture();
+    f.remote.clear();
+    for (let number = 1; number <= 250; number++) f.remote.set(number, edited(number, number));
+    const advance = skewClock(), create = f.h.ctx.issues.create.bind(f.h.ctx.issues);
+    let created = 0;
+    vi.spyOn(f.h.ctx.issues, "create").mockImplementation(async input => { const made = await create(input); if (++created % 100 === 0) advance(130_000); return made; });
+    expect(await f.service.sync(companyId)).toMatchObject({ imported: 100, partial: true });
+    expect(await f.native()).toHaveLength(100);
+    expect(await f.service.sync(companyId)).toMatchObject({ imported: 100, partial: true });
+    expect(f.list.mock.calls[1][5]?.since).toBe(resumeFrom(minute(100)));
+    expect(await f.native()).toHaveLength(200);
+    expect(await f.service.sync(companyId)).toMatchObject({ imported: 50, partial: false });
+    expect(await f.native()).toHaveLength(250);
+    expect(new Set((await f.native()).map(item => item.originId)).size).toBe(250);
+  });
+  /** Moves the clock past the run's budget after the given number of imports. */
+  function budgetAfter(f: Awaited<ReturnType<typeof fixture>>, imports: (count: number) => boolean) {
+    const advance = skewClock(), create = f.h.ctx.issues.create.bind(f.h.ctx.issues);
+    let created = 0;
+    vi.spyOn(f.h.ctx.issues, "create").mockImplementation(async input => { const made = await create(input); if (imports(++created)) advance(130_000); return made; });
+  }
+  it("saves the place of a run that ends mid-page at the last issue it finished, so the next run does not redo the page", async () => {
+    const f = await fixture();
+    f.remote.clear();
+    for (let number = 1; number <= 150; number++) f.remote.set(number, edited(number, number));
+    budgetAfter(f, count => count === 50);
+    expect(await f.service.sync(companyId)).toMatchObject({ imported: 50, partial: true });
+    expect(await f.service.sync(companyId)).toMatchObject({ imported: 100, checked: 101, partial: false });
+    expect(f.list.mock.calls[1][5]?.since).toBe(resumeFrom(minute(50)));
+    expect(new Set((await f.native()).map(item => item.originId)).size).toBe(150);
+  });
+  it("posts a ready publication while the repository's first full pass still takes several runs", async () => {
+    const f = await fixture();
+    f.remote.clear();
+    for (let number = 1; number <= 250; number++) f.remote.set(number, edited(number, number));
+    const local = await f.h.ctx.issues.create({ companyId, title: "Write the docs", projectId: "p1" });
+    await f.h.ctx.state.set(pendingKey, { [local.id]: { issueId: local.id, repositoryId: repo.id, phase: "ready", title: local.title, body: "" } });
+    budgetAfter(f, count => count % 100 === 0);
+    expect(await f.service.sync(companyId)).toMatchObject({ partial: true });
+    expect(f.create).toHaveBeenCalledTimes(1);
+    expect(await f.h.ctx.state.get(pendingKey)).toEqual({});
+    expect(await f.service.sync(companyId)).toMatchObject({ partial: true });
+    expect(await f.service.sync(companyId)).toMatchObject({ partial: false });
+    expect(f.create).toHaveBeenCalledTimes(1);
+    expect(await f.native()).toHaveLength(251);
+  });
+  it("pushes an edit made here that the host announced, without GitHub listing the issue again", async () => {
+    const f = await synced();
+    await editHere(f, 1, "Local title");
+    expect(await f.service.sync(companyId)).toMatchObject({ updated: 1, checked: 3 });
+    expect(f.get.mock.calls.every(call => call[3] === 1)).toBe(true);
+    expect(f.remote.get(1)?.title).toBe("Local title");
+    await f.service.sync(companyId);
+    expect(f.update).toHaveBeenCalledTimes(1);
+    expect(await f.h.ctx.state.get(queueKey())).toEqual({});
+  });
+  it("finds an edit that no event announced in the next full pass", async () => {
+    const f = await synced();
+    await f.h.ctx.issues.update(f.task(1).id, { title: "Local title" }, companyId);
+    await f.service.sync(companyId);
+    expect(f.update).not.toHaveBeenCalled();
+    skewClock()(6 * 3_600_000 + 60_000);
+    await f.service.sync(companyId);
+    expect(f.list.mock.calls.at(-1)?.[5]?.since).toBeUndefined();
+    expect(f.remote.get(1)?.title).toBe("Local title");
+  });
+  it("retries an issue whose sync failed a minute later, though GitHub lists nothing new for it", async () => {
+    const f = await synced();
+    await editHere(f, 1, "Local title");
+    f.update.mockRejectedValueOnce(new GitHubError(403));
+    expect((await f.service.sync(companyId))?.warnings.join(" ")).toContain("denied");
+    expect(f.remote.get(1)?.title).toBe("Issue 1");
+    skewClock()(QUEUE_RETRY_MS);
+    await f.service.sync(companyId);
+    expect(f.remote.get(1)?.title).toBe("Local title");
+  });
+  it("looks at an issue that keeps failing later each time, and leaves it to the full pass after a few failures", async () => {
+    const f = await synced();
+    await editHere(f, 1, "Local title");
+    f.update.mockRejectedValue(new GitHubError(403));
+    const advance = skewClock(), looks: number[] = [];
+    for (let minute = 0; minute < 160; minute++) {
+      f.get.mockClear();
+      await f.service.sync(companyId);
+      if (f.get.mock.calls.length) looks.push(minute);
+      advance(60_000);
+    }
+    expect(looks).toEqual([0, 1, 3, 7, 15, 31, 61, 91, 121, 151]);
+    expect(await f.h.ctx.state.get(queueKey())).toEqual({});
+  });
+  it("counts a failure only when its look was due, also for the newest issue that every run lists again", async () => {
+    const f = await synced();
+    await editHere(f, 3, "Local title");
+    f.update.mockRejectedValue(new GitHubError(403));
+    const advance = skewClock();
+    for (let minute = 0; minute < 10; minute++) {
+      await f.service.sync(companyId);
+      advance(60_000);
+    }
+    // The walk listed issue 3 on each of the 10 runs; its looks were due in runs 0, 1, 3 and 7.
+    expect(f.list).toHaveBeenCalledTimes(10);
+    expect((await f.h.ctx.state.get(queueKey()) as Record<string, { attempts?: number }>)["3"]?.attempts).toBe(4);
+  });
+  it("gives the issues that keep failing only a share of the run, so GitHub's changes still sync", async () => {
+    const f = await fixture();
+    f.remote.clear();
+    for (let number = 1; number <= 60; number++) f.remote.set(number, edited(number, number));
+    await f.service.sync(companyId);
+    // Every task is marked done here, and the App may not write issues: each push fails, after 3 s per read.
+    for (const task of await f.native()) {
+      await f.h.ctx.issues.update(task.id, { status: "done" }, companyId);
+      await f.h.emit("issue.updated", { id: task.id }, { companyId, actorType: "user", entityId: task.id });
+    }
+    f.update.mockRejectedValue(new GitHubError(403));
+    const advance = skewClock();
+    f.get.mockImplementation(async (_id, _pem, _repo, number) => { advance(3_000); return f.remote.get(number)!; });
+    f.remote.set(61, edited(61, 70, { title: "New on GitHub" }));
+    const read = () => new Set(f.get.mock.calls.map(call => call[3]));
+    f.get.mockClear();
+    expect(await f.service.sync(companyId)).toMatchObject({ imported: 1, partial: false });
+    expect((await f.native()).find(task => task.originId === "61")?.title).toBe("New on GitHub");
+    const first = read();
+    f.get.mockClear();
+    await f.service.sync(companyId);
+    expect([...read()].filter(number => first.has(number))).toEqual([]);
+  });
+  it("looks at 20 queued issues of a repository in a run, and at the rest in the next run", async () => {
+    const f = await fixture();
+    f.remote.clear();
+    for (let number = 1; number <= 26; number++) f.remote.set(number, edited(number, number));
+    await f.service.sync(companyId);
+    // 25 tasks are edited here. Issue 26, the newest, is the one that each walk lists again; it has no edit.
+    for (const task of (await f.native()).filter(item => Number(item.originId) <= 25)) {
+      await f.h.ctx.issues.update(task.id, { title: `Local ${task.originId}` }, companyId);
+      await f.h.emit("issue.updated", { id: task.id }, { companyId, actorType: "user", entityId: task.id });
+    }
+    await f.service.sync(companyId);
+    expect(f.update).toHaveBeenCalledTimes(20);
+    expect(Object.keys(await f.h.ctx.state.get(queueKey()) as object)).toHaveLength(5);
+    await f.service.sync(companyId);
+    expect(f.update).toHaveBeenCalledTimes(25);
+    expect(await f.h.ctx.state.get(queueKey())).toEqual({});
+  });
+  it("pushes an edit of a later repository in the same run, although an earlier repository's walk took a long time", async () => {
+    const f = await fixture();
+    // Repository "org/alpha" sorts first, and its walk takes 40 s once both repositories have had their first full pass.
+    const alpha = { ...repo, id: 21, name: "alpha", fullName: "org/alpha", url: "https://github.com/org/alpha" };
+    f.catalog.mockResolvedValue({ app: { id: "12", slug: "app", name: "App" }, installations: [], repositories: [alpha, repo], warnings: [], truncated: false });
+    f.h.seed({ projectWorkspaces: [{ id: "w3", companyId, projectId: "p2", repoUrl: alpha.url }] as any });
+    f.remote.clear();
+    for (const number of [1, 2, 3]) f.remote.set(number, edited(number, number));
+    const advance = skewClock(), listing = f.list.getMockImplementation()!;
+    let slow = false;
+    f.list.mockImplementation(async (...args) => {
+      if (args[2].id !== alpha.id) return listing(...args);
+      if (slow) advance(40_000);
+      return { issues: [], nextPage: null, repository: alpha.fullName, cursor: null };
+    });
+    await f.service.sync(companyId);
+    const task = (await f.native()).find(item => item.originId === "1")!;
+    await f.h.ctx.issues.update(task.id, { title: "Local title" }, companyId);
+    await f.h.emit("issue.updated", { id: task.id }, { companyId, actorType: "user", entityId: task.id });
+    slow = true;
+    expect(await f.service.sync(companyId)).toMatchObject({ partial: false });
+    expect(f.remote.get(1)?.title).toBe("Local title");
+  });
+  it("drops the asks for issues of a repository that is no longer linked, so a full queue takes new edits again", async () => {
+    const f = await synced();
+    await f.h.ctx.state.set(queueKey(), Object.fromEntries(Array.from({ length: QUEUE_LIMIT }, (_, index) => [String(1000 + index), { repositoryId: 99, number: index + 1, at: 0 }])));
+    await f.service.sync(companyId);
+    expect(await f.h.ctx.state.get(queueKey())).toEqual({});
+    // A repository that one catalog read missed keeps a recent ask.
+    await f.h.ctx.state.set(queueKey(), { "2000": { repositoryId: 99, number: 1, at: Date.now() } });
+    await f.service.sync(companyId);
+    expect(Object.keys(await f.h.ctx.state.get(queueKey()) as object)).toEqual(["2000"]);
+    // A retry is due 30 minutes after its sixth failure; its age counts from the failure. 2001 failed 61 minutes ago, 2002 10 minutes ago.
+    await f.h.ctx.state.set(queueKey(), { "2001": { repositoryId: 99, number: 2, at: Date.now() - 31 * 60_000, attempts: 6 },
+      "2002": { repositoryId: 99, number: 3, at: Date.now() + 20 * 60_000, attempts: 6 } });
+    await f.service.sync(companyId);
+    expect(Object.keys(await f.h.ctx.state.get(queueKey()) as object)).toEqual(["2002"]);
+    await f.h.ctx.state.set(queueKey(), {});
+    await editHere(f, 2, "Local title");
+    await f.service.sync(companyId);
+    expect(f.remote.get(2)?.title).toBe("Local title");
+  });
+  it("drops the ask for an issue that GitHub no longer has", async () => {
+    const f = await synced();
+    await editHere(f, 1, "Local title");
+    f.remote.delete(1);
+    await f.service.sync(companyId);
+    expect(await f.h.ctx.state.get(queueKey())).toEqual({});
+    expect(f.update).not.toHaveBeenCalled();
+  });
+  it("queues nothing for a task that GitHub does not know, the plugin's own write, or another company's task", async () => {
+    const f = await synced();
+    const local = await f.h.ctx.issues.create({ companyId, title: "Local only", projectId: "p1" });
+    await f.h.emit("issue.updated", {}, { companyId, actorType: "user", entityId: local.id });
+    await f.h.emit("issue.updated", {}, { companyId, actorType: "plugin", entityId: f.task(1).id });
+    await f.h.emit("issue.updated", {}, { companyId, actorType: "user" });
+    await f.h.emit("issue.updated", {}, { companyId: "c2", actorType: "user", entityId: f.task(1).id });
+    expect(await f.h.ctx.state.get(queueKey())).toBeNull();
+    expect(await f.h.ctx.state.get(queueKey("c2"))).toBeNull();
+    await f.service.sync(companyId);
+    expect(f.get).not.toHaveBeenCalled();
+  });
+  it("reads every issue again after the settings are saved, so a new rule reaches all of them", async () => {
+    const f = await synced();
+    f.h.seed({ agents: [{ id: "a1", companyId, name: "Engineer", status: "idle" }] as any });
+    // The save comes after the last pass started; without this, a fast machine makes both happen in the same millisecond.
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await f.h.performAction("save-sync-settings", { settings: { enabled: true, rules: [{ ...rule, then: { ...rule.then, wake: false } }] } }, actor);
+    await f.service.sync(companyId);
+    expect(f.list.mock.calls.at(-1)?.[5]?.since).toBeUndefined();
+    expect((await f.native()).map(item => item.assigneeAgentId)).toEqual(["a1", "a1", "a1"]);
+  });
+  it("reports how long the run took and how many issues it looked at", async () => {
+    const f = await synced();
+    const report = await f.service.sync(companyId);
+    expect(report).toMatchObject({ checked: 1, partial: false, durationMs: expect.any(Number) });
+    expect(await f.h.ctx.state.get({ scopeKind: "company", scopeId: companyId, namespace: "sync", stateKey: "report" })).toMatchObject({ checked: 1, durationMs: expect.any(Number) });
   });
 });
