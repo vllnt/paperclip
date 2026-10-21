@@ -3390,6 +3390,7 @@ export function routineService(
     ): Promise<RoutineListItem[]> => {
       const conditions = [eq(routines.companyId, companyId)];
       if (filters.projectId) conditions.push(eq(routines.projectId, filters.projectId));
+      if (filters.goalId) conditions.push(eq(routines.goalId, filters.goalId));
       if (filters.assigneeAgentId) conditions.push(eq(routines.assigneeAgentId, filters.assigneeAgentId));
       if (filters.folderId === "none") conditions.push(isNull(routines.folderId));
       else if (filters.folderId) conditions.push(eq(routines.folderId, filters.folderId));

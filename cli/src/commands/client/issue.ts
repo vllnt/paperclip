@@ -57,6 +57,7 @@ interface IssueBaseOptions extends BaseClientOptions {
   status?: string;
   assigneeAgentId?: string;
   projectId?: string;
+  goalId?: string;
   match?: string;
 }
 
@@ -276,6 +277,7 @@ export function registerIssueCommands(program: Command): void {
       .option("--status <csv>", "Comma-separated statuses")
       .option("--assignee-agent-id <id>", "Filter by assignee agent ID")
       .option("--project-id <id>", "Filter by project ID")
+      .option("--goal-id <id>", "Only tasks whose own goal is this one")
       .option("--match <text>", "Local text match on identifier/title/description")
       .action(async (opts: IssueBaseOptions) => {
         try {
@@ -284,6 +286,7 @@ export function registerIssueCommands(program: Command): void {
           if (opts.status) params.set("status", opts.status);
           if (opts.assigneeAgentId) params.set("assigneeAgentId", opts.assigneeAgentId);
           if (opts.projectId) params.set("projectId", opts.projectId);
+          if (opts.goalId) params.set("goalId", opts.goalId);
 
           const query = params.toString();
           const path = `${apiPath`/api/companies/${ctx.companyId}/issues`}${query ? `?${query}` : ""}`;
@@ -310,6 +313,7 @@ export function registerIssueCommands(program: Command): void {
                 assigneeAgentId: item.assigneeAgentId,
                 title: item.title,
                 projectId: item.projectId,
+                goalId: item.goalId,
               }),
             );
           }

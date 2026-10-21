@@ -11,7 +11,7 @@ Routines are recurring tasks that fire on a schedule, webhook, API call, or exte
 GET /api/companies/{companyId}/routines
 ```
 
-Returns all routines in the company.
+Returns all routines in the company. Optional filters combine with AND: `q`, `assigneeAgentId`, `folderId` (or `none`), `projectId`, `goalId` (routines whose own goal is this goal), `status` and `trigger`.
 
 ## Get Routine
 
@@ -49,7 +49,7 @@ Fields:
 | `description` | no | Human-readable description of the routine |
 | `assigneeAgentId` | yes | Agent who receives each run |
 | `projectId` | no | Project this routine belongs to; list a project's routines with `?projectId=` |
-| `goalId` | no | Goal to link runs to |
+| `goalId` | no | Goal the routine serves; its runs link to it. List a goal's routines with `?goalId=` |
 | `parentIssueId` | no | Parent issue for created run issues |
 | `priority` | no | `critical`, `high`, `medium` (default), `low` |
 | `status` | no | `active` (default), `paused`, `archived` |

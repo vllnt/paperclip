@@ -405,9 +405,17 @@ describe("openapi routes", () => {
       ["assigneeAgentId", false],
       ["folderId", false],
       ["projectId", false],
+      ["goalId", false],
       ["status", false],
       ["trigger", false],
     ]);
+    const issueListParameters: Array<{ name: string; in: string; required: boolean }> =
+      res.body.paths["/api/companies/{companyId}/issues"].get.parameters;
+    expect(issueListParameters.filter((param) => param.in === "query").map((param) => [param.name, param.required])).toEqual([
+      ["view", false],
+      ["goalId", false],
+    ]);
+    expect(res.body.paths["/api/companies/{companyId}/issues"].get.responses).toHaveProperty("400");
     expect(routineListParameters).toContainEqual({
       name: "status",
       in: "query",
