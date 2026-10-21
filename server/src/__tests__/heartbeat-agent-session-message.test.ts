@@ -1,3 +1,5 @@
+import type { SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import { goals } from "@paperclipai/db";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
@@ -14,18 +16,25 @@ describe("agent session wake messages", () => {
     workMode: "standard",
   };
 
-  /** A db whose goal reads return `goalRows` and record the tables they read. */
+  /** A db whose goal reads return `goalRows` and record the tables and the goal filters they read. */
   function goalDb(goalRows: Array<{ id: string; title: string }>) {
     const tablesRead: unknown[] = [];
+    const goalFilters: ReturnType<PgDialect["sqlToQuery"]>[] = [];
     const db = {
       select: () => ({
         from: (table: unknown) => {
           tablesRead.push(table);
-          return { where: async () => (table === goals ? goalRows : []) };
+          return {
+            where: async (condition: SQL) => {
+              if (table !== goals) return [];
+              goalFilters.push(new PgDialect().sqlToQuery(condition));
+              return goalRows;
+            },
+          };
         },
       }),
     };
-    return { db: db as never, tablesRead };
+    return { db: db as never, tablesRead, goalFilters };
   }
 
   it("names the task's goal, with its title cut like every goal text an agent reads", async () => {
@@ -50,7 +59,7 @@ describe("agent session wake messages", () => {
       contextSnapshot: { wakeReason: "issue_assigned", issueId: "issue-1" },
       issueSummary: { ...issueSummary, goalId: null },
     });
-    expect(withoutGoal?.issue?.goal).toBeNull();
+    expect(withoutGoal?.issue).not.toHaveProperty("goal");
     expect(noGoal.tablesRead).not.toContain(goals);
 
     // The goal read is scoped to the run's company, so another company's goal id finds no row.
@@ -61,8 +70,10 @@ describe("agent session wake messages", () => {
       contextSnapshot: { wakeReason: "issue_assigned", issueId: "issue-1" },
       issueSummary: { ...issueSummary, goalId: "goal-of-company-2" },
     });
-    expect(otherCompany.tablesRead).toContain(goals);
-    expect(crossCompany?.issue?.goal).toBeNull();
+    expect(otherCompany.goalFilters).toHaveLength(1);
+    expect(otherCompany.goalFilters[0]?.sql).toMatch(/"goals"\."company_id" = \$\d/);
+    expect(otherCompany.goalFilters[0]?.params).toEqual(expect.arrayContaining(["goal-of-company-2", "company-1"]));
+    expect(crossCompany?.issue).not.toHaveProperty("goal");
 
     const chat = goalDb([{ id: "goal-1", title: "Ship the beta" }]);
     const chatWake = await buildPaperclipWakePayload({
