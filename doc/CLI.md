@@ -528,6 +528,19 @@ npx paperclipai goal update <goal-id> [--title "..."] [--status achieved]
 npx paperclipai goal delete <goal-id> --yes
 ```
 
+## Policy Commands
+
+Policies are written rules and guardrails for a company or one project. Every company member and agent reads them; only the board writes them.
+
+```sh
+npx paperclipai policy list --company-id <company-id> [--scope company|project] [--project-id <id>] [--status active]
+npx paperclipai policy get <key> --company-id <company-id>
+npx paperclipai policy history <key> --company-id <company-id>
+npx paperclipai policy create --company-id <company-id> --key code-review --title "Code review" [--summary "..."] [--body-file review.md] [--status active] [--project-id <id>]
+npx paperclipai policy update <key> --company-id <company-id> [--body-file review.md] [--change-summary "..."] [--status archived]
+npx paperclipai policy delete <key> --company-id <company-id> --yes
+```
+
 ## Agent Commands
 
 ```sh
