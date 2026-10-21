@@ -1405,7 +1405,7 @@ Per-agent run limits in `runtime_config.heartbeat`:
 - The recovery service's hourly `provider_quota_recovery` wait monitor (for quota failures after useful action, or with the lane disabled) is not part of this lane: it is neither coalesced nor bounded by these ceilings.
 - `providerQuotaRetry.enabled` (default `true`): `false` restores the default transient retry budget and counts every quota failure toward `maxDailyRuns`.
 
-Other failure classes keep the default bounded transient retry budget and count toward `maxDailyRuns`.
+Other failure classes keep the default bounded transient retry budget and count toward `maxDailyRuns`. A deterministic failure is never retried automatically: invalid provider tool definitions (`provider_tool_definition_invalid`) and a prompt larger than the model's context window (`context_window_exceeded`, read from the adapter's terminal error message only). Such a run takes no further slot, records why in its run log, clears its task session (resuming it would overflow again), and an assigned task becomes `blocked` for a person to decide.
 
 Scheduler must skip invocation when:
 

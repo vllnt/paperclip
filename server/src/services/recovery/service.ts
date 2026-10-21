@@ -1,5 +1,5 @@
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
-import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
+import { CONTEXT_WINDOW_EXCEEDED_ERROR_CODE, isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { selectInCommentBatches } from "../comment-id-batches.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
@@ -513,6 +513,8 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "provider_tool_definition_invalid",
+  // The same prompt overflows the model's context window every time.
+  CONTEXT_WINDOW_EXCEEDED_ERROR_CODE,
   "adapter_engine_unavailable",
   "agent_not_invokable",
   "agent_not_found",

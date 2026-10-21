@@ -187,6 +187,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // Read-only schema discovery for validated control-plane requests.
   { method: "GET", path: /^\/api\/openapi\.json$/ },
 
+  // Read-only deploy proof: `status` and the running build `commit`. The server
+  // redacts host paths from the agent view of this response.
+  { method: "GET", path: /^\/api\/health$/ },
+
   // Company-level reads used to discover work and context
   { method: "GET", path: /^\/api\/companies\/[^/]+$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/dashboard$/ },

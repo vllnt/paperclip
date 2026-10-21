@@ -45,6 +45,7 @@ import {
 import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure, truncateAtGrapheme, type ExecutionBlocker } from "@paperclipai/shared";
+import { CONTEXT_WINDOW_EXCEEDED_ERROR_CODE, isContextWindowExceededMessage } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_STATUSES, type HeartbeatRunStats, type HeartbeatRunStatus } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
@@ -175,6 +176,8 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  ISSUE_WAIT_MAX_DELAY_MS,
+  ISSUE_WAIT_MIN_DELAY_MS,
   ISSUE_WAIT_MONITOR_MAX_ATTEMPTS,
   envBindingSchema,
   isEnvironmentDriverSupportedForAdapter,
@@ -529,11 +532,22 @@ import {
 } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorRecheckedPatch,
   buildIssueMonitorRescheduledPatch,
   buildIssueMonitorTriggeredPatch,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
+import {
+  PULL_REQUEST_FINGERPRINT_CONTEXT_KEY,
+  PULL_REQUEST_GATE_TICK_BUDGET_MS,
+  PULL_REQUEST_UNCHANGED_SKIP_REASON,
+  evaluatePullRequestWakeGate,
+  readPullRequestWaitTarget,
+  toStoredPullRequestFingerprint,
+  type PullRequestWaitTarget,
+  type PullRequestWakeGateDeps,
+} from "./pull-request-wake-gate.js";
 import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
   isVerifiedIssueTreeControlInteractionWake,
@@ -851,6 +865,12 @@ const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "agent.harness_fallback_returned",
 ];
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+/** Pull-request gate misses that are configuration, not failures: logged at info. */
+const EXPECTED_PULL_REQUEST_GATE_MISSES = new Set([
+  "github_credentials_missing",
+  "github_credentials_unavailable",
+  "github_backoff",
+]);
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const ACCEPTED_PLAN_CONVERSION_SKILL_KEY =
@@ -1039,6 +1059,8 @@ type DeferredWakeHeldReason =
 // bounded transient budget instead of ending as a plain `adapter_failed`.
 const WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE = "workspace_restore_lock_timeout";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
+const CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE =
+  "Not retried automatically: the prompt is larger than the model's context window, so the same run would fail the same way. Start a fresh session or shorten what the run replays, then wake the agent again.";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
 const CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE = "configuration_incomplete";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON =
@@ -1302,6 +1324,11 @@ function readHeartbeatRunErrorFamily(
 ) {
   if (run.errorCode === "provider_quota") {
     return "provider_quota";
+  }
+  // A context overflow fails the same way every time, whatever family the
+  // adapter guessed from its output.
+  if (run.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) {
+    return null;
   }
   if (
     run.errorCode === "codex_transient_upstream" ||
@@ -4203,6 +4230,14 @@ interface WakeupOptions {
    * Only the deferred-wake sweep sets it; no route or payload can.
    */
   redeliverDeferredWake?: boolean;
+  /**
+   * Internal. Skip this wake when the pull request the wait targets did not
+   * change since the agent's last monitor-check run started (see
+   * pull-request-wake-gate.ts). Only the scheduled issue-monitor dispatch sets
+   * it, from a monitor armed with `issue wait --pull-request`; no route or
+   * payload can.
+   */
+  skipIfPullRequestUnchanged?: PullRequestWaitTarget;
 }
 
 type UsageTotals = {
@@ -6161,14 +6196,99 @@ export function deriveTaskKeyWithHeartbeatFallback(
   return null;
 }
 
+/**
+ * Each tick of a routine creates a new issue, so an issue-keyed session never
+ * outlives one tick. Keying the session by routine instead lets the next tick
+ * resume it. The agent_task_sessions row is already scoped by company, agent
+ * and adapter type, so a different assignee or harness gets its own session.
+ */
+const ROUTINE_TASK_SESSION_KEY_PREFIX = "routine:";
+/** Run-context key naming the routine session a running run holds. */
+export const ROUTINE_TASK_SESSION_CLAIM_KEY = "paperclipRoutineTaskSessionKey";
+/**
+ * Run-context key naming the run that took the claim. Retry and continuation
+ * runs copy their source run's context; a copied claim names another run and
+ * so does not count.
+ */
+export const ROUTINE_TASK_SESSION_CLAIM_RUN_KEY = "paperclipRoutineTaskSessionRunId";
+
+export function routineTaskSessionKey(input: {
+  adapterType: string;
+  issueTaskKey: string | null;
+  issue: {
+    id: string;
+    originKind: string | null;
+    originId: string | null;
+  } | null;
+  conversation: boolean;
+  /** The agent's session compaction is on and has a limit. */
+  sessionRotates: boolean;
+}): string | null {
+  const { issue } = input;
+  if (!issue || input.conversation) return null;
+  // A shared routine session grows with every tick, so only a session that
+  // rotates is shared. Adapter-managed defaults (all limits 0) keep one per issue.
+  if (!input.sessionRotates) return null;
+  if (issue.originKind !== "routine_execution" || !issue.originId) return null;
+  // An explicit non-issue task key on the wake keeps its own session.
+  if (input.issueTaskKey !== issue.id) return null;
+  // The native runtime resumes and tracks goals per issue.
+  if (input.adapterType === "paperclip_runner") return null;
+  return `${ROUTINE_TASK_SESSION_KEY_PREFIX}${issue.originId}`;
+}
+
+/**
+ * Takes the routine session for one running run. Another running run of the
+ * same agent holding it means overlapping ticks; the caller then keeps the
+ * per-issue key, so the two runs never share a session. The claim lives in the
+ * run's context and names the run, so it lapses when the run stops running
+ * (finished, failed, cancelled or reaped) and a copy in another run's context
+ * does not count. Reads only the claim keys of the agent's running runs.
+ */
+export async function claimRoutineTaskSession(
+  db: Db,
+  input: { companyId: string; agentId: string; runId: string; key: string },
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`routine-task-session:${input.companyId}:${input.agentId}:${input.key}`}, 0))`,
+    );
+    const holder = await tx
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          eq(heartbeatRuns.status, "running"),
+          ne(heartbeatRuns.id, input.runId),
+          sql`${heartbeatRuns.contextSnapshot} ->> ${ROUTINE_TASK_SESSION_CLAIM_KEY} = ${input.key}`,
+          sql`${heartbeatRuns.contextSnapshot} ->> ${ROUTINE_TASK_SESSION_CLAIM_RUN_KEY} = ${heartbeatRuns.id}::text`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (holder) return false;
+    await tx
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || jsonb_build_object(${ROUTINE_TASK_SESSION_CLAIM_KEY}::text, ${input.key}::text, ${ROUTINE_TASK_SESSION_CLAIM_RUN_KEY}::text, ${input.runId}::text)`,
+      })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return true;
+  });
+}
+
 export function shouldResetTaskSessionForWake(
   contextSnapshot: Record<string, unknown> | null | undefined,
+  options: { routineTaskSession?: boolean } = {},
 ) {
   if (contextSnapshot?.forceFreshSession === true) return true;
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (
-    wakeReason === "issue_assigned" ||
+    // Every routine tick is a new assignment; its session spans the ticks.
+    (wakeReason === "issue_assigned" && options.routineTaskSession !== true) ||
     wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON ||
     wakeReason === "execution_approval_requested" ||
     // PF-4: unscoped timer wakes are exploratory ("any new work?") and should
@@ -6264,12 +6384,14 @@ export function filterZombieCoalesceTarget<
 
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
+  options: { routineTaskSession?: boolean } = {},
 ) {
   if (contextSnapshot?.forceFreshSession === true)
     return "forceFreshSession was requested";
 
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
+  if (wakeReason === "issue_assigned" && options.routineTaskSession !== true)
+    return "wake reason is issue_assigned";
   if (wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON) {
     return `wake reason is ${EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON}`;
   }
@@ -7827,10 +7949,25 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // A run's pull-request fingerprint is the state it was admitted with. A wake
+  // merged into it later, maybe into a run that already started, must not
+  // claim that the run saw a newer state.
+  if (existing[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY] !== undefined) {
+    merged[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY] = existing[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY];
+  } else {
+    delete merged[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY];
+  }
   // Only executeRun can mint this proof. Coalescence may retain an unchanged
   // admitted proof, but must never accept a new marker from an incoming wake.
   delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
   delete merged[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY];
+  // The routine-session claim names the target run and only
+  // claimRoutineTaskSession mints it. Keep the target's claim; an incoming
+  // wake context may carry another run's copy of it, which must not replace it.
+  for (const key of [ROUTINE_TASK_SESSION_CLAIM_KEY, ROUTINE_TASK_SESSION_CLAIM_RUN_KEY]) {
+    if (existing[key] === undefined) delete merged[key];
+    else merged[key] = existing[key];
+  }
   const mergedAttachmentOmissions = mergeExternalAttachmentOmissions(
     existing,
     incoming,
@@ -9919,6 +10056,8 @@ export interface HeartbeatServiceOptions {
     runId: string;
     issueId: string;
   }) => Promise<void>;
+  /** GitHub fetch and token seams for the unchanged-pull-request wake gate. */
+  pullRequestWakeGate?: PullRequestWakeGateDeps;
 }
 
 export async function cancelHeartbeatNativeRun(input: {
@@ -12290,6 +12429,8 @@ export function heartbeatService(
       activitySource: "manual" | "scheduled";
       /** An authenticated user's check-now: exempt from the automation window like any human wake. */
       manualUserWake?: boolean;
+      /** May skip the wake when the linked pull request is unchanged (scheduled ticks only). */
+      pullRequestGate?: boolean;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -12366,6 +12507,85 @@ export function heartbeatService(
     }
 
     const monitorWakeKey = `issue-monitor:${claimed.id}:${scheduledAtIso}`;
+    // Only the scheduled re-check of a wait the assignee aimed at one pull
+    // request (`issue wait --pull-request`) may skip while that pull request is
+    // unchanged. Every other wait, a person's check-now, server-owned monitors
+    // and the last attempt a re-arm allows always wake the agent.
+    const skipIfPullRequestUnchanged =
+      input.pullRequestGate === true &&
+      !isProviderQuotaReviewMonitor &&
+      monitor?.scheduledBy === "assignee" &&
+      (monitor.maxAttempts == null || nextAttemptCount < monitor.maxAttempts)
+        ? readPullRequestWaitTarget(monitor)
+        : null;
+    // The pull request did not change since the agent's last run, so this check
+    // is done. Keep the monitor armed for the same wait the agent chose, as if it
+    // had woken, found nothing new, and waited again.
+    const rearmUnchangedPullRequestMonitor = async (skipDetails: Record<string, unknown>) => {
+      const lastCheckMs = Math.max(
+        claimed.monitorLastTriggeredAt?.getTime() ?? 0,
+        Date.parse(String(skipDetails.baselineFinishedAt ?? "")) || 0,
+      );
+      const waitMs = lastCheckMs > 0
+        ? Math.min(ISSUE_WAIT_MAX_DELAY_MS, Math.max(ISSUE_WAIT_MIN_DELAY_MS, claimed.monitorNextCheckAt!.getTime() - lastCheckMs))
+        : ISSUE_WAIT_MIN_DELAY_MS;
+      const timeoutAt = parseMonitorDate(monitor?.timeoutAt ?? null);
+      const nextCheckAt = new Date(
+        Math.min(input.now.getTime() + waitMs, timeoutAt?.getTime() ?? Number.POSITIVE_INFINITY),
+      );
+      // The gate may have taken seconds. Re-read under a lock and re-arm only
+      // the monitor this dispatch claimed; an edit since then wins.
+      const rechecked = await db.transaction(async (tx) => {
+        const [current] = await tx
+          .select(issueMonitorDispatchColumns)
+          .from(issues)
+          .where(and(eq(issues.id, claimed.id), eq(issues.companyId, claimed.companyId)))
+          .for("update");
+        if (
+          !current ||
+          current.monitorNextCheckAt?.getTime() !== claimed.monitorNextCheckAt?.getTime() ||
+          current.monitorWakeRequestedAt?.getTime() !== claimed.monitorWakeRequestedAt?.getTime() ||
+          current.assigneeAgentId !== claimed.assigneeAgentId ||
+          current.assigneeUserId !== null ||
+          !["in_progress", "in_review"].includes(current.status)
+        ) {
+          return null;
+        }
+        const patch = buildIssueMonitorRecheckedPatch({
+          issue: current as IssueMonitorDispatchRow,
+          policy: normalizeIssueExecutionPolicy(current.executionPolicy ?? null),
+          checkedAt: input.now,
+          nextCheckAt,
+        });
+        await tx
+          .update(issues)
+          .set(patch ? { ...patch, updatedAt: new Date() } : { monitorWakeRequestedAt: null, updatedAt: new Date() })
+          .where(eq(issues.id, claimed.id));
+        return patch;
+      });
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_pull_request_unchanged",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: scheduledAtIso,
+          rescheduledAt: rechecked ? nextCheckAt.toISOString() : null,
+          attemptCount: nextAttemptCount,
+          skipReason: PULL_REQUEST_UNCHANGED_SKIP_REASON,
+          baselineRunId: skipDetails.baselineRunId ?? null,
+          fingerprintDigest: skipDetails.fingerprintDigest ?? null,
+          pullRequest: skipDetails.pullRequest ?? null,
+          source: input.activitySource,
+        },
+      });
+      return { outcome: "skipped" as const, reason: "Pull request unchanged since the agent's last check" };
+    };
     // The queue dropped or refused the wake. Keep the monitor armed: count the
     // attempt, back off, and hand the issue to owner recovery once the attempts
     // run out, so a permanently blocked agent cannot retry without end.
@@ -12497,6 +12717,7 @@ export function heartbeatService(
           reason: wakeReason,
           idempotencyKey: monitorWakeKey,
           ...(input.manualUserWake ? { manualUserWake: true } : {}),
+          ...(skipIfPullRequestUnchanged ? { skipIfPullRequestUnchanged } : {}),
           payload: {
             issueId: claimed.id,
             nextCheckAt: scheduledAtIso,
@@ -12530,7 +12751,11 @@ export function heartbeatService(
       // will not run, so the monitor stays armed.
       if (monitorWake === null) {
         const skipped = await db
-          .select({ reason: agentWakeupRequests.reason })
+          .select({
+            reason: agentWakeupRequests.reason,
+            idempotencyKey: agentWakeupRequests.idempotencyKey,
+            heartbeatSkip: sql<unknown>`${agentWakeupRequests.payload} -> 'heartbeatSkip'`,
+          })
           .from(agentWakeupRequests)
           .where(
             and(
@@ -12541,8 +12766,16 @@ export function heartbeatService(
               gte(agentWakeupRequests.updatedAt, monitorWakeStartedAt),
             ),
           )
+          // This dispatch's own receipt first.
+          .orderBy(sql`${agentWakeupRequests.idempotencyKey} is not distinct from ${monitorWakeKey} desc`)
           .limit(1)
           .then((rows) => rows[0] ?? null);
+        if (
+          skipped?.reason === PULL_REQUEST_UNCHANGED_SKIP_REASON &&
+          skipped.idempotencyKey === monitorWakeKey
+        ) {
+          return await rearmUnchangedPullRequestMonitor(parseObject(skipped.heartbeatSkip));
+        }
         if (skipped) {
           return holdMonitorForRetry(
             `Monitor wake skipped (${skipped.reason ?? "skipped"})`,
@@ -12805,6 +13038,12 @@ export function heartbeatService(
 
     let triggered = 0;
     let skipped = 0;
+    // Bound the GitHub reads one tick may make: once the deadline passes, the
+    // remaining due monitors wake without the unchanged-pull-request check. A gate
+    // already running is not cut short, so a tick can overrun the deadline by one
+    // gate's own budget (PULL_REQUEST_GATE_BUDGET_MS).
+    const pullRequestGateDeadline =
+      Date.now() + (options.pullRequestWakeGate?.tickBudgetMs ?? PULL_REQUEST_GATE_TICK_BUDGET_MS);
 
     for (const due of dueMonitors) {
       const claimed = await db.transaction(async (tx) => {
@@ -12847,6 +13086,7 @@ export function heartbeatService(
           runId: null,
           clearOnClientError: true,
           activitySource: "scheduled",
+          pullRequestGate: Date.now() < pullRequestGateDeadline,
         });
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
@@ -13514,6 +13754,12 @@ export function heartbeatService(
     sessionDisplayId: string | null;
     lastRunId: string | null;
     lastError: string | null;
+    /**
+     * When set, an existing row is written only while its lastRunId is one of
+     * these. Any other value means a later run saved the row, and this write
+     * would put an older session back.
+     */
+    onlyIfLastRunIdIn?: ReadonlyArray<string | null>;
   }) {
     return db.transaction(async (tx) => {
       // A task key that is not an issue id locks nothing, as `id::text = taskKey` matched nothing.
@@ -13526,6 +13772,8 @@ export function heartbeatService(
       }
     const existing = await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey))).then((rows) => rows[0] ?? null);
     if (existing) {
+      const guard = input.onlyIfLastRunIdIn;
+      if (guard && !guard.includes(existing.lastRunId)) return null;
       return tx
         .update(agentTaskSessions)
         .set({
@@ -13535,7 +13783,15 @@ export function heartbeatService(
           lastError: input.lastError,
           updatedAt: new Date(),
         })
-        .where(eq(agentTaskSessions.id, existing.id))
+        .where(and(
+          eq(agentTaskSessions.id, existing.id),
+          // Under READ COMMITTED this re-checks the row a concurrent save just changed.
+          ...(guard
+            ? [existing.lastRunId === null
+                ? isNull(agentTaskSessions.lastRunId)
+                : eq(agentTaskSessions.lastRunId, existing.lastRunId)]
+            : []),
+        ))
         .returning()
         .then((rows) => rows[0] ?? null);
     }
@@ -13565,12 +13821,26 @@ export function heartbeatService(
       adapterType?: string | null;
       expectedRunId?: string;
       includeIssueAliases?: boolean;
+      /**
+       * When set, a row is cleared only while its lastRunId is one of these.
+       * Any other value means a later run saved the row after this one began.
+       */
+      onlyIfLastRunIdIn?: ReadonlyArray<string | null>;
     },
   ) {
     const conditions = [
       eq(agentTaskSessions.companyId, companyId),
       eq(agentTaskSessions.agentId, agentId),
     ];
+    if (opts?.onlyIfLastRunIdIn) {
+      const runIds = opts.onlyIfLastRunIdIn.filter((id): id is string => id !== null);
+      conditions.push(
+        or(
+          runIds.length > 0 ? inArray(agentTaskSessions.lastRunId, runIds) : sql`false`,
+          opts.onlyIfLastRunIdIn.includes(null) ? isNull(agentTaskSessions.lastRunId) : sql`false`,
+        )!,
+      );
+    }
     if (opts?.taskKey) {
       const exactTaskKey = eq(agentTaskSessions.taskKey, opts.taskKey);
       if (opts.includeIssueAliases) {
@@ -13581,6 +13851,7 @@ export function heartbeatService(
         // identifier used by some saved sessions. Resolve only from the current
         // same-company issue row, in this DELETE's snapshot; arbitrary custom
         // keys retain exact-match behavior and run/model context grants no alias.
+        // A routine-execution issue's session is its routine's session.
         conditions.push(
           or(
             exactTaskKey,
@@ -13589,7 +13860,9 @@ export function heartbeatService(
               where ${issues.companyId} = ${companyId}
                 and ${selectedIssue}
                 and (${agentTaskSessions.taskKey} = ${issues.id}::text
-                  or ${agentTaskSessions.taskKey} = ${issues.identifier})
+                  or ${agentTaskSessions.taskKey} = ${issues.identifier}
+                  or (${issues.originKind} = 'routine_execution'
+                    and ${agentTaskSessions.taskKey} = ${ROUTINE_TASK_SESSION_KEY_PREFIX}::text || ${issues.originId}))
             )`,
           )!,
         );
@@ -16829,6 +17102,24 @@ export function heartbeatService(
     return nextSlot.getTime() > input.dueAt.getTime() ? nextSlot : input.dueAt;
   }
 
+  /** Says in the run log why a context overflow gets no automatic retry. */
+  async function recordContextWindowExceededNotRetried(run: typeof heartbeatRuns.$inferSelect) {
+    if (run.errorCode !== CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) return;
+    // The event only explains the outcome; a write failure must not skip the
+    // retry and release steps that follow it.
+    try {
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE,
+        payload: { errorCode: CONTEXT_WINDOW_EXCEEDED_ERROR_CODE },
+      });
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to record why a context overflow is not retried");
+    }
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -16847,6 +17138,11 @@ export function heartbeatService(
     if (run.errorCode === "provider_tool_definition_invalid") {
       return { outcome: "not_scheduled" as const,
         reason: "Repair the invalid tool definitions before starting a new attempt.",
+        issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
+    }
+    if (run.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) {
+      return { outcome: "not_scheduled" as const,
+        reason: CONTEXT_WINDOW_EXCEEDED_NOT_RETRIED_MESSAGE,
         issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
     }
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
@@ -23490,7 +23786,7 @@ export function heartbeatService(
           );
         }
       }
-      const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
+      const issueTaskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
       const sessionCodec = getAdapterSessionCodec(agent.adapterType);
       const issueId = readNonEmptyString(context.issueId);
       let issueContext = issueId
@@ -23844,6 +24140,33 @@ export function heartbeatService(
         context.executionPolicy = retainedTrust.executionPolicy;
       }
       const config = parseObject(agent.adapterConfig);
+      const sessionCompactionPolicy = parseSessionCompactionPolicy(agent);
+      const candidateRoutineSessionKey = routineTaskSessionKey({
+        adapterType: agent.adapterType,
+        issueTaskKey,
+        issue: issueContext,
+        conversation: isConversation(issueContext),
+        sessionRotates:
+          sessionCompactionPolicy.enabled && hasSessionCompactionThresholds(sessionCompactionPolicy),
+      });
+      const routineSessionKey =
+        candidateRoutineSessionKey &&
+        (await claimRoutineTaskSession(db, {
+          companyId: agent.companyId,
+          agentId: agent.id,
+          runId: run.id,
+          key: candidateRoutineSessionKey,
+        }))
+          ? candidateRoutineSessionKey
+          : null;
+      if (routineSessionKey) {
+        context[ROUTINE_TASK_SESSION_CLAIM_KEY] = routineSessionKey;
+        context[ROUTINE_TASK_SESSION_CLAIM_RUN_KEY] = run.id;
+      } else {
+        delete context[ROUTINE_TASK_SESSION_CLAIM_KEY];
+        delete context[ROUTINE_TASK_SESSION_CLAIM_RUN_KEY];
+      }
+      const taskKey = routineSessionKey ?? issueTaskKey;
       const taskSession = taskKey
         ? await getTaskSession(
             agent.companyId,
@@ -24770,7 +25093,8 @@ export function heartbeatService(
         const canRefresh = typeof capability === "function" ? capability(runtimeConfig) : capability === true;
         if (!canRefresh) context.forceFreshSession = true;
       }
-      const wakeSessionResetReason = describeSessionResetReason(context);
+      const sessionResetOptions = { routineTaskSession: routineSessionKey !== null };
+      const wakeSessionResetReason = describeSessionResetReason(context, sessionResetOptions);
       const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
         hasTaskSession: taskSession != null,
         configuredModel,
@@ -24787,7 +25111,9 @@ export function heartbeatService(
       const harnessSwitched =
         previousIssueHarness !== null && previousIssueHarness !== agent.adapterType;
       const resetTaskSession =
-        shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset || harnessSwitched;
+        shouldResetTaskSessionForWake(context, sessionResetOptions) ||
+        sessionConfigFreshness.reset ||
+        harnessSwitched;
       const sessionResetReason =
         [
           ...sessionConfigFreshness.reasons,
@@ -26079,6 +26405,40 @@ export function heartbeatService(
         sessionDisplayId: previousSessionDisplayId,
         taskKey,
       };
+      // A resumed routine session last worked on an earlier tick's issue. Tell
+      // it plainly that this wake is a new issue and the earlier one is separate.
+      // Built after rotation and credential checks, so only a resume carries it.
+      const routineSessionLastRunId =
+        routineSessionKey &&
+        issueRef &&
+        (runtimeForAdapter.sessionId || runtimeForAdapter.sessionParams)
+          ? (taskSessionForRun?.lastRunId ?? null)
+          : null;
+      if (routineSessionLastRunId && issueRef) {
+        const previousIssue = await db
+          .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+          .from(heartbeatRuns)
+          .innerJoin(
+            issues,
+            and(
+              eq(issues.companyId, heartbeatRuns.companyId),
+              issueIdEqualsText(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`),
+            ),
+          )
+          .where(
+            and(
+              eq(heartbeatRuns.id, routineSessionLastRunId),
+              eq(heartbeatRuns.companyId, agent.companyId),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        if (previousIssue?.id !== issueRef.id) {
+          context[PAPERCLIP_WAKE_PAYLOAD_KEY] = {
+            ...parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]),
+            routineSession: { previousIssue },
+          };
+        }
+      }
       // A delta is safe only when the selected provider session is exactly the
       // task session whose last dispatch supplied the baseline history.
       if (
@@ -28478,16 +28838,22 @@ export function heartbeatService(
           : runErrorSummary;
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
+        // The provider's own refusal of an oversized prompt wins over the code
+        // the adapter guessed, so no retry path sends the same prompt again.
+        const contextWindowExceeded =
+          outcome === "failed" && isContextWindowExceededMessage(adapterResult.errorMessage);
         const runErrorCode =
           outcome === "timed_out"
             ? "timeout"
             : outcome === "cancelled"
               ? (latestRun?.errorCode ?? "cancelled")
-              : outcome === "failed"
-                ? (adapterResult.errorCode ??
-                  recordedResponsibleUserDenialCode ??
-                  "adapter_failed")
-                : null;
+              : contextWindowExceeded
+                ? CONTEXT_WINDOW_EXCEEDED_ERROR_CODE
+                : outcome === "failed"
+                  ? (adapterResult.errorCode ??
+                    recordedResponsibleUserDenialCode ??
+                    "adapter_failed")
+                  : null;
 
         let logSummary: {
           bytes: number | null;
@@ -28905,6 +29271,7 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
+          await recordContextWindowExceededNotRetried(livenessRun);
           const harnessFallbackOutcome = outcome === "failed" && !isMaxTurnExhaustionRun(livenessRun)
             ? await handleProviderQuotaFailure({
                 run: livenessRun,
@@ -29079,6 +29446,9 @@ export function heartbeatService(
           if (taskKey) {
             if (
               adapterResult.clearSession ||
+              // A session that overflowed the context window overflows again on
+              // its next resume; under a routine key that is the next tick.
+              runErrorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE ||
               (!nextSessionState.params && !nextSessionState.displayId)
             ) {
               await clearTaskSessions(agent.companyId, agent.id, {
@@ -29282,6 +29652,9 @@ export function heartbeatService(
           recordedResponsibleUserDenialCode ??
           nativeTerminalFailureCode ??
           (restoreLockTimeoutFailure ? WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE : null) ??
+          (isContextWindowExceededMessage(err instanceof Error ? err.message : null)
+            ? CONTEXT_WINDOW_EXCEEDED_ERROR_CODE
+            : null) ??
           "adapter_failed";
         logger.error({ err, runId }, "heartbeat execution failed");
 
@@ -29399,6 +29772,7 @@ export function heartbeatService(
           ) {
             await finalizeIssueCommentPolicy(livenessRun, agent);
           }
+          await recordContextWindowExceededNotRetried(livenessRun);
           if (livenessRun.errorCode === WORKSPACE_RESTORE_LOCK_TIMEOUT_FAILURE_CODE) {
             // Only this branch tolerates a scheduling error; the other keeps
             // propagating it as it always did.
@@ -29437,7 +29811,16 @@ export function heartbeatService(
             },
           );
 
-          if (
+          if (taskKey && livenessRun.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) {
+            // Resuming an overflowed session fails the same way, so drop it
+            // unless a later run has saved the row since.
+            await clearTaskSessions(agent.companyId, agent.id, {
+              taskKey,
+              adapterType: agent.adapterType,
+              expectedRunId: failedRun.id,
+              onlyIfLastRunIdIn: [taskSession?.lastRunId ?? null, failedRun.id],
+            });
+          } else if (
             taskKey &&
             (goalCheckpointSession.current ||
               previousSessionParams ||
@@ -29461,6 +29844,10 @@ export function heartbeatService(
                 previousSessionDisplayId,
               lastRunId: failedRun.id,
               lastError: message,
+              // This only re-saves the session the run started with. The release
+              // above may have started the next run on the same key, and a save
+              // by that run (or any run since this one began) is newer.
+              onlyIfLastRunIdIn: [taskSession?.lastRunId ?? null, failedRun.id],
             });
           }
         }
@@ -30068,6 +30455,8 @@ export function heartbeatService(
       triggerDetail,
       payload,
     });
+    // Only the pull-request gate below may record the fingerprint a run starts from.
+    delete enrichedContextSnapshot[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY];
     // Keep each request's own server-derived origin, including coalesced wakes.
     // A run's merged context cannot establish which caller authored one receipt.
     // Overwrite caller-supplied nested context rather than trusting it.
@@ -30675,6 +31064,55 @@ export function heartbeatService(
           releasePolicy: activePauseHold.releasePolicy,
           interaction: true,
         };
+      }
+    }
+
+    // A scheduled re-check of a wait on one pull request that did not change
+    // carries no new information: record a skipped wake instead of starting the
+    // adapter. Every doubt wakes. Runs outside the issue lock: it may call GitHub.
+    if (opts.skipIfPullRequestUnchanged && issueId) {
+      const gate = await evaluatePullRequestWakeGate(
+        db,
+        { companyId: agent.companyId, issueId, agentId, pullRequest: opts.skipIfPullRequestUnchanged },
+        options.pullRequestWakeGate,
+      ).catch((err: unknown) => {
+        logger.warn({ err, companyId: agent.companyId, issueId, agentId }, "pull request wake gate failed; waking the agent");
+        return { outcome: "wake" as const, reason: "gate_error", fingerprint: null };
+      });
+      if (gate.outcome === "skip") {
+        const pr = gate.fingerprint.pullRequest;
+        await writeSkippedHeartbeatRequest(PULL_REQUEST_UNCHANGED_SKIP_REASON, {
+          outcome: "no_change",
+          wakeReason: reason,
+          baselineRunId: gate.baselineRunId,
+          baselineFinishedAt: gate.baselineFinishedAt,
+          fingerprintDigest: gate.fingerprint.digest,
+          pullRequest: {
+            repo: pr.repo,
+            number: pr.number,
+            state: pr.state,
+            headSha: pr.headSha,
+            checks: pr.checks,
+            status: pr.status,
+          },
+        });
+        return null;
+      }
+      if (gate.fingerprint) {
+        const stored = toStoredPullRequestFingerprint(gate.fingerprint);
+        enrichedContextSnapshot[PULL_REQUEST_FINGERPRINT_CONTEXT_KEY] = stored;
+        payload = {
+          ...payload,
+          [DEFERRED_WAKE_CONTEXT_KEY]: {
+            ...parseObject(payload?.[DEFERRED_WAKE_CONTEXT_KEY]),
+            [PULL_REQUEST_FINGERPRINT_CONTEXT_KEY]: stored,
+          },
+        };
+      } else if (gate.reason !== "gate_error") {
+        const logContext = { companyId: agent.companyId, issueId, agentId, reason: gate.reason };
+        const message = "pull request wake gate could not read the pull request; waking the agent";
+        if (EXPECTED_PULL_REQUEST_GATE_MISSES.has(gate.reason)) logger.info(logContext, message);
+        else logger.warn(logContext, message);
       }
     }
 

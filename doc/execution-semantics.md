@@ -233,6 +233,19 @@ A configuration-incomplete result is a gate outcome, not a runtime failure. It i
 
 An unresolved workspace base ref is another configuration-incomplete condition. A `git_worktree` workspace bases a fresh worktree on a configured base ref. Paperclip first fetches a remote-only ref before dispatch: it maps an unqualified name (for example `fix/foo`) or a remote-tracking name (for example `origin/fix/foo`) to `origin/<branch>`, runs the authenticated fetch, and re-checks the commit. A ref that resolves lets work continue on the resolved commit. A ref that is still unresolvable after the fetch produces a configuration-incomplete blocker that names the requested ref, rather than a dispatched-then-failed run. Because the adapter never started, Paperclip queues no missing-comment retry. The recovery action dedupes by the canonical remote ref (`origin/<branch>`), not the operator spelling. Two equivalent spellings of one remote branch, for example `fix/foo` and `origin/fix/foo`, share one recovery identity, so a repeated failure reuses the active action and does not reset the attempt count or post a second notice. A different remote branch is a distinct blocker. Paperclip resolves the prior recovery action, creates a new action for the new ref, and notifies the operator with the new ref instead of overwriting the active action of the prior ref.
 
+### Routine sessions across ticks
+
+Each routine tick creates a new routine-execution issue (`originKind = routine_execution`, `originId` = the routine id). If the session were keyed by issue, every tick would start a fresh agent session. Instead, the session of a routine-execution issue is keyed by its routine. The `agent_task_sessions` row uses task key `routine:<routineId>`. The row is already scoped by company, agent and adapter type, so the effective key is (company, agent, adapter type, routine), and a different assignee or harness gets its own session. The next tick of the same routine for the same agent resumes the session the previous tick saved. The run's own `taskKey` in its context stays the issue id.
+
+This applies only when the agent's sessions rotate: its effective session compaction policy (the adapter's default, merged with `runtimeConfig.heartbeat.sessionCompaction`) is enabled and has at least one limit above 0 (runs, raw input tokens or age). A shared routine session grows with every tick, so without a limit each routine issue keeps its own session, as for any other issue. The adapters that manage their own context (`claude_local`, `codex_local`, `hermes_local`) have every limit at 0 by default, so they share a routine session only with an override that sets a limit. Adapters on the default policy share it without an override.
+
+- **New issue framing.** A resumed routine session is told plainly that the wake is for a new issue. The wake payload's `routineSession.previousIssue` names the issue the session last worked on, and the resume delta states that it is a separate item that the run must not continue, update, comment on, or close. The assignment wake still carries the new issue's full brief. Another wake on a routine issue (a comment on an older run's issue, for example) also resumes the routine session; its resume delta names the issue of the wake and says it is not the issue the session worked on last, without calling it new.
+- **Reset paths still apply.** A routine session does not reset on the `issue_assigned` wake, because every tick is a new assignment. Every other reset still starts a fresh session: `forceFreshSession`, recovery and approval wakes, a change of configured model or effective run configuration, an adapter type change (a separate row), and a credential mismatch. The harness-switch check compares the runs of one issue, so it still applies within one routine issue, but it does not compare ticks: when a tick runs on a fallback harness, that harness saves its own row, and the next tick on the primary harness resumes the primary's last session. Adapters that check the saved session's working directory, such as `claude_local` and `codex_local`, also start fresh when it differs from the run's. An operator reset by the issue's id or identifier also clears its routine session. A run that fails because its prompt overflows the model's context window (`context_window_exceeded`) clears the session it saved under, so the next tick starts fresh instead of resuming the session that overflowed.
+- **Rotation.** The existing session compaction policy (`runtimeConfig.heartbeat.sessionCompaction`) rotates a routine session exactly as it rotates any session: it counts the session's runs, raw input tokens and age, then starts a fresh session with a handoff note, and the new session is saved under the routine key. Adapters that manage their own context (`claude_local`, `codex_local`, `hermes_local`) have no default thresholds, so their routine issues share a session only when the agent sets an override such as `maxRawInputTokens`.
+- **Overlapping runs never share a session.** Identical open copies of a routine execution are already serialized by `issues_open_routine_execution_uq`. Copies with different dispatch fingerprints (for example, different payloads under `always_enqueue`) can run at once. A run takes the routine session by writing `paperclipRoutineTaskSessionKey` and its own id (`paperclipRoutineTaskSessionRunId`) into its own context, under an advisory lock. If another `running` run of the same agent already holds that key, the run keeps the per-issue key instead: it starts fresh and saves to its own issue. A claim copied into a retry or continuation run's context names the source run, so it does not count. The claim lapses as soon as the holder leaves `running` (finished, failed, cancelled or reaped), so a crashed run does not keep later ticks on fresh sessions. A wake that coalesces into a running routine run keeps that run's claim; the claim in an incoming wake context never replaces it. The holder saves the session after its status leaves `running`, not at the same time. Between the two it finalizes the run (events, workspace, comment policy, retry scheduling) and releases the issue's execution, which starts a wake that was deferred behind it on the same issue; another run of the same agent that ends in that window can also start a queued run. A tick that claims the session in that window resumes the row as it was before the holder's save (or starts fresh if there was no row). Then the holder saves, and the later save of the two wins. The two never use the session at once, but the saved session can lack the turn of the one that saved first. A run that ends with an adapter exception re-saves only the session it started with, and skips that re-save when another run has saved the row since.
+- **Scope.** This does not apply to non-routine issues, conversation issues, explicit non-issue task keys, or the `paperclip_runner` native runtime (native resume and session goals stay issue-scoped).
+- **Working directory.** For those adapters a session resumes only in the same working directory. A routine with no project, or with the project's shared workspace, runs every tick in the same directory. A per-issue isolated worktree gives each tick a new directory, so those ticks keep starting fresh.
+
 ## 6. Parent/Sub-Issue vs Blockers
 
 Paperclip uses two different relationships for different jobs.
@@ -463,6 +476,33 @@ An interaction can be created by a run on another task in the same company, or b
 
 New interactions exclude known comments from other tasks when recording their origins. At dispatch, older interactions may discard a copied origin only when both the producer's saved context and a comment on that producer's other task prove where it came from. Missing records, cross-company references, explicit wake comments, and unrelated origins still fail closed.
 
+### Bounded task history on wake
+
+A wake of the issue's assignee carries the task history in its continuation context (`executionContinuation`). The history is a bounded window, so a long-lived issue cannot make a prompt that is larger than the model context.
+
+- **Pinned comments.** The latest human request and the comments that woke the run are always in `messages`. Each is cut at 16,000 characters. They count toward the 48,000-character total: the latest request first, then the wake comments, newest first. When the total is used up, each further pinned comment keeps 200 characters.
+- **Newest comments.** Then come the newest other comments, up to 20. Each is cut at 4,000 characters, until all bodies together reach 48,000 characters. The window stops at the first comment that does not fit, so the recent part has no gaps.
+- **Cut marker.** A cut body ends with `[truncated: N more characters; read comment <id>]`.
+- **Older comments.** `olderMessages` lists each older comment with its id, author, time, length and a one-line preview of 120 characters. It lists at most the 50 newest of them, and `window` counts the rest.
+- **Documents.** `documents` lists the issue documents without system documents: key, title, revision, updated time and length, at most 20. A quarantined document's title is hidden. The task brief cuts the plan body at 32,000 characters and says where to read the rest.
+- **Objective and summary.** The envelope keeps the whole objective, because server checks (for example the native completion contract) read it. A prompt shows at most 16,000 characters of it. The completed-work summary is cut at 16,000 characters.
+- **Size guard.** If the envelope (without its resume delta, with the objective at its shown size) is still above 160,000 characters, the guard removes content in this order, until it fits:
+  1. index entries
+  2. the oldest unpinned comments
+  3. the oldest completed actions and interaction outcomes (the outcome of the triggering interaction stays)
+  4. it cuts the summary and the pinned comments to 2,000 characters
+  Human responses and recovery outcomes are never removed, so they alone can keep an envelope above the ceiling.
+- **Coverage.** `coverage.kind` is `bounded_task_history` when anything was left out or cut, and `window` says what was kept. `coverage.throughCommentId` is still the newest comment of the issue. A thread that fits keeps `full_task_history` and has no `window` or `olderMessages`.
+- **Resumed sessions.** A resumed session gets `resumeDelta`. Its `messages` are the comments of the current window that are new or edited since the named run. A body that only changed its cut length is not sent again. New or edited comments outside the window are listed in `resumeDelta.olderMessages` with a preview, at most 50, and `resumeDelta.unlistedMessages` counts the rest. The prompt says that their bodies must be read. An edit is seen only for a comment that the named run had in `messages`. A comment that commits after a newer comment was delivered sorts before it, so it can be missed when it falls outside the window. A native-runtime resume falls back to the full prompt when the delta lists comments outside the window.
+
+The prompt tells the agent how to read more only when it needs it:
+
+- one comment: `GET /api/issues/{id}/comments/{commentId}` (`paperclipai issue comment:get`)
+- older pages: `GET /api/issues/{id}/comments?order=desc&after={oldestIncludedCommentId}&limit=20` (`paperclipai issue comments --order desc --after-comment-id … --limit 20`)
+- documents: `GET /api/issues/{id}/documents/{key}` (`paperclipai issue document:get`)
+
+The request and authority checks still read every comment row and the whole objective. Only what the prompt carries is bounded.
+
 ### Comment interrupts and ownership handoffs
 
 A board comment can be an interrupt, an ownership change, both, or neither. Paperclip must keep those concepts separate in the product contract.
@@ -650,9 +690,49 @@ Monitor policy lives under `executionPolicy.monitor` and includes:
 - `notes`: non-secret instructions for what the assignee should check
 - `serviceName`: optional non-secret external-service context
 - `externalRef`: optional external-service reference input; Paperclip treats it as secret-adjacent, redacts it before persistence/visibility, and omits it from activity and wake payloads
+- `pullRequestUrl`: optional GitHub pull request the wait is about, stored canonical as `https://github.com/{owner}/{repo}/pull/{n}`; any other value is rejected (see [Unchanged pull request checks](#unchanged-pull-request-checks))
 - `timeoutAt`, `maxAttempts`, and `recoveryPolicy`: optional recovery hints for bounded waits
 
 Monitors are not recurring intervals. When a monitor fires, Paperclip clears the scheduled monitor and queues an `issue_monitor_due` wake for the assignee. If the external service is still pending, the assignee must explicitly re-arm the monitor with a new `nextCheckAt`. If the issue moves to `done`, `cancelled`, an invalid status, or a human/unassigned owner, the monitor is cleared.
+
+#### Unchanged pull request checks
+
+An agent that waits on review, CI checks or new commits of one open GitHub pull request can name it: `paperclipai issue wait <issue> --in 10m --reason "..." --pull-request <url>` (REST: `POST /api/issues/{id}/wait` with `pullRequest`). The wait stores `serviceName: "GitHub pull request"` and the canonical `pullRequestUrl`. Before Paperclip queues the wait's scheduled `issue_monitor_due` wake, it compares that pull request with the state that the assignee's last monitor check started from. If nothing changed, Paperclip does not start the agent.
+
+A wait without `--pull-request` behaves exactly as before: it always wakes the agent, whatever pull requests the issue links. Use the target only when the pull request itself is what you wait on, not for a deploy after a merge, a lock, a release or another repository.
+
+- **Target.** Only a canonical `https://github.com/{owner}/{repo}/pull/{n}` qualifies, with no `.` or `..` segment. The wait API and the policy validator reject anything else. The gate re-validates the stored value: another host (including GitHub Enterprise), a missing URL or a malformed one means the wait wakes as before. The board's monitor editor keeps the target when it reschedules, but a board-scheduled monitor always wakes.
+- **Fingerprint.** Paperclip reads the pull request's state (open, closed or merged), draft flag, merge conflict (`mergeable_state` is `dirty`), head and base commits and last update time. It also reads the issue-comment and review-comment counts, the review count and the latest review id. Then it reads a check-run rollup (none, pending, success or failure, plus the names of failing checks) and the combined commit status with the names of failing status contexts. It also reads the newest check run id and the newest commit status id. A re-run gets a new id, so a CI re-run that ends with the same result still wakes the agent. Paperclip stores only `{ version, digest, computedAt }` as `pullRequestFingerprint` in the context of the run that the wake starts.
+- **Skip rule.** Paperclip skips the wake only when all of these are true:
+  - the pull request is open (a closed or merged pull request cannot change, so a wait on it is about something else)
+  - the assignee's latest run on the issue was a monitor check (`issue_monitor_due`) and succeeded
+  - that run started from the same digest
+  - the digest was read before that run started
+  - nobody else commented on the issue after that run started
+  - that run finished less than 4 hours ago (`PULL_REQUEST_UNCHANGED_MAX_QUIET_MS`)
+
+  When a wake merges into a run that is queued or running, the run keeps the digest it was admitted with.
+- **Record of a skip.** Paperclip writes a skipped wake request with reason `heartbeat.pull_request_unchanged`. Its `payload.heartbeatSkip` holds `outcome: "no_change"`, the baseline run and a short pull request summary (repository, number, state, head commit, check and status rollup). Paperclip also writes an `issue.monitor_pull_request_unchanged` activity entry on the issue. The issue wake diagnostics show the reason. Paperclip creates no heartbeat run and does not invoke the adapter.
+- **Re-arm.** Paperclip re-arms the monitor for the same wait that the agent chose, within 1 minute to 24 hours, and never later than `timeoutAt`. It counts the check as an attempt and records the check time, so `maxAttempts` and `timeoutAt` apply as before. If the issue or its monitor changed while Paperclip read GitHub, the change wins and Paperclip does not re-arm.
+- **Always wakes.** These wakes are never skipped:
+  - every wait without a pull request target
+  - a manual "check now"
+  - a monitor that the board scheduled
+  - a server-owned monitor (provider quota, background-task re-check)
+  - the last attempt that a re-arm allows
+  - any wake that is not a scheduled monitor wake, including every comment wake
+- **Fail open.** Paperclip reads GitHub with the company's own credential: the managed GitHub connection, else a `GITHUB_TOKEN`/`GH_TOKEN`/`PAPERCLIP_GITHUB_TOKEN` company secret. It never uses the server-environment token, and it sends the credential only to `https://api.github.com`. Any of the following means the agent wakes as before, and Paperclip logs the reason with the company and issue ids:
+  - there is no credential, or it cannot be resolved
+  - GitHub answers with an error, or with a rate limit (a 429, or a 403 with no requests left or with `retry-after`)
+  - fewer than 100 requests remain in the rate limit
+  - the response is incomplete, paginated, or larger than 2 MiB (`MAX_GITHUB_RESPONSE_BYTES`)
+  - the check takes longer than 5 seconds (`PULL_REQUEST_GATE_BUDGET_MS`)
+- **Backoff.** After GitHub rate limits, refuses or does not answer a check, Paperclip stops calling GitHub for a while, and the agents wake as before in the meantime. A missing credential or an incomplete or oversize response starts no backoff. The memory is per server process. How long and for what depends on the failure:
+  - a rate limit (a 429, a 403 with no requests left or with `retry-after`, or fewer than 100 requests left): the whole company, for the time `retry-after` or `x-ratelimit-reset` asks, at most 1 hour (5 minutes when GitHub names no time)
+  - a timeout: the whole company, 5 minutes
+  - a 401, which means the company's credential is not accepted: the whole company, 15 minutes
+  - any other refusal or failure (a 403 without a rate limit, a 404, a 5xx, a redirect, a network error): that repository only, 15 minutes, so a repository the credential cannot see does not switch the check off for the company's other pull requests
+- **Tick bound.** A scheduler tick stops starting new checks 20 seconds after it begins dispatching its due monitors (`PULL_REQUEST_GATE_TICK_BUDGET_MS`), and the tick's remaining due monitors wake without a check. A check that already started is not cut short and runs to its own 5-second budget, so one tick spends at most about 25 seconds waiting on GitHub, plus its database reads.
 
 The task's waiting banner and composer countdown also display automatic retries
 while their run is `scheduled_retry`. Once a retry is `queued` or `running`, its

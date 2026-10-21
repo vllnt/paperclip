@@ -61,6 +61,19 @@ describe("buildMonitorSurfaceCopy", () => {
     expect(copy!.stripMeta.some((piece) => piece.includes("(your time)"))).toBe(false);
   });
 
+  it("names the pull request a wait targets", () => {
+    const copy = buildMonitorSurfaceCopy(
+      derived({
+        state: "scheduled",
+        nextCheckAt: new Date(NOW.getTime() + 10 * 60_000).toISOString(),
+        attemptCount: 1,
+        serviceName: "GitHub pull request acme/app#7",
+      }),
+      NOW,
+    );
+    expect(copy!.bannerMeta).toContain("Watching: GitHub pull request acme/app#7");
+  });
+
   it("keeps the retrying attempt count visible", () => {
     const copy = buildMonitorSurfaceCopy(
       derived({

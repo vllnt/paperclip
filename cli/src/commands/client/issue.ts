@@ -1651,10 +1651,19 @@ export function registerIssueCommands(program: Command): void {
       .argument("<issueId>", "Issue ID (must be assigned to you)")
       .requiredOption("--in <duration>", "Delay before the re-check: 1m to 24h, e.g. 10m, 90s, 1h30m")
       .requiredOption("--reason <text>", 'What you are waiting for, e.g. "CI on PR #4320 head abc123"')
+      .option(
+        "--pull-request <url>",
+        "The one open GitHub pull request you wait on (review, checks, new commits). " +
+          "While it does not change, a due check does not wake you.",
+      )
       .action(async (issueId: string, opts: IssueWaitOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
-          const payload = issueWaitRequestSchema.parse({ in: opts.in, reason: opts.reason });
+          const payload = issueWaitRequestSchema.parse({
+            in: opts.in,
+            reason: opts.reason,
+            ...(opts.pullRequest ? { pullRequest: opts.pullRequest } : {}),
+          });
           const result = await ctx.api.post(apiPath`/api/issues/${issueId}/wait`, payload);
           printOutput(result, { json: ctx.json });
         } catch (err) {
@@ -1683,6 +1692,7 @@ export function registerIssueCommands(program: Command): void {
 interface IssueWaitOptions extends BaseClientOptions {
   in: string;
   reason: string;
+  pullRequest?: string;
 }
 
 function parseCsv(value: string | undefined): string[] {

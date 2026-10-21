@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { parseIssueWaitPullRequestUrl } from "@paperclipai/shared";
 
 const SECOND_MS = 1_000;
 const MINUTE_MS = 60 * SECOND_MS;
@@ -18,6 +19,7 @@ type MonitorDetails = {
 type MonitorPolicy = {
   nextCheckAt?: MonitorDate | null;
   serviceName?: string | null;
+  pullRequestUrl?: string | null;
 };
 
 type ScheduledRetry = {
@@ -48,7 +50,18 @@ export interface DerivedMonitorState {
   source: "monitor" | "scheduled-retry" | "none";
   nextCheckAt: MonitorDate | null;
   attemptCount: number;
+  /**
+   * What the monitor watches, for display: the service name, followed by
+   * `owner/repo#n` for a wait on one pull request.
+   */
   serviceName: string | null;
+}
+
+/** The service name, followed by `owner/repo#n` when the wait targets a pull request. */
+function monitorWatchingLabel(serviceName: string | null, pullRequestUrl: string | null | undefined) {
+  const pullRequest = pullRequestUrl ? parseIssueWaitPullRequestUrl(pullRequestUrl) : null;
+  const pullRequestLabel = pullRequest ? `${pullRequest.owner}/${pullRequest.repo}#${pullRequest.number}` : null;
+  return [serviceName, pullRequestLabel].filter(Boolean).join(" ") || null;
 }
 
 export interface MonitorDateTimeFormatOptions {
@@ -197,7 +210,10 @@ export function deriveMonitorState(issue: MonitorIssueLike, now: MonitorDate = n
     (hasMonitor ? issue.monitorAttemptCount : null) ??
     (retryIsScheduled ? scheduledRetry?.scheduledRetryAttempt : null) ??
     0;
-  const serviceName = runtimeMonitor?.serviceName ?? policyMonitor?.serviceName ?? null;
+  const serviceName = monitorWatchingLabel(
+    runtimeMonitor?.serviceName ?? policyMonitor?.serviceName ?? null,
+    policyMonitor?.pullRequestUrl,
+  );
 
   if (runtimeMonitor?.status === "cleared") {
     return { state: "cleared", source, nextCheckAt, attemptCount, serviceName };

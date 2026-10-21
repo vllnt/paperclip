@@ -2771,6 +2771,56 @@ describe("IssueProperties", () => {
     dateNowSpy.mockRestore();
   });
 
+  it("keeps a wait's pull request target when the board reschedules the monitor", async () => {
+    const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(new Date("2026-04-11T10:00:00.000Z").getTime());
+    const onUpdate = vi.fn();
+    const root = renderProperties(container, {
+      issue: createIssue({
+        status: "in_review",
+        assigneeAgentId: "agent-1",
+        executionPolicy: createExecutionPolicy({
+          monitor: {
+            nextCheckAt: "2026-04-11T12:30:00.000Z",
+            notes: "Waiting: review on the fix",
+            scheduledBy: "assignee",
+            kind: "external_service",
+            serviceName: "GitHub pull request",
+            pullRequestUrl: "https://github.com/acme/app/pull/7",
+          },
+        }),
+      }),
+      childIssues: [],
+      onUpdate,
+      inline: true,
+    });
+    await flush();
+
+    const monitorTrigger = container.querySelector('[data-testid="monitor-row-trigger"]')?.closest("button");
+    await act(async () => {
+      monitorTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flush();
+    const scheduleButton = Array.from(container.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Schedule");
+    expect(scheduleButton).toBeTruthy();
+
+    act(() => {
+      scheduleButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onUpdate).toHaveBeenCalledWith({
+      executionPolicy: expect.objectContaining({
+        monitor: expect.objectContaining({
+          serviceName: "GitHub pull request",
+          pullRequestUrl: "https://github.com/acme/app/pull/7",
+        }),
+      }),
+    });
+
+    act(() => root.unmount());
+    dateNowSpy.mockRestore();
+  });
+
   it("renders scheduled, retrying, due, overdue, cleared, and empty monitor row states", async () => {
     // Anchored to a fixed *local* time, not a fixed UTC instant. The row renders
     // these in the machine's timezone and labels them "Today" only while they

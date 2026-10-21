@@ -511,6 +511,73 @@ describe("GET /health", () => {
     });
   });
 
+  it("gives an agent the status and commit with the backup block redacted", async () => {
+    const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-health-backups-"));
+    const backupFile = path.join(backupDir, "paperclip-20260706-031702.sql.gz");
+    const alertFile = path.join(backupDir, "db-backup-to-s3.failure");
+    fs.writeFileSync(backupFile, "backup");
+    fs.writeFileSync(alertFile, "db-backup-to-s3 failed at 2026-07-06T03:17:00.000Z exit=1\n");
+    const databaseBackupHealth = {
+      enabled: true,
+      backupDir,
+      maxAgeHours: 26,
+      alertFile,
+      now: new Date("2026-07-06T04:00:00.000Z"),
+    };
+    const createAdminedDb = (): Db => ({
+      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn().mockResolvedValue([{ count: 1 }]),
+        })),
+      })),
+    }) as unknown as Db;
+    const createAuthenticatedApp = (actor: Record<string, unknown>) => {
+      const app = express();
+      app.use((req, _res, next) => {
+        (req as any).actor = actor;
+        next();
+      });
+      app.use(
+        "/health",
+        healthRoutes(createAdminedDb(), {
+          deploymentMode: "authenticated",
+          deploymentExposure: "private",
+          authReady: true,
+          companyDeletionEnabled: false,
+          serverInfo: testServerInfo,
+          databaseBackupHealth,
+        }),
+      );
+      return app;
+    };
+
+    const agentRes = await request(
+      createAuthenticatedApp({ type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_jwt" }),
+    ).get("/health");
+
+    expect(agentRes.status).toBe(200);
+    expect(agentRes.body).toMatchObject({ status: "ok", commit: testServerInfo.git.fullSha });
+    expect(agentRes.body.databaseBackup).toEqual({
+      enabled: true,
+      status: "warning",
+      warnings: [{ code: "database_backup_last_failure", message: "Database backup failure marker is present." }],
+    });
+    expect(agentRes.body.warnings).toEqual(agentRes.body.databaseBackup.warnings);
+    expect(JSON.stringify(agentRes.body)).not.toContain(backupDir);
+    expect(JSON.stringify(agentRes.body)).not.toContain("exit=1");
+
+    const boardRes = await request(
+      createAuthenticatedApp({ type: "board", userId: "user-1", source: "session" }),
+    ).get("/health");
+
+    expect(boardRes.status).toBe(200);
+    expect(boardRes.body.databaseBackup).toMatchObject({
+      backupDir,
+      lastFailure: { path: alertFile, message: "db-backup-to-s3 failed at 2026-07-06T03:17:00.000Z exit=1" },
+    });
+  });
+
   it("reports bootstrap_pending in authenticated mode when no instance admin exists", async () => {
     const { healthRoutes } = await import("../routes/health.js");
     const db = {

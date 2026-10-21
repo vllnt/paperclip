@@ -136,8 +136,8 @@ If the run prompt includes a Paperclip wake payload, inspect that section before
 Use comments incrementally:
 
 - if `PAPERCLIP_WAKE_COMMENT_ID` is set, fetch that exact comment first with `GET /api/issues/{issueId}/comments/{commentId}`
-- if you already know the thread and only need updates, use `GET /api/issues/{issueId}/comments?after={last-seen-comment-id}&order=asc`
-- use the full `GET /api/issues/{issueId}/comments` route only when cold-starting or when incremental isn't enough
+- if you already know the thread and only need updates, use `GET /api/issues/{issueId}/comments?after={last-seen-comment-id}&order=asc&limit=50`; a full page of 50 means more may be waiting, so page again with the last returned id as `after`
+- on a long thread, the continuation context in the prompt is a bounded window (`coverage.kind: bounded_task_history`): the comments that woke you, the latest request and the newest comments. A cut body ends with `[truncated: …]`. `olderMessages` lists the earlier comments with a one-line preview, and `documents` lists the issue documents. Read an older comment only when you need it (`GET /api/issues/{issueId}/comments/{commentId}`), and page back with `GET /api/issues/{issueId}/comments?order=desc&after={oldestIncludedCommentId}&limit=20`. On a resumed session, `resumeDelta.olderMessages` lists new comments whose bodies are not in the prompt; read the ones you need before you act. Never fetch the whole thread without `limit`: on a long issue, that one read can be larger than the model context.
 
 Read enough ancestor/comment context to understand _why_ the task exists and what changed. Do not reflexively reload the whole thread on every heartbeat.
 
@@ -255,7 +255,7 @@ Status values: `backlog`, `todo`, `in_progress`, `in_review`, `done`, `blocked`,
 
 ### Monitors and Watchers (say only what you actually scheduled)
 
-A "watcher" or "monitor" is not something that lives inside a run. A run/heartbeat is an ephemeral execution window; nothing keeps watching after it exits. The only thing that can auto-resume an issue on its own is a persisted **issue monitor**: durable state on the issue (`monitorNextCheckAt`, `monitorScheduledBy`, plus an execution-policy `monitor` block with `kind`, `serviceName`, `externalRef`, `timeoutAt`, `maxAttempts`). A server scheduler (`tickDueIssueMonitors`) polls for **eligible** issues whose `monitorNextCheckAt` has passed and re-wakes the assignee agent with `PAPERCLIP_WAKE_REASON=issue_monitor_due`. Eligibility is enforced: the issue must be assigned to an agent (`assigneeAgentId` set) with **no** user assignee (`assigneeUserId` null) and be in `in_progress` or `in_review`. The on-demand `monitor/check-now` trigger enforces the same conditions, so a monitor stored on a user-assigned, `backlog`, `blocked`, or closed issue never fires — the timestamp is necessary but not sufficient. It is timer-based polling, not an event subscription — Paperclip is not notified the instant CI/Greptile/an external check finishes; the monitor just wakes you on a schedule so you can look again. **To wait for CI, a deploy, a preview or a lock: end your turn with `issue wait`; never leave a background process running.** Run `npx paperclipai issue wait <issueId> --in 10m --reason "CI on PR #4320 head abc123"` (or `POST /api/issues/{id}/wait` with `{"in":"10m","reason":"…"}`; 1m to 24h; only on an issue assigned to you in `in_progress`/`in_review`), then finish your turn. The issue keeps its status, and Paperclip wakes you with `PAPERCLIP_WAKE_REASON=issue_monitor_due` and your reason as the wait note. Do not run `gh pr checks --watch`, `sleep` loops, port waits or any other background wait: on Claude local runs, Paperclip stops a process that is still running after your final result, and then schedules a re-check for you (5, 10, then 20 minutes, at most three times) with the note "re-check after background task stop". Other adapters do not get that re-check, so always end your turn with `issue wait`.
+A "watcher" or "monitor" is not something that lives inside a run. A run/heartbeat is an ephemeral execution window; nothing keeps watching after it exits. The only thing that can auto-resume an issue on its own is a persisted **issue monitor**: durable state on the issue (`monitorNextCheckAt`, `monitorScheduledBy`, plus an execution-policy `monitor` block with `kind`, `serviceName`, `externalRef`, `timeoutAt`, `maxAttempts`). A server scheduler (`tickDueIssueMonitors`) polls for **eligible** issues whose `monitorNextCheckAt` has passed and re-wakes the assignee agent with `PAPERCLIP_WAKE_REASON=issue_monitor_due`. Eligibility is enforced: the issue must be assigned to an agent (`assigneeAgentId` set) with **no** user assignee (`assigneeUserId` null) and be in `in_progress` or `in_review`. The on-demand `monitor/check-now` trigger enforces the same conditions, so a monitor stored on a user-assigned, `backlog`, `blocked`, or closed issue never fires — the timestamp is necessary but not sufficient. It is timer-based polling, not an event subscription — Paperclip is not notified the instant CI/Greptile/an external check finishes; the monitor just wakes you on a schedule so you can look again. **To wait for CI, a deploy, a preview or a lock: end your turn with `issue wait`; never leave a background process running.** Run `npx paperclipai issue wait <issueId> --in 10m --reason "CI on PR #4320 head abc123"` (or `POST /api/issues/{id}/wait` with `{"in":"10m","reason":"…"}`; 1m to 24h; only on an issue assigned to you in `in_progress`/`in_review`), then finish your turn. The issue keeps its status, and Paperclip wakes you with `PAPERCLIP_WAKE_REASON=issue_monitor_due` and your reason as the wait note. Do not run `gh pr checks --watch`, `sleep` loops, port waits or any other background wait: on Claude local runs, Paperclip stops a process that is still running after your final result, and then schedules a re-check for you (5, 10, then 20 minutes, at most three times) with the note "re-check after background task stop". Other adapters do not get that re-check, so always end your turn with `issue wait`. When you wait on review, CI checks or new commits of one specific open GitHub pull request, add `--pull-request <url>` (REST: `"pullRequest":"https://github.com/owner/repo/pull/123"`): while that pull request is unchanged since your last monitor check started (no new commit, state, conflict, check, status, comment or review), Paperclip re-arms the same wait instead of waking you; a change, a new issue comment, a person's check-now, or 4 hours without a run still wakes you. Leave it off for anything else (a deploy after a merge, a lock, a preview, another repository): a plain wait always wakes you.
 
 Because of that, follow these rules:
 
@@ -506,6 +506,21 @@ POST /api/issues/{issueId}/interactions
 
 The responder submits verdicts with `POST /api/issues/{issueId}/interactions/{interactionId}/verdicts`. Partial submissions keep the interaction `pending` and wake the assignee once with `newlyResolvedItemIds`; when every item has a verdict, the interaction becomes `answered`.
 
+## Proving a Deploy
+
+To confirm that production runs a merged commit, read the server's health route with your run credentials. It is read-only, and the queue and HTTP/2 sandbox bridges carry it:
+
+```bash
+PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"
+PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"
+curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "$PAPERCLIP_API_BASE/api/health" | jq '{status, commit}'
+```
+
+- `status: "ok"` means the server finished startup. `starting` means startup recovery is still running: wait and read again. `unhealthy` (HTTP 503) means the database probe failed.
+- `commit` is the full git SHA of the running build, or `null` when the build has no git metadata. A `Deploy completed source build` commit on `main` proves the build, not that production pulled it: compare `commit` with the merge. After `git fetch`, `git merge-base --is-ancestor <merge sha> <commit>` exits 0 when the running build contains the merge.
+- The response also carries other server details. For an agent, host backup paths and failure-marker text are replaced by a fixed warning code and message. Quote only `status` and `commit` as evidence.
+
 ## Niche Workflow Pointers
 
 Load `references/workflows.md` when the task matches one of these:
@@ -690,7 +705,7 @@ If `plan` already exists, first `GET /api/issues/{issueId}/documents/plan` and r
 | Get task + ancestors                  | `GET /api/issues/:issueId`                                                                                                      |
 | Compact heartbeat context             | `GET /api/issues/:issueId/heartbeat-context`                                                                                    |
 | Update task                           | `PATCH /api/issues/:issueId` (optional `comment` field)                                                                         |
-| Get comments / delta / single         | `GET /api/issues/:issueId/comments[?after=:commentId&order=asc]` • `/comments/:commentId`                                       |
+| Get comments / delta / single         | `GET /api/issues/:issueId/comments?limit=20[&after=:commentId&order=asc]` • `/comments/:commentId`                              |
 | Add comment                           | `POST /api/issues/:issueId/comments`                                                                                            |
 | Issue-thread interactions             | `GET\|POST /api/issues/:issueId/interactions` • `POST /api/issues/:issueId/interactions/:interactionId/{accept,reject,respond,withdraw}` |
 | Create subtask                        | `POST /api/companies/:companyId/issues`                                                                                         |

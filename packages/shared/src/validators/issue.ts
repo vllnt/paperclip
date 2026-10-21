@@ -1,4 +1,5 @@
 import { runProfileSchema } from "../run-profile.js";
+import { parseIssueWaitPullRequestUrl } from "../issue-wait.js";
 import { z } from "zod";
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
@@ -417,6 +418,21 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .trim()
     .min(1)
     .max(500)
+    .optional()
+    .nullable()
+    .default(null),
+  /**
+   * The one GitHub pull request this wait is about (`issue wait --pull-request`);
+   * the server stores it canonical. Unlike externalRef it is not redacted: it
+   * can only be a github.com pull request URL.
+   */
+  pullRequestUrl: z
+    .string()
+    .trim()
+    .max(500)
+    .refine((value) => parseIssueWaitPullRequestUrl(value) !== null, {
+      message: "Use a GitHub pull request URL, e.g. https://github.com/owner/repo/pull/123",
+    })
     .optional()
     .nullable()
     .default(null),

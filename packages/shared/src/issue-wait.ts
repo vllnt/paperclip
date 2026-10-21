@@ -38,6 +38,30 @@ export function parseIssueWaitDurationMs(input: string | number): number | null 
   return total > 0 ? total : null;
 }
 
+const GITHUB_PULL_REQUEST_URL_RE =
+  /^https:\/\/(?:www\.)?github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9][0-9]{0,9})(?:\/[a-z]+)?\/?$/;
+
+/** The GitHub pull request a wait watches. */
+export type IssueWaitPullRequest = { owner: string; repo: string; number: number; url: string };
+
+/**
+ * Parses the GitHub pull request URL of a wait. Only github.com pull request
+ * URLs qualify; `.` and `..` path segments do not.
+ *
+ * @param input - A pull request URL, such as one copied from the browser.
+ * @returns Owner, repo, number and the canonical URL, or null for anything else.
+ * @example parseIssueWaitPullRequestUrl("https://github.com/acme/app/pull/7/files")?.url // "https://github.com/acme/app/pull/7"
+ */
+export function parseIssueWaitPullRequestUrl(input: string): IssueWaitPullRequest | null {
+  const match = GITHUB_PULL_REQUEST_URL_RE.exec(input.trim());
+  if (!match) return null;
+  const owner = match[1]!;
+  const repo = match[2]!;
+  if ([owner, repo].some((segment) => segment === "." || segment === "..")) return null;
+  const number = Number(match[3]);
+  return { owner, repo, number, url: `https://github.com/${owner}/${repo}/pull/${number}` };
+}
+
 export const issueWaitRequestSchema = z.object({
   in: z
     .union([z.string(), z.number()])
@@ -46,6 +70,18 @@ export const issueWaitRequestSchema = z.object({
       return ms !== null && ms >= ISSUE_WAIT_MIN_DELAY_MS && ms <= ISSUE_WAIT_MAX_DELAY_MS;
     }, { message: "Wait between 1m and 24h, e.g. 10m, 90s or 1h30m" }),
   reason: z.string().trim().min(1).max(ISSUE_WAIT_REASON_MAX_LENGTH),
+  /**
+   * The one open GitHub pull request this wait is about. While that pull
+   * request does not change, a due check does not start a run.
+   */
+  pullRequest: z
+    .string()
+    .trim()
+    .max(500)
+    .refine((value) => parseIssueWaitPullRequestUrl(value) !== null, {
+      message: "Use a GitHub pull request URL, e.g. https://github.com/owner/repo/pull/123",
+    })
+    .optional(),
 });
 
 export type IssueWaitRequest = z.infer<typeof issueWaitRequestSchema>;

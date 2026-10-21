@@ -179,6 +179,12 @@ describe("classifyAdapterFailureForRecovery", () => {
     expect(classifyAdapterFailureForRecovery(run)).toEqual({ kind: "configuration_incomplete" });
     expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
   });
+  it("never continues a context overflow, even with stale transient metadata", () => {
+    const run = { errorCode: "context_window_exceeded", error: "Claude run failed: subtype=success: Prompt is too long",
+      resultJson: { errorFamily: "transient_upstream" } };
+    expect(classifyAdapterFailureForRecovery(run)).toBeNull();
+    expect(classifyContinuationFailure(run as never)).toMatchObject({ kind: "non_retryable", maxAttempts: 0 });
+  });
 });
 
 // A failed run stores a fuller error (the short message plus a stderr tail) and
