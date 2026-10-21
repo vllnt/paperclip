@@ -25,6 +25,7 @@ import { IssuesList } from "../components/IssuesList";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { PageTabBar } from "../components/PageTabBar";
 import { ProjectWorkspacesContent } from "../components/ProjectWorkspacesContent";
+import { ProjectGoalsSection } from "../components/ProjectGoalsSection";
 import { ProjectRoutinesSection } from "../components/ProjectRoutinesSection";
 import { ProjectPoliciesSection } from "../components/ProjectPoliciesSection";
 import { SummarySlotCard } from "../components/SummarySlotCard";
@@ -905,6 +906,21 @@ export function ProjectDetail() {
             project={project}
             routines={
               <div className="flex flex-col gap-8">
+                <ProjectGoalsSection
+                  key={`goals-${project.id}`}
+                  companyId={project.companyId}
+                  projectId={project.id}
+                  goalRefs={project.goals}
+                  onGoalIdsChange={project.archivedAt ? undefined : async (goalIds) => {
+                    await updateProjectField("goals", { goalIds });
+                    // The next link or unlink must start from the saved goals, so wait until the page shows them,
+                    // and report a failed reload instead of offering changes from the old goals.
+                    await queryClient.refetchQueries(
+                      { queryKey: queryKeys.projects.detail(routeProjectRef), type: "active" },
+                      { throwOnError: true },
+                    );
+                  }}
+                />
                 <ProjectRoutinesSection
                   key={project.id}
                   companyId={project.companyId}

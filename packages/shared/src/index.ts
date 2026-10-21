@@ -379,6 +379,7 @@ export * from "./github-connectors.js";
 export * from "./company-storage.js";
 export * from "./company-archive.js";
 export * from "./goal-text.js";
+export * from "./goal-agents.js";
 export {
   BLOCKED_MCP_PROVIDERS,
   SELF_SERVE_MCP_CANDIDATES,
