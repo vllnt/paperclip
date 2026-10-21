@@ -20,6 +20,7 @@ import {
   type FindSimilarIssuesResult,
   type HeartbeatRun,
   type IssueDuplicatePair,
+  type IssueTriage,
   labelDuplicatePairSchema,
   linkIssueApprovalSchema,
   previewIssueTreeControlSchema,
@@ -464,6 +465,24 @@ export function registerIssueCommands(program: Command): void {
             apiPath`/api/issues/${idOrIdentifier}/duplicate-pairs`,
           );
           printOutput(pairs, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("triage")
+      .description(
+        "Show the triage recorded for an issue: suggested priority, category and owner, the probabilities behind them, the model, and what the router did",
+      )
+      .argument("<idOrIdentifier>", "Issue ID or identifier (e.g. PC-12)")
+      .action(async (idOrIdentifier: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const triage = await ctx.api.get<IssueTriage>(apiPath`/api/issues/${idOrIdentifier}/triage`);
+          printOutput(triage, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }

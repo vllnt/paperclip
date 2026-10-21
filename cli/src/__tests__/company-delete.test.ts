@@ -16,6 +16,7 @@ function makeCompany(overrides: Partial<Company>): Company {
     spentMonthlyCents: 0,
     requireBoardApprovalForNewAgents: false,
     duplicateDetectionMode: "off",
+    issueTriageMode: "off",
     runContextPolicy: null,
     feedbackDataSharingEnabled: false,
     feedbackDataSharingConsentAt: null,

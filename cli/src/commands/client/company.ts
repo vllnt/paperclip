@@ -1,4 +1,4 @@
-import { companyRunTiersSchema } from "@paperclipai/shared";
+import { companyRunTiersSchema, ISSUE_TRIAGE_MODES, issueTriageModeSchema } from "@paperclipai/shared";
 import { Command } from "commander";
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -56,6 +56,7 @@ interface CompanyJsonOptions extends BaseClientOptions {
 interface CompanyUpdateOptions extends CompanyJsonOptions {
   runContextJson?: string;
   transientRetryPolicyJson?: string;
+  issueTriageMode?: string;
 }
 interface AgentMeResponse {
   id: string;
@@ -1494,18 +1495,27 @@ export function registerCompanyCommands(program: Command): void {
         "--transient-retry-policy-json <json>",
         'Company transient-retry policy, e.g. {"perIssuePerHour":2,"suppressWhenBlocked":true,"wakeTypes":{"transient_failure_retry":{"perIssuePerHour":1}}}. perIssuePerHour 0 = unlimited (default).',
       )
+      .option(
+        "--issue-triage-mode <mode>",
+        `Issue triage mode: ${ISSUE_TRIAGE_MODES.join(", ")}. suggest records a suggested priority, category and owner for each new issue; apply also fills the empty assignee of an unassigned todo issue. Sends issue text to the model provider (see doc/issue-triage.md).`,
+      )
       .action(async (companyId: string, opts: CompanyUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const payload = {
             ...(opts.payloadJson ? (parseJson(opts.payloadJson) as Record<string, unknown>) : {}),
+            ...(opts.issueTriageMode === undefined
+              ? {}
+              : { issueTriageMode: issueTriageModeSchema.parse(opts.issueTriageMode) }),
             ...(opts.runContextJson ? { runContextPolicy: parseJson(opts.runContextJson) } : {}),
             ...(opts.transientRetryPolicyJson === undefined
               ? {}
               : { transientRetryPolicy: parseJson(opts.transientRetryPolicyJson) }),
           };
           if (Object.keys(payload).length === 0) {
-            throw new Error("Provide --payload-json, --run-context-json or --transient-retry-policy-json.");
+            throw new Error(
+              "Provide --payload-json, --run-context-json, --transient-retry-policy-json or --issue-triage-mode.",
+            );
           }
           printOutput(await ctx.api.patch(apiPath`/api/companies/${companyId}`, payload), { json: ctx.json });
         } catch (err) {

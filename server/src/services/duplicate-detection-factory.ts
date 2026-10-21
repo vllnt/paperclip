@@ -11,6 +11,7 @@ import {
   createJudgeClient,
   createJudgeUsageStore,
   readJudgeConfig,
+  type JudgeCache,
   type JudgeClient,
   type JudgeKeyResolver,
   type JudgeTransport,
@@ -42,9 +43,10 @@ export function createCompanySecretKeyResolver(db: Db, consumerId = "duplicate-d
 /**
  * Wires duplicate detection for the running server: each company's own gateway key from its secrets,
  * the daily cap backed by the database, and system comments posted through the issue service.
- * Create it once so the pre-create check and the after-create check share one answer cache.
+ * Create it once so the pre-create check and the after-create check share one answer cache; pass `cache`
+ * to share that cache with another feature on the same judge path.
  */
-export function createDuplicateDetection(db: Db): DuplicateDetectionService {
+export function createDuplicateDetection(db: Db, options: { cache?: JudgeCache } = {}): DuplicateDetectionService {
   const config = readJudgeConfig();
   const issues = issueService(db);
   return duplicateDetectionService({
@@ -53,6 +55,7 @@ export function createDuplicateDetection(db: Db): DuplicateDetectionService {
       config,
       usage: createJudgeUsageStore(db, config.dailyCallCap),
       resolveApiKey: createCompanySecretKeyResolver(db),
+      cache: options.cache,
     }),
     postSystemComment: (issueId, body, tx) => issues.addComment(issueId, body, {}, { authorType: "system" }, tx),
   });
