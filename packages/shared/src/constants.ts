@@ -583,6 +583,22 @@ export type GoalKind = (typeof GOAL_KINDS)[number];
 export const GOAL_HORIZONS = ["short", "medium", "long"] as const;
 export type GoalHorizon = (typeof GOAL_HORIZONS)[number];
 
+/**
+ * A company policy is a written rule or guardrail. Only active policies apply to agents.
+ * Archived keeps the key reserved, so a `policy://<key>` reference never points at another policy.
+ */
+export const COMPANY_POLICY_STATUSES = ["draft", "active", "archived"] as const;
+export type CompanyPolicyStatus = (typeof COMPANY_POLICY_STATUSES)[number];
+
+/** Which policies a list returns: company-wide ones, project ones, or both. */
+export const COMPANY_POLICY_SCOPES = ["company", "project"] as const;
+export type CompanyPolicyScope = (typeof COMPANY_POLICY_SCOPES)[number];
+
+export const COMPANY_POLICY_KEY_MAX_LENGTH = 64;
+export const COMPANY_POLICY_TITLE_MAX_LENGTH = 200;
+export const COMPANY_POLICY_SUMMARY_MAX_LENGTH = 280;
+export const COMPANY_POLICY_BODY_MAX_LENGTH = 100_000;
+
 /** Shown to agents beside the company focus so every run applies it the same way. */
 export const COMPANY_FOCUS_GUIDANCE =
   "These short term goals are the company's current focus. Pick work that serves them before other work. " +
@@ -1568,6 +1584,7 @@ export const PLUGIN_RESERVED_COMPANY_ROUTE_SEGMENTS = [
   "projects",
   "issues",
   "goals",
+  "policies",
   "approvals",
   "costs",
   "activity",
