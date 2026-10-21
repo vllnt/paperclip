@@ -58,7 +58,10 @@ async function api(method, route, body, attempt = 0) {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if ((res.status === 429 || res.status >= 502) && attempt < 6) {
-    await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
+    // Agent creation allows 30 requests per minute per actor and company, and its 429
+    // names the wait in Retry-After; 32 agents need one wait of up to a minute.
+    const retryAfterMs = Number(res.headers.get("retry-after")) * 1000;
+    await new Promise((r) => setTimeout(r, retryAfterMs > 0 ? retryAfterMs + 250 : 250 * 2 ** attempt));
     return api(method, route, body, attempt + 1);
   }
   if (!res.ok) throw new Error(`${method} ${route} -> ${res.status} ${(await res.text()).slice(0, 400)}`);
