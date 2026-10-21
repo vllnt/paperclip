@@ -12,8 +12,9 @@ without the user's go on the recommended option.
   credentials out of the sandbox.
 - **Where it fits.** Paperclip already has the right seam: a sandbox-provider
   plugin, the same kind Daytona uses. An OpenShell provider needs no core
-  change, and nine adapters plus the native runner can use it. Low-trust runs
-  already require a sandbox driver.
+  change, and nine adapters plus the native runner can use it. An open
+  upstream pull request already drafts it. Low-trust runs already require a
+  sandbox driver.
 - **What it adds.** Today Paperclip's guardrails act on its own HTTP API. It
   does not enforce network or filesystem policy inside a sandbox; the
   repository says so itself. OpenShell would add that enforcement.
@@ -314,6 +315,21 @@ and `novita`. It plugs in like this:
   would need a network path to an OpenShell gateway, plus a client: the
   `openshell` CLI binary, the GitHub-Packages-only SDK, or a client generated
   from OpenShell's protobufs.
+
+**Prior art upstream.** Two open, unmerged pull requests exist upstream [U1]:
+
+- **`paperclipai/paperclip#9220`** adds exactly this plugin at
+  `packages/plugins/sandbox-providers/openshell/`: 15 files, +3,627 lines, a
+  gRPC client and vendored OpenShell protos.
+  - It opened on 2026-07-08, before OpenShell 0.1.0 changed protocol field
+    names and time types [O12 L25, L77].
+  - It has bot reviews only.
+  - A 2026-10-17 comment reports that its branch is out of date.
+  - *Inference:* its protos need regenerating for 0.1.x.
+- **`#8953`** adds an `openshell_direct` adapter instead. `#9220` calls the
+  plugin route "architecturally preferred" [U1].
+
+Slice 1 below should start from `#9220`, not from scratch.
 
 ### 2.3 Path by path
 
@@ -617,6 +633,7 @@ CLI and the paperclip skill together (rule 8).
 0. **Spike (no Paperclip code).** Section 6. Go/no-go for the manager and the
    user.
 1. **The OpenShell sandbox-provider plugin.**
+   - Start from upstream `#9220` [U1], rebased and moved to OpenShell 0.1.x.
    - Hooks: acquire, execute, native sync, release, destroy, against one
      gateway.
    - Policy: a static deny-all-plus-baseline policy from the environment
@@ -726,3 +743,4 @@ The bars in rows 2–4 are proposals for the manager to confirm.
 | G2 | `GET /repos/NVIDIA/OpenShell/releases`: 100 versioned releases; v0.0.6 2026-03-16, v0.0.34 2026-04-21, v0.1.0 2026-09-25, v0.1.5 2026-10-20 |
 | G3 | NVIDIA/OpenShell PR #4565, "support Cedar as an alternate sandbox policy language", open on 2026-10-21 |
 | C1 | `cncf/sandbox#522` (closed 2026-10-02, labels `gitvote/passed`); `cncf/sandbox#535` onboarding (open) |
+| U1 | `https://github.com/paperclipai/paperclip/pull/9220` (open, created 2026-07-08, 15 files) and `https://github.com/paperclipai/paperclip/pull/8953` (open, created 2026-07-03), both read 2026-10-21 |
