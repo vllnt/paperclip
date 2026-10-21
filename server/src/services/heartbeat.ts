@@ -13677,12 +13677,26 @@ export function heartbeatService(
       adapterType?: string | null;
       expectedRunId?: string;
       includeIssueAliases?: boolean;
+      /**
+       * When set, a row is cleared only while its lastRunId is one of these.
+       * Any other value means a later run saved the row after this one began.
+       */
+      onlyIfLastRunIdIn?: ReadonlyArray<string | null>;
     },
   ) {
     const conditions = [
       eq(agentTaskSessions.companyId, companyId),
       eq(agentTaskSessions.agentId, agentId),
     ];
+    if (opts?.onlyIfLastRunIdIn) {
+      const runIds = opts.onlyIfLastRunIdIn.filter((id): id is string => id !== null);
+      conditions.push(
+        or(
+          runIds.length > 0 ? inArray(agentTaskSessions.lastRunId, runIds) : sql`false`,
+          opts.onlyIfLastRunIdIn.includes(null) ? isNull(agentTaskSessions.lastRunId) : sql`false`,
+        )!,
+      );
+    }
     if (opts?.taskKey) {
       const exactTaskKey = eq(agentTaskSessions.taskKey, opts.taskKey);
       if (opts.includeIssueAliases) {
@@ -29179,6 +29193,9 @@ export function heartbeatService(
           if (taskKey) {
             if (
               adapterResult.clearSession ||
+              // A session that overflowed the context window overflows again on
+              // its next resume; under a routine key that is the next tick.
+              runErrorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE ||
               (!nextSessionState.params && !nextSessionState.displayId)
             ) {
               await clearTaskSessions(agent.companyId, agent.id, {
@@ -29541,7 +29558,16 @@ export function heartbeatService(
             },
           );
 
-          if (
+          if (taskKey && livenessRun.errorCode === CONTEXT_WINDOW_EXCEEDED_ERROR_CODE) {
+            // Resuming an overflowed session fails the same way, so drop it
+            // unless a later run has saved the row since.
+            await clearTaskSessions(agent.companyId, agent.id, {
+              taskKey,
+              adapterType: agent.adapterType,
+              expectedRunId: failedRun.id,
+              onlyIfLastRunIdIn: [taskSession?.lastRunId ?? null, failedRun.id],
+            });
+          } else if (
             taskKey &&
             (goalCheckpointSession.current ||
               previousSessionParams ||

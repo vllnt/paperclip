@@ -10,6 +10,7 @@ import {
   heartbeatRuns,
   issues,
 } from "@paperclipai/db";
+import { CONTEXT_WINDOW_EXCEEDED_ERROR_CODE } from "@paperclipai/shared";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
@@ -79,6 +80,8 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
   const invocations: Invocation[] = [];
   /** Input tokens the next invocations report instead of the prompt size. */
   const reportedInputTokens: number[] = [];
+  /** Error messages the next invocations fail with, still naming their session. */
+  const failureMessages: string[] = [];
   /** Holds an invocation until the test releases it. */
   let gate: ((invocation: Invocation) => Promise<void>) | null = null;
 
@@ -118,8 +121,10 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
     if (gate) await gate(invocation);
     if (issueId) await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
     const inputTokens = reportedInputTokens.shift() ?? invocation.promptTokens;
+    const errorMessage = failureMessages.shift();
     return {
-      exitCode: 0,
+      exitCode: errorMessage ? 1 : 0,
+      ...(errorMessage ? { errorMessage } : {}),
       signal: null,
       timedOut: false,
       provider: "test-provider",
@@ -150,6 +155,7 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     invocations.length = 0;
     reportedInputTokens.length = 0;
+    failureMessages.length = 0;
     await db.execute(sql.raw(`
       TRUNCATE TABLE "activity_log", "heartbeat_run_events", "issue_comments", "issues", "routine_runs",
         "routine_triggers", "routine_revisions", "routines", "agent_task_sessions", "heartbeat_runs",
@@ -371,36 +377,39 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
     expect(invocations[1]!.sessionId).toBe(session);
   });
 
-  it("a failed run does not put its older session back over a save a later run made meanwhile", async () => {
-    const { companyId, agentId, routine } = await seed();
-    await tick(routine.id);
-    const [started] = await routineSessionRows(companyId, routine.id);
+  it.each(["adapter process crashed", "Prompt is too long"])(
+    "a failed run (%s) does not touch a save a later run made meanwhile",
+    async (failure) => {
+      const { companyId, agentId, routine } = await seed();
+      await tick(routine.id);
+      const [started] = await routineSessionRows(companyId, routine.id);
 
-    // The second tick starts from the session row above and then fails with an
-    // adapter exception. Another run saves the row while it is still running; the
-    // same save can also land in the gap after its release starts a wake that was
-    // deferred behind it, before it re-saves.
-    const [laterRun] = await db.insert(heartbeatRuns).values({
-      companyId, agentId, invocationSource: "automation", status: "succeeded", finishedAt: new Date(),
-    }).returning();
-    gate = async () => {
-      if (invocations.length !== 2) return;
-      await db.update(agentTaskSessions).set({
-        sessionDisplayId: "saved-by-a-later-run",
-        sessionParamsJson: { sessionId: "saved-by-a-later-run" },
-        lastRunId: laterRun!.id,
-        lastError: null,
-      }).where(eq(agentTaskSessions.id, started!.id));
-      throw new Error("adapter process crashed");
-    };
-    await tick(routine.id);
+      // The second tick starts from the session row above and then fails with an
+      // adapter exception. Another run saves the row while it is still running; the
+      // same save can also land in the gap after its release starts a wake that was
+      // deferred behind it, before it re-saves.
+      const [laterRun] = await db.insert(heartbeatRuns).values({
+        companyId, agentId, invocationSource: "automation", status: "succeeded", finishedAt: new Date(),
+      }).returning();
+      gate = async () => {
+        if (invocations.length !== 2) return;
+        await db.update(agentTaskSessions).set({
+          sessionDisplayId: "saved-by-a-later-run",
+          sessionParamsJson: { sessionId: "saved-by-a-later-run" },
+          lastRunId: laterRun!.id,
+          lastError: null,
+        }).where(eq(agentTaskSessions.id, started!.id));
+        throw new Error(failure);
+      };
+      await tick(routine.id);
 
-    const failedRun = invocations[1]!;
-    const [row] = await routineSessionRows(companyId, routine.id);
-    expect(row?.lastRunId, `the failed run ${failedRun.runId} re-saved over the later run`).toBe(laterRun!.id);
-    expect(row?.sessionDisplayId).toBe("saved-by-a-later-run");
-    expect(row?.lastError).toBeNull();
-  });
+      const failedRun = invocations[1]!;
+      const [row] = await routineSessionRows(companyId, routine.id);
+      expect(row?.lastRunId, `the failed run ${failedRun.runId} wrote over the later run`).toBe(laterRun!.id);
+      expect(row?.sessionDisplayId).toBe("saved-by-a-later-run");
+      expect(row?.lastError).toBeNull();
+    },
+  );
 
   it("a failed run still re-saves the session it started with when no other run saved it", async () => {
     const { companyId, routine } = await seed();
@@ -419,6 +428,32 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
     expect(row?.sessionDisplayId).toBe(started!.sessionDisplayId);
     expect(row?.lastError).toContain("adapter process crashed");
   });
+
+  it.each(["returns", "throws"] as const)(
+    "a tick whose prompt overflowed the context window (the adapter %s) does not hand its session to the next tick",
+    async (failureMode) => {
+      const { companyId, routine } = await seed();
+      await tick(routine.id);
+      const session = invocations[0]!.returnedSessionId;
+      if (failureMode === "returns") {
+        failureMessages.push("Claude run failed: subtype=success: Prompt is too long");
+      } else {
+        gate = async () => {
+          if (invocations.length === 2) throw new Error("Prompt is too long");
+        };
+      }
+      await tick(routine.id);
+      await tick(routine.id);
+
+      const [, overflowed, next] = invocations;
+      expect(overflowed!.sessionId).toBe(session);
+      const [overflowedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, overflowed!.runId));
+      expect(overflowedRun?.errorCode).toBe(CONTEXT_WINDOW_EXCEEDED_ERROR_CODE);
+      expect(next!.sessionId).toBeNull();
+      expect((await routineSessionRows(companyId, routine.id)).map((row) => row.sessionDisplayId))
+        .toEqual([next!.returnedSessionId]);
+    },
+  );
 
   it("rotation still happens once the session passes the token threshold", async () => {
     const { routine } = await seed();
@@ -485,5 +520,37 @@ describeEmbeddedPostgres("routine-execution issues reuse one session per (routin
     expect(invocations.every((invocation) => invocation.wake.routineSession === undefined)).toBe(true);
     const keys = (await db.select().from(agentTaskSessions)).map((row) => row.taskKey).sort();
     expect(keys).toEqual(invocations.map((invocation) => invocation.issueId).sort());
+  });
+
+  it("a comment wake after a context overflow on an ordinary issue starts a fresh session", async () => {
+    const { companyId, agentId } = await seed();
+    const issuePrefix = (await db.select().from(companies).where(eq(companies.id, companyId)))[0]!.issuePrefix;
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Manual task", status: "todo", priority: "medium",
+      responsibleUserId: "responsible-user", assigneeAgentId: agentId,
+      issueNumber: 100, identifier: `${issuePrefix}-100`,
+    });
+    const wake = async (wakeReason: "issue_assigned" | "issue_commented") => {
+      await heartbeat.wakeup(agentId, {
+        source: "assignment", triggerDetail: "system", reason: wakeReason,
+        payload: { issueId }, contextSnapshot: { issueId, taskId: issueId, wakeReason },
+        requestedByActorType: "system",
+      });
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      // The fake adapter closes the issue; the next comment arrives on an open one.
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+    };
+    await wake("issue_assigned");
+    failureMessages.push("Prompt is too long");
+    await wake("issue_commented");
+    await wake("issue_commented");
+
+    const [first, overflowed, next] = invocations;
+    expect(invocations).toHaveLength(3);
+    expect(overflowed!.sessionId).toBe(first!.returnedSessionId);
+    expect(next!.sessionId).toBeNull();
+    const [row] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, issueId));
+    expect(row?.sessionDisplayId).toBe(next!.returnedSessionId);
   });
 });
