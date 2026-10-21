@@ -495,6 +495,21 @@
       ]
     },
     {
+      "id": "skill:skills/paperclip/SKILL.md:policies:746",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/SKILL.md:746",
+      "title": "Policies",
+      "expectedSemantics": "Skill guidance headed “Policies”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/SKILL.md:746"
+      ]
+    },
+    {
       "id": "skill:skills/paperclip/references/api-reference.md:paperclip-api-reference:1",
       "sourceKind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/api-reference.md:1",
@@ -1602,6 +1617,21 @@
       ],
       "evidenceIds": [
         "skill:skills/paperclip/references/api-reference.md:1708"
+      ]
+    },
+    {
+      "id": "skill:skills/paperclip/references/api-reference.md:policies:1724",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md:1724",
+      "title": "Policies",
+      "expectedSemantics": "Skill guidance headed “Policies”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/references/api-reference.md:1724"
       ]
     },
     {

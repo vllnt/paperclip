@@ -8,9 +8,9 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 
 ## Baseline Counts
 
-- Skill/reference headings: 170
+- Skill/reference headings: 172
 - Eval cases: 106 across 16 groups
-- Total normative rows: 276
+- Total normative rows: 278
 - Legacy MCP aliases folded into normative rows: 42
 
 | Eval group | Cases |
@@ -73,6 +73,7 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/SKILL.md:searching-issues:726 | optional_agent_tool | skills/paperclip/SKILL.md:726 |
 | skill:skills/paperclip/SKILL.md:full-reference:736 | optional_agent_tool | skills/paperclip/SKILL.md:736 |
 | skill:skills/paperclip/SKILL.md:conversational-confirmation-answers:740 | always_agent_tool | skills/paperclip/SKILL.md:740 |
+| skill:skills/paperclip/SKILL.md:policies:746 | optional_agent_tool | skills/paperclip/SKILL.md:746 |
 | skill:skills/paperclip/references/api-reference.md:paperclip-api-reference:1 | optional_agent_tool | skills/paperclip/references/api-reference.md:1 |
 | skill:skills/paperclip/references/api-reference.md:response-schemas:9 | optional_agent_tool | skills/paperclip/references/api-reference.md:9 |
 | skill:skills/paperclip/references/api-reference.md:agent-record-get-api-agents-me-or-get-api-agents-agentid:11 | optional_agent_tool | skills/paperclip/references/api-reference.md:11 |
@@ -147,6 +148,7 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/references/api-reference.md:agent-secret-proposals:1568 | optional_agent_tool | skills/paperclip/references/api-reference.md:1568 |
 | skill:skills/paperclip/references/api-reference.md:agent-secret-access:1668 | optional_agent_tool | skills/paperclip/references/api-reference.md:1668 |
 | skill:skills/paperclip/references/api-reference.md:common-mistakes:1708 | optional_agent_tool | skills/paperclip/references/api-reference.md:1708 |
+| skill:skills/paperclip/references/api-reference.md:policies:1724 | optional_agent_tool | skills/paperclip/references/api-reference.md:1724 |
 | skill:skills/paperclip/references/artifacts.md:generated-artifacts-and-work-products:1 | always_agent_tool | skills/paperclip/references/artifacts.md:1 |
 | skill:skills/paperclip/references/artifacts.md:workspace-only-file-references:15 | optional_agent_tool | skills/paperclip/references/artifacts.md:15 |
 | skill:skills/paperclip/references/cases.md:cases:1 | optional_agent_tool | skills/paperclip/references/cases.md:1 |

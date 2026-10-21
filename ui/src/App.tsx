@@ -70,6 +70,7 @@ const RoutineDetail = lazy(() => import("./pages/RoutineDetail").then((m) => ({ 
 const UserProfile = lazy(() => import("./pages/UserProfile").then((m) => ({ default: m.UserProfile })));
 const ExecutionWorkspaceDetail = lazy(() => import("./pages/ExecutionWorkspaceDetail").then((m) => ({ default: m.ExecutionWorkspaceDetail })));
 const Goals = lazy(() => import("./pages/Goals").then((m) => ({ default: m.Goals })));
+const Policies = lazy(() => import("./pages/Policies").then((m) => ({ default: m.Policies })));
 const Artifacts = lazy(() => import("./pages/Artifacts").then((m) => ({ default: m.Artifacts })));
 const GoalDetail = lazy(() => import("./pages/GoalDetail").then((m) => ({ default: m.GoalDetail })));
 const Approvals = lazy(() => import("./pages/Approvals").then((m) => ({ default: m.Approvals })));
@@ -410,6 +411,7 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       </Route>
       <Route path="goals" element={<Goals />} />
       <Route path="goals/:goalId" element={<GoalDetail />} />
+      <Route path="policies" element={<Policies />} />
       <Route path="artifacts" element={<Artifacts />} />
       <Route path="approvals" element={<Navigate to="/approvals/pending" replace />} />
       <Route path="approvals/pending" element={<Approvals />} />

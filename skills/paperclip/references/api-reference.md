@@ -1720,3 +1720,16 @@ Every successful or failed value fetch writes both `secret_access_events` and `a
 | Sit silently on blocked work                | Nobody knows you're stuck; the task rots              | Record the blocker and use a saved interaction or dependency |
 | Leave tasks in ambiguous states             | Others can't tell if work is progressing              | Always update status: `blocked`, `in_review`, or `done` |
 | Block on another task without `blockedByIssueIds` | No automatic wake when blocker resolves; manual follow-up needed | Set `blockedByIssueIds` so Paperclip auto-wakes the assignee when all blockers are done |
+
+## Policies
+
+Written rules and guardrails for a company or one project. Every actor with company access reads them; only the board writes them. See `references/policies.md`.
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET    | `/api/companies/:companyId/policies` | List policies, company ones first; optional filters `scope` (`company`, `project`), `projectId`, `status` (`draft`, `active`, `archived`); `scope=company` with `projectId`: 400 |
+| GET    | `/api/companies/:companyId/policies/:key` | Policy with its full markdown body |
+| GET    | `/api/companies/:companyId/policies/:key/revisions` | Revisions, newest first (at most 100) |
+| POST   | `/api/companies/:companyId/policies` | Create a policy (board only; `key`, `title`, optional `summary`, `body`, `status`, `projectId`, `ownerAgentId` or `ownerUserId`; duplicate key: 409) |
+| PATCH  | `/api/companies/:companyId/policies/:key` | Update a policy (board only; a new title or body saves a revision; `baseRevisionId` returns 409 when stale; `status: "archived"` retires it) |
+| DELETE | `/api/companies/:companyId/policies/:key` | Delete an archived policy and its revisions (board only; any other status: 409) |

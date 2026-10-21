@@ -832,5 +832,29 @@ export const runnerApiReference: Record<string, { section: string; description?:
   "POST /api/agents/me/secrets/{}/value": {
     "section": "Secrets",
     "description": "Fetch one granted secret value; request body is empty"
+  },
+  "GET /api/companies/{}/policies": {
+    "section": "Policies",
+    "description": "List policies, company ones first; optional filters `scope` (`company`, `project`), `projectId`, `status` (`draft`, `active`, `archived`); `scope=company` with `projectId`: 400"
+  },
+  "GET /api/companies/{}/policies/{}": {
+    "section": "Policies",
+    "description": "Policy with its full markdown body"
+  },
+  "GET /api/companies/{}/policies/{}/revisions": {
+    "section": "Policies",
+    "description": "Revisions, newest first (at most 100)"
+  },
+  "POST /api/companies/{}/policies": {
+    "section": "Policies",
+    "description": "Create a policy (board only; `key`, `title`, optional `summary`, `body`, `status`, `projectId`, `ownerAgentId` or `ownerUserId`; duplicate key: 409)"
+  },
+  "PATCH /api/companies/{}/policies/{}": {
+    "section": "Policies",
+    "description": "Update a policy (board only; a new title or body saves a revision; `baseRevisionId` returns 409 when stale; `status: \"archived\"` retires it)"
+  },
+  "DELETE /api/companies/{}/policies/{}": {
+    "section": "Policies",
+    "description": "Delete an archived policy and its revisions (board only; any other status: 409)"
   }
 };

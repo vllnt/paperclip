@@ -290,6 +290,15 @@
       "expectedMockState": "operation_result"
     },
     {
+      "id": "skill:skills/paperclip/SKILL.md:746",
+      "kind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/SKILL.md#L746:policies",
+      "heading": "Policies",
+      "primaryDisposition": "control_plane_owned",
+      "semanticOperation": "runtime_reconciliation",
+      "expectedMockState": "runtime_decision_record"
+    },
+    {
       "id": "skill:skills/paperclip/references/api-reference.md:1",
       "kind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/api-reference.md#L1:paperclip-api-reference",
@@ -960,6 +969,15 @@
       "kind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/api-reference.md#L1708:common-mistakes",
       "heading": "Common Mistakes",
+      "primaryDisposition": "optional_agent_tool",
+      "semanticOperation": "scoped_discovery",
+      "expectedMockState": "operation_result"
+    },
+    {
+      "id": "skill:skills/paperclip/references/api-reference.md:1724",
+      "kind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md#L1724:policies",
+      "heading": "Policies",
       "primaryDisposition": "optional_agent_tool",
       "semanticOperation": "scoped_discovery",
       "expectedMockState": "operation_result"

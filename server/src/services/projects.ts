@@ -1,6 +1,8 @@
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  companyPolicies,
+  documents,
   projects,
   projectGoals,
   goals,
@@ -28,7 +30,7 @@ import {
   type PluginManagedProjectDeclaration,
   type PluginManagedProjectResolution,
 } from "@paperclipai/shared";
-import { unprocessable } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runtime-read-model.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -945,16 +947,44 @@ export function projectService(db: Db) {
       return cleared;
     },
 
-    remove: (id: string) =>
-      db
-        .delete(projects)
-        .where(eq(projects.id, id))
-        .returning()
-        .then((rows) => {
-          const row = rows[0] ?? null;
-          if (!row) return null;
-          return { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) };
-        }),
+    /**
+     * Deletes a project. Its policies go with it, together with their documents and revisions,
+     * so no policy text stays behind. Only the board writes policies, so a caller that may not remove
+     * them (`removePolicies: false`) gets 403 when the project has any. Returns the deleted project
+     * and the keys of its removed policies.
+     */
+    remove: (id: string, options: { removePolicies: boolean }) =>
+      db.transaction(async (tx) => {
+        // Lock the project first: a policy cannot then be created in it or moved into it meanwhile.
+        const locked = await tx
+          .select({ id: projects.id })
+          .from(projects)
+          .where(eq(projects.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!locked) return null;
+        const projectPolicies = await tx
+          .select({ key: companyPolicies.key, documentId: companyPolicies.documentId })
+          .from(companyPolicies)
+          .where(eq(companyPolicies.projectId, id))
+          .for("update");
+        if (projectPolicies.length > 0 && !options.removePolicies) {
+          throw forbidden("Only the board can delete a project that has policies.");
+        }
+        const row = await tx
+          .delete(projects)
+          .where(eq(projects.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!row) return null;
+        if (projectPolicies.length > 0) {
+          await tx.delete(documents).where(inArray(documents.id, projectPolicies.map((policy) => policy.documentId)));
+        }
+        return {
+          project: { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) },
+          removedPolicyKeys: projectPolicies.map((policy) => policy.key),
+        };
+      }),
 
     listWorkspaces: async (projectId: string): Promise<ProjectWorkspace[]> => {
       const rows = await db

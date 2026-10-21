@@ -1183,26 +1183,14 @@ function snapshotsMatch(left: DirectorySnapshot, right: DirectorySnapshot): bool
   return true;
 }
 
-/** A step of a directory merge, for a run log: how long it took and how many paths it covered. */
-export interface DirectoryMergeStep {
-  /** `snapshot` reads the source and the target; its paths are the source's
-   * entries. `copy` removes and copies; its paths are the entries written. */
-  name: "snapshot" | "copy";
-  ms: number;
-  paths: number;
-}
-
 export async function mergeDirectoryWithBaseline(input: {
   baseline: DirectorySnapshot;
   sourceDir: string;
   targetDir: string;
   conflictPolicy?: "reject";
   beforeApply?: () => Promise<void>;
-  /** Gets the relative paths the merge removed or copied. */
-  afterApply?: (written: ReadonlySet<string>) => Promise<void>;
-  /** Runs under the lock after every preflight check and before the first
-   * write. A hook that moves the target's git ref here, not in `beforeApply`,
-   * never moves it for a merge that refuses. Tests use it to race the writes. */
+  afterApply?: () => Promise<void>;
+  /** Test seam only: runs after every preflight check and before the first write. */
   afterPreflight?: () => Promise<void>;
   /** Caller holds the target's writer lock and validated an immutable sparse
    * source. Unchanged entries need no payload and are never copied. */
@@ -1210,33 +1198,24 @@ export async function mergeDirectoryWithBaseline(input: {
   /** Run log of a workspace copy-back: gets a line about every 30 s while the
    * merge waits for the target's lock, so a long teardown says why it waits. */
   onLockWaitProgress?: RuntimeProgressSink;
-  /** Run log of a workspace copy-back: gets the snapshot step, then the copy step. */
-  onStep?: (step: DirectoryMergeStep) => Promise<void>;
 }): Promise<void> {
   const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
-  let startedAt = Date.now();
   const source = input.snapshots?.source ?? await captureDirectorySnapshot(input.sourceDir, options);
-  let snapshotMs = Date.now() - startedAt;
   try {
     // A source equal to its baseline deletes and copies nothing and cannot
     // conflict. With no hooks to run, it skips the lock, so read-only runs do
     // not queue behind other restores into the same workspace.
-    if (!input.beforeApply && !input.afterApply && !input.afterPreflight && snapshotsMatch(input.baseline, source)) {
+    if (!input.beforeApply && !input.afterApply && snapshotsMatch(input.baseline, source)) {
       await disposeDirectorySnapshot(input.snapshots?.current ?? null);
-      await input.onStep?.({ name: "snapshot", ms: snapshotMs, paths: source.entries.size });
-      await input.onStep?.({ name: "copy", ms: 0, paths: 0 });
       return;
     }
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
       await input.beforeApply?.();
       // Strict preflight must see excluded children before a directory is
       // replaced. The merge still applies only the filtered source/baseline.
-      startedAt = Date.now();
       const current = input.snapshots?.current ?? await captureDirectorySnapshot(canonicalTargetDir,
         input.conflictPolicy === "reject" ? { exclude: [], diskBacked: true } : options);
-      snapshotMs += Date.now() - startedAt;
       try {
-        await input.onStep?.({ name: "snapshot", ms: snapshotMs, paths: source.entries.size });
         if (input.conflictPolicy === "reject") {
           const conflicts = directoryMergeConflicts(input.baseline, source, current);
           if (conflicts.length) throw new DirectoryMergeConflict(conflicts);
@@ -1249,8 +1228,6 @@ export async function mergeDirectoryWithBaseline(input: {
         const linked = await linkedAncestorConflicts(canonicalTargetDir, input.baseline, source, isApplied);
         if (linked.length) throw new DirectoryMergeConflict(linked);
         await input.afterPreflight?.();
-        startedAt = Date.now();
-        const written = new Set<string>();
         // A copy that was staged in the target root and then interrupted.
         await removeStaleStagingFiles(canonicalTargetDir, "");
         for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
@@ -1260,7 +1237,6 @@ export async function mergeDirectoryWithBaseline(input: {
           if (!parent) continue;
           try {
             await fs.rm(path.join(parent.dir, path.posix.basename(relative)), { force: true });
-            written.add(relative);
           } finally { await parent.close(); }
         }
         // Reverse path order visits descendants before their parent directory.
@@ -1270,12 +1246,9 @@ export async function mergeDirectoryWithBaseline(input: {
           });
         }
         for (const [relative, entry] of orderedEntries(source)) {
-          if (!isApplied(relative, entry)) continue;
-          await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
-          written.add(relative);
+          if (isApplied(relative, entry)) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
         }
-        await input.onStep?.({ name: "copy", ms: Date.now() - startedAt, paths: written.size });
-        await input.afterApply?.(written);
+        await input.afterApply?.();
       } finally { await disposeDirectorySnapshot(current); }
     }, process.env, undefined, workspaceRestoreLockWaitMs(), input.onLockWaitProgress
       ? (wait) => input.onLockWaitProgress?.(describeDirectoryMergeLockWait(wait))
