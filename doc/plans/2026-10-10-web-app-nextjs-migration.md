@@ -481,6 +481,47 @@ MF removes the catch-all, so every pattern of `App.tsx` has a slice. Paths are u
 3. Measure free disk right after. Below 9,000 MiB: stop, and keep the lockfile change out of any merge until the floor is back.
 4. The M0 pull request records both disk numbers, the two versions with their registry dates, the advisory check of section 15.1, rows 3 and 4, and the vendored-React check.
 
+### 15.6 M0 runs Next.js as a second process (maintainer decision, 2026-10-21)
+
+The fallback of section 3.3 ("If the custom server is not viable") becomes the design, before the spike. The reason is the V8 heap, not the container limit. In production the main server process has about 1.55 GB resident memory, with `--max-old-space-size=1536`, and a startup peak (`VmHWM`) of 1,310 MiB. A Next.js server inside that process would share the same heap, and nothing measures the room left in it. A second process has its own heap and its own limit.
+
+| Part | Section 3.3 (in-process) | Now |
+|---|---|---|
+| Where Next.js runs | `next({ … })` in the Express process | a child process started by the server (`ui/next-server.mjs`: `next()`, `prepare()`, an HTTP server on `127.0.0.1` with port 0), with its own `--max-old-space-size` (`PAPERCLIP_UI_MAX_OLD_SPACE_MB`, default 512) |
+| Requests | a late Express route calls the Next.js handler | the same late route proxies GET and HEAD to the child with `node:http` (no new dependency). Other methods still get 405; `/_next/image` and `/_next/mcp` still get 404; Express still sets `Cache-Control: private, no-store` and adds `Cookie` to `Vary` on every proxied response |
+| Websocket upgrades | a private `EventEmitter` given to Next.js, and a dev-only dispatcher | no upgrade reaches the child in production. In dev, one listener added first forwards `/_next/hmr` to the child's port |
+| Readiness | `prepare()` within 60 s | the child reports `ready` over IPC within 60 s of its start. The rest of the contract holds: UI 503 and `/api/health` 503 with `ui: "failed"` while the API answers. The maintainer decided on 2026-10-21 that a failed UI fails the deploy closed (open question 11) |
+| Supervision | - | a crash after `ready` restarts the child with backoff (1 s doubling to 30 s); shutdown stops it within the existing stop budget (SIGTERM, then SIGKILL after 10 s) |
+| Cost | one heap | one more process and one loopback hop per page request (about 1 ms). The memory row of section 8 sums both processes' resident memory, and adds the main process heap, read through the inspector on the CI runner only, at `--memory 2g` and at `3g` |
+| Image (section 10) | `next` in the runtime `node_modules` | unchanged |
+
+Production memory for the gate, measured after the restart into `2785c614c`: main server `VmHWM` 1,310 MiB; resident memory of all processes 1,805 MiB three minutes after the start; sum of the per-process peaks 2,212 MiB; the container is at 71% of a 3 GiB limit (an operator override of the 2g compose default).
+
+### 15.7 Route slices M2 to M10: a checklist any implementer can follow
+
+M2 to M10 start after M1's go (section 8). Each slice owns one segment directory, `ui/app/[companyPrefix]/<segment>/`, as section 15.3 lists, so two or three implementers can work at the same time without sharing files. Shared files (`ui/src/lib/router.tsx` with its registry of migrated patterns, the `ui/src/api/*` modules) take additive changes only, and the later pull request merges `main` first.
+
+A slice is ready to merge when all of these hold:
+
+1. **Segment.** `page.tsx` is a server component. It creates a per-request `QueryClient`, prefetches through the shared `ui/src/api/*` functions with the client's query keys and options, and passes `dehydrate(...)` to `<HydrationBoundary>`. Each prefetch has a timeout of about 1 s and fails open to the browser fetch. Only GET requests go out (a test checks it). `loading.tsx` has the shape of the final layout. The old page component stays a client component below the boundary.
+2. **Routing.** The slice adds its patterns to the registry in `ui/src/lib/router.tsx`. Links to them go through the wrapper. Long lists use `prefetch={false}` and switch to the default on pointer enter or focus. An unrecognised param renders the catch-all's content, not `notFound()` (section 2). The React Router route stays in `App.tsx` until MF.
+3. **Server safety.** The moved tree reads browser globals only in effects or in client-only components. Layout preferences that change the server render are cookies. Plugin slots render a placeholder of reserved size.
+4. **Numbers.** The `perf-web` workflow with `Perf-Slice: M<n>` in the pull request body: the gate passes for the slice's rows (`gate-bands.json`, `slices.M<n>`). That means no regression on the 10 harness pages against B1 on the same runner, and the slice's own number of section 9 is reported. `route-smoke.mjs --only <segment>` passes at 1440 and 390 px, with zero console errors.
+5. **Parity.** "No capability change" (AGENTS.md rule 8). A slice that adds a capability adds the REST route, the OpenAPI entry and the CLI command too.
+6. **After the merge.** Production health shows the merge commit. The slice's pages load at 1440 and 390 px with zero console errors in a real browser (the read-only method of section 15.1, row 6). The slice's metric is measured there with `measure.mjs --read-only`. Rollback is a revert pull request.
+
+| Slice | Pages to measure (the harness keys, or the route) | Watch for |
+|---|---|---|
+| M2 | `issue-long`, `issue-short` | the editor and chat thread stay client components; the header seed of `prefetchIssueDetailForNavigation` moves to the Query cache |
+| M3 | `dashboard` | the live-run panel starts with the summary |
+| M4 | `inbox/*`, `approvals/*` (route-smoke) | the inbox waits for its main list only; the Decisions redirects of section 15.2 |
+| M5 | `agents`, agent detail, run transcript | the run is fetched by id; the Workroom (`chats/:agentRef`) |
+| M6 | project detail (route-smoke) | the routines, goals and policies sections from section 15.2 |
+| M7 | `routines`, `costs`, `audit` | the step editor; the goal tabs |
+| M8 | `settings` | the gates that render nothing today (`HiddenSettingsPageGate`) get a loading state |
+| M9 | route-smoke for its segments | plugin pages stay client-rendered; databases from section 15.2 |
+| M10 | the public routes (route-smoke, signed out) | the invite page keeps fetching in the browser (rate limit, section 4.1); server `redirect()` for the unprefixed routes |
+
  Sources outside the repository
 
 - Next.js custom server (docs version 16.4.0): https://nextjs.org/docs/app/guides/custom-server
