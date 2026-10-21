@@ -1,0 +1,153 @@
+name: Image performance
+# The image rows of the web-app performance gate (plan section 8: Memory, Start, Image and CI;
+# doc/plans/2026-10-10-web-app-nextjs-migration.md, section 15.4). On ONE hosted runner it builds
+# the production target of the pull request's base commit and of its head, one after the other,
+# each from an empty BuildKit cache, and records the uncompressed size and the build time of
+# each. It then runs each image under the compose limits (2 GB with no swap, 1.5 GB heap, 2 CPUs)
+# against a throwaway Postgres, alternating the arms over two rounds: process start to
+# /api/health ok and to the first UI 200 (5 restarts), the startup peak (VmHWM), 10 parallel
+# cold loads, the steady resident memory, OOMKilled. Two builds and two runs on one runner are
+# compared, never numbers from two runners.
+#
+# Opt-in: the job runs only on a pull request that carries the label `perf-image`. Adding the
+# label starts a run; a later push or reopen starts another. Adding any other label does not.
+#
+# The gate (tests/perf/web-app/gate.mjs, slice `image-ci`) decides: the job fails when an image
+# row is outside its band (+350 MB image, +5 min build, +250 MB steady memory, +150 MB startup
+# peak, +2 s first UI, any out-of-memory kill) or when a row is missing.
+#
+# No secrets, a read-only token, nothing is pushed or published, and no registry login: the
+# images stay on the runner, and the Postgres image comes from mirror.gcr.io (see the Dockerfile
+# header). It builds and runs the pull request's code, which is why a maintainer applies the
+# label and nothing else starts it. The base arm is the merge base of the PR's base branch and
+# its head, so the two arms differ by this pull request's change only. Both arms run the
+# scripts of the HEAD tree: the base commit may not have them.
+#
+# Not a required check and not part of "CI gate" (ci.yml): it never reports without the label.
+# It changes neither the release workflow nor deploy/.
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  # A new push replaces the older run of the same pull request. A `labeled` event for another
+  # label must not cancel a run in progress, and a workflow-level group is entered before any
+  # job `if` is read, so such an event gets a group of its own.
+  group: perf-image-${{ github.event.pull_request.number }}-${{ (github.event.action != 'labeled' || github.event.label.name == 'perf-image') && 'measure' || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  perf-image:
+    name: Image rows, base vs head
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'perf-image') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'perf-image')
+    # A hosted runner on purpose, not CI_RUNS_ON: a shared or loaded pool defeats the comparison.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Start the time budget
+        # The second measuring round starts only when it fits before this deadline
+        # (image-rows.mjs), which leaves the rest of the 90 minutes for the gate and the upload.
+        run: echo "PERF_DEADLINE_EPOCH=$(( $(date +%s) + 78 * 60 ))" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Add the base commit as a second tree
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git cat-file -e "$PR_BASE_SHA^{commit}" ||
+            { echo "::error::the base commit $PR_BASE_SHA is not in the fetched history"; exit 1; }
+          base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
+          git worktree add --detach ../base "$base"
+          {
+            echo "PERF_BASE_DIR=$(cd ../base && pwd -P)"
+            echo "PERF_BASE_COMMIT=$base"
+          } >> "$GITHUB_ENV"
+          {
+            echo "### Commits measured"
+            echo
+            echo "- head: \`$PR_HEAD_SHA\`"
+            echo "- base: \`$base\`, the merge base of \`$PR_BASE_SHA\` and the head"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The scripts use node:* built-ins only: no install step.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      # No step deletes preinstalled tools to free disk space (see image-build-check.yml).
+      # The df lines show the headroom in every log: read them first if a build fails with
+      # "no space left on device".
+      - name: Show free disk space before the builds
+        run: df -h /
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        with:
+          # moby/buildkit:buildx-stable-1 from a mirror, never anonymous Docker Hub (see Dockerfile header).
+          driver-opts: image=mirror.gcr.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+          # The runner is a disposable hosted VM. Removing the builder at the end only costs time.
+          cleanup: false
+
+      # Each build starts from an empty BuildKit cache (image-rows.mjs prunes it first) and uses
+      # no cache import, so the two arms are timed under the same settings, in this order.
+      - name: Build the base image
+        timeout-minutes: 30
+        run: node tests/perf/web-app/image-rows.mjs build --arm base --context "$PERF_BASE_DIR" --commit "$PERF_BASE_COMMIT"
+
+      - name: Build the head image
+        timeout-minutes: 30
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          df -h /
+          node tests/perf/web-app/image-rows.mjs build --arm head --context "$GITHUB_WORKSPACE" --commit "$PR_HEAD_SHA"
+
+      - name: Measure both images
+        id: measure
+        timeout-minutes: 25
+        run: node tests/perf/web-app/image-rows.mjs measure --label ci --deadline-epoch "$PERF_DEADLINE_EPOCH"
+
+      - name: Run the gate
+        # Also after a failed measuring step: the gate then shows which rows are missing.
+        if: ${{ !cancelled() && steps.measure.outcome != 'skipped' }}
+        timeout-minutes: 5
+        run: |
+          set -uo pipefail
+          mkdir -p tmp/perf/image
+          code=0
+          node tests/perf/web-app/gate.mjs --slice image-ci \
+            --base tmp/perf/results --head tmp/perf/results \
+            --json tmp/perf/image/gate.json > tmp/perf/image/gate.md || code=$?
+          cat tmp/perf/image/gate.md
+          { echo "### Gate: image rows"; echo; cat tmp/perf/image/gate.md; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+
+      - name: Show free disk space after the run
+        if: always()
+        run: df -h /
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: perf-image-pr${{ github.event.pull_request.number }}-attempt${{ github.run_attempt }}
+          path: |
+            tmp/perf/results
+            tmp/perf/image
+          if-no-files-found: warn
+          retention-days: 14

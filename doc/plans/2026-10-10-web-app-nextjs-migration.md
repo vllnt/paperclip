@@ -522,7 +522,7 @@ A slice is ready to merge when all of these hold:
 | M9 | route-smoke for its segments | plugin pages stay client-rendered; databases from section 15.2 |
 | M10 | the public routes (route-smoke, signed out) | the invite page keeps fetching in the browser (rate limit, section 4.1); server `redirect()` for the unprefixed routes |
 
- Sources outside the repository
+## Appendix A. Sources outside the repository
 
 - Next.js custom server (docs version 16.4.0): https://nextjs.org/docs/app/guides/custom-server
 - Next.js linking and navigating, native History API, `loading.tsx` prefetch (docs version 16.4.0): https://nextjs.org/docs/app/getting-started/linking-and-navigating

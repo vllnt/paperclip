@@ -1,0 +1,440 @@
+{
+  "version": 1,
+  "source": "doc/plans/2026-10-10-web-app-nextjs-migration.md: section 8 (the rows), 13.2 (what each slice gates), 15.3 (route groups), 15.4 (image rows)",
+  "units": "Sizes are bytes. 'MB' in the plan is read as 1,000,000 bytes, the stricter of the two readings.",
+  "validity": {
+    "maxLoadAvgRatio": 2,
+    "loadAvgFloor": 2,
+    "minRunsPerCell": 5,
+    "minRoundsPerArm": 2,
+    "note": "Section 7: a comparison is invalid when the load average changes more than 2x between the arms. Loads under loadAvgFloor count as loadAvgFloor, so 0.3 against 0.9 on an idle machine is not a 3x change."
+  },
+  "sliceOrder": ["H", "M0", "M0b", "M0c", "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10", "MF"],
+  "bands": [
+    {
+      "id": "cold-fcp",
+      "section8": "No regression from M0 + M0b on the 10 harness pages: cold FCP median",
+      "tool": "measure",
+      "source": "results",
+      "cellFields": ["page", "profile"],
+      "metric": "fcpMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "rel-max",
+      "relPct": 5,
+      "absolute": 50
+    },
+    {
+      "id": "cold-lcp",
+      "section8": "No regression: cold LCP median",
+      "tool": "measure",
+      "source": "results",
+      "cellFields": ["page", "profile"],
+      "metric": "lcpMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "rel-max",
+      "relPct": 5,
+      "absolute": 50
+    },
+    {
+      "id": "cold-tti",
+      "section8": "No regression: cold TTI median",
+      "tool": "measure",
+      "source": "results",
+      "cellFields": ["page", "profile"],
+      "metric": "ttiMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "rel-max",
+      "relPct": 5,
+      "absolute": 50
+    },
+    {
+      "id": "api-calls-per-load",
+      "section8": "No regression: API calls per load <= base",
+      "tool": "measure",
+      "source": "results",
+      "cellFields": ["page", "profile"],
+      "metric": "apiRequests",
+      "statistic": "median",
+      "unit": "count",
+      "kind": "rel-max",
+      "relPct": 0,
+      "absolute": 0
+    },
+    {
+      "id": "js-on-wire",
+      "section8": "No regression: JS on the wire <= base + 10%",
+      "tool": "measure",
+      "source": "results",
+      "cellFields": ["page", "profile"],
+      "metric": "jsBytes",
+      "statistic": "median",
+      "unit": "bytes",
+      "kind": "rel-max",
+      "relPct": 10,
+      "absolute": 0
+    },
+    {
+      "id": "console-errors-pages",
+      "section8": "No regression: zero new console errors (the 10 harness pages; also catches hydration errors for M0c)",
+      "tool": "measure",
+      "source": "results",
+      "cellFields": ["page", "profile"],
+      "metric": "consoleErrors",
+      "statistic": "max",
+      "unit": "count",
+      "kind": "rel-max",
+      "relPct": 0,
+      "absolute": 0,
+      "noBase": "zero"
+    },
+    {
+      "id": "warm-nav-first-change",
+      "section8": "No regression: warm navigation median, input to first visual change, +5% or +20 ms",
+      "tool": "nav-timing",
+      "source": "results",
+      "cellFilter": "^(?!backforward\\|)",
+      "metric": "firstChangeMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "rel-max",
+      "relPct": 5,
+      "absolute": 20
+    },
+    {
+      "id": "warm-nav-usable",
+      "section8": "No regression: warm navigation median, input to usable, +5% or +20 ms",
+      "tool": "nav-timing",
+      "source": "results",
+      "cellFilter": "^(?!backforward\\|)",
+      "metric": "usableMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "rel-max",
+      "relPct": 5,
+      "absolute": 20
+    },
+    {
+      "id": "warm-nav-failed",
+      "section8": "No regression: a navigation that never became usable cannot hide in the medians (share of failed samples <= base)",
+      "tool": "nav-timing",
+      "source": "results",
+      "cellFilter": "^(?!backforward\\|)",
+      "metric": "!ok",
+      "statistic": "mean",
+      "unit": "frac",
+      "kind": "rel-max",
+      "relPct": 0,
+      "absolute": 0,
+      "noBase": "zero"
+    },
+    {
+      "id": "routes-console-errors",
+      "section8": "No regression: zero new console errors, read from route-smoke.mjs",
+      "tool": "route-smoke",
+      "source": "rows",
+      "routeFilter": true,
+      "metric": "consoleErrors",
+      "statistic": "max",
+      "unit": "count",
+      "kind": "rel-max",
+      "relPct": 0,
+      "absolute": 0,
+      "noBase": "zero"
+    },
+    {
+      "id": "routes-ok",
+      "section8": "Every other route: no non-200 page, no failed asset (a console error is the row routes-console-errors)",
+      "tool": "route-smoke",
+      "source": "rows",
+      "routeFilter": true,
+      "kind": "row-check",
+      "checks": [
+        { "field": "status", "op": "eq", "value": 200 },
+        { "field": "failedAssets", "op": "zero" },
+        { "field": "ok", "op": "notFalse" }
+      ]
+    },
+    {
+      "id": "board-warm-usable-p75",
+      "section8": "Board warm navigation: usable p75 on the head <= base's usable p75 (strict)",
+      "tool": "nav-timing",
+      "source": "results",
+      "cellFilter": "^board\\|",
+      "metric": "usableMs",
+      "statistic": "p75",
+      "unit": "ms",
+      "kind": "rel-max",
+      "relPct": 0,
+      "absolute": 0
+    },
+    {
+      "id": "board-warm-usable-median",
+      "section8": "Board warm navigation: usable median on the head <= base's usable median (strict)",
+      "tool": "nav-timing",
+      "source": "results",
+      "cellFilter": "^board\\|",
+      "metric": "usableMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "rel-max",
+      "relPct": 0,
+      "absolute": 0
+    },
+    {
+      "id": "board-cold-lcp",
+      "section8": "Board cold load, wan: LCP median <= base's (strict)",
+      "tool": "measure",
+      "source": "results",
+      "cellFields": ["page", "profile"],
+      "cellFilter": "^tasks-board\\|wan$",
+      "metric": "lcpMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "rel-max",
+      "relPct": 0,
+      "absolute": 0
+    },
+    {
+      "id": "board-cold-lcp-gain",
+      "section8": "Section 9, M0b: cold LCP about -90 to -110 ms on wan. Reported, never gated",
+      "tool": "measure",
+      "source": "results",
+      "cellFields": ["page", "profile"],
+      "cellFilter": "\\|wan$",
+      "metric": "lcpMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "report",
+      "expected": "about -90 to -110 ms"
+    },
+    {
+      "id": "router-state",
+      "section8": "Router state: scroll within 4 px after back, location.state kept, the right page on screen",
+      "tool": "nav-timing",
+      "source": "rows",
+      "cellFilter": "^backforward\\|",
+      "kind": "row-check",
+      "checks": [
+        { "field": "scrollDeltaPx", "op": "absLe", "value": 4 },
+        { "field": "stateKept", "op": "eq", "value": true },
+        { "field": "rightPage", "op": "eq", "value": true }
+      ]
+    },
+    {
+      "id": "spa-mounts",
+      "section8": "One SPA root across navigations: at most 1 mount in 20 navigations",
+      "tool": "spa-mounts",
+      "source": "rows",
+      "kind": "row-check",
+      "naAllowedBefore": "M0b",
+      "checks": [
+        { "field": "maxCount", "op": "le", "value": 1 },
+        { "field": "navigations", "op": "ge", "value": 20 }
+      ]
+    },
+    {
+      "id": "websockets",
+      "section8": "Websockets: every upgrade path reaches its handler and nothing closes during navigation",
+      "tool": "ws-persistence",
+      "source": "rows",
+      "kind": "row-check",
+      "checks": [
+        { "field": ["reachedHandler", "opened"], "op": "truthy" },
+        { "field": "closedDuringNav", "op": "zero" }
+      ]
+    },
+    {
+      "id": "isolation",
+      "section8": "Two users at once: no leak of ids, Cache-Control private no-store and Vary Cookie on every response",
+      "tool": "two-user-isolation",
+      "source": "rows",
+      "kind": "row-check",
+      "naAllowedBefore": "M0b",
+      "checks": [
+        { "field": "requests", "op": "ge", "value": 1 },
+        { "field": "leaks", "op": "zero" },
+        { "field": "missingCacheControl", "op": "zero" },
+        { "field": "missingVaryCookie", "op": "zero" }
+      ]
+    },
+    {
+      "id": "server-cpu-per-load",
+      "section8": "Server load: server CPU per board page load p75 <= 150 ms on the measuring machine",
+      "tool": "server-load",
+      "source": "rows",
+      "cellFilter": "^board-load-cpu$",
+      "metric": "cpuMsPerLoad",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "abs-max",
+      "limit": 150
+    },
+    {
+      "id": "server-api-p95",
+      "section8": "Server load: API p95 with 10 parallel board loads <= idle p95 x 1.2",
+      "tool": "server-load",
+      "source": "rows",
+      "cellFilter": "^api-p95$",
+      "metric": "loadedP95Ms",
+      "refMetric": "idleP95Ms",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "ratio-max",
+      "maxRatio": 1.2
+    },
+    {
+      "id": "server-load-requests",
+      "section8": "Server load: RSC and loopback requests per board load. Reported, never gated",
+      "tool": "server-load",
+      "source": "rows",
+      "cellFilter": "^board-load-requests$",
+      "metric": "rscRequestsPerLoad",
+      "statistic": "median",
+      "unit": "count",
+      "kind": "report"
+    },
+    {
+      "id": "memory-steady",
+      "section8": "Memory, 2 GB container, 1.5 GB heap: steady-state resident memory <= base + 250 MB",
+      "tool": "image",
+      "source": "rows",
+      "cellFilter": "^container$",
+      "metric": "steadyRssBytes",
+      "statistic": "median",
+      "unit": "bytes",
+      "kind": "delta-max",
+      "limit": 250000000
+    },
+    {
+      "id": "memory-startup-peak",
+      "section8": "Memory: startup peak (VmHWM) <= base + 150 MB",
+      "tool": "image",
+      "source": "rows",
+      "cellFilter": "^container$",
+      "metric": "startupPeakBytes",
+      "statistic": "median",
+      "unit": "bytes",
+      "kind": "delta-max",
+      "limit": 150000000
+    },
+    {
+      "id": "oom-kills",
+      "section8": "Memory: no out-of-memory kill during 10 parallel cold loads or 5 restarts",
+      "tool": "image",
+      "source": "rows",
+      "cellFilter": "^container$",
+      "metric": "oomKilled",
+      "statistic": "max",
+      "unit": "count",
+      "kind": "abs-max",
+      "limit": 0
+    },
+    {
+      "id": "start-first-ui",
+      "section8": "Start: process start to the first UI 200 <= base + 2 s",
+      "tool": "start-timer",
+      "source": "results",
+      "metric": "firstUiMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "delta-max",
+      "limit": 2000
+    },
+    {
+      "id": "start-api-ready",
+      "section8": "Start: API ready time unchanged (+0.5 s or +10%, whichever is larger)",
+      "tool": "start-timer",
+      "source": "results",
+      "metric": "apiReadyMs",
+      "statistic": "median",
+      "unit": "ms",
+      "kind": "rel-max",
+      "relPct": 10,
+      "absolute": 500
+    },
+    {
+      "id": "image-size",
+      "section8": "Image and CI: image <= base + 350 MB uncompressed",
+      "tool": "image",
+      "source": "rows",
+      "cellFilter": "^image$",
+      "metric": "sizeBytes",
+      "statistic": "median",
+      "unit": "bytes",
+      "kind": "delta-max",
+      "limit": 350000000
+    },
+    {
+      "id": "image-build",
+      "section8": "Image and CI: image build <= base + 5 min",
+      "tool": "image",
+      "source": "rows",
+      "cellFilter": "^image$",
+      "metric": "buildSeconds",
+      "statistic": "median",
+      "unit": "s",
+      "kind": "delta-max",
+      "limit": 300
+    }
+  ],
+  "groups": {
+    "no-regression": [
+      "cold-fcp",
+      "cold-lcp",
+      "cold-tti",
+      "api-calls-per-load",
+      "js-on-wire",
+      "console-errors-pages",
+      "warm-nav-first-change",
+      "warm-nav-usable",
+      "warm-nav-failed",
+      "routes-console-errors"
+    ],
+    "image-rows": ["start-first-ui", "start-api-ready", "image-size", "image-build", "memory-steady", "memory-startup-peak", "oom-kills"]
+  },
+  "slices": {
+    "H": { "gate": [], "report": [], "note": "H only produces numbers; nothing is gated." },
+    "M0": {
+      "gate": ["@no-regression", "routes-ok", "websockets", "@image-rows"],
+      "report": [],
+      "note": "Readiness (503 on a forced prepare() failure) is an M0 server test, not a gate row."
+    },
+    "M0b": {
+      "gate": ["@no-regression", "router-state", "spa-mounts", "isolation"],
+      "report": ["board-cold-lcp-gain"]
+    },
+    "M0c": { "gate": ["@no-regression"], "report": [], "note": "Zero hydration errors are read from the console error rows in @no-regression." },
+    "M1": { "gate": ["*"], "report": ["server-load-requests"] },
+    "M2": { "gate": ["@no-regression", "routes-ok"], "report": [], "routeGroup": "M2" },
+    "M3": { "gate": ["@no-regression", "routes-ok"], "report": [], "routeGroup": "M3" },
+    "M4": { "gate": ["@no-regression", "routes-ok"], "report": [], "routeGroup": "M4" },
+    "M5": { "gate": ["@no-regression", "routes-ok"], "report": [], "routeGroup": "M5" },
+    "M6": { "gate": ["@no-regression", "routes-ok"], "report": [], "routeGroup": "M6" },
+    "M7": { "gate": ["@no-regression", "routes-ok"], "report": [], "routeGroup": "M7" },
+    "M8": { "gate": ["@no-regression", "routes-ok"], "report": [], "routeGroup": "M8" },
+    "M9": { "gate": ["@no-regression", "routes-ok"], "report": [], "routeGroup": "M9" },
+    "M10": { "gate": ["@no-regression", "routes-ok"], "report": [], "routeGroup": "M10" },
+    "MF": { "gate": ["@no-regression", "routes-ok"], "report": [], "note": "All routes." },
+    "image-ci": {
+      "gate": ["@image-rows"],
+      "report": [],
+      "note": "Not a slice: the perf-image workflow gates the rows it can measure on a CI runner."
+    }
+  },
+  "routeGroups": {
+    "note": "Section 15.3. A pattern is matched after dropping its company-prefix segment. An entry with a leading slash is an unprefixed route. A trailing /* matches the segment and everything under it. :name segments are compared as ':'. The most specific entry wins. A pattern that no group names is gated by MF and M1 only.",
+    "M1": ["issues", "issues/all", "issues/active", "issues/backlog", "issues/done", "issues/recent", "tasks"],
+    "M2": ["issues/:issueId", "tests/perf/long-thread"],
+    "M3": ["dashboard", "dashboard/live", ""],
+    "M4": ["inbox/*", "decisions/*", "approvals/*", "review-queue"],
+    "M5": ["agents/*", "chats/*", "org"],
+    "M6": ["projects/*", "workspaces", "execution-workspaces/*"],
+    "M7": ["activity/*", "timeline", "audit/*", "runs", "costs", "budgets", "routines/*", "goals/*", "learnings"],
+    "M8": ["company/*", "instance/settings/*", "companies", "onboarding", "settings/*", "tools/*"],
+    "M9": ["apps/*", "plugins/*", ":pluginRoutePath/*", "skills/*", "artifacts", "cases/*", "pipelines/*", "status/*", "status-cards/*", "board-chat", "search", "u/*", "databases/*"],
+    "M10": ["/auth", "/invite/*", "/oauth-handoff", "/board-claim/*", "/cli-auth/*", "/chat-identity/*", "/onboarding", "/design-guide", "/dev/*", "/ux-lab/*", "/tests/perf/long-thread", "/*"]
+  }
+}

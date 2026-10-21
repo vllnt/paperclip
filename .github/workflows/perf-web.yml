@@ -1,0 +1,147 @@
+name: Web-app performance
+# Measures the pull request head against its base commit on ONE hosted runner, interleaved
+# (base, head, base, head), and runs the gate (tests/perf/web-app/gate.mjs). Plan section 7
+# (doc/plans/2026-10-10-web-app-nextjs-migration.md) asks for exactly that: two arms on one
+# machine, at least 5 runs per cell and 2 rounds. A shared developer machine cannot give it.
+#
+# Opt-in: the job runs only on a pull request that carries the label `perf-web`. Adding the
+# label starts a run; a later push or reopen starts another. Adding any other label does not.
+# The slice comes from a line `Perf-Slice: <id>` in the PR body (for example `Perf-Slice: M0`);
+# without it the slice is `none`: the comparison is reported and nothing fails. With a slice,
+# the gate's exit code is the job's.
+#
+# No secrets and a read-only token. It builds and runs the pull request's code, which is why a
+# maintainer applies the label and nothing else starts it. The base arm is the merge base of
+# the PR's base branch and its head, so the two arms differ by this pull request's change only,
+# even when the base branch has moved since the branch was cut.
+#
+# Not a required check and not part of "CI gate" (ci.yml): it never reports without the label.
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push replaces the older run of the same pull request. A `labeled` event for another
+  # label must not cancel a run in progress, and a workflow-level group is entered before any
+  # job `if` is read, so such an event gets a group of its own.
+  group: perf-web-${{ github.event.pull_request.number }}-${{ (github.event.action != 'labeled' || github.event.label.name == 'perf-web') && 'measure' || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  perf-web:
+    name: Web-app performance, base vs head
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'perf-web') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'perf-web')
+    # A hosted runner on purpose, not CI_RUNS_ON: a shared or loaded pool defeats the comparison.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Start the time budget
+        # The probes stop starting at this deadline (ci-run.sh), which leaves the rest of the
+        # 120 minutes for the gate, the summary and the upload.
+        run: echo "PERF_DEADLINE_EPOCH=$(( $(date +%s) + 105 * 60 ))" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read the slice from the PR body
+        id: slice
+        env:
+          # Untrusted text: it only ever reaches the shell through this variable.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          slice=none
+          line="$(printf '%s\n' "$PR_BODY" | tr -d '\r' | grep -m1 -E '^[[:space:]]*Perf-Slice:' || true)"
+          if [ -n "$line" ]; then
+            value="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*Perf-Slice:[[:space:]]*//; s/[[:space:]]+$//')"
+            if ! printf '%s' "$value" | grep -Eq '^[A-Za-z0-9]+$'; then
+              echo "::error::Perf-Slice must match ^[A-Za-z0-9]+\$, for example 'Perf-Slice: M0'"
+              exit 1
+            fi
+            slice="$value"
+          fi
+          echo "Slice: $slice"
+          echo "slice=$slice" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 9.15.4
+
+      - name: Add the base commit as a second tree
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git cat-file -e "$PR_BASE_SHA^{commit}" ||
+            { echo "::error::the base commit $PR_BASE_SHA is not in the fetched history"; exit 1; }
+          base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
+          git worktree add --detach ../base "$base"
+          echo "PERF_BASE_DIR=$(cd ../base && pwd -P)" >> "$GITHUB_ENV"
+          {
+            echo "### Commits measured"
+            echo
+            echo "- head: \`$PR_HEAD_SHA\`"
+            echo "- base: \`$base\`, the merge base of \`$PR_BASE_SHA\` and the head"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          df -h /
+
+      # Both arms run the scripts of the HEAD tree: the base commit may not have them. The head
+      # arm goes first because seeding uses the head tree's installed dependencies.
+      - name: Prepare the head arm
+        timeout-minutes: 35
+        run: bash tests/perf/web-app/ci-arm.sh "$GITHUB_WORKSPACE" 3192 54332 perf-head
+
+      - name: Install the browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Prepare the base arm
+        timeout-minutes: 35
+        run: bash "$GITHUB_WORKSPACE/tests/perf/web-app/ci-arm.sh" "$PERF_BASE_DIR" 3193 54333 perf-base
+
+      - name: Measure both arms and run the gate
+        env:
+          PERF_SLICE: ${{ steps.slice.outputs.slice }}
+        run: |
+          set -euo pipefail
+          bash tests/perf/web-app/ci-run.sh \
+            http://127.0.0.1:3193 "$PERF_BASE_DIR/tmp/perf/seed-out.json" \
+            http://127.0.0.1:3192 "$GITHUB_WORKSPACE/tmp/perf/seed-out.json" \
+            "$PERF_SLICE"
+
+      - name: Collect the server logs
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p tmp/perf/results/logs
+          tail -n 5000 tmp/perf/server.log > tmp/perf/results/logs/head-server.log 2>/dev/null || true
+          cp tmp/perf/seed-out.json tmp/perf/results/logs/head-seed-out.json 2>/dev/null || true
+          if [ -n "${PERF_BASE_DIR:-}" ]; then
+            tail -n 5000 "$PERF_BASE_DIR/tmp/perf/server.log" > tmp/perf/results/logs/base-server.log 2>/dev/null || true
+            cp "$PERF_BASE_DIR/tmp/perf/seed-out.json" tmp/perf/results/logs/base-seed-out.json 2>/dev/null || true
+          fi
+          df -h /
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: perf-web-pr${{ github.event.pull_request.number }}-attempt${{ github.run_attempt }}
+          path: tmp/perf/results
+          if-no-files-found: warn
+          retention-days: 14
