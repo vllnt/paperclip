@@ -1734,7 +1734,10 @@ A goal does not store its work. Tasks and routines link to a goal with `goalId`;
 | GET    | `/api/companies/:companyId/routines?goalId=:goalId` | Routines whose own goal is this goal |
 | GET    | `/api/companies/:companyId/projects` | Projects; a project serves each goal in its `goalIds` |
 | GET    | `/api/companies/:companyId/goals/progress` | Done, open and total tasks per goal, including the tasks of its sub-goals |
+| GET    | `/api/companies/:companyId/goals/focus` | The company's current focus: active short-horizon goals, nearest target date first, with progress and open milestones |
 
 The agents of a goal are its owner (`ownerAgentId`), the assignees of its open tasks, and the default agents of its routines that are not archived. Set a routine's goal with `goalId` on create or update (`null` clears it). Set a project's goals with `goalIds` on `PATCH /api/projects/:projectId`.
 
-CLI: `paperclipai goal links <goalId>` and `paperclipai goal progress -C <companyId>`; `--goal-id` on `issue list`, `routine list`, `routine create` and `routine update` (`none` clears it on a routine).
+CLI: `paperclipai goal links <goalId>`, `paperclipai goal progress -C <companyId>` and `paperclipai goal focus -C <companyId>`; `--goal-id` on `issue list`, `routine list`, `routine create` and `routine update` (`none` clears it on a routine).
+
+Your task's goal: when your task has a goal, the wake text names it on its own line, `- issue goal: <title> (goal id <goalId>)`. Read the rest of the goal with `GET /api/goals/:goalId`. A remote run reaches the goal reads through the sandbox callback bridge: the goal list and detail, `goals/focus`, `goals/progress`, and the task and routine lists with `goalId`. The bridge does not pass goal writes. In MCP, `paperclipListIssues` takes `goalId`; read the routines, the focus and the progress with `paperclipApiRequest`, whose path leaves out the `/api` prefix (for example `/companies/:companyId/goals/focus`). Link new work to a goal with `goalId` on task and routine writes, within your existing permissions.
