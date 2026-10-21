@@ -34,6 +34,11 @@ export function runnerApiMutationRestriction(path: string): string | null {
   // of a same-task user message. It checks the live run, resolver policy and
   // session under lock, and cannot execute governed approvals or enqueue work.
   if (/^\/api\/issues\/\{[^}]+\}\/interactions\/\{[^}]+\}\/resolve-from-comment$/.test(path)) return null;
+  // Policies are written by the board only. A run reads them (list, get, revisions); the server also
+  // refuses an agent write, and this keeps a native run from sending one.
+  if (/^\/api\/companies\/\{[^}]+\}\/policies(\/|$)/.test(path)) {
+    return "Company policies are written by the board only: call_api can read them (list, get, revisions) but cannot create, edit or delete one.";
+  }
   const issueRoute = /^\/api\/issues\/\{[^}]+\}/.test(path);
   const routineAnnotation =
     /^\/api\/routines\/\{[^}]+\}\/description\/annotations(?:\/\{[^}]+\}(?:\/comments)?)?$/.test(

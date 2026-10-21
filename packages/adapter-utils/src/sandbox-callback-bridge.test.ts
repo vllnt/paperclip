@@ -14,6 +14,7 @@ import {
   createFileSystemSandboxCallbackBridgeQueueClient,
   createSandboxCallbackBridgeAsset,
   createSandboxCallbackBridgeToken,
+  DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
   getSandboxBridgeProcessBodyLedgerSource,
   getSandboxCallbackBridgeServerSource,
   HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
@@ -1761,6 +1762,82 @@ describe("sandbox callback bridge", () => {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
         `Route not allowed: ${request.method} ${request.path}`,
       );
+    }
+  });
+
+  it("admits exactly the three policy reads and refuses every policy write", () => {
+    // The allowlist holds three policy rules, and each one is a GET.
+    const policyRules = DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST.filter((rule) =>
+      rule.path.source.includes("policies"),
+    );
+    expect(policyRules).toHaveLength(3);
+    expect(policyRules.every((rule) => rule.method === "GET")).toBe(true);
+
+    const allowed: Array<{ method: string; path: string }> = [
+      { method: "GET", path: "/api/companies/co-1/policies" },
+      { method: "GET", path: "/api/companies/co-1/policies/code-style" },
+      { method: "GET", path: "/api/companies/co-1/policies/code-style/revisions" },
+    ];
+    for (const request of allowed) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
+      expect(
+        authorizeSandboxCallbackBridgeRequestWithRoutes(request, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST),
+      ).toBeNull();
+    }
+
+    const denied: Array<{ method: string; path: string }> = [
+      // Every policy write is refused, on each of the three paths.
+      { method: "POST", path: "/api/companies/co-1/policies" },
+      { method: "PUT", path: "/api/companies/co-1/policies" },
+      { method: "PATCH", path: "/api/companies/co-1/policies" },
+      { method: "DELETE", path: "/api/companies/co-1/policies" },
+      { method: "POST", path: "/api/companies/co-1/policies/code-style" },
+      { method: "PUT", path: "/api/companies/co-1/policies/code-style" },
+      { method: "PATCH", path: "/api/companies/co-1/policies/code-style" },
+      { method: "DELETE", path: "/api/companies/co-1/policies/code-style" },
+      { method: "POST", path: "/api/companies/co-1/policies/code-style/revisions" },
+      { method: "PUT", path: "/api/companies/co-1/policies/code-style/revisions" },
+      { method: "PATCH", path: "/api/companies/co-1/policies/code-style/revisions" },
+      { method: "DELETE", path: "/api/companies/co-1/policies/code-style/revisions" },
+      // Extra or missing segments.
+      { method: "GET", path: "/api/companies/co-1/policies/" },
+      { method: "GET", path: "/api/companies/co-1/policies/code-style/" },
+      { method: "GET", path: "/api/companies/co-1/policies/code-style/revisions/1" },
+      { method: "GET", path: "/api/companies/co-1/policies/code-style/extra" },
+      { method: "GET", path: "/api/companies/co-1/policies//revisions" },
+      { method: "GET", path: "/api/companies//policies" },
+      // A key slot with /, ?, #, %, . or \ is refused (queue_v1 forwards the raw path).
+      { method: "GET", path: "/api/companies/co-1/policies/code/style" },
+      { method: "GET", path: "/api/companies/co-1/policies/code?x=1" },
+      { method: "GET", path: "/api/companies/co-1/policies/code#x" },
+      { method: "GET", path: "/api/companies/co-1/policies/code%2fstyle" },
+      { method: "GET", path: "/api/companies/co-1/policies/%2e%2e" },
+      { method: "GET", path: "/api/companies/co-1/policies/.." },
+      { method: "GET", path: "/api/companies/co-1/policies/code.style" },
+      { method: "GET", path: "/api/companies/co-1/policies/code\\style" },
+      { method: "GET", path: "/api/companies/co-1/policies/code/revisions/../other" },
+      { method: "GET", path: "/api/companies/co-1/policies/code?x=1/revisions" },
+      { method: "GET", path: "/api/companies/co-1/policies/code#x/revisions" },
+      { method: "GET", path: "/api/companies/co-1/policies/code%2f..%2frevisions" },
+      { method: "GET", path: "/api/companies/co-1/policies/code.style/revisions" },
+      { method: "GET", path: "/api/companies/co-1/policies/code\\style/revisions" },
+      // The same characters in the company slot.
+      { method: "GET", path: "/api/companies/co?1/policies" },
+      { method: "GET", path: "/api/companies/co#1/policies" },
+      { method: "GET", path: "/api/companies/co%2f1/policies" },
+      { method: "GET", path: "/api/companies/../policies" },
+      { method: "GET", path: "/api/companies/co.1/policies" },
+      { method: "GET", path: "/api/companies/co\\1/policies" },
+      { method: "GET", path: "/api/companies/co.1/policies/code-style" },
+      { method: "GET", path: "/api/companies/co\\1/policies/code-style/revisions" },
+    ];
+    for (const request of denied) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
+        `Route not allowed: ${request.method} ${request.path}`,
+      );
+      expect(
+        authorizeSandboxCallbackBridgeRequestWithRoutes(request, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST),
+      ).toBe(`Route not allowed: ${request.method} ${request.path}`);
     }
   });
 

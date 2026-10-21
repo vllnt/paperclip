@@ -210,6 +210,12 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+\/files$/ },
   { method: "PATCH", path: /^\/api\/companies\/[^/?#%.\\]+\/skills\/[^/?#%.\\]+\/files$/ },
   { method: "POST", path: /^\/api\/companies\/[^/?#%.\\]+\/skills$/ },
+  // Company policies: read-only. List, read one by key and read its revisions. Creating, editing and deleting
+  // a policy is board-only on the server, so no write rule exists here. Id and key slots exclude ?, #, %, .
+  // and \ like the skill and decision rules (a policy key is lowercase letters, numbers and -).
+  { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/policies$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/policies\/[^/?#%.\\]+$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/?#%.\\]+\/policies\/[^/?#%.\\]+\/revisions$/ },
   // Decisions: agents ask the board and withdraw their own open asks (the server allows the origin agent only).
   // Listing stays board-only; deciding and dismissing stay human-only.
   { method: "POST", path: /^\/api\/companies\/[^/?#%.\\]+\/decisions$/ },

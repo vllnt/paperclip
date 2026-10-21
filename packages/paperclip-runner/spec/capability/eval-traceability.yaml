@@ -2396,10 +2396,14 @@
       ],
       "evidenceIds": [
         "eval:rf-cskill-audit-01",
-        "mcp:paperclipListSkills"
+        "mcp:paperclipListSkills",
+        "mcp:paperclipListPolicies",
+        "mcp:paperclipGetPolicy"
       ],
       "legacyMcpAliases": [
-        "mcp:paperclipListSkills"
+        "mcp:paperclipListSkills",
+        "mcp:paperclipListPolicies",
+        "mcp:paperclipGetPolicy"
       ]
     },
     {

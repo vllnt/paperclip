@@ -156,7 +156,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "GET /api/issues/{}/comments": {
     "section": "Issues (Tasks)",
-    "description": "List comments"
+    "description": "List comments. `?order=asc\\"
   },
   "GET /api/issues/{}/comments/{}": {
     "section": "Issues (Tasks)",
@@ -494,8 +494,8 @@ export const runnerApiReference: Record<string, { section: string; description?:
     "description": "Archive company"
   },
   "GET /api/companies/{}/projects": {
-    "section": "Companies, Projects, Goals",
-    "description": "List projects"
+    "section": "A goal's linked work",
+    "description": "Projects; a project serves each goal in its `goalIds`"
   },
   "GET /api/projects/{}": {
     "section": "Companies, Projects, Goals",
@@ -608,15 +608,15 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "POST /api/companies/{}/routines": {
     "section": "Routines",
-    "description": "Create routine (`assigneeAgentId` + `projectId` required; agents: own only; optional `steps`, sub-tasks each run creates, see `references/routines.md` Routine steps; CLI `routine create --steps-file <path>`)"
+    "description": "Create routine (`assigneeAgentId` + `projectId` required; agents: own only; optional `steps`, sub-tasks each run creates, see `references/routines.md` Routine steps; CLI `routine create --steps-file <path>`; the response carries `warnings` for steps whose agent cannot take work now)"
   },
   "PATCH /api/routines/{}": {
     "section": "Routines",
-    "description": "Update routine (agents: own only, cannot reassign; `steps` replaces the list, CLI `routine update <id> --steps-file <path>`; `GET` returns `steps`)"
+    "description": "Update routine (agents: own only, cannot reassign; `steps` replaces the list, CLI `routine update <id> --steps-file <path>`; `GET` returns `steps`; the response carries `warnings`)"
   },
   "POST /api/routines/{}/triggers": {
     "section": "Routines",
-    "description": "Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`)"
+    "description": "Add trigger (`schedule`, `webhook`, `api`, or `event` kind; `event` takes `eventSourceId` + optional `eventMatch`, `eventGrouping`, `fallback`; `eventGrouping.issueMode: \"event_issue\"` starts the routine's steps on each task created, built-in Paperclip source only, see `references/routines.md` Event Triggers)"
   },
   "PATCH /api/routine-triggers/{}": {
     "section": "Routines",
@@ -632,7 +632,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "POST /api/routines/{}/run": {
     "section": "Routines",
-    "description": "Manual run (bypasses schedule; concurrency policy still applies)"
+    "description": "Manual run (bypasses schedule; concurrency policy still applies). `targetIssueId` (UUID) starts the routine's steps on that existing task: `202` with the run and `warnings`; `404` task not in the company, `409` task busy (status not backlog/todo/blocked, live run, open steps) or the routine was edited while the run started (send it again), `422` no steps or task refused. CLI `routine run <id> --target-issue <uuid-or-identifier>`"
   },
   "POST /api/routine-triggers/public/{}/fire": {
     "section": "Routines",
@@ -652,7 +652,7 @@ export const runnerApiReference: Record<string, { section: string; description?:
   },
   "POST /api/companies/{}/event-sources": {
     "section": "Event Sources",
-    "description": "Create source (board only); secret returned once in `secretMaterial`"
+    "description": "Create source (board only); secret returned once in `secretMaterial`. `POST /api/companies/:companyId/event-sources/paperclip` (board only, idempotent, CLI `event-sources ensure-paperclip -C <companyId>`) creates or returns the built-in Paperclip source instead: `issue.created` events, no URL, no secret; Paperclip manages it, so update (except `enabled`), archive, rotate and test answer `409`"
   },
   "GET /api/event-sources/{}": {
     "section": "Event Sources",
@@ -801,6 +801,10 @@ export const runnerApiReference: Record<string, { section: string; description?:
     "section": "Approvals, Costs, Activity, Dashboard",
     "description": "Company health summary"
   },
+  "GET /api/health": {
+    "section": "Server Health",
+    "description": "Server `status` and running build `commit`; see `SKILL.md` \"Proving a Deploy\""
+  },
   "GET /api/companies/{}/secrets": {
     "section": "Secrets",
     "description": "List secrets (metadata only)"
@@ -856,5 +860,17 @@ export const runnerApiReference: Record<string, { section: string; description?:
   "DELETE /api/companies/{}/policies/{}": {
     "section": "Policies",
     "description": "Delete an archived policy and its revisions (board only; any other status: 409)"
+  },
+  "GET /api/companies/{}/issues?goalId={}": {
+    "section": "A goal's linked work",
+    "description": "Tasks whose own goal is this goal; add `status` for the open ones. A blank `goalId` counts as not set; one that is not a UUID: 400"
+  },
+  "GET /api/companies/{}/routines?goalId={}": {
+    "section": "A goal's linked work",
+    "description": "Routines whose own goal is this goal"
+  },
+  "GET /api/companies/{}/goals/progress": {
+    "section": "A goal's linked work",
+    "description": "Done, open and total tasks per goal, including the tasks of its sub-goals"
   }
 };

@@ -5,11 +5,13 @@ import {
   addIssueCommentSchema,
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
+  companyPolicyKeySchema,
   connectionRequestInputSchema,
   connectionsSearchInputSchema,
   createApprovalSchema,
   createIssueInputSchema,
   issueThreadInteractionContinuationPolicySchema,
+  listCompanyPoliciesQuerySchema,
   requestCheckboxConfirmationPayloadSchema,
   requestConfirmationPayloadSchema,
   suggestTasksPayloadSchema,
@@ -91,6 +93,9 @@ const projectIdSchema = z.string().min(1);
 const goalIdSchema = z.string().guid();
 const approvalIdSchema = z.string().guid();
 const documentKeySchema = z.string().trim().min(1).max(64);
+
+const listPoliciesToolSchema = listCompanyPoliciesQuerySchema.extend({ companyId: companyIdOptional });
+const getPolicyToolSchema = z.object({ companyId: companyIdOptional, key: companyPolicyKeySchema });
 
 const listIssuesSchema = z.object({
   companyId: companyIdOptional,
@@ -474,6 +479,29 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "Get a goal by id",
       z.object({ goalId: goalIdSchema }),
       async ({ goalId }) => client.requestJson("GET", `/goals/${encodeURIComponent(goalId)}`),
+    ),
+    makeTool(
+      "paperclipListPolicies",
+      "List the company's policies (written rules and guardrails); filter by scope, projectId or status",
+      listPoliciesToolSchema,
+      async ({ companyId, scope, projectId, status }) => {
+        const params = new URLSearchParams();
+        if (scope) params.set("scope", scope);
+        if (projectId) params.set("projectId", projectId);
+        if (status) params.set("status", status);
+        const qs = params.size > 0 ? `?${params.toString()}` : "";
+        return client.requestJson("GET", `/companies/${client.resolveCompanyId(companyId)}/policies${qs}`);
+      },
+    ),
+    makeTool(
+      "paperclipGetPolicy",
+      "Get one company policy by key, with its body",
+      getPolicyToolSchema,
+      async ({ companyId, key }) =>
+        client.requestJson(
+          "GET",
+          `/companies/${client.resolveCompanyId(companyId)}/policies/${encodeURIComponent(key)}`,
+        ),
     ),
     makeTool(
       "paperclipListApprovals",
