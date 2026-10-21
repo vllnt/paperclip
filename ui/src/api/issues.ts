@@ -20,6 +20,9 @@ import type {
   IssueLabel,
   IssueRecoveryAction,
   IssueRetryNowResponse,
+  RoutineStepRun,
+  RoutineStepSendBackRequest,
+  RoutineStepSendBackResult,
   StalledReviewDecision,
   StalledReviewDecisionResponse,
   IssueThreadInteraction,
@@ -276,6 +279,9 @@ export const issuesApi = {
       `/issues/${id}/stalled-review-decision`,
       data,
     ),
+  routineStep: (id: string) => api.get<RoutineStepRun>(`/issues/${id}/routine-step`),
+  sendBackRoutineStep: (id: string, data: RoutineStepSendBackRequest) =>
+    api.post<RoutineStepSendBackResult>(`/issues/${id}/routine-step/send-back`, data),
   retryWorkspaceExport: (id: string, data: { actionId: string; runId: string; repairNote: string }) =>
     api.post<{ runId: string; resultId: string; leaseId: string; status: "queued" }>(`/issues/${id}/recovery-actions/retry-workspace-export`, data),
   resolveRecoveryAction: (

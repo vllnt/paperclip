@@ -117,6 +117,37 @@ describe("RoutineStepsEditor", () => {
     );
   });
 
+  it("lets a step send work back only to a step it waits for", async () => {
+    await render([step("build"), step("ship", ["build"])]);
+
+    expect(container.querySelector('button[aria-label^="Step 1 can send work back"]')).toBeNull();
+    expect(container.querySelector("li:nth-of-type(1)")?.textContent).toContain(
+      "Only a step this one waits for can take its work back",
+    );
+    await act(async () =>
+      container.querySelector<HTMLButtonElement>('button[aria-label="Step 2 can send work back to build"]')!.click(),
+    );
+
+    expect(onChange).toHaveBeenCalledWith([step("build"), step("ship", ["build"], { sendBackTo: ["build"] })]);
+  });
+
+  it("shows the default round cap of a send-back and changes it", async () => {
+    await render([step("build"), step("ship", ["build"], { sendBackTo: ["build"] })]);
+    const cap = container.querySelector<HTMLInputElement>("#routine-step-1-max-send-backs")!;
+    expect(cap.value).toBe("2");
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+
+    await act(async () => {
+      setValue.call(cap, "5");
+      cap.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    expect(onChange).toHaveBeenCalledWith([
+      step("build"),
+      step("ship", ["build"], { sendBackTo: ["build"], maxSendBacks: 5 }),
+    ]);
+  });
+
   it("asks for an agent only when neither the step nor the routine has one", async () => {
     await render([step("a")], null);
     expect(container.textContent).toContain("Choose an agent for this step");

@@ -107,6 +107,8 @@ import {
   updateRoutineTriggerSchema,
   rotateRoutineTriggerSecretSchema,
   runRoutineSchema,
+  routineStepSendBackRequestSchema,
+  routineStepSendBackSchema,
   // Event sources
   createEventSourceSchema,
   updateEventSourceSchema,
@@ -5039,6 +5041,104 @@ const routineStepWarningRef = registry.register(
     reason: z.string(),
   }),
 );
+
+const routineStepSendBackResultSchema = registry.register(
+  "RoutineStepSendBackResult",
+  z.object({
+    outcome: z.enum(["sent_back", "cap_reached"]),
+    routineRunId: z.string().guid(),
+    fromStepKey: z.string(),
+    toStepKey: z.string(),
+    fromIssueId: z.string().guid(),
+    toIssueId: z.string().guid(),
+    rounds: z.number().int().describe("Agent send-backs on this edge that count toward the cap, this one included."),
+    maxSendBacks: z.number().int(),
+    reblockedIssueIds: z
+      .array(z.string().guid())
+      .describe("The steps set back to `blocked`: the loop without its target. Empty when the cap refused."),
+    commentId: z.string().guid(),
+  }),
+);
+
+/** A success response whose body is the registered schema `ref`. */
+const okRef = (ref: { $ref: string }) => ({
+  description: "Success",
+  content: { "application/json": { schema: ref } },
+});
+
+const routineStepRunSchema = registry.register(
+  "RoutineStepRun",
+  z.object({
+    routineId: z.string().guid(),
+    routineRunId: z.string().guid(),
+    rootIssueId: z.string().guid(),
+    stepKey: z.string().describe("The viewed step."),
+    steps: z
+      .array(
+        z.object({
+          key: z.string(),
+          issueId: z.string().guid().nullable(),
+          identifier: z.string().nullable(),
+          title: z.string(),
+          status: z.string().nullable().describe("The step task's status now; null when the task is gone or hidden."),
+        }),
+      )
+      .describe("Every step of the run, in the routine's order."),
+    sendBackTo: z
+      .array(
+        z.object({
+          stepKey: z.string(),
+          issueId: z.string().guid().nullable(),
+          rounds: z.number().int().describe("Agent send-backs on this edge that count toward the cap."),
+          maxSendBacks: z.number().int(),
+        }),
+      )
+      .describe("The steps the viewed step may send its work back to."),
+    sendBacks: z.array(routineStepSendBackSchema).describe("Send-backs of the run, oldest first."),
+  }),
+);
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/routine-step",
+  tags: ["issues", "routines"],
+  summary: "Read the run of a routine step",
+  description:
+    "`{id}` is a step of a routine run (origin `routine_step`). Returns every step of the run with its task's status, " +
+    "the steps this one may send its work back to with the rounds used so far, and the run's send-backs. 404 when the issue is not a step of a run.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: okRef(routineStepRunSchema), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/routine-step/send-back",
+  tags: ["issues", "routines"],
+  summary: "Send a routine step's work back to an earlier step",
+  description:
+    "`{id}` is a step of a routine run (origin `routine_step`) that sends its work back to `toStepKey`, one of the step's `sendBackTo`. " +
+    "The caller is the step's agent or a board user, and the comment says what to fix. " +
+    "The target goes from `done` to `todo` with its assignee kept and is woken with `issue_reopened_via_comment`, so its agent resumes its session on it. " +
+    "The steps between the target and the sending step, and the sending step, go to `blocked` and wake again when the target is done again; other steps keep their status. " +
+    "422 when the issue is not a step of a run or `toStepKey` is not in its `sendBackTo`; 403 for an agent that is not the step's assignee; " +
+    "409 when the step is not todo, in_progress or blocked, the run's root is closed, the target or a step between is not done, " +
+    "or, for an agent, the step waits for the board (a board-owned block, such as the one a cap leaves). " +
+    "An agent past the edge's `maxSendBacks` (default 2) gets 409 with `details.code` `send_back_cap_reached` and the result: nothing is sent back, the comment is posted on the sending step, " +
+    "and that step is blocked with a board-owned `unblockDescriptor`. A board send-back is never capped and resets the edge's count.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(routineStepSendBackRequestSchema),
+  },
+  responses: {
+    200: okRef(routineStepSendBackResultSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
 
 /** A success response that is the stored record plus the non-blocking `warnings` of the save or run. */
 const okWithStepWarnings = () => ({

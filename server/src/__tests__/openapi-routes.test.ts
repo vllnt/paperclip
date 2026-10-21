@@ -430,8 +430,23 @@ describe("openapi routes", () => {
       const steps = operation.requestBody.content["application/json"].schema.properties.steps;
       expect(steps.maxItems).toBe(MAX_ROUTINE_STEPS);
       expect(steps.items.properties.after.maxItems).toBe(MAX_ROUTINE_STEPS);
+      expect(steps.items.properties.sendBackTo.maxItems).toBe(MAX_ROUTINE_STEPS);
+      expect(steps.items.properties.maxSendBacks).toMatchObject({ type: "integer", minimum: 1, maximum: 10 });
       expect(Object.keys(operation.responses)).toEqual(expect.arrayContaining(["403", "404", "409", "422"]));
     }
+    const sendBack = res.body.paths["/api/issues/{id}/routine-step/send-back"].post;
+    expect(sendBack.requestBody.content["application/json"].schema.required).toEqual(["toStepKey", "comment"]);
+    expect(Object.keys(sendBack.responses)).toEqual(expect.arrayContaining(["200", "403", "404", "409", "422"]));
+    expect(sendBack.responses["200"].content["application/json"].schema).toEqual({
+      $ref: "#/components/schemas/RoutineStepSendBackResult",
+    });
+    const stepRun = res.body.paths["/api/issues/{id}/routine-step"].get;
+    expect(stepRun.responses["200"].content["application/json"].schema).toEqual({
+      $ref: "#/components/schemas/RoutineStepRun",
+    });
+    expect(Object.keys(res.body.components.schemas.RoutineStepRun.properties)).toEqual(
+      expect.arrayContaining(["steps", "sendBackTo", "sendBacks"]),
+    );
     for (const operation of [
       res.body.paths["/api/routines/{id}/run"].post,
       res.body.paths["/api/routines/{id}/triggers"].post,

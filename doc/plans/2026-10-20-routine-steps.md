@@ -1,6 +1,6 @@
 # Plan: Routine steps
 
-Status: PR 1 (steps) implemented. PRs 2 and 3 are planned.
+Status: PR 1 (steps) and PR 2 (start on a task) implemented. Loop slice 1 (send back) implemented. PR 3 (conditions) and loop slices 2 to 4 are planned.
 
 ## Context
 
@@ -148,6 +148,47 @@ Routine create, update and run responses carry `warnings: RoutineStepWarning[]` 
 - Skipped steps are removed from every blocker set in the run, then `issue_blockers_resolved` wakes go out for steps that became ready.
 - A reconcile action runs when a `routine_step` issue reaches a terminal status, with a small periodic backstop. Reconcile is idempotent: it locks the root and re-derives everything from `triggerPayload.steps` and current statuses.
 - `when` is allowed only on `after` entries; the editor warns about a step that would always be skipped.
+
+## Loops, step results, stalled runs and the steps-run hint (planned 2026-10-21)
+
+Four slices, one PR each, in this order. Each ships with REST/OpenAPI, CLI, UI, the paperclip skill, tests and docs. Slice 2 builds the outcome part of PR 3; PR 3's plain `done`/`cancelled` rules stay as written above.
+
+### Slice 1: bounded loop back ("send back")
+
+A later step sends the work back to an earlier step of the same run, for example `qa` back to `implement`. The earlier step reopens with the same agent and resumes that agent's session on it. The steps after it wait again and wake again when it is done again. Rounds are capped.
+
+- **Step fields.** `sendBackTo: string[]` (default `[]`) names the steps this step may send work back to. Each key must be a step this step waits for, directly or through other steps; a step can never send work forward or to itself. `maxSendBacks` (1 to 10, default 2) caps the rounds on each of those edges. Both are stored with the steps in the run, so a later routine edit does not change a running loop.
+- **Call.** `POST /issues/{id}/routine-step/send-back` with `{ toStepKey, comment }`, where `{id}` is the step that sends the work back. The comment is required and says what to fix. The caller is the step's agent (from its run), or a board user. In one transaction, under a lock on the routine run row:
+  1. Refusals: 404 for an unknown or hidden issue; 422 when the issue is not a step of a run or `toStepKey` is not in its `sendBackTo`; 403 for an agent that is not the step's assignee; 409 when the step is not `todo`, `in_progress` or `blocked`, when the run's root is closed, or when the target or a step of the loop (below) is not `done`.
+  2. The **loop** is the target, every step between the target and the sender (steps that wait for the target and that the sender waits for), and the sender. Only the loop runs again. A step outside it keeps its status, also a done step on a parallel branch that waits for the target: with `implement → [docs, qa]`, `qa` sending back to `implement` leaves a finished `docs` finished. A step that must see every new round belongs on the path to the sender (make the sender wait for it). This keeps a round as small as the loop and leaves running parallel work alone.
+  3. The target goes from `done` to `todo` with the same assignee. Its execution state is cleared, so its review stages run again.
+  4. Every other step of the loop, the sender included, goes to `blocked` and gets a new `blockedTransitionAt`, so the `issue_blockers_resolved` wake for the next "target done" is a new wake and is not deduplicated against the first round. Their execution state is cleared too. They resume their own sessions when woken, and their rounds count toward no cap.
+  5. The comment is posted on the target, and the run records `{ fromStepKey, toStepKey, actorType, actorId, commentId, at, outcome: "sent_back" }` in `triggerPayload.routineSteps.sendBacks`.
+  6. After commit the target's agent is woken with `issue_reopened_via_comment` (payload `reopenedFrom: "done"` and `routineStepSendBack`). That reason does not force a fresh session, and the session row is keyed per agent, adapter and issue, so the agent resumes its session on the target.
+- **The sender's own run after a send-back.** The sender is `blocked` on a target that is open again, and its checkout is released. A later `status: "done"` from that same run is refused (409), so the sender is never marked done while the work it sent back is open. It finishes in the round after the target is done again.
+- **Cap and escalation.** An agent's send-back on an edge that already has `maxSendBacks` agent send-backs since the last board send-back on that edge is refused with 409 (`code: "send_back_cap_reached"`). The sending step is set to `blocked` with `unblockDescriptor: { owner: "board", action }`, where the action names the cap. That is the existing board-owned block item of the attention inbox (`blocker_attention`, "blocked issue has a human-owned unblockDescriptor"). The agent's comment is posted on the sending step, and the run records `outcome: "cap_reached"`. A board user may then send back again (that resets the edge's count, as human review decisions reset review rounds), or finish or cancel the step. Until then, an agent's send-back from a step with a board-owned block is refused with 409 and writes nothing, so a retrying agent cannot pile up comments or cap entries.
+- **Surfaces.** OpenAPI for the route and the step fields; CLI `paperclipai issue send-back <issue> --to <stepKey> --body <text>` and the fields in `--steps-file`; UI: "Can send back to" and a round cap in the step editor, and a run panel on a step issue with every step's status, the send-back history and a "Send back" form for the board, read from `GET /issues/{id}/routine-step` (CLI `paperclipai issue routine-step <issue>`); the skill tells a step agent when and how to send work back.
+- **Not in slice 1.** Sending back to a step of another run, a cancelled target, or automatic send-back from a result (slice 2).
+
+### Slice 2: step outcome
+
+- A step may declare `outcomes: string[]` (slugs, at most 10), for example `["confirmed", "not_reproduced"]`. Finishing such a step requires one of them; the result is stored on the run (`triggerPayload.routineSteps.outcomes[stepKey]`) and shown on the step.
+- PR 3's `when` arrives on `after` entries: `{ key, when: ["confirmed"] }`. An edge is dead when its source finished with another outcome, was cancelled through a condition, or was skipped. A step whose incoming edges are all dead is cancelled with "Skipped: condition not met", and the rule repeats downstream, as PR 3 describes. Plain edges keep today's meaning.
+- A `sendBackTo` entry may name an outcome: finishing `qa` with `not_fixed` performs the slice 1 send-back to `implement` with the finishing comment, under the same cap.
+
+### Slice 3: a stalled run wakes its root once
+
+- When a step is cancelled or skipped and `isRoutineStepRunStalled` says nothing else can move, the root's agent is woken once with `routine_steps_stalled`, the stalled and cancelled step keys in the payload, and an idempotency key derived from the run and its step statuses (a later, different stall wakes again).
+- The root's agent may then close the root although steps are open (today 409), because the run cannot move. A small periodic backstop covers a lost wake.
+
+### Slice 4: steps-run hint
+
+- The heartbeat context of an issue carries its origin kind and those of its ancestors (`routine_execution`, `routine_step`), and for a steps run a summary: the run id, the root issue and per step its key, issue and status, plus counts of open, done and cancelled steps.
+- An agent's preflight can then tell a steps root (blocked on its own steps by design) apart from real work in progress.
+
+### Verify in production (each slice)
+
+A `[qa-test]` routine in a test company runs implement, then qa, then a send back, then implement resuming the same session (`sessionIdBefore` of its second run equals the first run's session), then qa again, then done, within the cap. Test issues are cancelled and the test routine paused afterwards.
 
 ## Follow-ups (not scheduled)
 

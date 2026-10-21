@@ -329,7 +329,16 @@ To implement, review, fix and re-review, put the review on the step being review
 
 - The loop stays on one issue. The reviewer and the implementer alternate on it until the reviewer approves or `maxReviewRounds` is reached.
 - Sessions are stored per agent, adapter and issue (`agent_task_sessions`, unique on company, agent, adapter and task key; the task key is the issue id). `execution_review_requested` and `execution_changes_requested` wakes do **not** reset the session (`shouldResetTaskSessionForWake`), so the reviewer and the implementer each resume their own session between rounds.
-- A separate review step is a different issue, so it starts a fresh session and cannot send work back to an earlier step. Use separate steps for one-shot reviews or for parallel lens reviews that a later step joins.
+- A separate review step is a different issue, so it starts a fresh session. Use separate steps for one-shot reviews, for parallel lens reviews that a later step joins, or with `sendBackTo` (below) when a later step must be able to send the work back.
+
+#### Sending work back
+
+A step may send its work back to an earlier step of its run that it names in `sendBackTo` (`POST /issues/:id/routine-step/send-back`, the step's agent or a board user).
+
+- The target goes from `done` to `todo` with its assignee kept, gets the comment, and its agent is woken with `issue_reopened_via_comment`. That reason does not reset the session, so the agent resumes its own session on the target.
+- The loop is the steps that wait for the target and that the sender waits for, plus the sender. They go to `blocked` with a new blocked cycle, so the blockers-resolved wake fires again when the target is done again, and each resumes its session. Steps off the loop, such as a parallel step that also waits for the target, keep their status and do not run again.
+- The sender's run must stop after a send-back: its step now waits for the target, so a `done` it sends is refused with `409` (unresolved blockers).
+- Agent send-backs on one edge are capped by the step's `maxSendBacks` (default 2), counted since the last board send-back. Past the cap nothing is sent back; the sending step gets a board-owned block, which the board sees in its blocked attention and only a person can lift. A board send-back is never capped and resets the count.
 
 Caveats:
 

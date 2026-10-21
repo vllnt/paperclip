@@ -29,6 +29,9 @@ import {
   resolveIssueRecoveryActionSchema,
   reconcileIssueExecutionSchema,
   restoreIssueDocumentRevisionSchema,
+  routineStepSendBackRequestSchema,
+  type RoutineStepRun,
+  type RoutineStepSendBackResult,
   updateIssueSchema,
   updateIssueWorkProductSchema,
   type Issue,
@@ -158,6 +161,11 @@ interface IssueCommentOptions extends BaseClientOptions {
   attachmentId?: string[];
   reopen?: boolean;
   resume?: boolean;
+}
+
+interface IssueSendBackOptions extends BaseClientOptions {
+  to: string;
+  body: string;
 }
 
 interface IssueCommentListOptions extends BaseClientOptions {
@@ -585,6 +593,48 @@ export function registerIssueCommands(program: Command): void {
           });
           const comment = await ctx.api.post<IssueComment>(apiPath`/api/issues/${issueId}/comments`, payload);
           printOutput(comment, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("routine-step")
+      .description(
+        "Show the run of a routine step: each step's status, the steps this one can send work back to with their rounds, and the run's send-backs",
+      )
+      .argument("<issueId>", "A step of a routine run")
+      .action(async (issueId: string, opts: BaseClientOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const run = await ctx.api.get<RoutineStepRun>(apiPath`/api/issues/${issueId}/routine-step`);
+          printOutput(run, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    issue
+      .command("send-back")
+      .description(
+        "Send a routine step's work back to an earlier step of its run: the earlier step reopens with its agent, and this step waits for it again",
+      )
+      .argument("<issueId>", "The routine step that sends its work back")
+      .requiredOption("--to <stepKey>", "The earlier step that takes the work back; one of this step's sendBackTo")
+      .requiredOption("--body <text>", "What the earlier step must fix")
+      .action(async (issueId: string, opts: IssueSendBackOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const payload = routineStepSendBackRequestSchema.parse({ toStepKey: opts.to, comment: opts.body });
+          const result = await ctx.api.post<RoutineStepSendBackResult>(
+            apiPath`/api/issues/${issueId}/routine-step/send-back`,
+            payload,
+          );
+          printOutput(result, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }
