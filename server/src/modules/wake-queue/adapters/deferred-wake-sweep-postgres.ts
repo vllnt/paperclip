@@ -38,6 +38,8 @@ export type OrphanedDeferredWakeRow = OrphanedDeferredWake & {
   issueAssigneeAgentId: string | null;
   /** The reason the wake was requested for: the parked context's `wakeReason`, else the row's reason. */
   wakeReason: string | null;
+  /** The wake delivers saved input, so it is never superseded or folded; see `carriesSavedInput`. */
+  carriesSavedInput: boolean;
 };
 
 /** The wake's reason: the parked context's `wakeReason`, else the row's reason. */
@@ -55,7 +57,7 @@ const parkedWakeReason = (wake: { payload: AnyPgColumn; reason: AnyPgColumn }) =
  * - a message held for execution recovery (`executionWait`);
  * - a completed child (`issue_children_completed`), whose payload names the
  *   child and its summary.
- * Such a wake is never folded into another run.
+ * Such a wake is never folded into another run, and never closed as superseded.
  */
 const carriesSavedInput = (wake: { payload: AnyPgColumn; reason: AnyPgColumn; requestedByActorType: AnyPgColumn }) =>
   sql<boolean>`(
@@ -118,6 +120,7 @@ export async function listOrphanedDeferredWakes(
       projectId: issues.projectId,
       issueAssigneeAgentId: issues.assigneeAgentId,
       wakeReason: parkedWakeReason(agentWakeupRequests),
+      carriesSavedInput: carriesSavedInput(agentWakeupRequests),
     })
     .from(agentWakeupRequests)
     .innerJoin(

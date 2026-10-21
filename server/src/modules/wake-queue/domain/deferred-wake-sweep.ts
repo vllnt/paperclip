@@ -71,20 +71,29 @@ export type DeferredWakeDisposition =
   /** Re-deliver it through ordinary admission. */
   | "promote"
   /** An assignee wake for an agent that no longer holds the issue: close it, never run it. */
-  | "superseded";
+  | "superseded"
+  /**
+   * The same, but the wake carries saved input (for example a person's
+   * comment). Leave it parked: the new assignee's admission adopts its saved
+   * comments, and the release drain cancels it once the new assignee has run.
+   */
+  | "keptForHandoff";
 
 export type DeferredWakeDispositionFacts = {
   agentId: string;
   /** The reason the wake was requested for (the parked context's `wakeReason`, else the row's reason). */
   wakeReason: string | null;
   issueAssigneeAgentId: string | null;
+  /** The wake delivers saved input; see `carriesSavedInput` in the Postgres adapter. */
+  carriesSavedInput: boolean;
 };
 
 /**
  * Decides whether an orphaned parked wake may still run. An assignee wake
  * whose agent lost the issue is superseded: the new assignee got its own
  * wake, and this one could not check the issue out. It is closed with its
- * reason instead of started. Every other wake is promoted, however long it
+ * reason instead of started, unless it carries saved input, which is left
+ * parked for the handoff. Every other wake is promoted, however long it
  * waited: closing an old wake on an open issue could leave assigned work with
  * no run, because the stranded-issue recovery does not dispatch every such
  * issue again.
@@ -95,7 +104,7 @@ export function decideDeferredWakeDisposition(wake: DeferredWakeDispositionFacts
     ASSIGNEE_WAKE_REASONS.has(wake.wakeReason) &&
     wake.issueAssigneeAgentId !== wake.agentId
   ) {
-    return "superseded";
+    return wake.carriesSavedInput ? "keptForHandoff" : "superseded";
   }
   return "promote";
 }

@@ -193,10 +193,11 @@ describe("selectDeferredWakesToPromote", () => {
 });
 
 describe("decideDeferredWakeDisposition", () => {
-  const facts = (input: { wakeReason?: string | null; assignee?: string | null } = {}) => ({
+  const facts = (input: { wakeReason?: string | null; assignee?: string | null; carriesSavedInput?: boolean } = {}) => ({
     agentId: "agent-a",
     wakeReason: input.wakeReason === undefined ? "issue_assigned" : input.wakeReason,
     issueAssigneeAgentId: input.assignee === undefined ? "agent-a" : input.assignee,
+    carriesSavedInput: input.carriesSavedInput ?? false,
   });
 
   it("promotes a wake for the current assignee", () => {
@@ -208,6 +209,15 @@ describe("decideDeferredWakeDisposition", () => {
       expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: "agent-b" }))).toBe("superseded");
     }
     expect(decideDeferredWakeDisposition(facts({ assignee: null }))).toBe("superseded");
+  });
+
+  it("keeps a former assignee's wake that carries saved input parked for the handoff instead of closing it", () => {
+    for (const wakeReason of ["issue_commented", "issue_reopened_via_comment", "issue_assigned"]) {
+      expect(decideDeferredWakeDisposition(facts({ wakeReason, assignee: "agent-b", carriesSavedInput: true }))).toBe(
+        "keptForHandoff",
+      );
+    }
+    expect(decideDeferredWakeDisposition(facts({ wakeReason: "issue_commented", carriesSavedInput: true }))).toBe("promote");
   });
 
   it("still delivers a wake that addresses a non-assignee on purpose", () => {

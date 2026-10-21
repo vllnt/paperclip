@@ -3046,6 +3046,7 @@ registry.registerPath({
           ),
           awaitingConsent: z.number().int().nonnegative(),
           declined: z.number().int().nonnegative(),
+          expired: z.number().int().nonnegative(),
           cancelled: z.number().int().nonnegative(),
           settled: z.number().int().nonnegative(),
           canDismiss: z.boolean(),

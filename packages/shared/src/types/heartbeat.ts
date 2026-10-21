@@ -392,6 +392,8 @@ export interface DeferredWakeSweepCounters {
   retired: number;
   /** An assignee wake for an agent that no longer holds the issue: closed with a reason, never run. */
   superseded: number;
+  /** The same, but it carries saved input: left parked for the new assignee to adopt, never closed by the sweep. */
+  keptForHandoff: number;
   /** Duplicate parked wakes of the same agent and issue folded into a promoted wake's run. */
   coalesced: number;
   /** Left parked after admission declined to start them yet. */

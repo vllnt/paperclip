@@ -1363,6 +1363,42 @@ describeEmbeddedPostgres("deferred issue-execution wake redelivery", () => {
       expect(await closedActivity(mentionIssueId)).toEqual([]);
     });
 
+    it("keeps a former assignee's wake that carries a person's comment parked for the handoff, and still runs the new assignee", async () => {
+      const companyId = await seedCompany();
+      const formerId = await seedAgent(companyId, { name: "FormerAssignee", maxConcurrentRuns: 3 });
+      const assigneeId = await seedAgent(companyId, { name: "Assignee", maxConcurrentRuns: 3 });
+      const issueId = await seedIssue(companyId, { assigneeAgentId: assigneeId, title: "Reassigned with a saved comment" });
+      const [comment] = await db
+        .insert(issueComments)
+        .values({ companyId, issueId, authorUserId: "board-user", body: "Please also update the changelog." })
+        .returning();
+      const savedWakeId = await seedDeferredWake(companyId, formerId, issueId, {
+        ageMs: 40 * MINUTE_MS,
+        reason: "issue_commented",
+        commentIds: [comment!.id],
+        actor: { type: "user", id: "board-user" },
+      });
+      await seedDeferredWake(companyId, assigneeId, issueId, { ageMs: 30 * MINUTE_MS, reason: "issue_assigned" });
+
+      const pass = await heartbeat.sweepDeferredWakes();
+      await heartbeat.drainActiveRunExecutions();
+
+      expect(pass).toMatchObject({ superseded: 0, keptForHandoff: 1, promoted: 1, failed: 0 });
+      // The sweep left it parked; once the new assignee's run finished, its
+      // release drain handed the saved messages to the current assignee.
+      const saved = await wakeRow(savedWakeId);
+      expect(saved).toMatchObject({ status: "cancelled", runId: null });
+      expect(saved.error).toBe("Deferred task messages now belong to the current assignee");
+      expect(await closedActivity(issueId)).toEqual([]);
+      expect((await heartbeat.getDeferredWakeStats(companyId)).sweep.keptForHandoff).toBe(1);
+      const runs = await runsForIssue(issueId);
+      expect(runs.filter((run) => run.agentId === formerId)).toEqual([]);
+      const assigneeRunReasons = runs
+        .filter((run) => run.agentId === assigneeId)
+        .map((run) => (run.contextSnapshot as Record<string, unknown> | null)?.wakeReason);
+      expect(assigneeRunReasons).toContain("issue_assigned");
+    });
+
     it("folds an agent's duplicate parked signal wakes on one issue into the promoted wake's run", async () => {
       const companyId = await seedCompany();
       const agentId = await seedAgent(companyId, { name: "Reviewer", maxConcurrentRuns: 3 });

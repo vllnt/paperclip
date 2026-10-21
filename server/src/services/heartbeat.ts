@@ -10049,6 +10049,7 @@ function deferredWakeCountersForCompany(companyId: string): DeferredWakeSweepCou
       promoted: 0,
       retired: 0,
       superseded: 0,
+      keptForHandoff: 0,
       coalesced: 0,
       stillDeferred: 0,
       skippedHeld: 0,
@@ -22140,6 +22141,7 @@ export function heartbeatService(
       promoted: 0,
       retired: 0,
       superseded: 0,
+      keptForHandoff: 0,
       coalesced: 0,
       stillDeferred: 0,
       skippedHeld: 0,
@@ -22181,12 +22183,19 @@ export function heartbeatService(
     }
 
     // Close what must not run before anything is chosen: an assignee wake
-    // whose agent no longer holds the issue. Every other wake runs, however
-    // long it waited.
+    // whose agent no longer holds the issue. One that carries saved input stays
+    // parked for the new assignee's admission to adopt, at the back of the
+    // recheck window. Every other wake runs, however long it waited.
     const runnableOrphans: OrphanedDeferredWakeRow[] = [];
+    const keptForHandoff: OrphanedDeferredWakeRow[] = [];
     for (const orphan of orphans) {
-      if (decideDeferredWakeDisposition(orphan) === "promote") {
+      const disposition = decideDeferredWakeDisposition(orphan);
+      if (disposition === "promote") {
         runnableOrphans.push(orphan);
+        continue;
+      }
+      if (disposition === "keptForHandoff") {
+        keptForHandoff.push(orphan);
         continue;
       }
       const counters = countersForCompany(orphan.companyId);
@@ -22200,6 +22209,14 @@ export function heartbeatService(
         counters.failed += 1;
         logger.warn({ err, queueId: orphan.wakeId }, "failed to close a superseded parked deferred wake");
       }
+    }
+    if (keptForHandoff.length > 0) {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        inArray(agentWakeupRequests.id, keptForHandoff.map((orphan) => orphan.wakeId)),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      for (const orphan of keptForHandoff) countersForCompany(orphan.companyId).keptForHandoff += 1;
+      result.keptForHandoff = keptForHandoff.length;
     }
 
     // Agent facts for the whole batch: the agents and each company's org rows
@@ -22320,8 +22337,15 @@ export function heartbeatService(
           heldReasons.set(candidate.wakeId, { reason: "budget_stop", blocker: null });
           continue;
         }
-        // Only wakes requested before the promotion started may be folded into its run.
-        const promotionStartedAt = new Date();
+        // Only wakes requested before the promotion started may be folded into
+        // its run. `requested_at` is a database time, so the start mark comes
+        // from the database clock too.
+        const promotionStartedAt = await db
+          .select({ now: sql<string>`clock_timestamp()` })
+          .from(agents)
+          .where(eq(agents.id, candidate.agentId))
+          .limit(1)
+          .then((rows) => (rows[0] ? new Date(rows[0].now) : new Date()));
         const { outcome, runId } = await redeliverDeferredWake(candidate);
         result[outcome] += 1;
         counters[outcome] += 1;
