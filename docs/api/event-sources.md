@@ -414,14 +414,14 @@ No event is published for a hidden task, a task of origin `routine_execution`, `
 
 **What happens.** The task is created, then the event is published before the assignee is woken:
 
-- If a trigger matches, the steps are attached to the new task in the same request. The assignee is not woken for the task; the steps without predecessors are. The `201` answer carries the task as it is afterwards.
+- If a trigger matches and its author may assign each step's agent under the task (the same `tasks:assign` decision a manual run asks for its caller), the steps are attached to the new task in the same request. The assignee is not woken for the task; the steps without predecessors are. The `201` answer carries the task as it is afterwards.
 - A task owned by an agent becomes `blocked`; the task of a person keeps its status and only gains blocker edges. The refusals and what happens on failure are in [Start the steps on a task](routines.md#start-the-steps-on-a-task).
 - If nothing matches, or the company has no enabled `event_issue` trigger, nothing changes. In the second case Paperclip does not even create the source or a delivery row.
 - Publishing never fails the create request. If it fails, the failure is logged and recorded on the delivery, and the task gets its normal wake.
 - If the task already has open routine steps when the event is processed (a manual run on it got there first), the event's attach is refused, but the assignee is not woken: the task waits for those steps.
 - Publishing is idempotent per task: the delivery key is derived from the task id, so the same task never starts twice.
 
-**Outcome.** The delivery outcome for a routine is `issue_created` with `issueId` the task, the `runId`, and `note: "steps_attached"`. A task refused by a guard is `failed_permanent` with the guard's message (for example, a task already in progress). A spent budget is `storm_folded` (see [Storm breaker](#storm-breaker)). The run appears in the routine's run history with the task as its linked issue.
+**Outcome.** The delivery outcome for a routine is `issue_created` with `issueId` the task, the `runId`, and `note: "steps_attached"`. A task refused by a guard is `failed_permanent` with the guard's message (for example, a task already in progress, or a task or project that blocks assigning a step's agent to the author of the trigger). A spent budget is `storm_folded` (see [Storm breaker](#storm-breaker)). The run appears in the routine's run history with the task as its linked issue.
 
 **Limits.** Only a board user can set up the trigger (`403` for an agent). The trigger needs a routine with steps and `fallback: false`. A routine gate script that applies to event triggers cannot be combined with it, because the steps start in the create request and cannot wait for a gate.
 
