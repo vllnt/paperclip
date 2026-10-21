@@ -8180,7 +8180,8 @@ export function issueRoutes(
       res.status(400).json({ error: "view must be 'compact' when provided" });
       return;
     }
-    const goalIdFilter = req.query.goalId;
+    // A blank goalId counts as not set, like a blank projectId.
+    const goalIdFilter = req.query.goalId === "" ? undefined : req.query.goalId;
     if (goalIdFilter !== undefined && (typeof goalIdFilter !== "string" || !isUuidLike(goalIdFilter))) {
       res.status(422).json({ error: "goalId must be a UUID" });
       return;
