@@ -225,6 +225,7 @@ Both use the same rules. The task is locked, then checked, and then the steps ar
 | `404` | The task is not in the routine's company, or is hidden |
 | `409` | The task is not in `backlog`, `todo` or `blocked`; it has a checkout, an execution lock or a queued or running heartbeat run; or it already has open routine steps; or (manual run only) the routine changed while the run was starting |
 | `422` | The routine has no steps; the task is a routine run, a routine step or a conversation; or its sub-tasks plus the steps would pass 25 |
+| `403` | The caller may not assign a step's agent under the task: the task or its project blocks the assignment, or the caller lacks `tasks:assign`. A manual run asks this for the caller. An event trigger asks it for the board user who created the trigger, at the time of the event: a trigger without an author, or whose author has left the company or lost the right, fails the delivery with `failed_permanent` and the task stays as it was. |
 
 What happens to the task:
 

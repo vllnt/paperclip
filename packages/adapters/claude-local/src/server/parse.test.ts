@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   claudeModelUsageTotals,
   parseClaudeStreamJson,
+  createClaudeRunLogUsageReader,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
   isClaudeProviderQuotaError,
@@ -666,5 +667,107 @@ describe("parseClaudeStreamJson usage extraction", () => {
     const parsed = parseClaudeStreamJson(`${withoutModelUsage.join("\n")}\n`);
     expect(parsed.usage).toEqual({ inputTokens: 20, outputTokens: 88, cachedInputTokens: 34_108 });
     expect(parsed.costUsd).toBeCloseTo(0.0465983, 7);
+  });
+});
+
+describe("createClaudeRunLogUsageReader", () => {
+  const init = JSON.stringify({ type: "system", subtype: "init", session_id: "sess-1", model: "claude-sonnet-5-5" });
+  const assistant = (id: string | null, usage: Record<string, number> | null) =>
+    JSON.stringify({
+      type: "assistant",
+      session_id: "sess-1",
+      message: { ...(id ? { id } : {}), model: "claude-sonnet-5-5", content: [{ type: "text", text: "x" }], ...(usage ? { usage } : {}) },
+    });
+  const result = (costUsd: number, modelUsage: Record<string, number>) =>
+    JSON.stringify({
+      type: "result",
+      subtype: "success",
+      session_id: "sess-1",
+      result: "done",
+      total_cost_usd: costUsd,
+      modelUsage: { "claude-sonnet-5-5": modelUsage },
+    });
+  const readUsage = (lines: string[]) => {
+    const reader = createClaudeRunLogUsageReader();
+    for (const line of lines) reader.readLine(line);
+    return reader.finish();
+  };
+
+  it("reads the exact totals and the cost from a final result line", () => {
+    const final = result(0.42, { inputTokens: 100, cacheCreationInputTokens: 20, cacheReadInputTokens: 500, outputTokens: 80 });
+    expect(readUsage([init, assistant("m1", { output_tokens: 5 }), final])).toEqual({
+      usage: { inputTokens: 120, outputTokens: 80, cachedInputTokens: 500 },
+      costUsd: 0.42,
+      model: "claude-sonnet-5-5",
+      provider: "anthropic",
+      partial: false,
+    });
+  });
+
+  it("sums the assistant messages of a run that has no result line, one snapshot per message", () => {
+    const lines = [
+      init,
+      assistant("m1", { input_tokens: 10, cache_creation_input_tokens: 100, cache_read_input_tokens: 1_000, output_tokens: 5 }),
+      // The same message again, with the final output count.
+      assistant("m1", { input_tokens: 10, cache_creation_input_tokens: 100, cache_read_input_tokens: 1_000, output_tokens: 40 }),
+      assistant("m2", { input_tokens: 20, cache_read_input_tokens: 1_100, output_tokens: 60 }),
+      "not json at all",
+    ];
+    expect(readUsage(lines)).toEqual({
+      usage: { inputTokens: 130, outputTokens: 100, cachedInputTokens: 2_100 },
+      costUsd: null,
+      model: "claude-sonnet-5-5",
+      provider: "anthropic",
+      partial: true,
+    });
+  });
+
+  it("adds the turn a steered run was in when it was cut to the totals of the last result", () => {
+    const lines = [
+      init,
+      assistant("m1", { input_tokens: 10, output_tokens: 40 }),
+      result(0.1, { inputTokens: 10, cacheReadInputTokens: 0, outputTokens: 40 }),
+      // The mid-run message started a second turn; the stop came before its result line.
+      assistant("m2", { input_tokens: 5, cache_creation_input_tokens: 50, cache_read_input_tokens: 700, output_tokens: 30 }),
+    ];
+    expect(readUsage(lines)).toEqual({
+      usage: { inputTokens: 10 + 5 + 50, outputTokens: 40 + 30, cachedInputTokens: 700 },
+      // The cost of the first turn: the second one has none yet.
+      costUsd: 0.1,
+      model: "claude-sonnet-5-5",
+      provider: "anthropic",
+      partial: true,
+    });
+  });
+
+  it("takes the cumulative totals of the last result of a steered run that finished", () => {
+    const lines = [
+      init,
+      result(0.1, { inputTokens: 10, outputTokens: 40 }),
+      assistant("m2", { input_tokens: 5, output_tokens: 30 }),
+      result(0.25, { inputTokens: 15, outputTokens: 70 }),
+    ];
+    expect(readUsage(lines)).toMatchObject({
+      usage: { inputTokens: 15, outputTokens: 70, cachedInputTokens: 0 },
+      costUsd: 0.25,
+      partial: false,
+    });
+  });
+
+  it("counts every message that has no id, and skips a message that has no usage", () => {
+    expect(readUsage([assistant(null, { output_tokens: 7 }), assistant(null, { output_tokens: 8 }), assistant("m3", null)])?.usage.outputTokens).toBe(15);
+  });
+
+  it("ignores a tool result that mentions usage", () => {
+    const toolResult = JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", content: '{"usage":{"output_tokens":999}}' }] },
+    });
+    expect(readUsage([init, toolResult, assistant("m1", { output_tokens: 4 })])?.usage.outputTokens).toBe(4);
+  });
+
+  it("returns null when the stream holds no usage", () => {
+    expect(readUsage([])).toBeNull();
+    expect(readUsage([init, assistant("m1", null)])).toBeNull();
   });
 });
