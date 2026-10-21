@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Routine } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client";
+import { queryKeys } from "../lib/queryKeys";
 import { RoutineComposerDialog, routineEditPatch, routineComposerDraftFrom } from "./RoutineComposerDialog";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -281,6 +282,7 @@ describe("RoutineComposerDialog", () => {
   });
 
   it("keeps an unsaved new routine across a reopen and drops unsaved edits to a saved one", async () => {
+    projectsListMock.mockResolvedValue([...activeProjects, { id: "project-2", name: "Project Beta", color: null, archivedAt: null }]);
     await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} initialDraft={{ projectId: "project-1" }} />);
     await act(() => typeInto(titleInput(), "Weekly sweep"));
     await rerender(<RoutineComposerDialog companyId="company-1" open={false} onOpenChange={onOpenChange} initialDraft={{ projectId: "project-1" }} />);
@@ -322,6 +324,32 @@ describe("RoutineComposerDialog", () => {
 
     expect(dialog()?.querySelector('[data-selector="Responsible"]')?.getAttribute("data-labels")).toBe("Builder");
     expect(dialog()?.querySelector('[data-selector="Project"]')?.getAttribute("data-labels")).toBe("Project Alpha");
+  });
+
+  it("drops a seeded project the picker does not offer, but keeps one it does", async () => {
+    projectsListMock.mockResolvedValue([...activeProjects, { id: "project-old", name: "Old project", color: null, archivedAt: "2026-01-01T00:00:00.000Z" }]);
+    const projectSelector = () => dialog()?.querySelector('[data-selector="Project"]')?.textContent;
+
+    await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} initialDraft={{ projectId: "project-old" }} />);
+    expect(projectSelector()).toBe("Project");
+
+    await rerender(<RoutineComposerDialog companyId="company-1" open={false} onOpenChange={onOpenChange} initialDraft={{ projectId: "project-gone" }} />);
+    await rerender(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} initialDraft={{ projectId: "project-gone" }} />);
+    expect(projectSelector()).toBe("Project");
+
+    await rerender(<RoutineComposerDialog companyId="company-1" open={false} onOpenChange={onOpenChange} initialDraft={{ projectId: "project-1" }} />);
+    await rerender(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} initialDraft={{ projectId: "project-1" }} />);
+    expect(projectSelector()).toBe("project-1");
+  });
+
+  it("keeps a seeded project that only a refreshed project list contains", async () => {
+    queryClient.setQueryData(queryKeys.projects.list("company-1", { includeArchived: true }), []);
+    const projectSelector = () => dialog()?.querySelector('[data-selector="Project"]')?.textContent;
+
+    await render(<RoutineComposerDialog companyId="company-1" open onOpenChange={onOpenChange} initialDraft={{ projectId: "project-1" }} />);
+
+    expect(projectsListMock).toHaveBeenCalled();
+    expect(projectSelector()).toBe("project-1");
   });
 
   it("fetches nothing while closed and loads its lists once opened", async () => {

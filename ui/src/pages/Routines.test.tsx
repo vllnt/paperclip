@@ -1003,6 +1003,28 @@ describe("Routines page", () => {
     });
   });
 
+  it("opens the composer without the project when the link names an archived one", async () => {
+    currentSearch = "new=1&projectId=project-archived";
+    routinesListMock.mockResolvedValue([]);
+    issuesListMock.mockResolvedValue([]);
+
+    const root = await renderRoutines(<Routines />);
+    await act(async () => {
+      await flush();
+    });
+
+    const projectSelector = inlineEntitySelectorRenderMock.mock.calls.map(([props]) => props).filter((props) => {
+      const ids = (props.options ?? []).map((option) => option.id);
+      return ids.includes("project-1") && ids.includes("project-2");
+    }).at(-1);
+    expect(projectSelector?.options?.map((option) => option.id)).not.toContain("project-archived");
+    expect(projectSelector?.value).toBe("");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("embedded: ignores a New routine link on the host page", async () => {
     currentSearch = "new=1&projectId=project-1";
     routinesListMock.mockResolvedValue([]);
