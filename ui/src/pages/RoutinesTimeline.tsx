@@ -8,7 +8,7 @@
  * Both views read `GET /companies/:companyId/routines/timeline`; the chart is the work timeline chart.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { CalendarClock, ChevronLeft, ChevronRight, Minus, Plus, RefreshCw, RotateCcw } from "lucide-react";
 import type { RoutineTimelineResult, WorkTimelineSpan } from "@paperclipai/shared";
 import { routinesApi } from "@/api/routines";
@@ -275,6 +275,8 @@ export function RoutinesTimeline() {
     queryKey: queryKeys.routines.timeline(selectedCompanyId ?? "", from, to),
     queryFn: ({ signal }) => routinesApi.timeline(selectedCompanyId!, { from, to }, { signal }),
     enabled: !!selectedCompanyId,
+    // Moving the window keeps the chart on screen until the next window arrives.
+    placeholderData: keepPreviousData,
   });
 
   const setView = (next: string) => {
