@@ -114,9 +114,11 @@ import {
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
+import { authorizationService } from "./authorization.js";
 import {
   LIVE_HEARTBEAT_RUN_STATUSES,
   ROUTINE_STEP_ACTOR_ID,
+  assertActorMayAssignSteps,
   assertRoutineStepReferences,
   attachRoutineStepsToIssue,
   createRoutineRunIssues,
@@ -2226,6 +2228,18 @@ export function routineService(
     resolveResponsibleUserId: async (executor, routine) =>
       (await resolveLatestRevisionResponsibleUserId(executor, routine)) ?? routine.responsibleUserId ?? null,
     gateApplies: (routine) => routineGateAppliesToSource(routine.gate, "event"),
+    assertStepsAssignable: async (routine, task, authorUserId, executor) => {
+      if (!authorUserId) {
+        throw new EventDispatchError("The trigger has no author to assign the routine's steps as", "permanent");
+      }
+      await assertActorMayAssignSteps({
+        authorization: authorizationService(executor),
+        actor: { type: "board", userId: authorUserId },
+        task,
+        steps: routine.steps ?? [],
+        defaultAssigneeAgentId: routine.assigneeAgentId,
+      });
+    },
     assertStepsCanStart: (routine, task, executor) =>
       assertStartingStepAgentsAdmitted(executor, routine, routine.assigneeAgentId, task.projectId),
     onGating: (runId) => kickGate(runId),
