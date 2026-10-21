@@ -8,12 +8,14 @@ import {
   routineStepMaxSendBacks,
   routineStepSendBackLoopKeys,
   type IssueComment,
+  type RoutineStepRun,
   type RoutineStepSendBack,
   type RoutineStepSendBackResult,
 } from "@paperclipai/shared";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { executeIssuePostCommitActions, issueService, type IssuePostCommitAction } from "./issues.js";
+import { isHumanOwnedBlock } from "./routable-blocked.js";
 
 /** Statuses a step may send its work back from: it is being worked on or waits. */
 const SENDABLE_STEP_STATUSES: readonly string[] = ["todo", "in_progress", "blocked"];
@@ -57,6 +59,61 @@ function commentAuthor(actor: RoutineStepSendBackActor) {
   return actor.actorType === "agent"
     ? { author: { agentId: actor.agentId, runId: actor.runId }, options: {} }
     : { author: { userId: actor.userId, runId: null }, options: { authorType: "user" as const } };
+}
+
+/**
+ * The run of a routine step: every step with its task's status now, the steps this one may send work
+ * back to with their rounds, and the run's send-backs. Null when the issue is not a step of a run with
+ * steps.
+ */
+export async function getRoutineStepRun(db: Db, companyId: string, issueId: string): Promise<RoutineStepRun | null> {
+  const step = await db
+    .select({ id: issues.id, originKind: issues.originKind, originRunId: issues.originRunId, parentId: issues.parentId })
+    .from(issues)
+    .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!step || step.originKind !== "routine_step" || !step.originRunId || !step.parentId) return null;
+  const run = await db
+    .select({ id: routineRuns.id, routineId: routineRuns.routineId, triggerPayload: routineRuns.triggerPayload })
+    .from(routineRuns)
+    .where(and(eq(routineRuns.id, step.originRunId), eq(routineRuns.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  const recorded = run ? readRoutineStepsRunPayload(run.triggerPayload) : null;
+  const stepKey = recorded
+    ? Object.entries(recorded.stepIssueIds).find(([, id]) => id === step.id)?.[0]
+    : undefined;
+  const definition = stepKey ? recorded?.steps.find((entry) => entry.key === stepKey) : undefined;
+  if (!run || !recorded || !stepKey || !definition) return null;
+
+  const rows = await db
+    .select({ id: issues.id, identifier: issues.identifier, title: issues.title, status: issues.status, hiddenAt: issues.hiddenAt })
+    .from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, Object.values(recorded.stepIssueIds))));
+  const byId = new Map(rows.filter((row) => !row.hiddenAt).map((row) => [row.id, row]));
+  const maxSendBacks = routineStepMaxSendBacks(definition);
+  return {
+    routineId: run.routineId,
+    routineRunId: run.id,
+    rootIssueId: step.parentId,
+    stepKey,
+    steps: recorded.steps.map((entry) => {
+      const row = byId.get(recorded.stepIssueIds[entry.key] ?? "");
+      return {
+        key: entry.key,
+        issueId: row?.id ?? null,
+        identifier: row?.identifier ?? null,
+        title: row?.title ?? entry.title,
+        status: row?.status ?? null,
+      };
+    }),
+    sendBackTo: (definition.sendBackTo ?? []).map((toStepKey) => ({
+      stepKey: toStepKey,
+      issueId: byId.get(recorded.stepIssueIds[toStepKey] ?? "")?.id ?? null,
+      rounds: countRoutineStepSendBackRounds(recorded.sendBacks, stepKey, toStepKey),
+      maxSendBacks,
+    })),
+    sendBacks: recorded.sendBacks,
+  };
 }
 
 /** The board-facing text of the block a capped send-back leaves on the sending step. */
@@ -156,6 +213,13 @@ export async function sendBackRoutineStep(db: Db, input: SendBackRoutineStepInpu
         `Step "${fromStepKey}" is ${lockedSender?.status ?? "gone"}; a step sends work back while it is ${SENDABLE_STEP_STATUSES.join(", ")}`,
         { stepKey: fromStepKey, status: lockedSender?.status ?? null },
       );
+    }
+    // After a cap the board owns the step; a retry by its agent must not post or record again.
+    if (input.actor.actorType === "agent" && isHumanOwnedBlock(lockedSender)) {
+      throw conflict(`Step "${fromStepKey}" waits for the board; only the board can send its work back now`, {
+        stepKey: fromStepKey,
+        unblockDescriptor: lockedSender.unblockDescriptor,
+      });
     }
     for (const key of [toStepKey, ...loopKeys.filter((key) => key !== fromStepKey)]) {
       const status = byId.get(recorded.stepIssueIds[key] ?? "")?.status ?? null;

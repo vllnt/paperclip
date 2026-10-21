@@ -441,7 +441,11 @@ npx paperclipai issue heartbeat-context <issue-id>
 npx paperclipai issue checkout <issue-id> --agent-id <agent-id> [--expected-statuses todo,backlog,blocked]
 npx paperclipai issue release <issue-id>
 npx paperclipai issue force-release <issue-id>
+npx paperclipai issue routine-step <step-issue-id>
+npx paperclipai issue send-back <step-issue-id> --to <step-key> --body "What to fix"
 ```
+
+`issue send-back` sends the work of a routine step back to an earlier step of its run, one the step names in `sendBackTo`. The earlier step reopens with its agent, which resumes its session, and the steps between them wait for it again. The step's agent or a board user may call it. An agent past the step's `maxSendBacks` gets a 409, and the step goes to the board; until the board acts, the agent's further send-backs get a 409 too. `issue routine-step` shows the run: each step's status, the steps this one can send work back to with the rounds used, and the run's send-backs.
 
 Issue subresources are exposed as Paperclip API wrappers. Commands that map to broad server schemas accept JSON payloads and validate them with shared schemas before sending.
 

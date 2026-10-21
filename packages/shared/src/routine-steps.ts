@@ -303,6 +303,37 @@ export interface RoutineStepSendBackResult {
   commentId: string;
 }
 
+/** One step of a run as its task stands now; the task is null when it is gone or hidden. */
+export interface RoutineStepRunStep {
+  key: string;
+  issueId: string | null;
+  identifier: string | null;
+  title: string;
+  status: string | null;
+}
+
+/** A step the viewed step may send its work back to, and how many of its rounds count so far. */
+export interface RoutineStepRunSendBackTarget {
+  stepKey: string;
+  issueId: string | null;
+  rounds: number;
+  maxSendBacks: number;
+}
+
+/** The run of one routine step, as `GET /issues/{id}/routine-step` returns it. */
+export interface RoutineStepRun {
+  routineId: string;
+  routineRunId: string;
+  rootIssueId: string;
+  /** The viewed step. */
+  stepKey: string;
+  /** Every step of the run, in the routine's order. */
+  steps: RoutineStepRunStep[];
+  sendBackTo: RoutineStepRunSendBackTarget[];
+  /** Send-backs of the run, oldest first. */
+  sendBacks: RoutineStepSendBack[];
+}
+
 /** What a run with steps records in its trigger payload, so the run stays self-contained. */
 export const routineStepsRunPayloadSchema = z.object({
   steps: z.array(routineStepSchema),

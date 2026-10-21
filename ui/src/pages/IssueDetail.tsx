@@ -220,6 +220,7 @@ import {
   IssueMonitorComposerStrip,
   hasVisibleMonitorSurface,
 } from "../components/IssueMonitorBanner";
+import { RoutineStepRunPanel } from "../components/RoutineStepRunPanel";
 import { IssueScheduledRetryCard } from "../components/IssueScheduledRetryCard";
 import { ExternallyConnectedTaskBanner } from "../components/chat/ExternallyConnectedTaskBanner";
 import {
@@ -7517,6 +7518,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         onCheckNow={() => checkIssueMonitorNow.mutate()}
         checkingNow={checkIssueMonitorNow.isPending}
       />
+
+      {issue.originKind === "routine_step" ? (
+        <RoutineStepRunPanel issueId={issue.id} companyId={issue.companyId} onSentBack={invalidateIssueDetail} />
+      ) : null}
 
       {taskChatShellEnabled ? null : (
         <InlineEditor

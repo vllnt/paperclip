@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { RoutineStep } from "@paperclipai/shared";
 import {
   addRoutineStep,
+  canRoutineStepSendBackTo,
   canRoutineStepWaitFor,
   nextRoutineStepKey,
   removeRoutineStep,
@@ -9,6 +10,7 @@ import {
   routineStepsEqual,
   routineStepsIssues,
   toggleRoutineStepPredecessor,
+  toggleRoutineStepSendBack,
   updateRoutineStep,
 } from "./routine-steps";
 
@@ -81,5 +83,32 @@ describe("routine step helpers", () => {
     expect(routineStepsIssues([step("a"), step("a")])).toContain('Duplicate step key "a"');
     expect(routineStepsIssues([step("a", ["ghost"])])).toContain('Step "a" waits for unknown step "ghost"');
     expect(routineStepsIssues([{ ...step("a"), title: "" }]).length).toBeGreaterThan(0);
+  });
+
+  it("offers only the steps a step waits for as send-back targets and toggles them", () => {
+    const steps = [step("implement"), step("review", ["implement"]), step("qa", ["review"]), step("docs", ["implement"])];
+    expect(canRoutineStepSendBackTo(steps, "qa", "implement")).toBe(true);
+    expect(canRoutineStepSendBackTo(steps, "qa", "review")).toBe(true);
+    expect(canRoutineStepSendBackTo(steps, "qa", "docs")).toBe(false);
+    expect(canRoutineStepSendBackTo(steps, "implement", "qa")).toBe(false);
+
+    const added = toggleRoutineStepSendBack(steps, "qa", "implement");
+    expect(added[2]).toMatchObject({ key: "qa", sendBackTo: ["implement"] });
+    const capped = updateRoutineStep(added, "qa", { maxSendBacks: 3 });
+    const removed = toggleRoutineStepSendBack(capped, "qa", "implement");
+    expect(removed[2]).toEqual(step("qa", ["review"]));
+  });
+
+  it("keeps send-back targets in step with renames, removals and starts-after changes", () => {
+    const steps = toggleRoutineStepSendBack(
+      [step("implement"), step("review", ["implement"]), step("qa", ["review"])],
+      "qa",
+      "implement",
+    );
+    expect(renameRoutineStepKey(steps, "implement", "build")[2]!.sendBackTo).toEqual(["build"]);
+    // Without review, qa no longer waits for implement, so it cannot send work back to it.
+    expect(removeRoutineStep(steps, "review")[1]).toEqual(step("qa"));
+    expect(toggleRoutineStepPredecessor(steps, "qa", "review")[2]).toEqual(step("qa"));
+    expect(routineStepsIssues(steps)).toEqual([]);
   });
 });

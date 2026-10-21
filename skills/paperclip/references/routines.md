@@ -297,6 +297,8 @@ Use `steps` when the same multi-stage work repeats (for example implement, revie
 | `description` | no | Task instructions in Markdown. `{{variables}}` and `skill://` mentions work |
 | `assigneeAgentId` | no | Agent for the step. Defaults to the run's agent: the `assigneeAgentId` of the run request, else the routine's agent. An agent can name only itself in a run of a routine with steps. Every step needs an agent, so validation fails when it has neither |
 | `after` | no | Keys of the steps it waits for. Empty means it starts with the run |
+| `sendBackTo` | no | Keys of steps it waits for (directly or through other steps) that its agent may send the work back to. See "Sending work back" |
+| `maxSendBacks` | no | How many times the step's agent may send work back to each of them (1 to 10, default 2) |
 | `executionPolicy` | no | Review or approval stages for this step, as on any task |
 | `labelIds` | no | Labels of the company |
 | `priority` | no | Defaults to the routine's priority |
@@ -307,7 +309,7 @@ Use `steps` when the same multi-stage work repeats (for example implement, revie
 - The run's task, in status `blocked` and not woken at the start.
 - One child task per step (origin kind `routine_step`), `todo` when it has no `after` and `blocked` by its predecessors otherwise. Steps are created in layers: steps with nothing to wait for first, then the steps whose predecessors are all created, each layer in the order written.
 - Only the steps with no predecessors are woken. Each step that finishes wakes the steps that were waiting for it. The run's task is woken once, after the last step is done, to wrap up.
-- The run records `routineSteps` (`steps` and `stepIssueIds`) in its trigger payload, so editing the routine never changes a run in flight. The `routineSteps` and `targetIssueId` keys are reserved: a trigger payload you send with either key loses it (send `targetIssueId` as a field of the run request instead). Cancel the run's task with the tree control (the task and its sub-tasks) to stop the whole tree and free the routine.
+- The run records `routineSteps` (`steps`, `stepIssueIds` and `sendBacks`) in its trigger payload, so editing the routine never changes a run in flight. The `routineSteps` and `targetIssueId` keys are reserved: a trigger payload you send with either key loses it (send `targetIssueId` as a field of the run request instead). Cancel the run's task with the tree control (the task and its sub-tasks) to stop the whole tree and free the routine.
 
 **A cancelled step.** A cancelled step never counts as done: the steps that wait for it, and the run's task, stay `blocked`. Nothing cascades, so a person decides. When every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled* and no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run with another branch still running stays live. When the run's task is next updated, a stalled run is recorded as `failed`. Clean up a stalled run by cancelling its task with the tree control.
 
@@ -317,7 +319,23 @@ Use `steps` when the same multi-stage work repeats (for example implement, revie
 
 **Skills.** A step description can mention a company skill with a Markdown link whose target is `skill://<skillId>` (the editor inserts it). The step's agent gets that skill for the run. Mentions apply on adapters that sync skills and on `paperclip_runner`; they are ignored on `cursor_cloud`, `openclaw_gateway`, `http` and `process`.
 
-**Review loops.** To implement, review, fix and re-review, put the review on the step being reviewed as an `executionPolicy` review stage. Do not add a separate review step. The loop stays on one task, bounded by `maxReviewRounds` (default 3). Sessions are stored per agent, adapter and task, and `execution_review_requested` and `execution_changes_requested` wakes do not reset the session, so the reviewer and the implementer each resume their own session between rounds. Caveats: `execution_approval_requested` and `issue_assigned` wakes start a fresh session, session resume only works on adapters with a session codec (claude, codex, cursor, gemini, grok, hermes, kimi, opencode, pi), and a separate review step cannot send work back to an earlier step, so use separate steps for one-shot or parallel lens reviews.
+**Review loops.** To implement, review, fix and re-review, put the review on the step being reviewed as an `executionPolicy` review stage. Do not add a separate review step. The loop stays on one task, bounded by `maxReviewRounds` (default 3). Sessions are stored per agent, adapter and task, and `execution_review_requested` and `execution_changes_requested` wakes do not reset the session, so the reviewer and the implementer each resume their own session between rounds. Caveats: `execution_approval_requested` and `issue_assigned` wakes start a fresh session, session resume only works on adapters with a session codec (claude, codex, cursor, gemini, grok, hermes, kimi, opencode, pi). Use separate steps for one-shot or parallel lens reviews, and a separate step with `sendBackTo` when that step must be able to send the work back.
+
+**Sending work back.** A step can send its work back to an earlier step of the same run when that step is in its `sendBackTo`, for example `{ "key": "qa", "title": "QA", "after": ["implement"], "sendBackTo": ["implement"] }`. As the step's agent, while your step is `todo`, `in_progress` or `blocked`:
+
+```
+POST /api/issues/{stepIssueId}/routine-step/send-back
+{ "toStepKey": "implement", "comment": "The retry test fails on an empty response; handle it." }
+```
+
+CLI: `paperclipai issue send-back <stepIssueId> --to implement --body "..."`.
+
+- Your comment is posted on the earlier step. That step goes from `done` to `todo` with its agent, which is woken with `issue_reopened_via_comment` and resumes its own session there.
+- The steps between it and yours, and your own step, go to `blocked` and wake again (`issue_blockers_resolved`) once the earlier step is done again. You resume your session then. Steps off that path, such as a parallel `docs` step that also waits for `implement`, keep their status and do not run again.
+- After a send-back, stop. Do not set your step to `done` in the same run: it now waits for the earlier step, so that answers `409`.
+- Refusals: `422` when `toStepKey` is not in your step's `sendBackTo`; `403` when you are not the step's agent; `409` when your step is not `todo`, `in_progress` or `blocked`, the run's task is closed, or the earlier step or a step between is not `done`.
+- Rounds: an agent may send back to one step `maxSendBacks` times (default 2) before the board decides. One more answers `409` with `details.code` `send_back_cap_reached`. Nothing is sent back: your comment is posted on your step, and the step is blocked for the board, which sees it in its blocked attention. Do not retry, since further send-backs answer `409` until the board acts. The board can send the work back again (that resets the count), finish the step, or cancel the run.
+- Read the run with `GET /api/issues/{stepIssueId}/routine-step` (CLI `paperclipai issue routine-step <stepIssueId>`): each step's status, your send-back targets with the rounds used, and the run's send-backs.
 
 **Example.** Implement, review on the same task, two parallel checks, then a join:
 
@@ -345,7 +363,7 @@ With the CLI, keep the array in a file and pass it with `paperclipai routine cre
 
 **Limits.**
 
-- At most 25 steps. Keys must be unique, `after` must name other steps, and there can be no cycles.
+- At most 25 steps. Keys must be unique, `after` must name other steps, and there can be no cycles. `sendBackTo` may name only steps the step waits for, each once.
 - Every step needs an agent, and agents and labels must belong to the company.
 - You need permission to assign tasks to write steps, and an agent can only assign steps to itself. An agent restoring a revision with steps follows the same rule, and a low-trust agent can restore only steps that already carry its containment (`403` otherwise).
 - Routine environment variables and secrets apply to the run's task only. Step agents do not inherit them.

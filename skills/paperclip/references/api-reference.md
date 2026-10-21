@@ -1496,6 +1496,8 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/routines/:routineId/run` | Manual run (bypasses schedule; concurrency policy still applies). `targetIssueId` (UUID) starts the routine's steps on that existing task: `202` with the run and `warnings`; `404` task not in the company, `409` task busy (status not backlog/todo/blocked, live run, open steps) or the routine was edited while the run started (send it again), `422` no steps or task refused. CLI `routine run <id> --target-issue <uuid-or-identifier>` |
 | POST   | `/api/routine-triggers/public/:publicId/fire` | Fire webhook trigger from external system |
 | GET    | `/api/routines/:routineId/runs` | Run history (default 50) |
+| GET    | `/api/issues/:issueId/routine-step` | The run of a routine step: each step's status, the steps it can send work back to with the rounds used, and the run's send-backs (`404` when the task is not a step). CLI `issue routine-step <id>` |
+| POST   | `/api/issues/:issueId/routine-step/send-back` | Send a step's work back to an earlier step in its `sendBackTo` (`{ toStepKey, comment }`; the step's agent or a board user). The earlier step reopens and resumes its session; the steps between and this one wait again. `409` with `details.code` `send_back_cap_reached` past `maxSendBacks`; see `references/routines.md` Sending work back. CLI `issue send-back <id> --to <key> --body <text>` |
 | GET    | `/api/routines/:routineId/event-groups` | Alert groups of a routine with `event` triggers (`?open=true` default, `?limit=`) |
 
 ### Event Sources

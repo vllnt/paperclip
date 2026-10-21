@@ -241,6 +241,10 @@ describeEmbeddedPostgres("routine step send-back", () => {
     return call.send(body);
   }
 
+  function readStepRun(companyId: string, issueId: string) {
+    return request(app).get(`/api/issues/${issueId}/routine-step`).set("x-test-company-id", companyId);
+  }
+
   function patchIssue(companyId: string, issueId: string, body: Record<string, unknown>, actor: { agentId: string; runId: string }) {
     return request(app)
       .patch(`/api/issues/${issueId}`)
@@ -401,10 +405,30 @@ describeEmbeddedPostgres("routine step send-back", () => {
       agentId: fx.ids.tester,
     });
     expect(agentRetry.status).toBe(409);
+    expect(agentRetry.body.error).toContain("waits for the board");
+    const qaComments = await db.select().from(issueComments).where(eq(issueComments.issueId, fx.issueOf("qa")));
+    expect(qaComments.filter((comment) => comment.body === "Once more")).toEqual([]);
 
     const board = await sendBack(fx.companyId, fx.issueOf("qa"), { toStepKey: "implement", comment: "One more try" });
     expect(board.status).toBe(200);
     expect(board.body).toMatchObject({ outcome: "sent_back", rounds: 0 });
+    const view = await readStepRun(fx.companyId, fx.issueOf("qa"));
+    expect(view.status).toBe(200);
+    expect(view.body).toMatchObject({
+      routineRunId: fx.routineRunId,
+      rootIssueId: fx.rootId,
+      stepKey: "qa",
+      steps: [
+        { key: "implement", issueId: fx.issueOf("implement"), status: "todo" },
+        { key: "qa", issueId: fx.issueOf("qa"), status: "blocked" },
+      ],
+      sendBackTo: [{ stepKey: "implement", issueId: fx.issueOf("implement"), rounds: 0, maxSendBacks: 1 }],
+    });
+    expect(view.body.sendBacks.map((entry: { actorType: string; outcome: string }) => [entry.actorType, entry.outcome])).toEqual([
+      ["agent", "sent_back"],
+      ["agent", "cap_reached"],
+      ["user", "sent_back"],
+    ]);
     const [qaAfter] = await db.select().from(issues).where(eq(issues.id, fx.issueOf("qa")));
     expect(qaAfter).toMatchObject({ status: "blocked", unblockDescriptor: null });
     await settle(fx.companyId);
@@ -428,6 +452,8 @@ describeEmbeddedPostgres("routine step send-back", () => {
 
     const notAStep = await sendBack(fx.companyId, fx.rootId, { toStepKey: "implement", comment: "x" });
     expect(notAStep.status).toBe(422);
+    expect((await readStepRun(fx.companyId, fx.rootId)).status).toBe(404);
+    expect((await readStepRun(fx.companyId, fx.issueOf("docs"))).body.sendBackTo).toEqual([]);
 
     const noComment = await sendBack(fx.companyId, fx.issueOf("qa"), { toStepKey: "implement", comment: " " });
     expect(noComment.status).toBe(400);

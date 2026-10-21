@@ -1,7 +1,7 @@
-import { routineStepsSchema, type RoutineStep } from "@paperclipai/shared";
+import { routineStepAncestorKeys, routineStepsSchema, type RoutineStep } from "@paperclipai/shared";
 
-/** The fields of a step an editor can change; the key has its own rename helper. */
-export type RoutineStepPatch = Partial<Omit<RoutineStep, "key" | "after">>;
+/** The fields of a step an editor can change; the key, `after` and `sendBackTo` have their own helpers. */
+export type RoutineStepPatch = Partial<Omit<RoutineStep, "key" | "after" | "sendBackTo">>;
 
 /** A key no other step uses, in the form the key pattern accepts. */
 export function nextRoutineStepKey(steps: readonly RoutineStep[]): string {
@@ -25,24 +25,47 @@ export function updateRoutineStep(
   return steps.map((step) => (step.key === key ? { ...step, ...patch } : step));
 }
 
+/** Sets `sendBackTo`, dropping it and its round cap when nothing is left. */
+function withSendBackTo(step: RoutineStep, sendBackTo: string[]): RoutineStep {
+  if (sendBackTo.length > 0) return { ...step, sendBackTo };
+  const rest = { ...step };
+  delete rest.sendBackTo;
+  delete rest.maxSendBacks;
+  return rest;
+}
+
+/** Drops every `sendBackTo` entry that no longer names a step its step waits for. */
+function pruneRoutineStepSendBacks(steps: RoutineStep[]): RoutineStep[] {
+  return steps.map((step) => {
+    if (!step.sendBackTo) return step;
+    const earlier = routineStepAncestorKeys(steps, step.key);
+    const kept = step.sendBackTo.filter((key) => earlier.has(key));
+    return kept.length === step.sendBackTo.length ? step : withSendBackTo(step, kept);
+  });
+}
+
 /**
- * Renames a step and every `after` entry that points to it. A key another step
+ * Renames a step and every `after` and `sendBackTo` entry that points to it. A key another step
  * already uses is ignored, so two steps never share one.
  */
 export function renameRoutineStepKey(steps: readonly RoutineStep[], from: string, to: string): RoutineStep[] {
   if (from === to || steps.some((step) => step.key === to)) return [...steps];
+  const rename = (entry: string) => (entry === from ? to : entry);
   return steps.map((step) => ({
     ...step,
-    key: step.key === from ? to : step.key,
-    after: step.after.map((entry) => (entry === from ? to : entry)),
+    key: rename(step.key),
+    after: step.after.map(rename),
+    ...(step.sendBackTo ? { sendBackTo: step.sendBackTo.map(rename) } : {}),
   }));
 }
 
-/** Removes a step and every `after` entry that pointed to it. */
+/** Removes a step and every `after` and `sendBackTo` entry that pointed to it. */
 export function removeRoutineStep(steps: readonly RoutineStep[], key: string): RoutineStep[] {
-  return steps
-    .filter((step) => step.key !== key)
-    .map((step) => ({ ...step, after: step.after.filter((entry) => entry !== key) }));
+  return pruneRoutineStepSendBacks(
+    steps
+      .filter((step) => step.key !== key)
+      .map((step) => ({ ...step, after: step.after.filter((entry) => entry !== key) })),
+  );
 }
 
 /** True when `key` waits for `predecessorKey`, directly or through other steps. */
@@ -67,19 +90,41 @@ export function canRoutineStepWaitFor(steps: readonly RoutineStep[], key: string
   return key !== predecessorKey && !waitsForTransitively(steps, predecessorKey, key);
 }
 
-/** Adds or removes one predecessor of a step. */
+/**
+ * Adds or removes one predecessor of a step. A step that no longer waits for a step it could send
+ * work back to loses that send-back.
+ */
 export function toggleRoutineStepPredecessor(
   steps: readonly RoutineStep[],
   key: string,
   predecessorKey: string,
 ): RoutineStep[] {
+  return pruneRoutineStepSendBacks(
+    steps.map((step) => {
+      if (step.key !== key) return step;
+      const waits = step.after.includes(predecessorKey);
+      return {
+        ...step,
+        after: waits ? step.after.filter((entry) => entry !== predecessorKey) : [...step.after, predecessorKey],
+      };
+    }),
+  );
+}
+
+/** A step may send work back only to a step it waits for, directly or through other steps. */
+export function canRoutineStepSendBackTo(steps: readonly RoutineStep[], key: string, targetKey: string): boolean {
+  return routineStepAncestorKeys(steps, key).has(targetKey);
+}
+
+/** Adds or removes one step that a step may send work back to. */
+export function toggleRoutineStepSendBack(steps: readonly RoutineStep[], key: string, targetKey: string): RoutineStep[] {
   return steps.map((step) => {
     if (step.key !== key) return step;
-    const waits = step.after.includes(predecessorKey);
-    return {
-      ...step,
-      after: waits ? step.after.filter((entry) => entry !== predecessorKey) : [...step.after, predecessorKey],
-    };
+    const current = step.sendBackTo ?? [];
+    return withSendBackTo(
+      step,
+      current.includes(targetKey) ? current.filter((entry) => entry !== targetKey) : [...current, targetKey],
+    );
   });
 }
 

@@ -1,5 +1,10 @@
 import { Plus, X } from "lucide-react";
-import { ISSUE_PRIORITIES, type RoutineStep } from "@paperclipai/shared";
+import {
+  DEFAULT_ROUTINE_STEP_MAX_SEND_BACKS,
+  ISSUE_PRIORITIES,
+  MAX_ROUTINE_STEP_SEND_BACKS,
+  type RoutineStep,
+} from "@paperclipai/shared";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,11 +19,13 @@ import {
 import { cn } from "@/lib/utils";
 import {
   addRoutineStep,
+  canRoutineStepSendBackTo,
   canRoutineStepWaitFor,
   removeRoutineStep,
   renameRoutineStepKey,
   routineStepsIssues,
   toggleRoutineStepPredecessor,
+  toggleRoutineStepSendBack,
   updateRoutineStep,
 } from "../lib/routine-steps";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
@@ -237,6 +244,85 @@ function StepCard({
           <p className="text-xs text-muted-foreground">Nothing selected: this step starts with the run.</p>
         ) : null}
       </div>
+
+      <SendBackSection index={index} step={step} steps={steps} onChange={onChange} />
     </li>
+  );
+}
+
+function SendBackSection({
+  index,
+  step,
+  steps,
+  onChange,
+}: {
+  index: number;
+  step: RoutineStep;
+  steps: RoutineStep[];
+  onChange: (steps: RoutineStep[]) => void;
+}) {
+  const earlier = steps.filter((other) => canRoutineStepSendBackTo(steps, step.key, other.key));
+  const sendsBackTo = new Set(step.sendBackTo ?? []);
+  const capId = `routine-step-${index}-max-send-backs`;
+
+  return (
+    <div className="space-y-1.5">
+      <Label>Can send back to</Label>
+      {earlier.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          Only a step this one waits for can take its work back. Choose one in &ldquo;Starts after&rdquo; first.
+        </p>
+      ) : (
+        <div className="flex flex-wrap gap-2">
+          {earlier.map((other) => {
+            const selected = sendsBackTo.has(other.key);
+            return (
+              <Button
+                key={other.key}
+                type="button"
+                size="sm"
+                variant={selected ? "secondary" : "outline"}
+                aria-pressed={selected}
+                aria-label={`Step ${index + 1} can send work back to ${other.key}`}
+                className="font-mono text-xs"
+                onClick={() => onChange(toggleRoutineStepSendBack(steps, step.key, other.key))}
+              >
+                {other.key}
+              </Button>
+            );
+          })}
+        </div>
+      )}
+      {sendsBackTo.size > 0 ? (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <Label htmlFor={capId} className="text-xs font-normal text-muted-foreground">
+            Rounds per step
+          </Label>
+          <Input
+            id={capId}
+            type="number"
+            inputMode="numeric"
+            min={1}
+            max={MAX_ROUTINE_STEP_SEND_BACKS}
+            className="h-8 w-20"
+            value={step.maxSendBacks ?? DEFAULT_ROUTINE_STEP_MAX_SEND_BACKS}
+            onChange={(event) => {
+              const rounds = Number.parseInt(event.target.value, 10);
+              onChange(
+                updateRoutineStep(steps, step.key, {
+                  maxSendBacks: Number.isNaN(rounds)
+                    ? undefined
+                    : Math.min(MAX_ROUTINE_STEP_SEND_BACKS, Math.max(1, rounds)),
+                }),
+              );
+            }}
+          />
+          <span>
+            The step&apos;s agent sends the work back with a comment; the earlier step reopens, resumes its session,
+            and this step waits for it again. After this many rounds the board decides.
+          </span>
+        </div>
+      ) : null}
+    </div>
   );
 }

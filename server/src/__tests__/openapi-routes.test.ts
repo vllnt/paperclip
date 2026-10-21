@@ -440,6 +440,13 @@ describe("openapi routes", () => {
     expect(sendBack.responses["200"].content["application/json"].schema).toEqual({
       $ref: "#/components/schemas/RoutineStepSendBackResult",
     });
+    const stepRun = res.body.paths["/api/issues/{id}/routine-step"].get;
+    expect(stepRun.responses["200"].content["application/json"].schema).toEqual({
+      $ref: "#/components/schemas/RoutineStepRun",
+    });
+    expect(Object.keys(res.body.components.schemas.RoutineStepRun.properties)).toEqual(
+      expect.arrayContaining(["steps", "sendBackTo", "sendBacks"]),
+    );
     for (const operation of [
       res.body.paths["/api/routines/{id}/run"].post,
       res.body.paths["/api/routines/{id}/triggers"].post,

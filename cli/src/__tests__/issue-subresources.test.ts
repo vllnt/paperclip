@@ -105,6 +105,46 @@ describe("issue subresource commands", () => {
     exit.mockRestore();
   });
 
+  it("sends a routine step's work back to an earlier step", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["issue", "send-back", ISSUE_ID, "--to", "implement", "--body", "The retry test fails."]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`http://localhost:3100/api/issues/${ISSUE_ID}/routine-step/send-back`);
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("POST");
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      toStepKey: "implement",
+      comment: "The retry test fails.",
+    });
+  });
+
+  it("reads the run of a routine step", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await run(["issue", "routine-step", ISSUE_ID]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(`http://localhost:3100/api/issues/${ISSUE_ID}/routine-step`);
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("GET");
+  });
+
+  it("refuses a send-back without a step key it can send to before calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const exit = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`exit ${code}`);
+    }) as never);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(run(["issue", "send-back", ISSUE_ID, "--to", "Implement!", "--body", "x"])).rejects.toThrow();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    exit.mockRestore();
+  });
+
   it("binds explicit uploaded attachments when adding a comment", async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse()));
     vi.stubGlobal("fetch", fetchMock);

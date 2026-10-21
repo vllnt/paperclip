@@ -2,7 +2,7 @@ import { capGoalTextForAgents, heartbeatContextGoal, readCompanyFocusForIssue } 
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import { ROUTINE_STEP_SEND_BACK_CAP_REACHED, routineStepSendBackRequestSchema } from "@paperclipai/shared";
-import { sendBackRoutineStep } from "../services/routine-step-send-back.js";
+import { getRoutineStepRun, sendBackRoutineStep } from "../services/routine-step-send-back.js";
 import {
   PULL_REQUEST_WAIT_MONITOR_SERVICE_NAME,
   issueWaitRequestSchema,
@@ -13254,6 +13254,17 @@ export function issueRoutes(
       });
     },
   );
+
+  router.get("/issues/:id/routine-step", async (req, res) => {
+    const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!issue) return;
+    const run = await getRoutineStepRun(db, issue.companyId, issue.id);
+    if (!run) {
+      res.status(404).json({ error: "This issue is not a step of a routine run" });
+      return;
+    }
+    res.json(run);
+  });
 
   router.post(
     "/issues/:id/routine-step/send-back",
