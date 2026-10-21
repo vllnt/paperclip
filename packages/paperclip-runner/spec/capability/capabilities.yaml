@@ -1620,6 +1620,21 @@
       ]
     },
     {
+      "id": "skill:skills/paperclip/references/api-reference.md:a-goal-s-linked-work:1727",
+      "sourceKind": "skill_heading",
+      "sourceAnchor": "skills/paperclip/references/api-reference.md:1727",
+      "title": "A goal's linked work",
+      "expectedSemantics": "Skill guidance headed “A goal's linked work”.",
+      "primaryDisposition": "optional_agent_tool",
+      "requiredGrants": [],
+      "assertionClasses": [
+        "control_plane_invariant"
+      ],
+      "evidenceIds": [
+        "skill:skills/paperclip/references/api-reference.md:1727"
+      ]
+    },
+    {
       "id": "skill:skills/paperclip/references/artifacts.md:generated-artifacts-and-work-products:1",
       "sourceKind": "skill_heading",
       "sourceAnchor": "skills/paperclip/references/artifacts.md:1",

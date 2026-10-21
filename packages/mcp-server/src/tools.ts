@@ -96,6 +96,7 @@ const listIssuesSchema = z.object({
   companyId: companyIdOptional,
   status: z.string().optional(),
   projectId: z.string().guid().optional(),
+  goalId: z.string().guid().optional(),
   assigneeAgentId: z.string().guid().optional(),
   participantAgentId: z.string().guid().optional(),
   assigneeUserId: z.string().optional(),
