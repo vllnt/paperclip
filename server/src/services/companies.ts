@@ -70,6 +70,7 @@ import {
   managedAgentProfiles,
   toolMcpGateways,
   issueDuplicatePairs,
+  issueTriages,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -212,6 +213,7 @@ export function companyService(db: Db) {
     requireBoardApprovalForNewAgents: companies.requireBoardApprovalForNewAgents,
     interactionResolverGovernance: companies.interactionResolverGovernance,
     duplicateDetectionMode: companies.duplicateDetectionMode,
+    issueTriageMode: companies.issueTriageMode,
     automationWakeSettings: companies.automationWakeSettings,
     routineNoopSkipSettings: companies.routineNoopSkipSettings,
     runContextPolicy: companies.runContextPolicy,
@@ -664,6 +666,7 @@ export function companyService(db: Db) {
           await removeOwned(chatPublications);
           await removeOwned(issueComments);
           await removeOwned(issueDuplicatePairs);
+          await removeOwned(issueTriages);
           await removeOwned(approvalComments);
           await removeOwned(budgetIncidents);
           await removeOwned(approvals);

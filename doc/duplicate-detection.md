@@ -207,8 +207,8 @@ content sent to an external model provider** (Vercel AI Gateway, then TypeSafe).
 
 `server/src/services/judge-client.ts` is the shared decisions client: typed `predicate`, `choice` and
 `score` questions with abstain, a content-hash cache, a per-company daily cap, a hard timeout and fail-open
-results. The queue ranker's classification questions (kind, ready, irreversible, size) can use it without
-changes.
+results. [Issue triage](issue-triage.md) already uses it for priority, category and owner. The queue ranker's
+classification questions (kind, ready, irreversible, size) can use it without changes.
 
 ## AI SDK call
 

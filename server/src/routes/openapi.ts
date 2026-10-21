@@ -4389,6 +4389,21 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/triage",
+  tags: ["issues"],
+  summary: "Read the triage recorded for an issue",
+  description:
+    "Returns the suggested priority, category and owner, the probabilities behind them, the model id, and what the router did with the owner (`applyOutcome`). 404 when no triage was recorded: the company mode is off, a rule left the issue alone (routine-made issues), or the check has not run yet.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    404: { ...r.notFound, description: "Issue not found, it belongs to another company, or it has no triage" },
+  },
+});
+
+registry.registerPath({
   method: "post",
   path: "/api/companies/{companyId}/issue-duplicate-pairs/{pairId}/label",
   tags: ["issues"],

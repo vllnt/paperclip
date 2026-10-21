@@ -70,7 +70,10 @@ import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
 import { issueDuplicateRoutes } from "./routes/issue-duplicates.js";
+import { issueTriageRoutes } from "./routes/issue-triage.js";
 import { createDuplicateDetection } from "./services/duplicate-detection-factory.js";
+import { createIssueTriage } from "./services/issue-triage-factory.js";
+import { createJudgeCache } from "./services/judge-client.js";
 import { setIssueCreatedListener } from "./services/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
 import { issueGitLinkRoutes } from "./routes/issue-git-links.js";
@@ -874,9 +877,20 @@ export async function createApp(
   // Issue routes are intentionally mounted after the gateway is constructed because
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
-  const duplicateDetection = createDuplicateDetection(db);
-  setIssueCreatedListener((event) => void duplicateDetection.checkAfterCreate(event));
+  // Duplicate detection and issue triage ask the same decision model with the same company keys, so
+  // they share one answer cache and run from the one issue-created listener.
+  const judgeCache = createJudgeCache();
+  const duplicateDetection = createDuplicateDetection(db, { cache: judgeCache });
+  const issueTriage = createIssueTriage(db, {
+    heartbeat: heartbeatService(db, { pluginWorkerManager: workerManager }),
+    cache: judgeCache,
+  });
+  setIssueCreatedListener((event) => {
+    void duplicateDetection.checkAfterCreate(event);
+    void issueTriage.triageAfterCreate(event);
+  });
   api.use(issueDuplicateRoutes(db, duplicateDetection));
+  api.use(issueTriageRoutes(db, issueTriage));
   api.use(issueRoutes(db, opts.storageService, {
     chatRunRetries: chatChannels,
     feedbackExportService: opts.feedbackExportService,

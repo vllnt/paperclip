@@ -2913,6 +2913,7 @@ export * from "./github-installation-token.js";
 export * from "./resource-capacity.js";
 export * from "./issue-wait.js";
 export * from "./duplicate-detection.js";
+export * from "./issue-triage.js";
 export * from "./automation-wake.js";
 export * from "./routine-noop-skip.js";
 export * from "./routine-gate.js";
