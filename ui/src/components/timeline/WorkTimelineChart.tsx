@@ -753,6 +753,7 @@ function ActorGutter({ rows, height }: { rows: ReturnType<typeof computeLayout>[
         const actorGlyphId = svgFragmentId(`gutter-${row.actor.id}`);
         return (
           <g key={`gutter-${row.actor.id}`}>
+            <title>{row.actor.name}</title>
             {row.sectionTitle !== null && (
               <g>
                 <rect x={0} y={row.y - SECTION_H + AXIS_H} width={GEOM.gutter} height={SECTION_H} fill="var(--color-muted)" />

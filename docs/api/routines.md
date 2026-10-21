@@ -452,6 +452,38 @@ Returns recent run history for the routine. Defaults to 50 most recent runs.
 
 A dispatch to an assignee that the wake would refuse (a budget hard-stop, or a paused or otherwise non-invokable agent) records a `failed` run with that reason and creates no issue. While the company is not active or scheduling is suppressed, the wake does not check these, so the issue is created as before.
 
+## Routines Timeline
+
+```
+GET /api/companies/{companyId}/routines/timeline?from=<iso>&to=<iso>
+```
+
+Returns every routine of the company on one timeline, read-only. `from` and `to` are ISO date-times with an offset. With neither, the window is a day back and a day ahead of now; with one, the other side gets a two-day span. The window is at most 31 days (`400` when `to` is not after `from`, or the window is longer).
+
+| Field | Content |
+|-------|---------|
+| `rows` | One row per routine (`id` is `routine:<id>`): title, status, its triggers (`cronExpression`, `timezone`, `nextRunAt`, `eventSourceId`) and `scheduled`, true when an enabled schedule trigger can fire it. |
+| `runs` | The runs that overlap the window (started before its end and not finished before its start): `start`, `end` (null while running), `status`, `source`, `linkedIssueId` and `linkedIssue`. Newest first, at most 5000. |
+| `fires` | The fires each enabled schedule trigger will make in the window, projected from `nextRunAt` and the cron expression in the trigger's timezone. They start no earlier than `generatedAt`. At most 500 across all triggers; the earliest win. |
+| `nodes`, `edges` | The links, see below. |
+| `limits` | `fires` and `runs`, each with its `cap` and whether the response was `truncated`. |
+
+Links come only from stored data; nothing is inferred. Each edge has a `kind`:
+
+| Kind | Source of the edge |
+|------|--------------------|
+| `event_trigger` | An enabled or disabled `event` trigger: the event source starts the routine. `label` is the match filter. |
+| `step_after` | `steps[].after` in the routine: a step waits for another step of the same routine. |
+| `parent_issue` | A routine files its runs under an issue (`parentIssueId`) that a run of another routine created. |
+| `targets_issue` | A run of a routine whose task is an issue that a run of another routine created. |
+| `serves_goal`, `serves_project` | The goal or project of the routine. |
+
+An edge with `enabled: false` comes from a trigger that is switched off. Rows, nodes and edges carry a `kind` so that other kinds (workflows that start workflows, nested steps) can join without a breaking change.
+
+The caller needs the same company-wide read access as the work timeline (`403` otherwise). `linkedIssue` is `null` for an agent that may not read that task; `linkedIssueId` stays.
+
+The board UI shows this at **Routines > Timeline** (`/routines/timeline`): a **Timeline** view with a bar per run (coloured by outcome) and a hollow bar per next fire, grouped as scheduled routines and routines with no schedule, and a **Links** view with the graph of routines, steps, event sources, goals and projects. A click on a run opens its issue.
+
 ## Agent Access Rules
 
 Agents can read all routines in their company but can only create and manage routines assigned to themselves:

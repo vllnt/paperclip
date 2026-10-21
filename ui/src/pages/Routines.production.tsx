@@ -677,10 +677,15 @@ export function Routines() {
             Recurring work definitions that materialize into auditable execution tasks.
           </p>
         </div>
-        <Button onClick={openCreateRoutine}>
-          <Plus className="mr-2 h-4 w-4" />
-          Create routine
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" asChild>
+            <Link to="/routines/timeline">Timeline</Link>
+          </Button>
+          <Button onClick={openCreateRoutine}>
+            <Plus className="mr-2 h-4 w-4" />
+            Create routine
+          </Button>
+        </div>
       </div>
 
       <Tabs value={activeTab} onValueChange={handleTabChange}>
