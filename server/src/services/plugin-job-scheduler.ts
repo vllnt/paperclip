@@ -10,7 +10,9 @@
  * ## Responsibilities
  *
  * 1. **Tick loop** — A `setInterval`-based loop fires every `tickIntervalMs`
- *    (default 30s). Each tick scans for due jobs and dispatches them.
+ *    (default 30s). Each tick scans for due jobs and starts their dispatch
+ *    without waiting for them to finish, so one slow job never delays the
+ *    start of any other job.
  *
  * 2. **Cron parsing & next-run calculation** — Uses the lightweight built-in
  *    cron parser ({@link parseCron}, {@link nextCronTick}) to compute the
@@ -122,7 +124,7 @@ export interface PluginJobScheduler {
    * Stop the scheduler tick loop.
    *
    * In-flight job runs are NOT cancelled — they are allowed to finish
-   * naturally. The tick loop simply stops firing.
+   * naturally (and are not awaited). The tick loop simply stops firing.
    */
   stop(): void;
 
@@ -161,6 +163,8 @@ export interface PluginJobScheduler {
 
   /**
    * Run a single scheduler tick immediately (for testing).
+   *
+   * Resolves once the due jobs have been started, not when they finish.
    *
    * @internal
    */
@@ -224,7 +228,11 @@ export function createPluginJobScheduler(
   /** Whether the scheduler is running. */
   let running = false;
 
-  /** Set of job IDs currently being executed (for overlap prevention). */
+  /**
+   * Set of job IDs currently being executed (for overlap prevention). A job
+   * stays in the set until its run is recorded and its schedule pointer has
+   * advanced.
+   */
   const activeJobs = new Set<string>();
 
   /** Total number of ticks since start. */
@@ -233,7 +241,10 @@ export function createPluginJobScheduler(
   /** Timestamp of the last tick. */
   let lastTickAt: Date | null = null;
 
-  /** Guard against concurrent tick execution. */
+  /**
+   * Guard against concurrent tick execution. Covers the query and dispatch
+   * phase only; running jobs are tracked in `activeJobs`.
+   */
   let tickInProgress = false;
 
   // -----------------------------------------------------------------------
@@ -241,7 +252,10 @@ export function createPluginJobScheduler(
   // -----------------------------------------------------------------------
 
   /**
-   * A single scheduler tick. Queries for due jobs and dispatches them.
+   * A single scheduler tick. Queries for due jobs and starts their dispatch.
+   * It does not wait for the dispatches to finish: a job that runs for minutes
+   * must not hold the tick, or no other job of any plugin could start until it
+   * ends.
    */
   async function tick(): Promise<void> {
     // Prevent overlapping ticks (in case a tick takes longer than the interval)
@@ -276,9 +290,7 @@ export function createPluginJobScheduler(
 
       log.debug({ count: dueJobs.length }, "found due jobs");
 
-      // Dispatch each due job (respecting concurrency limits)
-      const dispatches: Promise<void>[] = [];
-
+      // Start each due job (respecting concurrency limits)
       for (const job of dueJobs) {
         // Concurrency limit
         if (activeJobs.size >= maxConcurrentJobs) {
@@ -316,11 +328,20 @@ export function createPluginJobScheduler(
           continue;
         }
 
-        dispatches.push(dispatchJob(job));
-      }
-
-      if (dispatches.length > 0) {
-        await Promise.allSettled(dispatches);
+        // `dispatchJob` adds the job to `activeJobs` before its first await,
+        // so the concurrency and overlap checks above see it on the next
+        // iteration and on the next tick.
+        void dispatchJob(job).catch((err: unknown) => {
+          log.error(
+            {
+              jobId: job.id,
+              jobKey: job.jobKey,
+              pluginId: job.pluginId,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            "unexpected job dispatch error",
+          );
+        });
       }
     } catch (err) {
       log.error(
@@ -339,6 +360,9 @@ export function createPluginJobScheduler(
   /**
    * Dispatch a single job run — create the run record, call the worker,
    * record the result, and advance the schedule pointer.
+   *
+   * The job stays in `activeJobs` for the whole run and leaves it only after
+   * the schedule pointer has advanced.
    */
   async function dispatchJob(
     job: typeof pluginJobs.$inferSelect,
@@ -417,10 +441,10 @@ export function createPluginJobScheduler(
         }
       }
     } finally {
-      // Remove from active set
-      activeJobs.delete(jobId);
-
-      // 5. Always advance the schedule pointer (even on failure)
+      // 5. Always advance the schedule pointer (even on failure). Ticks do not
+      // wait for dispatches, so the job must stay in `activeJobs` until the
+      // pointer has moved: a tick that ran in between would see the job as
+      // still due and start it a second time.
       try {
         await advanceSchedulePointer(job);
       } catch (err) {
@@ -428,6 +452,9 @@ export function createPluginJobScheduler(
           { err: err instanceof Error ? err.message : String(err) },
           "failed to advance schedule pointer",
         );
+      } finally {
+        // Remove from active set
+        activeJobs.delete(jobId);
       }
     }
   }
