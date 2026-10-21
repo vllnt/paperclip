@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createRoutineSchema,
   routineRevisionSnapshotV1Schema,
   routineVariableSchema,
   updateRoutineSchema,
@@ -98,6 +99,12 @@ describe("routine validators", () => {
 
     expect(() => updateRoutineSchema.parse({ activityGatePolicy: "when_busy" })).toThrow();
     expect(() => updateRoutineSchema.parse({ activityGateScope: "agent" })).toThrow();
+  });
+
+  it("validates the routine slot priority and leaves it unset when omitted", () => {
+    expect(updateRoutineSchema.parse({ slotPriority: "first" }).slotPriority).toBe("first");
+    expect(createRoutineSchema.parse({ title: "Hourly maintenance" }).slotPriority).toBeUndefined();
+    expect(() => updateRoutineSchema.parse({ slotPriority: "urgent" })).toThrow();
   });
 
   it("accepts date variables with valid YYYY-MM-DD defaults", () => {

@@ -23306,8 +23306,18 @@ export function heartbeatService(
           id: issues.id,
           status: issues.status,
           priority: issues.priority,
+          // A routine's execution and step issues carry its slot priority.
+          routineSlotPriority: routines.slotPriority,
         })
         .from(issues)
+        .leftJoin(
+          routines,
+          and(
+            eq(routines.companyId, issues.companyId),
+            inArray(issues.originKind, ["routine_execution", "routine_step"]),
+            sql`${routines.id}::text = ${issues.originId}`,
+          ),
+        )
         .where(
           queuedIssueIds.length > 0
             ? and(
@@ -23331,6 +23341,7 @@ export function heartbeatService(
             inProgress: issue?.status === "in_progress",
             dependencyReady:
               dependencyReadiness.get(issueId)?.isDependencyReady ?? true,
+            routineRunsFirst: issue?.routineSlotPriority === "first",
           };
         },
         new Date(),

@@ -143,6 +143,8 @@ export function RoutineDetail() {
   // Wake settings the draft started from. A refetch can change the stored value under a dirty
   // draft, so edits are detected, and conflicts checked, against this base and not the latest.
   const editBaseWakeSettingsRef = useRef<RoutineEditDraft["automationWakeSettings"]>({});
+  // The slot priority is not versioned either, so it is sent only when this edit changed it.
+  const editBaseSlotPriorityRef = useRef<RoutineEditDraft["slotPriority"]>("normal");
   const titleInputRef = useRef<HTMLTextAreaElement | null>(null);
   const descriptionEditorRef = useRef<MarkdownEditorRef>(null);
   const assigneeSelectorRef = useRef<HTMLButtonElement | null>(null);
@@ -161,6 +163,7 @@ export function RoutineDetail() {
     priority: "medium",
     concurrencyPolicy: "coalesce_if_active",
     catchUpPolicy: "skip_missed",
+    slotPriority: "normal",
     activityGatePolicy: "always",
     activityGateScope: "company",
     variables: [],
@@ -269,6 +272,7 @@ export function RoutineDetail() {
             priority: routine.priority,
             concurrencyPolicy: routine.concurrencyPolicy,
             catchUpPolicy: routine.catchUpPolicy,
+            slotPriority: routine.slotPriority ?? "normal",
             activityGatePolicy: routine.activityGatePolicy,
             activityGateScope: routine.activityGateScope,
             variables: routine.variables,
@@ -301,6 +305,9 @@ export function RoutineDetail() {
     }
     if (editDraft.catchUpPolicy !== routineDefaults.catchUpPolicy) {
       result.push({ key: "catchUpPolicy", label: "the catch-up policy" });
+    }
+    if (editDraft.slotPriority !== editBaseSlotPriorityRef.current) {
+      result.push({ key: "slotPriority", label: "the slot priority" });
     }
     if (editDraft.activityGatePolicy !== routineDefaults.activityGatePolicy) {
       result.push({ key: "activityGatePolicy", label: "the advanced run policy" });
@@ -357,6 +364,7 @@ export function RoutineDetail() {
       if (keys.includes("automationWakeSettings")) {
         editBaseWakeSettingsRef.current = routineDefaults.automationWakeSettings;
       }
+      if (keys.includes("slotPriority")) editBaseSlotPriorityRef.current = routineDefaults.slotPriority;
     },
     [routineDefaults],
   );
@@ -369,6 +377,7 @@ export function RoutineDetail() {
     if (changedRoutine || !isEditDirty) {
       setEditDraft(routineDefaults);
       editBaseWakeSettingsRef.current = routineDefaults.automationWakeSettings;
+      editBaseSlotPriorityRef.current = routineDefaults.slotPriority;
       hydratedRoutineIdRef.current = routine.id;
     }
   }, [routine, routineDefaults, isEditDirty, setBreadcrumbs, triggerSetup]);
@@ -399,7 +408,7 @@ export function RoutineDetail() {
 
   const saveRoutine = useMutation({
     mutationFn: () => {
-      const { automationWakeSettings, ...payload } = buildRoutineMutationPayload(editDraft);
+      const { automationWakeSettings, slotPriority, ...payload } = buildRoutineMutationPayload(editDraft);
       const baseRevisionId = routine?.latestRevisionId ?? null;
       // Wake settings are not versioned, so send them only when edited, together with
       // the value the edit started from, and a concurrent change surfaces as a conflict.
@@ -409,6 +418,7 @@ export function RoutineDetail() {
       return routinesApi.update(routineId!, {
         ...payload,
         ...(wakeSettingsEdited ? { automationWakeSettings, baseAutomationWakeSettings } : {}),
+        ...(slotPriority !== editBaseSlotPriorityRef.current ? { slotPriority } : {}),
         ...(baseRevisionId ? { baseRevisionId } : {}),
       });
     },
@@ -422,7 +432,12 @@ export function RoutineDetail() {
       // settings do not stay dirty against a value saved or refetched in the meantime.
       const savedWakeSettings = readAutomationWakeSettings(saved.automationWakeSettings);
       editBaseWakeSettingsRef.current = savedWakeSettings;
-      setEditDraft((current) => ({ ...current, automationWakeSettings: savedWakeSettings }));
+      editBaseSlotPriorityRef.current = saved.slotPriority ?? "normal";
+      setEditDraft((current) => ({
+        ...current,
+        automationWakeSettings: savedWakeSettings,
+        slotPriority: saved.slotPriority ?? "normal",
+      }));
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.detail(routineId!) }),
         queryClient.invalidateQueries({ queryKey: queryKeys.routines.list(selectedCompanyId!) }),
@@ -656,6 +671,7 @@ export function RoutineDetail() {
     if (!routineDefaults) return;
     setEditDraft(routineDefaults);
     editBaseWakeSettingsRef.current = routineDefaults.automationWakeSettings;
+    editBaseSlotPriorityRef.current = routineDefaults.slotPriority;
   }, [routineDefaults]);
 
   const reloadLatest = useCallback(() => {
@@ -703,6 +719,7 @@ export function RoutineDetail() {
         priority: response.routine.priority,
         concurrencyPolicy: response.routine.concurrencyPolicy,
         catchUpPolicy: response.routine.catchUpPolicy,
+        slotPriority: response.routine.slotPriority ?? "normal",
         activityGatePolicy: response.routine.activityGatePolicy,
         activityGateScope: response.routine.activityGateScope,
         variables: response.routine.variables as RoutineVariable[],
@@ -712,6 +729,7 @@ export function RoutineDetail() {
         runContextPolicy: response.routine.runContextPolicy ?? null,
       });
       editBaseWakeSettingsRef.current = readAutomationWakeSettings(response.routine.automationWakeSettings);
+      editBaseSlotPriorityRef.current = response.routine.slotPriority ?? "normal";
       hydratedRoutineIdRef.current = response.routine.id;
     },
     [queryClient, routineId],

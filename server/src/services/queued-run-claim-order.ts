@@ -22,6 +22,8 @@ export type QueuedRunIssueFacts = {
   priority: string | null | undefined;
   inProgress: boolean;
   dependencyReady: boolean;
+  /** The issue belongs to a routine run whose routine's slot priority is `first`. */
+  routineRunsFirst: boolean;
 };
 
 type QueuedRunTiming = {
@@ -79,6 +81,7 @@ function rank(run: QueuedRunTiming, issue: QueuedRunIssueFacts | null, now: Date
   return {
     blocked: issue ? !issue.dependencyReady : false,
     resume: run.scheduledRetryReason === PLANNED_RESTART_RESUME_RETRY_REASON,
+    first: issue?.routineRunsFirst ?? false,
     level: Math.max(0, baseLevel - agingSteps),
     aged: agingSteps > 0,
     inProgress: issue?.inProgress ?? false,
@@ -91,10 +94,11 @@ function rank(run: QueuedRunTiming, issue: QueuedRunIssueFacts | null, now: Date
  * 1. runs whose issue still has unresolved blockers go last;
  * 2. a resume of a run that a server restart cut short starts first: it had
  *    the slot before the restart, so it must not queue behind new work;
- * 3. higher effective priority first (issue priority, raised one level per aging step);
- * 4. at equal effective priority, a run that has aged starts before a fresh one,
+ * 3. runs of a routine whose slot priority is `first` go before the rest;
+ * 4. higher effective priority first (issue priority, raised one level per aging step);
+ * 5. at equal effective priority, a run that has aged starts before a fresh one,
  *    and fresh runs of in-progress issues start before other fresh runs;
- * 5. then the run that has waited longest first, measured like aging.
+ * 6. then the run that has waited longest first, measured like aging.
  *
  * A run re-delivered from a parked wake is measured from the wake's request
  * (`QUEUED_RUN_REQUESTED_AT_CONTEXT_KEY`), so parked and queued work is served
@@ -110,6 +114,7 @@ export function orderQueuedRunsForClaim<T extends QueuedRunTiming>(
     .sort((a, b) =>
       Number(a.rank.blocked) - Number(b.rank.blocked) ||
       Number(b.rank.resume) - Number(a.rank.resume) ||
+      Number(b.rank.first) - Number(a.rank.first) ||
       a.rank.level - b.rank.level ||
       Number(b.rank.aged) - Number(a.rank.aged) ||
       (a.rank.aged ? 0 : Number(b.rank.inProgress) - Number(a.rank.inProgress)) ||

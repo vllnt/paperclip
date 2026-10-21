@@ -252,6 +252,7 @@ function makeContext(
     priority: routineDetail.priority,
     concurrencyPolicy: routineDetail.concurrencyPolicy,
     catchUpPolicy: routineDetail.catchUpPolicy,
+    slotPriority: routineDetail.slotPriority ?? "normal",
     activityGatePolicy: "always",
     activityGateScope: "company",
     variables: routineDetail.variables,

@@ -43,7 +43,7 @@ function run(
     createdAt: new Date(NOW.getTime() - waitedMs),
     scheduledRetryAt,
     scheduledRetryReason,
-    issue: issue ? { priority: "medium", inProgress: false, dependencyReady: true, ...issue } : null,
+    issue: issue ? { priority: "medium", inProgress: false, dependencyReady: true, routineRunsFirst: false, ...issue } : null,
   };
 }
 
@@ -98,6 +98,49 @@ describe("orderQueuedRunsForClaim", () => {
     ])).toEqual(["in-progress-newer", "todo-older"]);
   });
 
+  describe("routine slot priority", () => {
+    it("starts a routine run set to first before older, aged and more urgent work", () => {
+      expect(order([
+        run("critical-old", 4 * STEP, { priority: "critical", inProgress: true }),
+        run("high-aged", 2 * STEP, { priority: "high" }),
+        run("routine-tick", MINUTE, { priority: "low", routineRunsFirst: true }),
+        run("no-issue", 3 * STEP, null),
+      ])).toEqual(["routine-tick", "critical-old", "no-issue", "high-aged"]);
+    });
+
+    it("keeps the usual order among several routine runs set to first", () => {
+      expect(order([
+        run("first-low-new", MINUTE, { priority: "low", routineRunsFirst: true }),
+        run("first-high", 2 * MINUTE, { priority: "high", routineRunsFirst: true }),
+        run("first-low-old", 3 * MINUTE, { priority: "low", routineRunsFirst: true }),
+        run("medium", 4 * MINUTE, { priority: "medium" }),
+      ])).toEqual(["first-high", "first-low-old", "first-low-new", "medium"]);
+    });
+
+    it("still starts a dependency-blocked routine run last", () => {
+      expect(order([
+        run("blocked-routine", 5 * MINUTE, { priority: "critical", routineRunsFirst: true, dependencyReady: false }),
+        run("low", MINUTE, { priority: "low" }),
+      ])).toEqual(["low", "blocked-routine"]);
+    });
+
+    it("leaves the order unchanged for a routine at the default", () => {
+      const queue = [
+        run("routine-tick", MINUTE, { priority: "medium" }),
+        run("medium-old", 2 * MINUTE, { priority: "medium" }),
+        run("high", MINUTE, { priority: "high" }),
+      ];
+      expect(order(queue)).toEqual(["high", "medium-old", "routine-tick"]);
+    });
+
+    it("starts a routine run set to first before a re-delivered wake that was parked for hours", () => {
+      expect(order([
+        redelivered("parked-3-hours", 0, 3 * 60 * MINUTE, { priority: "critical" }),
+        run("routine-first", 0, { priority: "low", routineRunsFirst: true }),
+      ])).toEqual(["routine-first", "parked-3-hours"]);
+    });
+  });
+
   describe("restart resume", () => {
     const resume = PLANNED_RESTART_RESUME_RETRY_REASON;
     const dueNow = NOW;
@@ -130,6 +173,13 @@ describe("orderQueuedRunsForClaim", () => {
         run("blocked-resume", 0, { priority: "critical", dependencyReady: false }, dueNow, resume),
         run("low", MINUTE, { priority: "low" }),
       ])).toEqual(["low", "blocked-resume"]);
+    });
+
+    it("starts a resume before a routine run set to first", () => {
+      expect(order([
+        run("routine-first", 5 * MINUTE, { priority: "critical", routineRunsFirst: true }),
+        run("resume-low", 0, { priority: "low" }, dueNow, resume),
+      ])).toEqual(["resume-low", "routine-first"]);
     });
 
     it("starts a resume before a re-delivered wake that was parked for hours", () => {

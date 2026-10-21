@@ -243,7 +243,7 @@ function addRoutineCreate(parent: Command): void {
   addCommonClientOptions(
     parent
       .command("create")
-      .description("Create a routine (payload may set steps)")
+      .description("Create a routine (payload may set steps and slotPriority)")
       .option("-C, --company-id <id>", "Company ID")
       .requiredOption("--payload-json <json>", "JSON payload")
       .option("--steps-file <path>", STEPS_FILE_DESCRIPTION)
@@ -263,7 +263,7 @@ function addRoutineUpdate(parent: Command): void {
   addCommonClientOptions(
     parent
       .command("update")
-      .description("Update a routine (payload may set runContextPolicy and steps; steps [] clears them)")
+      .description("Update a routine (payload may set runContextPolicy, slotPriority and steps; steps [] clears them)")
       .argument("<id>", "ID")
       .option("--payload-json <json>", "JSON payload", "{}")
       .option("--steps-file <path>", STEPS_FILE_DESCRIPTION)

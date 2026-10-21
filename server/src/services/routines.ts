@@ -3557,6 +3557,7 @@ export function routineService(
             activityGatePolicy: input.activityGatePolicy ?? "always",
             activityGateScope: input.activityGateScope ?? "company",
             transientRetryPolicy: input.transientRetryPolicy ?? {},
+            slotPriority: input.slotPriority ?? "normal",
             variables,
             steps,
             env,
@@ -3750,6 +3751,21 @@ export function routineService(
             .set({ routineNoopSkipSettings: patch.routineNoopSkipSettings })
             .where(eq(routines.id, id));
           locked.routineNoopSkipSettings = patch.routineNoopSkipSettings;
+        }
+
+        // The slot priority is queue tuning, not routine content: it applies at
+        // the agent's next claim and is not versioned in routine revisions.
+        if (patch.slotPriority !== undefined && patch.slotPriority !== locked.slotPriority) {
+          await txDb
+            .update(routines)
+            .set({
+              slotPriority: patch.slotPriority,
+              updatedByAgentId: actor.agentId ?? null,
+              updatedByUserId: actor.userId ?? null,
+              updatedAt: new Date(),
+            })
+            .where(eq(routines.id, id));
+          locked.slotPriority = patch.slotPriority;
         }
 
         const candidate: RoutineRow = {
