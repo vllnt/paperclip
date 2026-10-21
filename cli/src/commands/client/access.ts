@@ -445,7 +445,7 @@ function addInboxAttentionCommand(inbox: Command): void {
       .description("List open attention items (the Inbox Decide and Alerts tabs)")
       .option("-C, --company-id <id>", "Company ID")
       .option("--tab <tab>", `Only one tab's items: ${INBOX_ATTENTION_TABS.join(" or ")}`)
-      .option("--queue <key>", "Only one decision queue's items")
+      .option("--queue <key>", "Only one decision queue's items, of every kind (--tab does not filter a queue)")
       .option("--include-dismissed", "Include snoozed and dismissed items")
       .option("--archived", "List archived items instead of open ones")
       .action(async (opts: InboxAttentionOptions) => {
@@ -462,7 +462,7 @@ function addInboxAttentionCommand(inbox: Command): void {
           const feed = await ctx.api.get<AttentionFeed>(
             `${apiPath`/api/companies/${ctx.companyId}`}/attention?${params.toString()}`,
           );
-          const output = feed && tab
+          const output = feed && tab && !opts.queue
             ? {
               ...feed,
               items: feed.items.filter(

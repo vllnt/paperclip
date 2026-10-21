@@ -109,7 +109,8 @@ counted, as before. The old "new today" Decisions badge goes away.
   `inbox`) already serves Decide, Alerts and the attention part of Archived.
 - CLI: new `paperclipai inbox attention -C <companyId> [--tab decide|alerts]
   [--queue <key>] [--include-dismissed] [--archived]`, which reads the same feed
-  and applies the same shared kind split.
+  and applies the same shared kind split. As in the UI, a queue lists all its
+  items, so `--tab` does not filter `--queue`.
 - Skill: the paperclip skill API reference names the merged Inbox tabs and the
   CLI command.
 - Allowed visual exception, named in the PR: the nav merge, tab layout and badge

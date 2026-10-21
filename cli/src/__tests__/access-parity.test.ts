@@ -134,7 +134,7 @@ describe("access parity commands", () => {
     ]);
   });
 
-  it("lists the Inbox attention tabs, keeping one tab's items with --tab", async () => {
+  it("lists the Inbox attention tabs, keeping one tab's items with --tab and a whole queue with --queue", async () => {
     const feed = {
       companyId: COMPANY_ID,
       totalCount: 2,
@@ -159,7 +159,7 @@ describe("access parity commands", () => {
     const printed = log.mock.calls.map((call) => JSON.parse(String(call[0])) as { items: Array<{ id: string }> });
     expect(printed.map((output) => output.items.map((item) => item.id))).toEqual([
       ["decision:1", "failed_run:1"],
-      ["failed_run:1"],
+      ["decision:1", "failed_run:1"],
       ["decision:1"],
     ]);
   });
