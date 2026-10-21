@@ -132,6 +132,13 @@ describe("orderQueuedRunsForClaim", () => {
       ];
       expect(order(queue)).toEqual(["high", "medium-old", "routine-tick"]);
     });
+
+    it("starts a routine run set to first before a re-delivered wake that was parked for hours", () => {
+      expect(order([
+        redelivered("parked-3-hours", 0, 3 * 60 * MINUTE, { priority: "critical" }),
+        run("routine-first", 0, { priority: "low", routineRunsFirst: true }),
+      ])).toEqual(["routine-first", "parked-3-hours"]);
+    });
   });
 
   describe("restart resume", () => {
@@ -180,13 +187,6 @@ describe("orderQueuedRunsForClaim", () => {
         redelivered("parked-3-hours", 0, 3 * 60 * MINUTE, { priority: "high" }),
         run("resume-low", 0, { priority: "low" }, dueNow, resume),
       ])).toEqual(["resume-low", "parked-3-hours"]);
-    });
-
-    it("starts a routine run set to first before a re-delivered wake that was parked for hours", () => {
-      expect(order([
-        redelivered("parked-3-hours", 0, 3 * 60 * MINUTE, { priority: "critical" }),
-        run("routine-first", 0, { priority: "low", routineRunsFirst: true }),
-      ])).toEqual(["routine-first", "parked-3-hours"]);
     });
 
     it("gives no priority to an ordinary scheduled retry", () => {
