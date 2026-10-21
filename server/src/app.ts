@@ -69,7 +69,9 @@ import { environmentService } from "./services/environments.js";
 import { environmentRuntimeService } from "./services/environment-runtime.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
+import { companyEvalRoutes } from "./routes/company-evals.js";
 import { issueDuplicateRoutes } from "./routes/issue-duplicates.js";
+import { createCompanyEvals } from "./services/company-evals-factory.js";
 import { createDuplicateDetection } from "./services/duplicate-detection-factory.js";
 import { setIssueCreatedListener } from "./services/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
@@ -497,6 +499,8 @@ export async function createApp(
     chatWebhookPublicBaseUrl?: string;
     authReady: boolean;
     companyDeletionEnabled: boolean;
+    /** Days a company eval run keeps its redacted input; 0 stores none. Defaults to 30. */
+    evalInputRetentionDays?: number;
     announcements?: { enabled: boolean; feedUrl: string };
     instanceId?: string;
     hostVersion?: string;
@@ -877,6 +881,7 @@ export async function createApp(
   const duplicateDetection = createDuplicateDetection(db);
   setIssueCreatedListener((event) => void duplicateDetection.checkAfterCreate(event));
   api.use(issueDuplicateRoutes(db, duplicateDetection));
+  api.use(companyEvalRoutes(db, createCompanyEvals(db, { inputRetentionDays: opts.evalInputRetentionDays ?? 30 })));
   api.use(issueRoutes(db, opts.storageService, {
     chatRunRetries: chatChannels,
     feedbackExportService: opts.feedbackExportService,

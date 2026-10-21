@@ -229,3 +229,4 @@ export * from "./company_skill_sources.js";
 
 export { issueDuplicatePairs } from "./issue_duplicate_pairs.js";
 export { judgeUsageDaily } from "./judge_usage_daily.js";
+export { companyEvals, companyEvalVersions, companyEvalRuns, companyEvalFeedback } from "./company_evals.js";

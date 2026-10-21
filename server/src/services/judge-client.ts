@@ -88,6 +88,12 @@ export interface JudgeRequest {
 export const JUDGE_FAILURE_REASONS = ["no_key", "cap_exceeded", "timeout", "error"] as const;
 export type JudgeFailureReason = (typeof JUDGE_FAILURE_REASONS)[number];
 
+/** Tokens the model used for one call. A field is absent when the gateway did not report it. */
+export interface JudgeUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
 export type JudgeOutcome =
   | {
       ok: true;
@@ -95,6 +101,10 @@ export type JudgeOutcome =
       modelId: string;
       inputHash: string;
       cached: boolean;
+      /** Absent on a cache hit and on a refusal, where no usage data exists. */
+      usage?: JudgeUsage;
+      /** Absent unless the gateway reported a cost for the call. */
+      costUsd?: number;
     }
   | { ok: false; reason: JudgeFailureReason; inputHash: string };
 
@@ -114,6 +124,8 @@ export interface RawDecision {
   answers: Readonly<Record<string, RawAnswer>>;
   modelId: string;
   confidence: Readonly<Record<string, number>>;
+  usage?: JudgeUsage;
+  costUsd?: number;
 }
 
 export interface JudgeTransportCall {
@@ -295,6 +307,29 @@ function toSdkQuestion(question: JudgeQuestion): SdkQuestion {
   return { type: "score", instructions: question.instructions, criteria: [...question.levels] };
 }
 
+function tokenCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined;
+}
+
+function readUsage(usage: unknown): JudgeUsage | undefined {
+  if (!isRecord(usage)) return undefined;
+  const inputTokens = tokenCount(usage.inputTokens);
+  const outputTokens = tokenCount(usage.outputTokens);
+  if (inputTokens === undefined && outputTokens === undefined) return undefined;
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+  };
+}
+
+/** The gateway's own cost for the call, when it reports one. It is never estimated from a price table. */
+function readCostUsd(metadata: unknown): number | undefined {
+  if (!isRecord(metadata) || !isRecord(metadata.gateway)) return undefined;
+  const raw = metadata.gateway.cost;
+  const cost = typeof raw === "string" ? Number(raw) : raw;
+  return typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : undefined;
+}
+
 function readConfidence(metadata: unknown): Record<string, number> {
   if (!isRecord(metadata)) return {};
   const typesafe = metadata.typesafe;
@@ -321,10 +356,14 @@ export function createGatewayTransport(options: { apiKey: string; zeroDataRetent
       abortSignal: signal,
       ...(options.zeroDataRetention ? { providerOptions: { gateway: { zeroDataRetention: true } } } : {}),
     });
+    const usage = readUsage(result.usage);
+    const costUsd = readCostUsd(result.providerMetadata);
     return {
       answers: result.answers,
       modelId: result.response.modelId,
       confidence: readConfidence(result.providerMetadata),
+      ...(usage ? { usage } : {}),
+      ...(costUsd !== undefined ? { costUsd } : {}),
     };
   };
 }
@@ -489,7 +528,15 @@ export function createJudgeClient(options: {
           answers[id] = answer;
         }
         cache.set(cacheKey, { answers, modelId: raw.modelId });
-        return { ok: true, answers, modelId: raw.modelId, inputHash, cached: false };
+        return {
+          ok: true,
+          answers,
+          modelId: raw.modelId,
+          inputHash,
+          cached: false,
+          ...(raw.usage ? { usage: raw.usage } : {}),
+          ...(raw.costUsd !== undefined ? { costUsd: raw.costUsd } : {}),
+        };
       } catch (error) {
         if (DecisionRefusalError.isInstance(error)) {
           const answers: Record<string, JudgeAnswer> = {};
