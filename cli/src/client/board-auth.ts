@@ -175,12 +175,24 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export async function openUrl(url: string): Promise<boolean> {
+  // The URL can come from a server response, so hand the platform opener only
+  // a normalized http(s) URL. Windows goes through rundll32 rather than
+  // `cmd /c start`, because cmd reads `&`, `|` and `^` in the URL as shell syntax.
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    return false;
+  }
+  if (target.protocol !== "http:" && target.protocol !== "https:") return false;
+  const href = target.href;
+
   const { command, args } =
     process.platform === "darwin"
-      ? { command: "open", args: [url] }
+      ? { command: "open", args: [href] }
       : process.platform === "win32"
-        ? { command: "cmd", args: ["/c", "start", "", url] }
-        : { command: "xdg-open", args: [url] };
+        ? { command: "rundll32", args: ["url.dll,FileProtocolHandler", href] }
+        : { command: "xdg-open", args: [href] };
 
   return new Promise<boolean>((resolve) => {
     let child: ChildProcess;
