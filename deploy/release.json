@@ -1,4 +1,4 @@
 {
-  "source_commit": "fbf5a874a4b3bcd976c225e3b9bb44c76b4e745f",
-  "image": "ghcr.io/vllnt/paperclip@sha256:72f516c1ccb5989bfc4b67e407f11a980fe89e613ecd223524420795ca5167b3"
+  "source_commit": "22d0727b700b706ba1b2e4b90cc767ab8bcb34e8",
+  "image": "ghcr.io/vllnt/paperclip@sha256:f5636fabe05d7b15c03edadc20b71f13cd5d474229ebf146b59ba98338202dd6"
 }
