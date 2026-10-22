@@ -9,7 +9,7 @@
 # bump a pin, read the new digest with
 # `docker buildx imagetools inspect docker.io/<image>:<tag>`, confirm the
 # mirror returns the same digest, and replace the @sha256 part.
-FROM mirror.gcr.io/library/node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS base
+FROM mirror.gcr.io/library/node:24.22.1-trixie-slim@sha256:43b9ba1142b8dcf33fa8f922ca1be85714adc444e0586c7cf7726daaeabc1bea AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
