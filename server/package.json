@@ -90,7 +90,7 @@
     "express-rate-limit": "8.6.2",
     "heif2jpeg": "0.1.6",
     "jsdom": "^30.0.1",
-    "multer": "^2.4.0",
+    "multer": "^2.5.0",
     "nice-grpc": "2.1.17",
     "nice-grpc-common": "2.0.4",
     "open": "^11.0.4",
