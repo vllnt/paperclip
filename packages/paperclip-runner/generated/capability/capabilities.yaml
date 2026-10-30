@@ -1487,18 +1487,18 @@
       "expectedMockState": "operation_result"
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:387",
+      "id": "skill:skills/paperclip/references/routines.md:403",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md#L387:slot-priority",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L403:slot-priority",
       "heading": "Slot Priority",
       "primaryDisposition": "control_plane_owned",
       "semanticOperation": "runtime_reconciliation",
       "expectedMockState": "runtime_decision_record"
     },
     {
-      "id": "skill:skills/paperclip/references/routines.md:402",
+      "id": "skill:skills/paperclip/references/routines.md:418",
       "kind": "skill_heading",
-      "sourceAnchor": "skills/paperclip/references/routines.md#L402:a-project-s-routines",
+      "sourceAnchor": "skills/paperclip/references/routines.md#L418:a-project-s-routines",
       "heading": "A project's routines",
       "primaryDisposition": "optional_agent_tool",
       "semanticOperation": "scoped_discovery",

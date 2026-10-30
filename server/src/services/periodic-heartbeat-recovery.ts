@@ -1,5 +1,6 @@
 import { logger } from "../middleware/logger.js";
 import type { heartbeatService } from "./heartbeat.js";
+import type { RoutineStepConditionsBackstopResult } from "./routine-steps.js";
 
 type RecoveryHeartbeat = Pick<
   ReturnType<typeof heartbeatService>,
@@ -18,8 +19,13 @@ type RecoveryHeartbeat = Pick<
  * catch, so a step that throws is logged and the later steps still run. The
  * stale-lock sweep is the last step and frees the slot that an earlier step
  * may have failed on, so it must not depend on the steps before it.
+ * @param routineStepConditions The capped backstop for routine step conditions. It runs before the
+ * dependency-wake reconciliation, so a step it releases can be woken in the same pass.
  */
-export async function runPeriodicHeartbeatRecovery(heartbeat: RecoveryHeartbeat) {
+export async function runPeriodicHeartbeatRecovery(
+  heartbeat: RecoveryHeartbeat,
+  routineStepConditions?: { reconcileOpenRuns: () => Promise<RoutineStepConditionsBackstopResult> },
+) {
   const step = async <T>(name: string, run: () => Promise<T>): Promise<T | undefined> => {
     try {
       return await run();
@@ -51,6 +57,14 @@ export async function runPeriodicHeartbeatRecovery(heartbeat: RecoveryHeartbeat)
       );
     }
   });
+  if (routineStepConditions) {
+    await step("reconcileRoutineStepConditions", async () => {
+      const reconciled = await routineStepConditions.reconcileOpenRuns();
+      if (reconciled.skipped > 0 || reconciled.released > 0 || reconciled.failed > 0) {
+        logger.warn({ ...reconciled }, "periodic routine step condition reconciliation changed step state");
+      }
+    });
+  }
   await step("reconcileResolvedDependencyWakes", async () => {
     const reconciled = await heartbeat.reconcileResolvedDependencyWakes();
     if (reconciled.healed > 0) {

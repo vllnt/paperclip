@@ -296,7 +296,7 @@ Use `steps` when the same multi-stage work repeats (for example implement, revie
 | `title` | yes | Task title (at most 200). `{{variables}}` are filled in at run time |
 | `description` | no | Task instructions in Markdown. `{{variables}}` and `skill://` mentions work |
 | `assigneeAgentId` | no | Agent for the step. Defaults to the run's agent: the `assigneeAgentId` of the run request, else the routine's agent. An agent can name only itself in a run of a routine with steps. Every step needs an agent, so validation fails when it has neither |
-| `after` | no | Keys of the steps it waits for. Empty means it starts with the run |
+| `after` | no | The steps it waits for: a step key, or `{ "step": "<key>", "when": "done" \| "cancelled" }` to run on that step's outcome (see "Conditions on steps"). Empty means it starts with the run |
 | `executionPolicy` | no | Review or approval stages for this step, as on any task |
 | `labelIds` | no | Labels of the company |
 | `priority` | no | Defaults to the routine's priority |
@@ -309,9 +309,25 @@ Use `steps` when the same multi-stage work repeats (for example implement, revie
 - Only the steps with no predecessors are woken. Each step that finishes wakes the steps that were waiting for it. The run's task is woken once, after the last step is done, to wrap up.
 - The run records `routineSteps` (`steps` and `stepIssueIds`) in its trigger payload, so editing the routine never changes a run in flight. The `routineSteps` and `targetIssueId` keys are reserved: a trigger payload you send with either key loses it (send `targetIssueId` as a field of the run request instead). Cancel the run's task with the tree control (the task and its sub-tasks) to stop the whole tree and free the routine.
 
-**A cancelled step.** A cancelled step never counts as done: the steps that wait for it, and the run's task, stay `blocked`. Nothing cascades, so a person decides. When every step is done, cancelled or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled* and no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run with another branch still running stays live. When the run's task is next updated, a stalled run is recorded as `failed`. Clean up a stalled run by cancelling its task with the tree control.
+**A cancelled step.** A cancelled step never counts as done: the steps that wait for it, and the run's task, stay `blocked`. Nothing cascades without a condition, so a person decides. When every step is done, cancelled, skipped or blocked, at least one is cancelled, and every blocked step waits (directly or through other blocked steps) for a cancelled one, the run is *stalled* and no longer counts as live, so `skip_if_active` and `coalesce_if_active` let the next run start. A run with another branch still running stays live. When the run's task is next updated, a stalled run is recorded as `failed`. Clean up a stalled run by cancelling its task with the tree control.
 
 **Fork and join.** Several steps with the same `after` run in parallel. A step that lists several keys in `after` starts only after all of them are done.
+
+**Conditions on steps.** A step can run on the outcome of another step, so one branch runs when a reviewer approves and another when the board rejects or stops the step. The outcome of a step is its final status: `done` (for a step with an approval or review stage, approved) or `cancelled` (rejected or stopped by the board). A reviewer who asks for changes does not end the step. Write the entry as `{ "step": "review", "when": "done" }` or `{ "step": "review", "when": "cancelled" }`; a plain key waits for `done`.
+
+```json
+{ "key": "review", "title": "Review {{target}}", "executionPolicy": { "stages": [{ "type": "approval" }] } },
+{ "key": "ship", "title": "Ship", "after": [{ "step": "review", "when": "done" }] },
+{ "key": "rework", "title": "Rework", "after": [{ "step": "review", "when": "cancelled" }] },
+{ "key": "announce", "title": "Announce", "after": ["ship", "rework"] }
+```
+
+- An edge is dead when its condition does not match the outcome of its source, or when its source was skipped. A step whose edges are all dead is cancelled with the comment `Skipped: condition not met`, and the rule repeats for the steps after it. A step with both dead and live edges drops the dead ones and waits for the live ones. In the example, an approval skips `rework` and `announce` runs after `ship`; a cancel skips `ship` and `announce` runs after `rework`.
+- A plain `after` on a cancelled step is not dead: the step stays `blocked`, so a cancel that no condition handles never cascades.
+- The run's task stops waiting for skipped steps and for cancelled steps whose every outgoing `after` has a condition. A cancelled step that a plain `after` waits for still holds the run. A step that a person blocked is never skipped.
+- A step names another step once. Two entries for one step with different conditions are refused (`400`).
+- Skipped steps are ordinary cancelled tasks and stay visible. Steps that become ready are woken once. Paperclip applies the conditions when a step ends and again on a periodic check, so you never repeat anything by hand.
+- An image from before conditions cannot run a routine that has them (see `doc/DATABASE.md`).
 
 **Variables.** `{{name}}` in a step title, description or acceptance criteria uses the routine's variables. A variable that appears only in a step is added to the routine's variables, so manual runs ask for it.
 
@@ -349,7 +365,7 @@ With the CLI, keep the array in a file and pass it with `paperclipai routine cre
 - Every step needs an agent, and agents and labels must belong to the company.
 - You need permission to assign tasks to write steps, and an agent can only assign steps to itself. An agent restoring a revision with steps follows the same rule, and a low-trust agent can restore only steps that already carry its containment (`403` otherwise).
 - Routine environment variables and secrets apply to the run's task only. Step agents do not inherit them.
-- `after` takes plain step keys.
+- A condition goes on an `after` entry only; there is no condition on a whole step.
 - Steps are not supported with `appendToIssueId` (append issue mode); the API returns `422`.
 - A new step with no own workspace reuses the workspace of the earliest step it waited for, so a reviewer sees the implementer's checkout.
 - While a run's task is open, `skip_if_active` and `coalesce_if_active` treat the routine as active, except for a stalled run (see "A cancelled step").

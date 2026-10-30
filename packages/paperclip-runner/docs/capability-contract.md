@@ -205,8 +205,8 @@ The skill/reference inventory and eval cases are the only normative behavior sou
 | skill:skills/paperclip/references/routines.md:updating-a-routine:263 | optional_agent_tool | skills/paperclip/references/routines.md:263 |
 | skill:skills/paperclip/references/routines.md:reading-routines-and-runs:274 | optional_agent_tool | skills/paperclip/references/routines.md:274 |
 | skill:skills/paperclip/references/routines.md:routine-steps:287 | optional_agent_tool | skills/paperclip/references/routines.md:287 |
-| skill:skills/paperclip/references/routines.md:slot-priority:387 | optional_agent_tool | skills/paperclip/references/routines.md:387 |
-| skill:skills/paperclip/references/routines.md:a-project-s-routines:402 | optional_agent_tool | skills/paperclip/references/routines.md:402 |
+| skill:skills/paperclip/references/routines.md:slot-priority:403 | optional_agent_tool | skills/paperclip/references/routines.md:403 |
+| skill:skills/paperclip/references/routines.md:a-project-s-routines:418 | optional_agent_tool | skills/paperclip/references/routines.md:418 |
 | skill:skills/paperclip/references/workflows.md:paperclip-workflow-playbooks:1 | optional_agent_tool | skills/paperclip/references/workflows.md:1 |
 | skill:skills/paperclip/references/workflows.md:project-setup-ceo-manager:7 | optional_agent_tool | skills/paperclip/references/workflows.md:7 |
 | skill:skills/paperclip/references/workflows.md:openclaw-invite-ceo:22 | optional_agent_tool | skills/paperclip/references/workflows.md:22 |

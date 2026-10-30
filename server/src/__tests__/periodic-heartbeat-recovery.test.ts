@@ -72,3 +72,66 @@ describe("runPeriodicHeartbeatRecovery", () => {
     expect(heartbeat.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("runPeriodicHeartbeatRecovery routine step conditions", () => {
+  const backstop = (counts: Partial<Record<"checked" | "skipped" | "released" | "woken" | "failed", number>> = {}) => ({
+    reconcileOpenRuns: vi.fn(async () => ({ checked: 0, skipped: 0, released: 0, woken: 0, failed: 0, ...counts })),
+  });
+
+  it("reconciles the step conditions just before the dependency wakes, so a released step is woken in the same pass", async () => {
+    const heartbeat = stubHeartbeat();
+    const conditions = backstop();
+    const order: string[] = [];
+    for (const name of steps) heartbeat[name].mockImplementation((async () => { order.push(name); return stubHeartbeat()[name](); }) as never);
+    conditions.reconcileOpenRuns.mockImplementation(async () => {
+      order.push("routineStepConditions");
+      return { checked: 0, skipped: 0, released: 0, woken: 0, failed: 0 };
+    });
+
+    await runPeriodicHeartbeatRecovery(heartbeat as never, conditions);
+
+    const expected: string[] = [...steps];
+    expected.splice(expected.indexOf("reconcileResolvedDependencyWakes"), 0, "routineStepConditions");
+    expect(order).toEqual(expected);
+  });
+
+  it("runs as before when no step condition backstop is given", async () => {
+    const heartbeat = stubHeartbeat();
+    await runPeriodicHeartbeatRecovery(heartbeat as never);
+    for (const name of steps) expect(heartbeat[name]).toHaveBeenCalledTimes(1);
+  });
+
+  it("contains a failure of the backstop and still runs every other step", async () => {
+    const heartbeat = stubHeartbeat();
+    const conditions = backstop();
+    conditions.reconcileOpenRuns.mockRejectedValue(new Error("boom"));
+
+    await expect(runPeriodicHeartbeatRecovery(heartbeat as never, conditions)).resolves.toBeUndefined();
+
+    for (const name of steps) expect(heartbeat[name]).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["skipped", "released", "failed"] as const)("reports a pass that changed step state (%s)", async (counter) => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      await runPeriodicHeartbeatRecovery(stubHeartbeat() as never, backstop({ checked: 3, [counter]: 1 }));
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ checked: 3, [counter]: 1 }),
+        "periodic routine step condition reconciliation changed step state",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("stays quiet when the pass found nothing to change", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      await runPeriodicHeartbeatRecovery(stubHeartbeat() as never, backstop({ checked: 5 }));
+      expect(warn).not.toHaveBeenCalledWith(expect.anything(), "periodic routine step condition reconciliation changed step state");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+

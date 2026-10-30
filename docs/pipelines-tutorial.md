@@ -229,6 +229,8 @@ paperclipai routine update "$DRAFTING_ROUTINE_ID" --steps-file /tmp/drafting-ste
 
 Steps default to the routine's agent; set `assigneeAgentId` on a step to hand it to another agent. See [Routines](api/routines.md#routine-steps) for the step fields, review loops, and limits.
 
+**Steps that depend on an outcome.** An `after` entry can name the outcome it waits for, so one branch runs when a reviewer approves and another when the board rejects or stops the step. Use `{ "step": "review", "when": "done" }` or `{ "step": "review", "when": "cancelled" }` in place of the plain key. The branch that does not apply is cancelled with the comment `Skipped: condition not met`, and the steps after it follow the branch that ran. See [Conditions on steps](api/routines.md#conditions-on-steps).
+
 **Steps on a task you already have.** A run opens its own task by default. To plan the steps on a task that exists, or on every task a person creates, start them there. Run the routine on one task:
 
 ```sh

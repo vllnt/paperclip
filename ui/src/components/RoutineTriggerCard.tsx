@@ -66,7 +66,9 @@ export function RoutineTriggerCard({
   const lastResultFailed = /fail|error/i.test(trigger.lastResult ?? "");
   const lastResultLabel = trigger.lastResult?.startsWith("Created execution issue ")
     ? "Task created"
-    : trigger.lastResult;
+    : trigger.lastResult?.startsWith("Attached the steps to task ")
+      ? "Steps attached"
+      : trigger.lastResult;
 
   return (
     <form
