@@ -1,4 +1,4 @@
-import type { AutomationWakeSettings, DuplicateDetectionMode, InteractionResolverGovernance, RoutineNoopSkipSettings, RunContextPolicy, TransientRetryPolicy } from "@paperclipai/shared";
+import type { AutomationWakeSettings, DuplicateDetectionMode, InteractionResolverGovernance, IssueTriageMode, RoutineNoopSkipSettings, RunContextPolicy, TransientRetryPolicy } from "@paperclipai/shared";
 import { pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const companies = pgTable(
@@ -24,6 +24,10 @@ export const companies = pgTable(
       .default({}),
     duplicateDetectionMode: text("duplicate_detection_mode")
       .$type<DuplicateDetectionMode>()
+      .notNull()
+      .default("off"),
+    issueTriageMode: text("issue_triage_mode")
+      .$type<IssueTriageMode>()
       .notNull()
       .default("off"),
     automationWakeSettings: jsonb("automation_wake_settings")

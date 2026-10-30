@@ -97,7 +97,7 @@ interface Violation {
   reason: string;
 }
 
-const CASCADE_COVERED_DELETES = ["chat_teams_file_transfers", "decision_queue_items", "issue_duplicate_pairs"];
+const CASCADE_COVERED_DELETES = ["chat_teams_file_transfers", "decision_queue_items", "issue_duplicate_pairs", "issue_triages"];
 
 const HEX_DIGEST = "a".repeat(64);
 
@@ -128,6 +128,7 @@ const ADDED_DELETES = [
   "decisions",
   "inbox_dismissals",
   "issue_duplicate_pairs",
+  "issue_triages",
   "managed_agent_profiles",
   "native_run_finalizations",
   "native_run_results",

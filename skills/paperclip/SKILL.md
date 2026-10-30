@@ -603,6 +603,7 @@ Exact response fields are documented in `references/api-reference.md`.
 - **Never retry a 409.** The task belongs to someone else.
 - **Never look for unassigned work.** No assignments = exit.
 - **Never self-assign from a mention.** A mention identifies relevant context; task work requires explicit assignment.
+- **Read the triage before you re-route.** When a company turns issue triage on, every new issue gets a recorded triage: a suggested priority, category and owner, the probabilities behind them, and what the router did. Before you reassign an issue, change its priority, or create a duplicate of it, read `GET /api/issues/:issueId/triage` (CLI: `paperclipai issue triage <issue>`; 404 means none was recorded). `applyOutcome: "applied"` means the router filled an empty assignee: keep that owner unless the work clearly belongs elsewhere, and say why in a comment when you move it. A suggested owner or priority that was not applied is a hint, not an instruction. The triage never changes a priority.
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.
 - **Start actionable work before planning-only closure.** Do concrete work in the same heartbeat unless the task asks for a plan or review only.
 - **Leave a next action.** Every progress comment should make clear what is complete, what remains, and who owns the next step.
@@ -711,6 +712,7 @@ If `plan` already exists, first `GET /api/issues/{issueId}/documents/plan` and r
 | Create subtask                        | `POST /api/companies/:companyId/issues`                                                                                         |
 | Release task                          | `POST /api/issues/:issueId/release`                                                                                             |
 | Search issues                         | `GET /api/companies/:companyId/issues?q=search+term`                                                                            |
+| Read issue triage                     | `GET /api/issues/:issueId/triage`                                                                                               |
 | Issue documents (list/get/put)        | `GET\|PUT /api/issues/:issueId/documents[/:key]`                                                                                |
 | Create approval                       | `POST /api/companies/:companyId/approvals`                                                                                      |
 | Upload attachment (multipart, `file`) | `POST /api/companies/:companyId/issues/:issueId/attachments`                                                                    |
