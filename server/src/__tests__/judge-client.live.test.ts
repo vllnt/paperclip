@@ -61,4 +61,38 @@ describe.skipIf(!live)("judge client against the live Vercel AI Gateway", () => 
     const kind = duplicate.answers.kind;
     expect(kind?.type === "choice" ? kind.choice : null).toBe("chore");
   }, 30_000);
+
+  // Company evals record these numbers (usage, latency). A cost is recorded only when the gateway reports one,
+  // so this test prints it: the plan left open whether the gateway sends a cost at all.
+  it("reports token usage and the latency of a two-question call", async () => {
+    const startedAt = performance.now();
+    const outcome = await client.ask({
+      companyId: "live-smoke",
+      rubricVersion: "live-smoke-usage-1",
+      state: {
+        title: "Fix a typo in the contributing guide",
+        changedFiles: ["CONTRIBUTING.md"],
+        additions: 1,
+        deletions: 1,
+      },
+      questions: {
+        needs_qa: {
+          type: "predicate",
+          instructions: "Decide whether a person should test the preview deployment of this pull request before merge.",
+          whenTrue: "The change can alter what users see or do.",
+          whenFalse: "The change cannot alter user-visible behaviour: docs only, tests only, CI config, comments.",
+        },
+        qa_depth: {
+          type: "choice",
+          instructions: "Pick how much QA the preview needs.",
+          options: { none: "No user-visible change.", smoke: "A small user-visible change.", full_qa: "A broad or risky change." },
+        },
+      },
+    });
+    const latencyMs = Math.round(performance.now() - startedAt);
+    console.info(`two-question call: ${latencyMs} ms, usage ${JSON.stringify(outcome.ok ? outcome.usage : null)}, cost ${outcome.ok ? outcome.costUsd : "n/a"}`);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.usage?.inputTokens).toBeGreaterThan(0);
+  }, 30_000);
 });

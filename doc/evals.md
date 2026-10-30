@@ -29,6 +29,9 @@ standard/Ask tasks early, while preserving user-supplied titles. Its oracle
 correlates browser creation, native tool receipts, durable titles, audit ownership,
 and the reloaded task UI; fixture prompts contain no naming instructions.
 
+Neither family is a **company eval**. A company eval is a decision that a company defines for its own work
+(an input schema and Jev questions) and that its agents run as a tool; see [Company evals](./company-evals.md).
+
 ## Selecting a family
 
 Use **Runner Evals** for a runner protocol, adapter, transport, native session,

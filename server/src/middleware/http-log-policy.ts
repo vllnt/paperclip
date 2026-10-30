@@ -47,6 +47,21 @@ export function isRuntimeGitHubHttpRequest(method: string | undefined, url: stri
   return !!method && !!url && method.toUpperCase() === "POST" && /^\/runtime-tools\/github\/(?:credentials|sign)\/?$/.test(normalizePath(url));
 }
 
+const COMPANY_EVAL_BODY_PATH =
+  /^\/api\/companies\/[^/]+\/evals\/[^/]+\/runs(?:\/[^/]+\/feedback)?\/?$/i;
+
+/**
+ * Company eval runs and feedback marks. A run body is input that an agent wrote (it can carry text
+ * from a pull request, a ticket or a log), and a mark can carry a note. A rejected input answers 422
+ * and keeps its body out of the logs, with no retention limit on the log side. The match follows the
+ * browser sign-in rule: any method, any letter case, a dropped fragment, an absolute-form target.
+ */
+export function isCompanyEvalHttpRequest(url: string | undefined): boolean {
+  if (!url) return false;
+  const target = normalizePath((url.split("#")[0] ?? "").replace(/\\/g, "/"));
+  return COMPANY_EVAL_BODY_PATH.test(target.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, ""));
+}
+
 const BROWSER_SIGN_IN_INPUT_PATH = /^\/api\/companies\/[^/]+\/browser\/profiles\/[^/]+\/signin\/input\/?$/i;
 
 /**

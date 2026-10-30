@@ -121,3 +121,15 @@ ui/src/pages/AgentRoutinesTab.test.tsx
 ui/src/pages/IssueDetail.test.tsx
 ui/src/pages/Routines.test.tsx
 ui/src/pages/agent-detail-navigation.test.ts
+packages/shared/src/company-evals.test.ts
+server/src/modules/evals/domain/canonical.test.ts
+server/src/modules/evals/domain/cursor.test.ts
+server/src/modules/evals/domain/input-validator.test.ts
+server/src/modules/evals/domain/input.test.ts
+server/src/modules/evals/domain/policy.test.ts
+server/src/__tests__/company-evals-service.test.ts
+server/src/__tests__/company-evals-routes.test.ts
+server/src/__tests__/company-evals-log-redaction.test.ts
+server/src/__tests__/http-log-policy.test.ts
+server/src/__tests__/judge-client.test.ts
+cli/src/__tests__/evals.test.ts

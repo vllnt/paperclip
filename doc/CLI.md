@@ -544,6 +544,29 @@ npx paperclipai policy update <key> --company-id <company-id> [--body-file revie
 npx paperclipai policy delete <key> --company-id <company-id> --yes
 ```
 
+## Eval Commands
+
+Company evals are decisions a company defines once and runs many times, answered by Jev. Only the board creates and changes them; agents list published evals, run them and mark their own runs. They are not the developer evals in `doc/evals.md`. See `doc/company-evals.md`.
+
+```sh
+npx paperclipai evals list --company-id <company-id> [--status draft|published|archived] [--limit 50] [--cursor <cursor>]
+npx paperclipai evals show <slug> --company-id <company-id>
+
+# Board only. definition.json holds { "inputSchema": {...}, "questions": {...} }.
+npx paperclipai evals create --company-id <company-id> --slug <slug> --title "..." --when-to-use "..." --definition definition.json [--note "..."]
+npx paperclipai evals edit <slug> --company-id <company-id> [--title "..."] [--when-to-use "..."] [--definition definition.json [--note "..."]]
+npx paperclipai evals versions <slug> --company-id <company-id>
+npx paperclipai evals publish <slug> --company-id <company-id> [--version <n>]
+npx paperclipai evals archive <slug> --company-id <company-id>
+
+# Run with a JSON file (or - for stdin) or inline JSON. --version and --try-it are board only.
+npx paperclipai evals run <slug> --company-id <company-id> (--input input.json | --input-json '{...}') [--issue-id <id>] [--version <n>] [--try-it]
+npx paperclipai evals runs <slug> --company-id <company-id> [--from <iso>] [--to <iso>] [--version <n>] [--agent-id <id>] [--project-id <id>] [--outcome answered|failed|rejected] [--mode live|try_it]
+npx paperclipai evals feedback <slug> <run-id> --company-id <company-id> (--correct | --incorrect) [--question <id>] [--note "..."]
+```
+
+`evals edit` with `--definition` saves a new version; a definition equal to the latest version creates nothing. A run that Jev cannot answer (`no_key`, `cap_exceeded`, `timeout`, `error`) is recorded and printed as a failed run; the command still exits 0. An input that is too large or does not match the schema exits non-zero and prints the `runId` of the rejected run.
+
 ## Agent Commands
 
 ```sh

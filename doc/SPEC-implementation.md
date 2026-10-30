@@ -527,6 +527,14 @@ Company policies are written rules and guardrails for a company or one of its pr
 - Every actor with company access reads policies (`GET /companies/:companyId/policies[/:key[/revisions]]`). Only the board writes them (`POST`, `PATCH`, `DELETE`; agents get `403`). A changed title or body saves a revision; a stale `baseRevisionId` answers `409`. Every mutation writes a `policy.created`, `policy.updated` or `policy.deleted` activity entry.
 - A policy is guidance, not an enforced setting. Approvals, execution-policy review stages, budgets, tool policies, the company skill policy and the GitHub operation checks keep enforcing limits on the server.
 
+Company evals are decisions a company defines once and any caller runs through the one Jev client (`company_evals`, `company_eval_versions`, `company_eval_runs`, `company_eval_feedback`; `doc/company-evals.md`):
+
+- `company_evals` holds the slug (unique per company, never changes), the title, the `when_to_use` text, the status (`draft`, `published`, `archived`), the `published_version_id` and a `latest_version_number` counter. A new version appends with a compare-and-set on that counter, so two writers cannot take the same number. `company_eval_versions` is insert only: an input schema (a small JSON Schema subset) and one to eight Jev questions, with a definition hash. A definition equal to the latest version creates nothing.
+- `company_eval_runs` records every call: caller (agent or user), the verified heartbeat run, issue and project, the redacted-input hash, the size, the outcome (`answered`, `failed`, `rejected`), the answers, latency, model, token counts and cost when the gateway reports them. The input is kept for `PAPERCLIP_EVAL_INPUT_RETENTION_DAYS` (30) and then cleared by a sweep; the hash stays. A rejected input (over 32 KiB or off-schema) is recorded without its input. A Jev failure is a recorded failed run, never a guessed answer.
+- Secret-shaped text in the string values of an input is masked before it is sent, hashed or stored. The heartbeat run id a caller sends is checked against the company (and, for agents, the agent) before it is stored.
+- Board users author (`POST`, `PATCH`, `DELETE`, versions, `publish`, `archive`). Agents list and read published evals, run them, read their own runs and mark them (`PUT .../runs/:runId/feedback`); one mark per author per run per question. A configuration change and a feedback mark write an activity log entry; a run is recorded in its own table, not in the activity log. The data stays in the instance database: it is not Telemetry and not Observability.
+- Eval calls share the company's `judge_usage_daily` cap with duplicate detection.
+
 Decision-desk triage uses company-scoped sidecars rather than adding queue fields to every attention source:
 
 - `decision_queues` stores durable named queues, optional retention overrides, server-derived creator/run provenance, and data-backed seed rules.

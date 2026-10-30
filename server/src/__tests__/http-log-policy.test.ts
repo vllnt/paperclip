@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  isCompanyEvalHttpRequest,
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
   shouldSilenceHttpSuccessLog,
@@ -184,5 +185,40 @@ describe("shouldSilenceHttpSuccessLog", () => {
         404,
       ),
     ).toBe(false);
+  });
+});
+
+describe("isCompanyEvalHttpRequest", () => {
+  const companyId = "11111111-1111-4111-8111-111111111111";
+  const runId = "22222222-2222-4222-8222-222222222222";
+
+  it("matches the run and feedback routes, whatever the form of the target", () => {
+    for (const target of [
+      `/api/companies/${companyId}/evals/triage/runs`,
+      `/api/companies/${companyId}/evals/triage/runs/`,
+      `/api/companies/${companyId}/evals/triage/runs?x=1`,
+      `/API/Companies/${companyId}/Evals/triage/Runs#frag`,
+      `http://paperclip.invalid/api/companies/${companyId}/evals/triage/runs`,
+      `/api/companies/${companyId}/evals/triage/runs/${runId}/feedback`,
+      `/api/companies/${companyId}/evals/triage/runs/${runId}/feedback/`,
+      `ftp://h/api/companies/${companyId}/evals/triage/runs/${runId}/feedback`,
+    ]) {
+      expect(isCompanyEvalHttpRequest(target), target).toBe(true);
+    }
+  });
+
+  it("leaves the other eval routes and other prefixes alone", () => {
+    for (const target of [
+      undefined,
+      "",
+      `/api/companies/${companyId}/evals`,
+      `/api/companies/${companyId}/evals/triage`,
+      `/api/companies/${companyId}/evals/triage/versions`,
+      `/api/companies/${companyId}/evals/triage/publish`,
+      `/api/companies/${companyId}/evals/triage/runs/${runId}`,
+      `/api/companies/${companyId}/issues/triage/runs`,
+    ]) {
+      expect(isCompanyEvalHttpRequest(target), String(target)).toBe(false);
+    }
   });
 });

@@ -16,7 +16,8 @@ import {
   judgeUsageDaily,
 } from "@paperclipai/db";
 import { parseLabelledPairRefs } from "../services/duplicate-calibration.js";
-import { createCompanySecretKeyResolver, prepareCompanyCalibration } from "../services/duplicate-detection-factory.js";
+import { prepareCompanyCalibration } from "../services/duplicate-detection-factory.js";
+import { createCompanySecretKeyResolver } from "../services/judge-key-resolver.js";
 import {
   JUDGE_API_KEY_SECRET_NAME,
   createJudgeClient,
