@@ -2,6 +2,12 @@
 
 When work produces a user-inspectable file, upload true deliverables to the current issue before final disposition. Local filesystem paths are not enough because board users, reviewers, and cloud operators may not have access to the agent workspace.
 
+## Engineering work products
+
+When work produces or updates an operator-facing engineering output, create or update the matching work product: `pull_request` for opened PRs, `preview_url` for published previews, `runtime_service` for managed preview/dev services, `commit` for notable pushed commits, and `branch` when the branch itself is the handoff. Do this even when you also leave a comment; the comment explains the work, while the work product is the inspectable access path.
+
+## Uploading a file
+
 Use Bash to run the helper bundled with this skill; installed skill files may not retain executable permissions. From an installed `paperclip` skill directory, the helper lives at `scripts/paperclip-upload-artifact.sh`:
 
 ```bash

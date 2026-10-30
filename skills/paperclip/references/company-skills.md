@@ -9,6 +9,8 @@ Use this reference when a board user, CEO, or manager asks you to find a skill, 
 - Agent skill assignment: add or remove company skills on an existing agent.
 - Hire/create composition: pass `desiredSkills` when creating or hiring an agent so the same assignment model applies immediately.
 
+Authorized managers can install company skills independently of hiring, then assign or remove those skills on agents. Assign skills to existing agents with `POST /api/agents/{agentId}/skills/sync` and an explicit `add`, `remove`, or `replace` mode. Prefer `add`; `replace` overwrites the complete desired skill set. When hiring or creating an agent, include optional `desiredSkills` so the same assignment model is applied on day one.
+
 The canonical model is:
 
 1. add the skill to the company library — either from the app catalog (`skills install`), an external source (`skills import`), or a managed local skill (`skills create`/`skills scan-projects`)
