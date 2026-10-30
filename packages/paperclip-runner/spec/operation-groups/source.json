@@ -364,6 +364,8 @@
     "atomic_checkout": {"kind": "control_plane", "targets": ["checkout_task"], "reason": "Checkout is an atomic control-plane transaction."},
     "runtime_release": {"kind": "control_plane", "targets": ["release_task"], "reason": "Release is runner/control-plane cleanup."},
     "restore_document_revision": {"kind": "known_gap", "targets": [], "reason": "Approved optional documents:restore operation is not yet in the canonical catalog."},
+    "list_company_policies": {"kind": "known_gap", "targets": [], "reason": "Read-only policy list: native runs read policies through search_api and call_api, and no semantic operation exists yet."},
+    "get_company_policy": {"kind": "known_gap", "targets": [], "reason": "Read-only policy get: native runs read policies through search_api and call_api, and no semantic operation exists yet."},
     "link_approval": {"kind": "folded", "targets": ["request_approval", "get_task_context"], "reason": "Issue linkage is part of approval request/context composites."},
     "unlink_approval": {"kind": "control_plane", "targets": ["append_audit_record"], "reason": "No standalone agent unlink tool is approved in V1."},
     "test_only_api_escape_hatch": {"kind": "folded", "targets": ["generic_api_request"], "reason": "Compatibility alias for the test-only escape hatch."}

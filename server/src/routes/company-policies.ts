@@ -6,6 +6,7 @@ import {
   listCompanyPoliciesQuerySchema,
   updateCompanyPolicySchema,
 } from "@paperclipai/shared";
+import { isForeignKeyViolation } from "../db-errors.js";
 import { badRequest, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { companyPolicyService, logActivity } from "../services/index.js";
@@ -15,6 +16,20 @@ function parseKey(raw: unknown): string {
   const parsed = companyPolicyKeySchema.safeParse(raw);
   if (!parsed.success) throw badRequest(parsed.error.issues[0]?.message ?? "Invalid policy key");
   return parsed.data;
+}
+
+/**
+ * A save checks that the project and owner exist, then writes. When the project is deleted between the check and
+ * the write, Postgres refuses the write with a foreign-key violation. The project is gone, so answer 404, not 500.
+ * Only create and update use this: both insert or update a row that points at the project.
+ */
+async function orNotFoundWhenReferenceIsGone<T>(save: () => Promise<T>): Promise<T> {
+  try {
+    return await save();
+  } catch (error) {
+    if (isForeignKeyViolation(error)) throw notFound("The project or owner of this policy no longer exists");
+    throw error;
+  }
 }
 
 /**
@@ -55,7 +70,9 @@ export function companyPolicyRoutes(db: Db) {
     assertBoard(req);
     assertCompanyAccess(req, companyId);
     const actor = getActorInfo(req);
-    const policy = await svc.create(companyId, req.body, { userId: actor.actorId, runId: actor.runId });
+    const policy = await orNotFoundWhenReferenceIsGone(() =>
+      svc.create(companyId, req.body, { userId: actor.actorId, runId: actor.runId }),
+    );
     await logActivity(db, {
       companyId,
       actorType: actor.actorType,
@@ -74,10 +91,10 @@ export function companyPolicyRoutes(db: Db) {
     assertBoard(req);
     assertCompanyAccess(req, companyId);
     const actor = getActorInfo(req);
-    const { policy, changed } = await svc.update(companyId, parseKey(req.params.key), req.body, {
-      userId: actor.actorId,
-      runId: actor.runId,
-    });
+    const key = parseKey(req.params.key);
+    const { policy, changed } = await orNotFoundWhenReferenceIsGone(() =>
+      svc.update(companyId, key, req.body, { userId: actor.actorId, runId: actor.runId }),
+    );
     if (changed.length > 0) {
       await logActivity(db, {
         companyId,

@@ -11,6 +11,7 @@ import {
   validateRunnerApiCall,
   type RunnerApiIo,
 } from "./runner-api-client.js";
+import { runnerApiRestriction } from "./runner-api-policy.js";
 import { RUNNER_API_RESPONSE_MAX_BYTES } from "./runner-api-response-limits.js";
 
 const context = {
@@ -142,7 +143,7 @@ describe("runner API catalog", () => {
       searchRunnerApi({ query: "GET /api/companies/{companyId}/issues" })
         .results[0].dedicatedTools,
     ).toContain("search_tasks");
-    expect(searchRunnerApi({ query: "nothing-zzzzzzzzzz" }).total).toBe(0);
+    expect(searchRunnerApi({ query: "qzxvk-zzzzzzzzzz" }).total).toBe(0);
   });
   it("paginates without duplicates and rejects stale or mismatched cursors", () => {
     const first = searchRunnerApi({ query: "project", limit: 1 });
@@ -760,5 +761,136 @@ describe("runner API request boundary", () => {
     await expect(
       readBoundedResponse(new Response("too large"), 3),
     ).rejects.toThrow("transfer limit");
+  });
+});
+
+describe("company policies through search_api and call_api", () => {
+  const listPolicies = "GET /api/companies/{companyId}/policies";
+  const getPolicy = "GET /api/companies/{companyId}/policies/{key}";
+  const policyRevisions = "GET /api/companies/{companyId}/policies/{key}/revisions";
+  const policyReads = [listPolicies, getPolicy, policyRevisions];
+  const policyWrites = [
+    "POST /api/companies/{companyId}/policies",
+    "PATCH /api/companies/{companyId}/policies/{key}",
+    "DELETE /api/companies/{companyId}/policies/{key}",
+  ];
+  const pathParamsFor = (operationId: string): Record<string, string> =>
+    operationId.includes("{key}") ? { companyId: context.companyId, key: "code-style" } : { companyId: context.companyId };
+
+  function searchAll(query: string): string[] {
+    const found: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = searchRunnerApi({ query, limit: 10, ...(cursor ? { cursor } : {}) });
+      found.push(...page.results.map((entry) => entry.operationId));
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return found;
+  }
+
+  it("finds the policy reads with search_api", () => {
+    expect(searchAll("company policies")).toEqual(expect.arrayContaining(policyReads));
+    expect(searchAll("policy revisions")).toEqual(expect.arrayContaining([policyRevisions]));
+  });
+
+  it.each(policyReads)("lists %s as a plain REST read that every work mode may call", (operationId) => {
+    const operation = runnerApiOperation(operationId);
+    expect(operation.callPolicy).toBe("rest");
+    expect(operation.transport).toBe("rest");
+    expect(operation.allowedModes).toEqual(["standard", "ask", "planning", "skill_test"]);
+    expect(operation.authorization.actor).not.toBe("board");
+    expect(operation.runnerRestrictions?.join(" ")).not.toContain("written by the board only");
+    expect(runnerApiRestriction("GET", operation.path)).toBeNull();
+  });
+
+  it.each(["standard", "ask", "planning", "skill_test"])("validates each policy read in %s mode", (workMode) => {
+    for (const operationId of policyReads) {
+      const { operation } = validateRunnerApiCall(
+        { operationId, pathParams: pathParamsFor(operationId) },
+        { ...context, workMode },
+      );
+      expect(operation.operationId).toBe(operationId);
+    }
+  });
+
+  it.each(policyReads)("refuses %s for another company before dispatch", async (operationId) => {
+    const request = vi.fn<typeof fetch>();
+    await expect(
+      executeRunnerApi(
+        { operationId, pathParams: { ...pathParamsFor(operationId), companyId: "company-b" } },
+        context,
+        io(request),
+      ),
+    ).rejects.toThrow("another company");
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("reads a policy with call_api as a GET with the run's token and no body", async () => {
+    const request = vi.fn<typeof fetch>(async () => Response.json({ key: "code-style", title: "Code style" }));
+    const result = await executeRunnerApi({ operationId: getPolicy, pathParams: pathParamsFor(getPolicy) }, context, io(request));
+
+    expect(result).toMatchObject({ ok: true, status: 200 });
+    expect(JSON.stringify(result)).toContain("Code style");
+    expect(request).toHaveBeenCalledTimes(1);
+    const [url, init] = request.mock.calls[0] as [URL, RequestInit];
+    expect(String(url)).toBe("http://127.0.0.1:3100/api/companies/company-a/policies/code-style");
+    expect(init.method).toBe("GET");
+    expect(init.body).toBeUndefined();
+  });
+
+  it.each(policyWrites)("refuses %s and sends no request", async (operationId) => {
+    const operation = runnerApiOperation(operationId);
+    expect(operation.callPolicy).toBe("restricted");
+    expect(operation.runnerRestrictions?.join(" ")).toContain("written by the board only");
+
+    const request = vi.fn<typeof fetch>();
+    await expect(
+      executeRunnerApi(
+        { operationId, pathParams: pathParamsFor(operationId), body: { title: "Rewrite", body: "No rules." } },
+        context,
+        io(request),
+      ),
+    ).rejects.toThrow("written by the board only");
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("refuses every non-read method on every policy path", () => {
+    const paths = [
+      "/api/companies/{companyId}/policies",
+      "/api/companies/{companyId}/policies/{key}",
+      "/api/companies/{companyId}/policies/{key}/revisions",
+    ];
+    for (const path of paths) {
+      for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+        expect(runnerApiRestriction(method, path), `${method} ${path}`).toContain("written by the board only");
+      }
+      for (const method of ["GET", "HEAD", "OPTIONS"]) {
+        expect(runnerApiRestriction(method, path), `${method} ${path}`).toBeNull();
+      }
+    }
+  });
+
+  it("keeps the policy rule off the neighbouring tool policy routes", () => {
+    for (const path of ["/api/companies/{companyId}/tools/policies", "/api/companies/{companyId}/tools/policies/{policyId}"]) {
+      expect(runnerApiRestriction("POST", path)).toBeNull();
+    }
+  });
+
+  it("builds the policy URL only from a key that stays in its path segment", () => {
+    const operation = runnerApiOperation(getPolicy);
+    const url = (key: string) =>
+      runnerApiUrl(operation, { operationId: getPolicy, pathParams: { companyId: context.companyId, key } }, context, "http://127.0.0.1:3100");
+
+    expect(url("code-style").pathname).toBe("/api/companies/company-a/policies/code-style");
+    for (const key of ["a/b", "a\\b", "..", ".", "a%2fb", "a%2e%2e", ""]) {
+      expect(() => url(key), JSON.stringify(key)).toThrow();
+    }
+    // ? and # are encoded into the segment: no query and no fragment ride on the key.
+    for (const key of ["a?x=1", "a#x"]) {
+      const built = url(key);
+      expect(built.search).toBe("");
+      expect(built.hash).toBe("");
+      expect(built.pathname.startsWith("/api/companies/company-a/policies/a%")).toBe(true);
+    }
   });
 });

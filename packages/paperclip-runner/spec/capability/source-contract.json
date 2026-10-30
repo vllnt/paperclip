@@ -34,6 +34,8 @@
     "paperclipWaitForIssueWorkspaceService": ["optional_agent_tool", "wait_for_workspace_service"],
     "paperclipListGoals": ["optional_agent_tool", "list_goals"],
     "paperclipGetGoal": ["optional_agent_tool", "get_goal"],
+    "paperclipListPolicies": ["optional_agent_tool", "list_company_policies"],
+    "paperclipGetPolicy": ["optional_agent_tool", "get_company_policy"],
     "paperclipListApprovals": ["optional_agent_tool", "list_approvals"],
     "paperclipCreateApproval": ["optional_agent_tool", "request_approval"],
     "paperclipGetApproval": ["optional_agent_tool", "get_approval"],
