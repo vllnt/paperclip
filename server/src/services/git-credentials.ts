@@ -219,6 +219,8 @@ export function createGitRemoteAuthProvider(
     heartbeatRunId?: string | null;
     responsibleUserId?: string | null;
     agentId?: string | null;
+    /** `false` ignores the agent's standing delegations, as the run-time credential broker does. */
+    allowStandingDelegation?: boolean;
   },
   deps?: {
     secrets?: GitCredentialSecretsDeps;

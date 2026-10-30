@@ -44,6 +44,32 @@ and webhook binding uses the same order:
 4. Legacy `GH_TOKEN`/`GITHUB_TOKEN` only when no managed GitHub connection is
    configured for the company.
 
+The server also reads GitHub when no run exists yet: the unchanged pull request
+check for a wait (`issue wait --pull-request`) and the GitHub panel of an issue.
+These reads use the order above for a read by the issue's assignee, as the
+runtime-tools credential route answers it. The responsible user is the one that
+the issue continues under (its continuation identity). Standing delegations do
+not count, and a company-default identity names nobody to act as. A low-trust
+issue, the write-identity kill switch, and an App-user policy apply as they do
+for a run.
+
+A GitHub object in the panel is stored once for the company, and every issue
+that mentions it shows the same snapshot. Paperclip reads it with the
+credential of the three newest assigned issues that mention it, in order, until
+one gives a token. Anyone who can read such an issue therefore sees what the
+GitHub account of the user that issue continues under can see of that object.
+This stays inside the company's trust boundary: the agent's own run could post
+the same data in a comment. When two issues give different accounts, a private
+repository can show data after one refresh and "not found" after the next:
+the issue tried first is the one updated last, and that changes over time.
+
+Text of low trust does not choose a credential. A mention in a quarantined
+comment or document does not count when Paperclip picks the issue to read
+with. An object that only quarantined text mentions has no credential, and the
+panel shows "Requires auth": it does not fall back to a `GITHUB_TOKEN` company
+secret either. A promoted comment or document counts again. An object that no
+assigned issue mentions uses the company secret, as before.
+
 An unavailable or ambiguous managed identity fails visibly. It never falls
 through to another person, an organization credential, or a legacy token.
 Agent grants are company-scoped, have exactly one `subjectAgentId`, cannot be

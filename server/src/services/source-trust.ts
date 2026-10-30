@@ -1,4 +1,5 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql, type SQL } from "drizzle-orm";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, projects } from "@paperclipai/db";
 import {
@@ -28,6 +29,17 @@ export type SourceTrustIssueContext = {
 
 export function isLowTrustQuarantined(sourceTrust: SourceTrustMetadata | null | undefined): boolean {
   return sourceTrust?.preset === LOW_TRUST_REVIEW_PRESET && sourceTrust.disposition === "quarantined";
+}
+
+/**
+ * isLowTrustQuarantined for a query, over a `source_trust` column. False, never null, when the
+ * column is null or its row is missing (an outer join), so `not(...)` keeps those rows.
+ *
+ * @param column - A jsonb `source_trust` column.
+ * @returns A condition that is true for a low-trust quarantined record.
+ */
+export function isLowTrustQuarantinedSql(column: AnyPgColumn): SQL<boolean> {
+  return sql<boolean>`coalesce(${column} ->> 'preset' = ${LOW_TRUST_REVIEW_PRESET} and ${column} ->> 'disposition' = 'quarantined', false)`;
 }
 
 export function redactQuarantinedBodyForHigherTrust<T extends { body?: string | null; sourceTrust?: SourceTrustMetadata | null }>(
