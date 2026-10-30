@@ -35,6 +35,7 @@ export type {
   SandboxAdditionalSource,
 } from "./sandbox-managed-runtime.js";
 import {
+  buildBridgeForwardUrl,
   createCommandManagedSandboxCallbackBridgeQueueClient,
   formatSandboxCallbackBridgeSlowPickup,
   createSandboxCallbackBridgeAsset,
@@ -2072,13 +2073,6 @@ function buildBridgeResponseHeaders(response: Response): Record<string, string> 
     if (value && value.trim().length > 0) out[key] = value.trim();
   }
   return out;
-}
-
-function buildBridgeForwardUrl(baseUrl: string, request: { path: string; query: string }): URL {
-  const url = new URL(request.path, baseUrl);
-  const query = request.query.trim();
-  url.search = query.startsWith("?") ? query.slice(1) : query;
-  return url;
 }
 
 function bridgeResponseBodyLimitError(maxBodyBytes: number): Error {
@@ -4701,10 +4695,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   });
 
   // PAPERCLIP_BRIDGE_DEBUG opts into verbose stdout logs of every bridge proxy
-  // request/response. The query string is logged verbatim, so callers who pass
-  // auth tokens or other sensitive values as query parameters should be aware
-  // those values appear in the host process's stdout when this flag is enabled.
-  // Only intended for active debugging in trusted environments.
+  // request/response. The logs carry the method, the path and the response
+  // status, never the query string: a caller can pass an auth token or another
+  // sensitive value as a query parameter. Only intended for active debugging in
+  // trusted environments.
   const bridgeDebugEnabled = isBridgeDebugEnabled(process.env);
 
   // One forward of a relayed sandbox request onto the existing Paperclip API
@@ -4732,14 +4726,14 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     },
   ): Promise<{ status: number; headers: Record<string, string>; body: Buffer }> => {
     const method = request.method.trim().toUpperCase() || "GET";
-    // The per-request debug log prints the method, the path, and the query. The
-    // duplex path suppresses it, so no route or query rides a log line there. The
-    // file path keeps the existing behavior.
+    // The per-request debug log prints the method and the path, and only marks
+    // that a query was present. The duplex path suppresses it, so no route rides
+    // a log line there. The file path keeps the existing behavior.
     const emitDebugLog = bridgeDebugEnabled && options?.suppressDebugLog !== true;
     if (emitDebugLog) {
       await onLog(
         "stdout",
-        `[paperclip] Bridge proxy ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
+        `[paperclip] Bridge proxy ${method} ${request.path}${request.query ? "?<query omitted>" : ""}\n`,
       );
     }
     // Forward only the allowlisted headers, the one rule the sandbox gateway
@@ -4776,7 +4770,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     if (emitDebugLog) {
       await onLog(
         "stdout",
-        `[paperclip] Bridge proxy response ${response.status} for ${method} ${request.path}${request.query ? `?${request.query}` : ""}\n`,
+        `[paperclip] Bridge proxy response ${response.status} for ${method} ${request.path}${request.query ? "?<query omitted>" : ""}\n`,
       );
     }
     // The host delivered response headers, so the response-body read starts after
