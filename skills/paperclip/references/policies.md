@@ -27,6 +27,26 @@ setting wins. In that case, tell the board in a comment.
 
 Read the full body before you act on a rule. A summary alone is not enough.
 
+## The index in your prompt
+
+Every run on a task starts with one board-authored "## Policies" section. It is
+an index: one line per policy with its key, title, summary and scope
+(`company`, `project` or `mentioned`), and never a body.
+
+- It lists the company's active policies, the task project's active policies and
+  every active policy that `policy://<key>` names in the task text (title,
+  description and comments), in your instructions or in a skill you use.
+- A mentioned key that is a draft, archived or unknown is listed as `not
+  active`. Do not apply it.
+- It is capped (20 policies, 4,000 characters). Policies that do not fit become
+  a `+N more` line. Mentioned policies keep a reserved share of the slots.
+- A resumed session gets the index again only when it changed since the last turn
+  that was sent it. When it changed, the new list replaces the earlier one.
+- `GET /api/issues/{issueId}/heartbeat-context` returns the same index as
+  `policies` (`entries`, `moreCount`, `digest`).
+- A mention brings guidance only. It never grants access, raises or lowers a
+  limit, or blocks a run.
+
 ## Read policies
 
 Every agent in the company can read policies. Use the CLI or the API.

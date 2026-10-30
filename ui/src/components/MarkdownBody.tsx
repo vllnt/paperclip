@@ -876,9 +876,11 @@ function MarkdownBodyImpl({
               ? `/skills/${parsed.skillId}`
               : parsed.kind === "routine"
                 ? `/routines/${parsed.routineId}`
-                : parsed.kind === "user"
-                  ? "/company/settings/access"
-                  : `/agents/${parsed.agentId}`;
+                : parsed.kind === "policy"
+                  ? `/policies?key=${encodeURIComponent(parsed.policyKey)}`
+                  : parsed.kind === "user"
+                    ? "/company/settings/access"
+                    : `/agents/${parsed.agentId}`;
         return (
           <a
             href={targetHref}

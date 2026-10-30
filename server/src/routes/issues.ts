@@ -222,6 +222,8 @@ import {
   QueuedCommentMutationForbiddenError,
   type QueuedCommentIssueContext,
 } from "../modules/wake-queue/index.js";
+import { createPolicyIndexResolver, listCompanySkillKeys } from "../modules/policy-index/index.js";
+import { resolveRootBoundInstructionsFingerprintPath } from "../services/heartbeat.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
 import {
@@ -3705,6 +3707,39 @@ export function issueRoutes(
     opts.searchRateLimiter ?? defaultCompanySearchRateLimiter;
   const instanceSettings = instanceSettingsService(db);
   const agentsSvc = agentService(db);
+  const policyIndexResolver = createPolicyIndexResolver(db, {
+    onSourceError: (source, err) => logger.warn({ err, source }, "a policy mention source could not be read"),
+  });
+  /**
+   * The policy index a run on this issue would carry: the same resolver and the same inputs as the run,
+   * for the assignee (or the agent the caller names). Guidance only, so a failure costs the field, never
+   * the response.
+   */
+  const readPolicyIndexForIssue = async (
+    issue: { id: string; companyId: string; projectId: string | null; title: string; description: string | null; assigneeAgentId: string | null },
+    requestedAgentId: string | null,
+  ) => {
+    try {
+      const agentId = requestedAgentId ?? issue.assigneeAgentId;
+      const agent = agentId ? await agentsSvc.getById(agentId) : null;
+      const config = agent && agent.companyId === issue.companyId ? readObject(agent.adapterConfig) : {};
+      const committedInstructions = resolveRootBoundInstructionsFingerprintPath({
+        instructionsFilePath: readNonEmptyString(config.instructionsFilePath),
+        instructionsRootPath: readNonEmptyString(config.instructionsRootPath),
+        instructionsEntryFile: readNonEmptyString(config.instructionsEntryFile),
+      });
+      return await policyIndexResolver.resolve({
+        companyId: issue.companyId,
+        projectId: issue.projectId,
+        issue: { id: issue.id, title: issue.title, description: issue.description ?? null },
+        instructionsFilePath: committedInstructions.filePath,
+        skillKeys: await listCompanySkillKeys(db, issue.companyId),
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: issue.id }, "failed to build the policy index for the heartbeat context");
+      return null;
+    }
+  };
   const loadCompanyRunTiers = async (companyId: string) =>
     (await instanceSettings.getGeneral()).companyRunTiers?.[companyId] ?? null;
   const loadRunProfileAssignee = async (agentId: string) => {
@@ -8730,6 +8765,7 @@ export function issueRoutes(
       req.query.wakeCommentId.trim().length > 0
         ? req.query.wakeCommentId.trim()
         : null;
+    const policyAgentId = readNonEmptyString(req.query.agentId);
 
     const currentExecutionWorkspacePromise = issue.executionWorkspaceId
       ? executionWorkspacesSvc.getById(issue.executionWorkspaceId)
@@ -8748,6 +8784,7 @@ export function issueRoutes(
       currentExecutionWorkspace,
       activeRecoveryAction,
       companyFocus,
+      policies,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -8769,6 +8806,7 @@ export function issueRoutes(
       currentExecutionWorkspacePromise,
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
       readCompanyFocusForIssue(db, issue.companyId, issue.goalId),
+      readPolicyIndexForIssue(issue, policyAgentId),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -8856,6 +8894,7 @@ export function issueRoutes(
         : null,
       goal: goal ? heartbeatContextGoal(goal) : null,
       ...(companyFocus ? { companyFocus } : {}),
+      ...(policies ? { policies } : {}),
       commentCursor,
       wakeComment: safeWakeComment,
       attachments: attachments.map((a) => ({

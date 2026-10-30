@@ -1,16 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
   buildAgentMentionHref,
+  buildPolicyMentionHref,
   buildProjectMentionHref,
   buildRoutineMentionHref,
   buildSkillMentionHref,
   buildUserMentionHref,
   extractAgentMentionIds,
+  extractPolicyMentionKeys,
   extractProjectMentionIds,
   extractRoutineMentionIds,
   extractSkillMentionIds,
   extractUserMentionIds,
   parseAgentMentionHref,
+  parsePolicyMentionHref,
   parseProjectMentionHref,
   parseRoutineMentionHref,
   parseSkillMentionHref,
@@ -59,5 +62,44 @@ describe("project-mentions", () => {
       routineId: "routine-123",
     });
     expect(extractRoutineMentionIds(`[/routine:Weekly review](${href})`)).toEqual(["routine-123"]);
+  });
+
+  it("round-trips policy mentions", () => {
+    const href = buildPolicyMentionHref("code-review");
+    expect(href).toBe("policy://code-review");
+    expect(parsePolicyMentionHref(href)).toEqual({ key: "code-review" });
+    expect(extractPolicyMentionKeys(`[/policy:Code review](${href})`)).toEqual(["code-review"]);
+  });
+
+  it("lowercases a policy key and rejects a malformed one", () => {
+    expect(parsePolicyMentionHref("policy://Code-Review")).toEqual({ key: "code-review" });
+    expect(parsePolicyMentionHref("policy://a1")).toEqual({ key: "a1" });
+    for (const href of [
+      "policy://",
+      "policy://-leading-dash",
+      "policy://has space",
+      "policy://under_score",
+      "policy://a/b",
+      "policy://dotted.key",
+      "policy://%20",
+      `policy://${"a".repeat(65)}`,
+      "skill://code-review",
+      "code-review",
+    ]) {
+      expect(parsePolicyMentionHref(href), href).toBeNull();
+    }
+    expect(parsePolicyMentionHref(`policy://${"a".repeat(64)}`)).toEqual({ key: "a".repeat(64) });
+  });
+
+  it("extracts each policy key once, in order, and skips invalid ones", () => {
+    const markdown = [
+      "[a](policy://first)",
+      "[b](policy://second) and [again](policy://first)",
+      "[bad](policy://-nope) [also bad](policy://has_underscore)",
+      "[skill](skill://not-a-policy) policy://bare-text-is-not-a-link",
+      "[Upper](policy://FIRST)",
+    ].join("\n");
+    expect(extractPolicyMentionKeys(markdown)).toEqual(["first", "second"]);
+    expect(extractPolicyMentionKeys("")).toEqual([]);
   });
 });

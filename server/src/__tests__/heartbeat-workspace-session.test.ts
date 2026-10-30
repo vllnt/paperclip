@@ -7,11 +7,13 @@ import { describe, expect, it, vi } from "vitest";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { readPolicyIndexSessionDigest } from "../modules/policy-index/index.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
   assertGitWorktreeBaseWorkspaceReady,
   assertPushCapabilityCheckoutValid,
+  attachPaperclipSessionMetadataToSessionParams,
   buildExplicitResumeSessionOverride,
   buildEffectiveRunSessionConfigMetadata,
   buildEffectiveRunWorkspaceConfigMetadata,
@@ -2626,11 +2628,65 @@ describe("stripPaperclipSessionMetadataFromSessionParams", () => {
         __paperclipConfigFingerprintVersion: 1,
         __paperclipConfigCategories: ["adapterConfig"],
         __paperclipConfigCategoryFingerprints: { adapterConfig: "v1:sha256:def" },
+        __paperclipPoliciesLastSentDigest: "0123456789abcdef0123456789abcdef",
       }),
     ).toEqual({
       sessionId: "thread-1",
       cwd: "/tmp/project",
     });
+  });
+});
+
+describe("policy index session digest", () => {
+  const DIGEST = "0123456789abcdef0123456789abcdef";
+
+  it("is saved with the session and read back from the stored params, not from the codec's view of them", async () => {
+    const metadata = await buildSessionConfigMetadata();
+    const saved = attachPaperclipSessionMetadataToSessionParams({ sessionId: "thread-1" }, "gpt-5.4-mini", metadata, DIGEST)!;
+    expect(saved.__paperclipPoliciesLastSentDigest).toBe(DIGEST);
+    expect(readPolicyIndexSessionDigest(saved)).toBe(DIGEST);
+    // The Codex codec drops keys it does not know, so a codec-decoded copy cannot be the source.
+    expect(readPolicyIndexSessionDigest(codexSessionCodec.deserialize(saved))).toBeNull();
+    // An adapter never sees it.
+    expect(stripPaperclipSessionMetadataFromSessionParams(saved)).toEqual({ sessionId: "thread-1" });
+  });
+
+  it("is left out when the run was told nothing, and does not disturb the other metadata", async () => {
+    const metadata = await buildSessionConfigMetadata();
+    const without = attachPaperclipSessionMetadataToSessionParams({ sessionId: "thread-1" }, "gpt-5.4-mini", metadata, null)!;
+    expect(without).not.toHaveProperty("__paperclipPoliciesLastSentDigest");
+    const withDigest = attachPaperclipSessionMetadataToSessionParams({ sessionId: "thread-1" }, "gpt-5.4-mini", metadata, DIGEST)!;
+    const { __paperclipPoliciesLastSentDigest: _digest, ...rest } = withDigest;
+    expect(rest).toEqual(without);
+    expect(attachPaperclipSessionMetadataToSessionParams({ sessionId: "thread-1" }, null, null, null)).toEqual({ sessionId: "thread-1" });
+    expect(attachPaperclipSessionMetadataToSessionParams({ sessionId: "thread-1" }, null, null, DIGEST)).toEqual({
+      sessionId: "thread-1",
+      __paperclipPoliciesLastSentDigest: DIGEST,
+    });
+  });
+
+  it("ignores anything that is not a digest string", () => {
+    for (const value of [null, undefined, "x", 3, [], {}, { __paperclipPoliciesLastSentDigest: 7 }, { __paperclipPoliciesLastSentDigest: "" }, { __paperclipPoliciesLastSentDigest: "d".repeat(129) }]) {
+      expect(readPolicyIndexSessionDigest(value)).toBeNull();
+    }
+  });
+
+  it("never resets the session or changes the config fingerprint when the policies change", async () => {
+    // The policy index is not an input of the fingerprint: the same config gives the same fingerprint
+    // whichever policies exist, and a session saved under one digest resumes under another.
+    const first = await buildSessionConfigMetadata();
+    const second = await buildSessionConfigMetadata();
+    expect(second.fingerprint).toBe(first.fingerprint);
+    const saved = attachPaperclipSessionMetadataToSessionParams({ sessionId: "thread-1" }, "gpt-5.4-mini", first, "an-older-digest")!;
+    const decision = resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4-mini",
+      taskSessionParams: saved,
+      configMetadata: second,
+    });
+    expect(decision.reset).toBe(false);
+    expect(decision.reasons).toEqual([]);
+    expect(saved.__paperclipConfigFingerprint).toBe(first.fingerprint);
   });
 });
 

@@ -4291,7 +4291,15 @@ registry.registerPath({
   path: "/api/issues/{id}/heartbeat-context",
   tags: ["issues"],
   summary: "Get issue heartbeat context",
-  request: { params: z.object({ id: z.string() }) },
+  description:
+    "The compact context an agent starts a run from. `policies` is the index of the active policies that apply to the issue: " +
+    "the company's, the issue project's and any a `policy://<key>` mention names, each with key, title, summary and scope and never a body " +
+    "(a mentioned draft, archived or unknown key shows as `not_active`). It is capped, with a `moreCount` for the rest, and `digest` changes " +
+    "when the index does. Read a policy's full text with `GET /api/companies/{companyId}/policies/{key}`. Policies are guidance only.",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: z.object({ wakeCommentId: z.string().optional(), agentId: z.string().optional() }),
+  },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 

@@ -45,7 +45,7 @@ import {
   buildRoutineMentionHref,
   buildUserMentionHref,
 } from "@paperclipai/shared";
-import { Boxes, CalendarClock, Flag, Hash, User, X } from "lucide-react";
+import { Boxes, CalendarClock, Flag, Hash, ScrollText, User, X } from "lucide-react";
 import { applyMentionChipDecoration, clearMentionChipDecoration, parseMentionChipHref } from "../lib/mention-chips";
 import { MentionAwareLinkNode, mentionAwareLinkNodeReplacement } from "../lib/mention-aware-link-node";
 import { mentionDeletionPlugin } from "../lib/mention-deletion";
@@ -348,6 +348,12 @@ const FALLBACK_CODE_BLOCK_DESCRIPTOR: CodeBlockEditorDescriptor = {
   Editor: CodeMirrorEditor,
 };
 
+/** Slash queries that name a routine or policy by title, which may contain spaces. */
+function hasSpacedSlashQueryPrefix(query: string): boolean {
+  const lower = query.toLowerCase();
+  return lower.startsWith("routine:") || lower.startsWith("policy:");
+}
+
 export function findMentionMatch(
   text: string,
   offset: number,
@@ -370,7 +376,7 @@ export function findMentionMatch(
 
   if (atPos === -1) return null;
   const query = text.slice(atPos + 1, offset);
-  if (trigger === "skill" && /\s/.test(query) && !query.toLowerCase().startsWith("routine:")) {
+  if (trigger === "skill" && /\s/.test(query) && !hasSpacedSlashQueryPrefix(query)) {
     return null;
   }
 
@@ -553,6 +559,7 @@ function mentionMarkdown(option: MentionOption): string {
 
 function slashCommandLabel(option: SlashCommandOption): string {
   if (option.kind === "routine") return `/routine:${option.name}`;
+  if (option.kind === "policy") return `/policy:${option.name}`;
   if (option.kind === "action") return `/${option.command}`;
   return `/${option.slug}`;
 }
@@ -565,11 +572,18 @@ function slashCommandMarkdown(option: SlashCommandOption): string {
   if (option.kind === "routine") {
     return `[${slashCommandLabel(option)}](${buildRoutineMentionHref(option.routineId)}) `;
   }
+  if (option.kind === "policy") {
+    return `[${escapeMarkdownLinkLabel(option.name)}](${option.href}) `;
+  }
   return `[/${option.slug}](${option.href}) `;
 }
 
+function escapeMarkdownLinkLabel(value: string): string {
+  return value.replace(/[\\[\]]/g, "\\$&");
+}
+
 function autocompleteMarkdown(option: AutocompleteOption): string {
-  return option.kind === "skill" || option.kind === "routine" || option.kind === "action"
+  return option.kind === "skill" || option.kind === "routine" || option.kind === "policy" || option.kind === "action"
     ? slashCommandMarkdown(option)
     : mentionMarkdown(option);
 }
@@ -607,6 +621,9 @@ function autocompleteOptionMatchesLink(option: AutocompleteOption, href: string)
   }
   if (option.kind === "routine") {
     return parsed.kind === "routine" && parsed.routineId === option.routineId;
+  }
+  if (option.kind === "policy") {
+    return parsed.kind === "policy" && parsed.policyKey === option.policyKey;
   }
 
   if (option.kind === "issue" && option.issueIdentifier) {
@@ -1017,7 +1034,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
         continue;
       }
 
-      if (parsed.kind === "skill" || parsed.kind === "routine") {
+      if (parsed.kind === "skill" || parsed.kind === "routine" || parsed.kind === "policy") {
         applyMentionChipDecoration(link, parsed);
         continue;
       }
@@ -1594,6 +1611,8 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
               >
                 {option.kind === "routine" ? (
                   <CalendarClock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                ) : option.kind === "policy" ? (
+                  <ScrollText className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 ) : option.kind === "action" ? (
                   <Flag className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 ) : option.kind === "skill" ? (
@@ -1619,7 +1638,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
                   </span>
                 ) : (
                   <span className="truncate">
-                    {option.kind === "skill" || option.kind === "routine" || option.kind === "action"
+                    {option.kind === "skill" || option.kind === "routine" || option.kind === "policy" || option.kind === "action"
                       ? slashCommandLabel(option)
                       : option.name}
                   </span>
@@ -1647,6 +1666,11 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
                 {option.kind === "routine" && (
                   <span className="ml-auto text-(length:--text-nano) uppercase tracking-wide text-muted-foreground">
                     Routine
+                  </span>
+                )}
+                {option.kind === "policy" && (
+                  <span className="ml-auto text-(length:--text-nano) uppercase tracking-wide text-muted-foreground">
+                    Policy
                   </span>
                 )}
                 {option.kind === "action" && (

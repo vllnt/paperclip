@@ -7,6 +7,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   buildAgentMentionHref,
   buildIssueReferenceHref,
+  buildPolicyMentionHref,
   buildProjectMentionHref,
   buildRoutineMentionHref,
   buildSkillMentionHref,
@@ -170,6 +171,28 @@ describe("MarkdownBody", () => {
     expect(html).toContain('data-mention-kind="skill"');
     expect(html).toContain('href="/routines/routine-123"');
     expect(html).toContain('data-mention-kind="routine"');
+  });
+
+  it("renders a policy mention as a chip that opens the policy and keeps its link text", () => {
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <ThemeProvider>
+          <MarkdownBody>{`Follow [Never ship on Friday](${buildPolicyMentionHref("never-ship-on-friday")}) always.`}</MarkdownBody>
+        </ThemeProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(html).toContain('href="/policies?key=never-ship-on-friday"');
+    expect(html).toContain('data-mention-kind="policy"');
+    expect(html).toContain("paperclip-mention-chip--policy");
+    expect(html).toContain(">Never ship on Friday</a>");
+    expect(html).not.toContain("policy://");
+  });
+
+  it("does not turn a malformed policy link into a chip", () => {
+    const html = renderMarkdown("[bad](policy://not a key)");
+
+    expect(html).not.toContain('data-mention-kind="policy"');
   });
 
   it("sanitizes unsafe javascript markdown links", () => {
