@@ -4,7 +4,7 @@ import { toolAccessService } from "../services/tool-access.js";
 import { skillSourceCreateSchema, skillSourceDiscoverySchema, skillSourcePreviewSchema, skillSourceSelectionSchema } from "@paperclipai/shared";
 import type { ActivityPublication } from "../services/activity-log.js";
 import { once } from "node:events";
-import type { SkillSourceDiscoveryEvent } from "@paperclipai/shared";
+import type { CompanySkillFileUpdate, SkillSourceDiscoveryEvent } from "@paperclipai/shared";
 import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog, companySkills } from "@paperclipai/db";
@@ -1231,7 +1231,10 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const skillId = req.params.skillId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
-      const { idempotencyKey, expectedVersionId, ...input } = req.body;
+      const body: CompanySkillFileUpdate = req.body;
+      const { idempotencyKey, expectedVersionId, ...input } = body;
+      const change = input.hunks ? { hunks: input.hunks } : input.content ?? "";
+      const hunkCount = input.hunks?.length;
       if (idempotencyKey) {
         const actor = getActorInfo(req);
         const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
@@ -1252,7 +1255,7 @@ export function companySkillRoutes(db: Db) {
           }
           let publication: ActivityPublication | null = null;
           let receipt: { skillId: string; path: string; versionId: string | null; studioPath: string } | null = null;
-          await companySkillService(tx as unknown as Db).updateFile(companyId, skillId, input.path, input.content, skillActor(req), {
+          await companySkillService(tx as unknown as Db).updateFile(companyId, skillId, input.path, change, skillActor(req), {
             encoding: input.encoding, executable: input.executable, expectedVersionId,
             onRollback: (restore, versionId) => { rollbackState.current = { restore, versionId }; },
             afterUpdate: async (versionId) => {
@@ -1261,7 +1264,7 @@ export function companySkillRoutes(db: Db) {
                 companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId,
                 runId: actor.runId, agentApiKeyId: actor.agentApiKeyId, issueId: runContext?.issue.id,
                 action: "company.skill_file_updated", entityType: "company_skill", entityId: skillId,
-                details: { path: input.path, markdown: input.path === "SKILL.md", versionId,
+                details: { path: input.path, markdown: input.path === "SKILL.md", versionId, ...(hunkCount ? { hunkCount } : {}),
                   sourceIssueId: runContext?.issue.id ?? null, idempotencyKey: receiptKey, fingerprint, receipt },
               });
               publication = activity.publication;
@@ -1287,10 +1290,10 @@ export function companySkillRoutes(db: Db) {
       const result = await svc.updateFile(
         companyId,
         skillId,
-        String(req.body.path ?? ""),
-        String(req.body.content ?? ""),
+        input.path,
+        change,
         skillActor(req),
-        { encoding: req.body.encoding, executable: req.body.executable, expectedVersionId },
+        { encoding: input.encoding, executable: input.executable, expectedVersionId },
       );
 
       const actor = getActorInfo(req);
@@ -1307,6 +1310,7 @@ export function companySkillRoutes(db: Db) {
         details: {
           path: result.path,
           markdown: result.markdown,
+          ...(hunkCount ? { hunkCount } : {}),
         },
       });
 

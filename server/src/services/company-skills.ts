@@ -95,8 +95,10 @@ import type {
   CompanySkillVersionFileInventoryEntry,
   IssueAttachment,
   IssueDocument,
+  SkillFileHunk,
 } from "@paperclipai/shared";
 import {
+  applySkillFileHunks,
   isUuidLike,
   joinFrontmatterBlock,
   normalizeAgentUrlKey,
@@ -2952,6 +2954,32 @@ async function listLastEditorsBySkillId(
   return editors;
 }
 
+/**
+ * Returns the current UTF-8 file with `hunks` applied. A missing file is 404, a
+ * binary file is 422, and a hunk that does not match exactly once is 409 with
+ * its `code` and `hunkIndex`, so the caller can rebuild only that hunk.
+ */
+function applyHunksToSkillFile(
+  normalizedPath: string,
+  current: Buffer | null,
+  hunks: readonly SkillFileHunk[],
+  currentVersionId: string | null,
+): string {
+  if (current === null) throw notFound("Skill file not found");
+  if (snapshotFile(normalizedPath, "other", current).encoding === "base64") {
+    throw unprocessable("Hunks apply only to UTF-8 text files.");
+  }
+  const result = applySkillFileHunks(current.toString("utf8"), hunks);
+  if (result.ok) return result.content;
+  const { ok: _ok, ...failure } = result;
+  const message = failure.code === "hunk_not_found"
+    ? `hunks[${failure.hunkIndex}] did not apply: its old text is not in the current file. Read the file and rebuild the hunk.`
+    : failure.code === "hunk_ambiguous"
+      ? `hunks[${failure.hunkIndex}] did not apply: its old text matches ${failure.matchCount} places. Add surrounding lines so it matches once.`
+      : `hunks[${failure.otherHunkIndex}] and hunks[${failure.hunkIndex}] overlap. Merge them into one hunk.`;
+  throw conflict(message, { ...failure, currentVersionId });
+}
+
 export function companySkillService(db: Db) {
   const folderSvc = folderService(db);
   const agents = agentService(db);
@@ -4676,11 +4704,16 @@ export function companySkillService(db: Db) {
     return inventory;
   }
 
+  /**
+   * Writes one file of an editable local skill under the skill lock. `change` is
+   * the full file, or hunks applied to the file as it is inside the lock, so a
+   * hunk never reverts an edit made after the caller read the file.
+   */
   async function updateFile(
     companyId: string,
     skillId: string,
     relativePath: string,
-    content: string,
+    change: string | { hunks: readonly SkillFileHunk[] },
     actor: SkillActor | null = null,
     format: { encoding?: "utf8" | "base64"; executable?: boolean; expectedVersionId?: string | null;
       afterUpdate?: (versionId: string | null) => Promise<void>;
@@ -4689,7 +4722,9 @@ export function companySkillService(db: Db) {
     return withSkillFileMutation(companyId, skillId, async (skill, tx) => {
 
       if (format.expectedVersionId !== undefined && skill.currentVersionId !== format.expectedVersionId) {
-        throw conflict("Skill version changed. Read the current version before retrying.");
+        throw conflict("Skill version changed. Read the current version before retrying.", {
+          code: "version_changed", currentVersionId: skill.currentVersionId,
+        });
       }
 
       const source = deriveSkillSourceInfo(skill);
@@ -4702,11 +4737,14 @@ export function companySkillService(db: Db) {
       if (!absolutePath) throw notFound("Skill file not found");
 
       if (normalizedPath === "SKILL.md" && format.encoding === "base64") throw unprocessable("SKILL.md must be UTF-8 text.");
+      const previousContent = await fs.readFile(absolutePath).catch(() => null);
+      const content = typeof change === "string"
+        ? change
+        : applyHunksToSkillFile(normalizedPath, previousContent, change.hunks, skill.currentVersionId);
       const bytes = skillFileBytes({ content, encoding: format.encoding });
       if (format.encoding === "base64" && bytes.toString("base64") !== content) {
         throw unprocessable("Binary files must use canonical base64 encoding.");
       }
-      const previousContent = await fs.readFile(absolutePath).catch(() => null);
       const previousMode = (await fs.stat(absolutePath).catch(() => null))?.mode ?? 0o644;
       const restore = async () => {
         if (previousContent === null) await fs.rm(absolutePath, { force: true });
