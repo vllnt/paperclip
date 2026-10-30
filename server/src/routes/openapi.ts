@@ -345,6 +345,9 @@ import {
   listRoutinesQuerySchema,
   observabilityUsageQuerySchema,
   observabilityUsageResponseSchema,
+  ROUTINE_TIMELINE_EDGE_KINDS,
+  ROUTINE_TIMELINE_NODE_KINDS,
+  ROUTINE_TIMELINE_ROW_KINDS,
 } from "@paperclipai/shared";
 import {
   COMPANY_IMPORT_TRANSFERS_API_PATH,
@@ -1191,6 +1194,92 @@ const workTimelineQuerySchema = z
     offset: z.string().optional(),
   })
   .strict();
+
+const routineTimelineQuerySchemaDoc = z
+  .object({
+    from: z.string().datetime({ offset: true }).optional(),
+    to: z.string().datetime({ offset: true }).optional(),
+  })
+  .describe(
+    "Window of the timeline as ISO instants with an offset. With no bounds it is a day back and a day ahead; " +
+      "one bound alone gets 48 hours on the other side. The window is at most 31 days.",
+  );
+
+const routineTimelineResponseSchema = z
+  .object({
+    window: z.object({ from: z.string(), to: z.string() }),
+    generatedAt: z.string(),
+    rows: z.array(
+      z.object({
+        id: z.string(),
+        kind: z.enum(ROUTINE_TIMELINE_ROW_KINDS),
+        refId: z.string(),
+        title: z.string(),
+        status: z.string(),
+        scheduled: z.boolean(),
+        triggers: z.array(
+          z.object({
+            id: z.string(),
+            kind: z.string(),
+            label: z.string().nullable(),
+            enabled: z.boolean(),
+            cronExpression: z.string().nullable(),
+            timezone: z.string().nullable(),
+            nextRunAt: z.string().nullable(),
+            eventSourceId: z.string().nullable(),
+          }),
+        ),
+      }),
+    ),
+    runs: z.array(
+      z.object({
+        id: z.string(),
+        rowId: z.string(),
+        triggerId: z.string().nullable(),
+        source: z.string(),
+        status: z.string(),
+        start: z.string(),
+        end: z.string().nullable(),
+        linkedIssueId: z.string().nullable(),
+        linkedIssue: z
+          .object({
+            id: z.string(),
+            identifier: z.string().nullable(),
+            title: z.string(),
+            status: z.string(),
+          })
+          .nullable(),
+      }),
+    ),
+    fires: z.array(z.object({ rowId: z.string(), triggerId: z.string(), at: z.string() })),
+    nodes: z.array(
+      z.object({
+        id: z.string(),
+        kind: z.enum(ROUTINE_TIMELINE_NODE_KINDS),
+        refId: z.string(),
+        label: z.string(),
+        parentId: z.string().nullable(),
+        status: z.string().nullable(),
+      }),
+    ),
+    edges: z.array(
+      z.object({
+        id: z.string(),
+        kind: z.enum(ROUTINE_TIMELINE_EDGE_KINDS),
+        from: z.string(),
+        to: z.string(),
+        label: z.string().nullable(),
+        enabled: z.boolean(),
+        triggerId: z.string().nullable(),
+        issueId: z.string().nullable(),
+        runId: z.string().nullable(),
+      }),
+    ),
+    limits: z.object({
+      fires: z.object({ cap: z.number(), truncated: z.boolean() }),
+      runs: z.object({ cap: z.number(), truncated: z.boolean() }),
+    }),
+  });
 
 const workTimelineResponseSchema = z
   .object({
@@ -5069,6 +5158,31 @@ const okWithStepWarnings = () => ({
         additionalProperties: true,
       },
     },
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/routines/timeline",
+  tags: ["routines"],
+  summary: "Get the routines timeline: past runs, projected fires and the links between routines",
+  description:
+    "One row per routine (archived routines are left out). `runs` are the routine runs inside the window, newest " +
+    "first, capped at 5000. `fires` are the next scheduled fires of enabled schedule triggers of active routines: " +
+    "the trigger's `nextRunAt`, then its cron expression in the trigger's time zone, earliest first, capped at 500; " +
+    "`limits` says when a cap cut the list. `nodes` and `edges` come from stored data only: event triggers (the " +
+    "event source that fires a routine), routine steps (`step_after`), the goal and project a routine serves, and " +
+    "the issues that join runs of two routines (`parent_issue`, `targets_issue`). An agent sees a run's issue title " +
+    "only when it may read that issue.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: routineTimelineQuerySchemaDoc,
+  },
+  responses: {
+    200: r.ok(routineTimelineResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
   },
 });
 

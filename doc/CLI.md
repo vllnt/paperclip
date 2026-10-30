@@ -679,6 +679,8 @@ npx paperclipai archive export --company-id <company-id> [--since <iso>] [--unti
 
 `routine list` filters combine with AND: `--q` searches the title and description (case-insensitive), `--folder-id none` lists routines in no folder, and `--trigger manual` lists routines that have no trigger and only run when started by hand. With no filter it lists every routine, as before.
 
+`routine timeline` shows every routine of the company with its runs in a window, the next scheduled fires, and the links between routines, steps, event sources, goals and projects. `--from` and `--to` are ISO date-times with an offset; with neither, the window is a day back and a day ahead, and it is at most 31 days. Use `--json` for the full result.
+
 ```sh
 npx paperclipai routine list --company-id <company-id> [--project-id <project-id>] [--goal-id <goal-id>] [--q <text>] [--agent-id <agent-id>] [--folder-id <folder-id>|none] [--status active|paused|archived] [--trigger schedule|webhook|api|event|manual]
 npx paperclipai routine create --company-id <company-id> --payload-json '{...}' [--project-id <project-id>] [--goal-id <goal-id>]
@@ -687,6 +689,7 @@ npx paperclipai routine update <routine-id> --payload-json '{...}' [--project-id
 npx paperclipai routine revisions <routine-id>
 npx paperclipai routine revision:restore <routine-id> <revision-id>
 npx paperclipai routine runs <routine-id> [--limit 50]
+npx paperclipai routine timeline --company-id <company-id> [--from <iso>] [--to <iso>]
 npx paperclipai routine run <routine-id> [--payload-json '{...}']
 npx paperclipai routine trigger:create <routine-id> --payload-json '{...}'
 npx paperclipai routine trigger:update <trigger-id> --payload-json '{...}'

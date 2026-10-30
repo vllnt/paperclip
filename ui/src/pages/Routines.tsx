@@ -715,10 +715,15 @@ export function Routines({ fixedAssigneeAgentId, embedded = false, excludeRoutin
               Recurring work definitions that materialize into auditable execution tasks.
             </p>
           </div>
-          <Button onClick={openCreateRoutine}>
-            <Plus className="mr-2 h-4 w-4" />
-            Create routine
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" asChild>
+              <Link to="/routines/timeline">Timeline</Link>
+            </Button>
+            <Button onClick={openCreateRoutine}>
+              <Plus className="mr-2 h-4 w-4" />
+              Create routine
+            </Button>
+          </div>
         </div>
         <Tabs value={activeTab} onValueChange={handleLegacyTabChange}>
           <PageTabBar
@@ -758,6 +763,11 @@ export function Routines({ fixedAssigneeAgentId, embedded = false, excludeRoutin
           </div>
         )}
         <div className="flex items-center gap-2">
+          {!embedded ? (
+            <Button variant="outline" asChild>
+              <Link to="/routines/timeline">Timeline</Link>
+            </Button>
+          ) : null}
           {streamlinedUiEnabled && !embedded ? (
             <Button variant="outline" asChild>
               <Link to={auditSectionHref("runs", {})}>View all runs</Link>

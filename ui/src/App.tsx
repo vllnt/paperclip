@@ -59,6 +59,7 @@ const AgentChats = lazy(() => import("./pages/AgentChats").then((m) => ({ defaul
 const AgentChat = lazy(() => import("./pages/AgentChat").then((m) => ({ default: m.AgentChat })));
 const IssueChatLongThreadPerf = lazy(() => import("./pages/IssueChatLongThreadPerf").then((m) => ({ default: m.IssueChatLongThreadPerf })));
 const Routines = lazy(() => import("./pages/Routines").then((m) => ({ default: m.Routines })));
+const RoutinesTimeline = lazy(() => import("./pages/RoutinesTimeline").then((m) => ({ default: m.RoutinesTimeline })));
 const Learnings = lazy(() => import("./pages/Pipelines").then((m) => ({ default: m.Learnings })));
 const PipelineItemDetail = lazy(() => import("./pages/Pipelines").then((m) => ({ default: m.PipelineItemDetail })));
 const PipelineItemLegacyRedirect = lazy(() => import("./pages/Pipelines").then((m) => ({ default: m.PipelineItemLegacyRedirect })));
@@ -348,6 +349,7 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
         <Route path="tests/perf/long-thread" element={<IssueChatLongThreadPerf />} />
       ) : null}
       <Route path="routines" element={streamlinedUiEnabled ? <Routines /> : <ProductionSurface><ProductionRoutines /></ProductionSurface>} />
+      <Route path="routines/timeline" element={<RoutinesTimeline />} />
       <Route
         path="cases"
         element={<CasesExperimentalGate><Cases /></CasesExperimentalGate>}
